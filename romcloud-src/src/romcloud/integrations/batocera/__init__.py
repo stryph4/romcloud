@@ -6,10 +6,9 @@ from romcloud.integrations.batocera.launcher import (
     is_romcloud_proxy,
 )
 from romcloud.integrations.batocera.es_config import (
-    install as es_install,
-    refresh as es_refresh,
-    status as es_status,
-    remove as es_remove,
+    install_wrapper_script,
+    is_wrapper_installed,
+    generate_es_systems_note,
 )
 
 __all__ = [
@@ -18,8 +17,7 @@ __all__ = [
     "find_rom_path",
     "replace_rom_path",
     "is_romcloud_proxy",
-    "es_install",
-    "es_refresh",
-    "es_status",
-    "es_remove",
+    "install_wrapper_script",
+    "is_wrapper_installed",
+    "generate_es_systems_note",
 ]

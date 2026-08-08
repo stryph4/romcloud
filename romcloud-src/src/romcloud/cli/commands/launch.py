@@ -3,11 +3,9 @@
 This command is primarily useful for development, testing, and pre-caching
 games before they are needed.
 
-For actual Batocera launch from EmulationStation, ROMCloud's own ES override
-(see ``romcloud es install``) configures the system's ``<command>`` to use
-``romcloud-run`` as the transparent wrapper automatically. See
-:mod:`romcloud.integrations.batocera.es_config` for how that override is
-generated.
+For actual Batocera launch from EmulationStation, configure the system's
+``<command>`` to use ``romcloud-run`` as the transparent wrapper.  See
+:mod:`romcloud.integrations.batocera.es_config` for the required command line.
 
 ROMCloud does not reconstruct a reduced Batocera launch from only the system
 name and ROM path — the full ``emulatorlauncher`` argv passthrough is required

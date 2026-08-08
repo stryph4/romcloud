@@ -101,15 +101,6 @@ class TestGameRepository:
         game_repo.save(Game.create("nes", "x", "local", "/roms", []))
         assert game_repo.count() == 1
 
-    def test_list_systems_returns_distinct_sorted_systems(self, game_repo):
-        game_repo.save(Game.create("ps2", "Game A", "local", "/roms", []))
-        game_repo.save(Game.create("ps2", "Game B", "local", "/roms", []))
-        game_repo.save(Game.create("nes", "Game C", "local", "/roms", []))
-        assert game_repo.list_systems() == ["nes", "ps2"]
-
-    def test_list_systems_empty_catalog(self, game_repo):
-        assert game_repo.list_systems() == []
-
 
 class TestCacheRepository:
     def _add_game(self, game_repo, system="ps2", title="Test"):

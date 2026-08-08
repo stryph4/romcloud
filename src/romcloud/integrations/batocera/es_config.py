@@ -1,4 +1,8 @@
-"""EmulationStation system config overlay.
+"""EmulationStation `es_systems` override — I/O layer.
+
+Delegates all XML transformation to the pure functions in
+:mod:`romcloud.integrations.batocera.es_systems`; this module only owns
+reading the real stock file and writing/removing ROMCloud's own override.
 
 Verified command format on Batocera 42
 ---------------------------------------
@@ -9,120 +13,188 @@ Verified command format on Batocera 42
 
 ``batocera-run`` does not exist on Batocera 42.
 
-How the ROMCloud wrapper plugs in
-----------------------------------
-1. The ``romcloud-run`` Python script is installed at
-   ``/userdata/system/romcloud/bin/romcloud-run``.
+Override mechanism
+-------------------
+ROMCloud **never** modifies ``/usr/share/emulationstation/es_systems.cfg``
+(Batocera's stock file). Instead it writes its own, separate override file
+using Batocera's persistent override mechanism:
 
-2. The ES ``<command>`` for a system is changed to::
+    /userdata/system/configs/emulationstation/es_systems_romcloud.cfg
 
-       /userdata/system/romcloud/bin/romcloud-run %CONTROLLERSCONFIG% -system %SYSTEM% -rom %ROM% -gameinfoxml %GAMEINFOXML% -systemname %SYSTEMNAME%
+This file contains **only** the systems actually managed by the ROMCloud
+catalog (see the ``managed_systems`` argument below — callers typically pass
+``container.game_repo.list_systems()``), each cloned from the stock
+definition with its ``<command>`` executable swapped for the
+``romcloud-run`` wrapper and ``.romcloud`` appended to its ``<extension>``
+list if not already present. Every other Batocera system, and any other
+user override file, is left completely untouched. Removing ROMCloud's
+integration (:func:`remove`) only ever deletes this one file.
 
-   This is exactly the original command with the executable replaced.
-   **All arguments and their order are preserved.**
-
-3. ``romcloud-run`` inspects only the ``-rom`` value:
-
-   * Not a ``.romcloud`` file → ``exec emulatorlauncher`` with original argv unchanged.
-   * Is a ``.romcloud`` file → resolve/cache the real ROM, replace only the
-     ``-rom`` value, ``exec emulatorlauncher`` with every other arg preserved.
-
-4. No automatic modification of ES config is performed — the ``<command>``
-   change must be made manually per system after verifying the wrapper works.
-
-Spike tasks still open
------------------------
-- [x] **Confirmed**: ``emulatorlauncher`` selects emulator/core automatically —
-      no ``-emulator`` or ``-core`` args needed (verified Batocera 42, SNES).
-- [x] **Confirmed**: per-game settings are keyed by filename; the argv-passthrough
-      design plus filename-preserving cache satisfies this requirement.
-- [ ] Confirm ``romcloud-run`` is invoked correctly by ES with the full argv
-      (quoting, spaces in paths, ordering).
-- [ ] Test that controller config is preserved (``%CONTROLLERSCONFIG%`` arg
-      forwarded to ``emulatorlauncher`` correctly).
-- [ ] Verify ``emulatorlauncher`` blocks until the emulator exits (required for
-      future save-sync post-launch hook).
-- [ ] Test on other Batocera systems beyond SNES to confirm the
-      ``<command>`` format is consistent across systems.
-- [!] **Known limitation**: ``folder["/userdata/roms/<system>"].*`` overrides
-      will not apply to cached ROMs because the cache directory path differs.
-      Document this for users; no fix planned for v0.1.
+Known limitation — folder-specific settings
+----------------------------------------------
+``snes.folder["/userdata/roms/snes"].*`` overrides are keyed on the ROM's
+containing directory. Cached ROMs live under
+``/userdata/romcloud-cache/<system>/...``, which differs from the original
+``/userdata/roms/<system>/`` directory used as the folder key — those
+overrides will not apply to cached ROMs. System-level (``snes.*``) and
+per-game (``snes["Game.sfc"].*``) settings are unaffected and work
+correctly, since the original filename is always preserved.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
+from romcloud.core.exceptions import ProviderError
 from romcloud.infrastructure.logging import get_logger
+from romcloud.integrations.batocera.es_systems import (
+    GeneratedOverride,
+    generate_override,
+    parse_override_systems,
+)
 
 log = get_logger("batocera.es_config")
 
-# SPIKE: these paths need validation
-_ES_SYSTEMS_OVERRIDE = Path(
-    "/userdata/system/configs/emulationstation/es_systems.cfg"
+STOCK_ES_SYSTEMS_PATH = Path("/usr/share/emulationstation/es_systems.cfg")
+ROMCLOUD_OVERRIDE_PATH = Path(
+    "/userdata/system/configs/emulationstation/es_systems_romcloud.cfg"
 )
-_WRAPPER_SCRIPT = Path("/userdata/system/romcloud/bin/romcloud-run")
-
-_WRAPPER_CONTENT = """\
-#!/usr/bin/env python3
-\"\"\"romcloud-run — Batocera 42+ EmulationStation launch wrapper.
-
-Receives the exact argv that EmulationStation would pass to emulatorlauncher.
-
-  - Non-.romcloud ROM:  exec emulatorlauncher with original argv unchanged.
-  - .romcloud proxy:    resolve/cache the real ROM, replace only the -rom
-                        value, exec emulatorlauncher with all other args intact.
-
-Example <command> for es_systems.cfg:
-    /userdata/system/romcloud/bin/romcloud-run %CONTROLLERSCONFIG% -system %SYSTEM% -rom %ROM% -gameinfoxml %GAMEINFOXML% -systemname %SYSTEMNAME%
-\"\"\"
-import sys as _sys
-
-_APP = "/userdata/system/romcloud/app"
-if _APP not in _sys.path:
-    _sys.path.insert(0, _APP)
-
-from romcloud.integrations.batocera.launcher import run_launcher_wrapper
-
-run_launcher_wrapper(_sys.argv)
-"""
+WRAPPER_SCRIPT_PATH = Path("/userdata/system/romcloud/bin/romcloud-run")
 
 
-def install_wrapper_script() -> None:
-    """Write the romcloud-run wrapper script and make it executable."""
-    _WRAPPER_SCRIPT.parent.mkdir(parents=True, exist_ok=True)
-    _WRAPPER_SCRIPT.write_text(_WRAPPER_CONTENT, encoding="utf-8")
-    _WRAPPER_SCRIPT.chmod(0o755)
-    log.info("Wrote wrapper script: %s", _WRAPPER_SCRIPT)
+class ESConfigError(ProviderError):
+    """Reading the stock es_systems.cfg or writing the override failed."""
 
 
-def is_wrapper_installed() -> bool:
-    return _WRAPPER_SCRIPT.exists()
+@dataclass(frozen=True)
+class ESIntegrationStatus:
+    """Snapshot of ROMCloud's EmulationStation integration state."""
+
+    wrapper_installed: bool
+    override_exists: bool
+    managed_systems: list[str]
+    """Systems the catalog currently manages (may differ from what's on disk
+    if the override is stale — see ``up_to_date``)."""
+
+    systems_in_override: list[str]
+    """Systems actually present in the on-disk override file, if any."""
+
+    up_to_date: bool
+    """True if regenerating right now would produce byte-identical content."""
 
 
-def generate_es_systems_note() -> str:
-    """Return a human-readable note about the ES configuration change needed.
+def _read_stock_xml(stock_path: Path) -> str:
+    if not stock_path.exists():
+        raise ESConfigError(
+            f"Batocera stock es_systems.cfg not found at {stock_path}. "
+            "Is this running on a Batocera system?"
+        )
+    try:
+        return stock_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ESConfigError(f"Failed to read {stock_path}: {exc}") from exc
 
-    Shown to the user during setup; never applied automatically.
+
+def _generate(
+    managed_systems: Iterable[str],
+    *,
+    stock_path: Path,
+    wrapper_path: Path,
+) -> GeneratedOverride:
+    stock_xml = _read_stock_xml(stock_path)
+    return generate_override(stock_xml, managed_systems, str(wrapper_path))
+
+
+def install(
+    managed_systems: Iterable[str],
+    *,
+    stock_path: Path = STOCK_ES_SYSTEMS_PATH,
+    override_path: Path = ROMCLOUD_OVERRIDE_PATH,
+    wrapper_path: Path = WRAPPER_SCRIPT_PATH,
+) -> GeneratedOverride:
+    """Generate and write the ROMCloud override for the first time (or refresh it).
+
+    Idempotent: writing the same *managed_systems* against an unchanged stock
+    file always produces the same file content.
     """
-    return (
-        "ROMCloud EmulationStation integration — manual setup required.\n\n"
-        "Verified on Batocera 42. 'batocera-run' does not exist.\n\n"
-        "Steps:\n\n"
-        "1. Confirm the wrapper script exists:\n"
-        f"   {_WRAPPER_SCRIPT}\n\n"
-        "2. In /userdata/system/configs/emulationstation/es_systems.cfg,\n"
-        "   copy the target system entry from /usr/share/emulationstation/es_systems.cfg\n"
-        "   and change only the <command> line — replacing 'emulatorlauncher' with\n"
-        "   the romcloud-run wrapper while preserving every argument:\n\n"
-        "   Original:\n"
-        "     emulatorlauncher %CONTROLLERSCONFIG% -system %SYSTEM% -rom %ROM%\n"
-        "       -gameinfoxml %GAMEINFOXML% -systemname %SYSTEMNAME%\n\n"
-        "   Replace with:\n"
-        "     /userdata/system/romcloud/bin/romcloud-run %CONTROLLERSCONFIG%\n"
-        "       -system %SYSTEM% -rom %ROM% -gameinfoxml %GAMEINFOXML%\n"
-        "       -systemname %SYSTEMNAME%\n\n"
-        "3. Add .romcloud to the system's <extension> list.\n\n"
-        "4. Restart EmulationStation.\n\n"
-        "Do not apply automatically until confirmed working on real hardware."
+    result = _generate(managed_systems, stock_path=stock_path, wrapper_path=wrapper_path)
+    override_path.parent.mkdir(parents=True, exist_ok=True)
+    override_path.write_text(result.xml, encoding="utf-8")
+    log.info(
+        "Wrote ES override for %d system(s) to %s (missing from stock: %s)",
+        len(result.included_systems),
+        override_path,
+        result.missing_systems or "none",
     )
+    return result
+
+
+def refresh(
+    managed_systems: Iterable[str],
+    *,
+    stock_path: Path = STOCK_ES_SYSTEMS_PATH,
+    override_path: Path = ROMCLOUD_OVERRIDE_PATH,
+    wrapper_path: Path = WRAPPER_SCRIPT_PATH,
+) -> GeneratedOverride:
+    """Regenerate the override to match the catalog's current managed systems.
+
+    Identical to :func:`install` — kept as a distinct name for CLI clarity
+    (``romcloud es refresh`` after ``romcloud refresh``).
+    """
+    return install(
+        managed_systems,
+        stock_path=stock_path,
+        override_path=override_path,
+        wrapper_path=wrapper_path,
+    )
+
+
+def status(
+    managed_systems: Iterable[str],
+    *,
+    stock_path: Path = STOCK_ES_SYSTEMS_PATH,
+    override_path: Path = ROMCLOUD_OVERRIDE_PATH,
+    wrapper_path: Path = WRAPPER_SCRIPT_PATH,
+) -> ESIntegrationStatus:
+    """Report the current state of ROMCloud's ES integration without changing anything."""
+    managed_list = sorted(set(managed_systems))
+    override_exists = override_path.exists()
+    systems_in_override: list[str] = []
+    up_to_date = False
+
+    if override_exists:
+        try:
+            current_xml = override_path.read_text(encoding="utf-8")
+        except OSError:
+            current_xml = ""
+        systems_in_override = parse_override_systems(current_xml)
+
+        try:
+            fresh = _generate(managed_list, stock_path=stock_path, wrapper_path=wrapper_path)
+            up_to_date = fresh.xml == current_xml
+        except ESConfigError:
+            up_to_date = False
+
+    return ESIntegrationStatus(
+        wrapper_installed=wrapper_path.exists(),
+        override_exists=override_exists,
+        managed_systems=managed_list,
+        systems_in_override=systems_in_override,
+        up_to_date=up_to_date,
+    )
+
+
+def remove(*, override_path: Path = ROMCLOUD_OVERRIDE_PATH) -> bool:
+    """Delete ROMCloud's override file only.
+
+    Never touches the stock ``es_systems.cfg`` or any other override file.
+    Returns True if a file was removed, False if there was nothing to do.
+    """
+    if not override_path.exists():
+        return False
+    override_path.unlink()
+    log.info("Removed ES override: %s", override_path)
+    return True
+

@@ -129,15 +129,6 @@ class GameRepository:
             ).fetchall()
             return [self._row_to_game(conn, r) for r in rows]
 
-    def list_systems(self) -> list[str]:
-        """Return the distinct systems that currently have at least one
-        cataloged game — i.e. the systems ROMCloud actually manages."""
-        with self._db.connect() as conn:
-            rows = conn.execute(
-                "SELECT DISTINCT system FROM games ORDER BY system"
-            ).fetchall()
-            return [r["system"] for r in rows]
-
     def count(self) -> int:
         with self._db.connect() as conn:
             return conn.execute("SELECT COUNT(*) FROM games").fetchone()[0]

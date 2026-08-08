@@ -54,36 +54,3 @@ def write_smb_password(credentials_path: Path, password: str) -> None:
 
     credentials_path.write_text(content, encoding="utf-8")
     credentials_path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600
-
-
-def write_cifs_credentials_file(
-    path: Path,
-    username: str,
-    password: str,
-    domain: Optional[str] = None,
-) -> None:
-    """Write a ``mount.cifs -o credentials=<file>`` style credentials file.
-
-    This is the format ``mount.cifs`` itself expects — plain ``key=value``
-    lines, *not* TOML. Keeping the password out of the mount command line
-    (rather than passing ``username=...,password=...`` as a ``-o`` option)
-    means it never appears in ``ps`` output, shell history, or logs.
-
-    Always written with mode 0600.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    lines = [f"username={username}", f"password={password}"]
-    if domain:
-        lines.append(f"domain={domain}")
-    content = "\n".join(lines) + "\n"
-
-    # Create/truncate with restrictive permissions from the start, rather than
-    # writing world/group-readable content and chmod'ing afterwards.
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(content)
-    finally:
-        pass
-    path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600, in case an existing file had looser perms

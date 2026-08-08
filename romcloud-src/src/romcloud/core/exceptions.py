@@ -35,11 +35,7 @@ class ProviderAuthError(ProviderError):
     """Authentication with the storage source failed."""
 
 
-class MountError(ProviderError):
-    """Mounting or unmounting a source filesystem failed."""
-
-
-# ── Catalog ─────────────────────────────────────────────────────────────────
+# ── Catalog ───────────────────────────────────────────────────────────────────
 
 
 class CatalogError(ROMCloudError):
