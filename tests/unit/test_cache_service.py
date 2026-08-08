@@ -231,3 +231,78 @@ class TestCacheCollisionSafety:
         assert disc1_path != disc2_path
         assert Path(disc1_path).read_bytes() == b"disc_one" * 20
         assert Path(disc2_path).read_bytes() == b"disc_two" * 20
+
+
+class TestRemoveAndEvictionSiblingSafety:
+    """Regression coverage: `CacheEntry.cache_path` is now the exact cached
+    asset *file* under ``<cache_root>/<system>/<relative_path>`` — remove and
+    eviction must delete only that file, never sibling games in the same
+    system directory.
+    """
+
+    @staticmethod
+    def _make_sibling_games(source_root, game_repo):
+        (source_root / "ps2").mkdir(parents=True)
+        (source_root / "ps2" / "Game A.iso").write_bytes(b"a" * 500)
+        (source_root / "ps2" / "Game B.iso").write_bytes(b"b" * 500)
+
+        asset_a = GameAsset("Game A.iso", "ps2/Game A.iso", size_bytes=500, is_primary=True)
+        asset_b = GameAsset("Game B.iso", "ps2/Game B.iso", size_bytes=500, is_primary=True)
+        game_a = Game.create("ps2", "Game A", "local", str(source_root), [asset_a])
+        game_b = Game.create("ps2", "Game B", "local", str(source_root), [asset_b])
+        game_repo.save(game_a)
+        game_repo.save(game_b)
+        return game_a, game_b
+
+    def test_remove_deletes_only_target_file_and_preserves_siblings(
+        self, cache_service, cache_repo, game_repo, tmp_path
+    ):
+        source_root = tmp_path / "source"
+        game_a, game_b = self._make_sibling_games(source_root, game_repo)
+
+        path_a = cache_service.cache_game(game_a.id)
+        path_b = cache_service.cache_game(game_b.id)
+
+        # Sanity: both live directly under the same system directory.
+        assert Path(path_a).parent == Path(path_b).parent
+        assert Path(path_a).parent.name == "ps2"
+
+        cache_service.remove(game_a.id)
+
+        assert not Path(path_a).exists(), "removed game's file must be gone"
+        assert Path(path_b).exists(), "sibling game's file must be untouched"
+        assert Path(path_b).read_bytes() == b"b" * 500
+        assert cache_repo.get(game_a.id) is None
+        assert cache_service.is_cached(game_b.id)
+        # The shared system directory itself must not be removed.
+        assert Path(path_a).parent.exists()
+
+    def test_evict_removes_only_lru_target_file_and_preserves_siblings(
+        self, cache_service, cache_repo, game_repo, tmp_path
+    ):
+        from datetime import datetime, timedelta, timezone
+
+        from romcloud.core.models.cache import CachePolicy
+
+        source_root = tmp_path / "source"
+        game_a, game_b = self._make_sibling_games(source_root, game_repo)
+
+        path_a = cache_service.cache_game(game_a.id)
+        path_b = cache_service.cache_game(game_b.id)
+
+        # game_a is the oldest-accessed → the LRU eviction candidate.
+        old_time = datetime.now(timezone.utc) - timedelta(days=30)
+        cache_repo.update_last_accessed(game_a.id, old_time)
+
+        # Quota only has room for one 500-byte entry, forcing exactly one eviction.
+        cache_service._policy = CachePolicy(max_size_bytes=500, min_free_bytes=0)
+        evicted = cache_service.evict()
+
+        assert evicted == [game_a.id]
+        assert not Path(path_a).exists(), "evicted game's file must be gone"
+        assert Path(path_b).exists(), "non-evicted sibling's file must be untouched"
+        assert Path(path_b).read_bytes() == b"b" * 500
+        assert not cache_service.is_cached(game_a.id)
+        assert cache_service.is_cached(game_b.id)
+        # The shared system directory itself must not be removed.
+        assert Path(path_a).parent.exists()
