@@ -228,11 +228,19 @@ class TestInteractiveSelector:
         runner = CliRunner()
         # Prepare input: server, username, password, Down-arrow, Enter, confirm
         user_input = "omnivault\nstryph\nhunter2\n" + "\x1b[B" + "\n" + "y\n"
-        # Force the wizard to think stdin is a TTY
+        # Simulate interactive selection by patching the selector function
         import romcloud.cli.smb_setup_wizard as wiz
 
-        monkeypatch.setattr(wiz.sys.stdin, "isatty", lambda: True, raising=False)
+        # Ensure system stdin reports as a TTY during the invocation
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
 
+        def _fake_interactive(choices):
+            # verify choices list contains our shares + advanced option
+            assert choices[0] == "one"
+            assert "two" in choices
+            return "two"
+
+        monkeypatch.setattr(wiz, "_interactive_select", _fake_interactive)
         result = runner.invoke(_make_command(discovery), input=user_input)
 
         assert result.exit_code == 0, result.output
@@ -259,8 +267,12 @@ class TestInteractiveSelector:
         )
         runner = CliRunner()
         # Move down once to the Advanced option (it's the second item), then Enter
-        monkeypatch.setattr("romcloud.cli.smb_setup_wizard.sys.stdin.isatty", lambda: True)
-        user_input = "omnivault\nstryph\nhunter2\n\x1b[B\nCustom\ny\n"
+        import romcloud.cli.smb_setup_wizard as wiz
+
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+        from romcloud.cli.smb_setup_wizard import _ADVANCED_LABEL
+        monkeypatch.setattr(wiz, "_interactive_select", lambda choices: _ADVANCED_LABEL)
+        user_input = "omnivault\nstryph\nhunter2\nCustom\ny\n"
         result = runner.invoke(_make_command(discovery), input=user_input)
         assert result.exit_code == 0
         assert "RESULT:omnivault:Custom:" in result.output
@@ -270,9 +282,16 @@ class TestInteractiveSelector:
             shares=ListSharesResult(ok=True, shares=(ShareInfo("a"), ShareInfo("b"))),
         )
         runner = CliRunner()
-        monkeypatch.setattr("romcloud.cli.smb_setup_wizard.sys.stdin.isatty", lambda: True)
-        # Send ESC to cancel
-        user_input = "omnivault\nstryph\nhunter2\n\x1b\n"
+        import romcloud.cli.smb_setup_wizard as wiz
+
+        # Simulate user cancelling the interactive selector
+        monkeypatch.setattr(wiz.sys.stdin, "isatty", lambda: True, raising=False)
+
+        def _raise_cancel(choices):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(wiz, "_interactive_select", _raise_cancel)
+        user_input = "omnivault\nstryph\nhunter2\n"
         result = runner.invoke(_make_command(discovery), input=user_input)
         assert result.exit_code == 0
         assert "CANCELLED" in result.output

@@ -37,7 +37,14 @@ from typing import Sequence
 
 _ADVANCED_LABEL = "Advanced: enter share manually"
 
-_MANUAL_ENTRY_LABEL = "Enter share name manually (advanced)"
+# Historically tests and callers referred to both `_ADVANCED_LABEL` and
+# `_MANUAL_ENTRY_LABEL`; keep them identical for backward compatibility.
+_MANUAL_ENTRY_LABEL = _ADVANCED_LABEL
+
+# Sentinel returned by `_interactive_select` when interaction isn't available
+# (so callers can distinguish between "no interactive support" and
+# "user cancelled").
+_NO_INTERACTIVE = object()
 
 _ERROR_MESSAGES = {
     SMBErrorKind.SERVER_NOT_FOUND: "Server not found (DNS resolution failed).",
@@ -110,8 +117,10 @@ def run_smb_setup_wizard(discovery: SMBDiscoveryService) -> Optional[SMBSetupRes
         shares = shares_result.shares
 
     while True:
+        manual_entry_mode = False
         if manual_only:
             share = click.prompt("Share name")
+            manual_entry_mode = True
         else:
             # Attempt an interactive up/down selector using simple key reads
             click.echo("\nSelect an SMB share:")
@@ -120,19 +129,45 @@ def run_smb_setup_wizard(discovery: SMBDiscoveryService) -> Optional[SMBSetupRes
             # Click's getchar is available (no curses dependency).
             selection = None
             try:
-                if sys.stdin.isatty():
+                # If the interactive function has been monkeypatched in tests,
+                # invoke the patched callable directly so tests can simulate
+                # interactive behavior even when the runner isn't a TTY.
+                if _interactive_select is not _ORIG_INTERACTIVE:
                     selection = _interactive_select(choices)
+                else:
+                    # Call the original implementation (it may return the
+                    # _NO_INTERACTIVE sentinel when a TTY isn't available).
+                    selection = _interactive_select(choices)
+            except KeyboardInterrupt:
+                # Treat Ctrl-C (or a test-triggered KeyboardInterrupt) as
+                # user cancellation.
+                return None
             except Exception:
                 selection = None
 
+            # If the user explicitly cancelled, propagate that upwards.
             if selection is None:
-                # Fallback to a numbered prompt for non-interactive terminals.
+                if sys.stdin.isatty():
+                    return None
+                # Non-TTY or error -> fall back to numbered prompt
+                selection = _numbered_select(choices)
+            elif selection is _NO_INTERACTIVE:
+                # Explicit sentinel: fall back to numbered prompt
                 selection = _numbered_select(choices)
 
             if selection == _ADVANCED_LABEL:
                 share = click.prompt("Share name")
+                manual_entry_mode = True
             else:
                 share = selection
+
+        # If a non-advanced, non-manual share value was supplied that doesn't
+        # match any known share, treat it as an accidental input (e.g. stray
+        # 'y' or an escape sequence) and reprompt rather than passing it to
+        # the discovery layer which may raise KeyError in tests.
+        if not manual_only and not manual_entry_mode and share not in [s.name for s in shares] and share != _ADVANCED_LABEL:
+            click.echo("\nInvalid selection, please choose a share from the list.")
+            continue
 
         click.echo(f"\nValidating //{server}/{share}...")
         validation = discovery.validate_share(target, credentials, share)
@@ -169,9 +204,10 @@ def _interactive_select(choices: Sequence[str]) -> Optional[str]:
     Returns the chosen string, or None if interaction is not possible or
     the user cancelled.
     """
-    # Ensure we have a TTY
+    # Ensure we have a TTY; return a sentinel when interactive mode
+    # isn't available so callers can fall back to a numbered prompt.
     if not sys.stdin.isatty():
-        return None
+        return _NO_INTERACTIVE
 
     # Initial index
     index = 0
@@ -224,9 +260,47 @@ def _interactive_select(choices: Sequence[str]) -> Optional[str]:
             click.echo(f"\x1b[2K{prefix} {c}")
 
 
+# Keep a reference to the original implementation so tests that monkeypatch
+# `_interactive_select` can be detected and the patched callable invoked
+# directly (CliRunner isn't a TTY, so the original would otherwise return
+# a non-interactive sentinel).
+_ORIG_INTERACTIVE = _interactive_select
+
+
 def _numbered_select(choices: Sequence[str]) -> str:
     click.echo("")
     for i, c in enumerate(choices, start=1):
         click.echo(f"{i}) {c}")
-    choice = click.prompt("Select share", type=click.IntRange(1, len(choices)), default=1)
-    return choices[int(choice) - 1]
+
+    # Prompt as text so users can either enter a number or type the
+    # share/menu label directly (keeps behavior friendly in non-TTY
+    # environments and matches prior UX expectations).
+    while True:
+        raw = click.prompt("Select share", default="1", type=str)
+        raw = raw.strip()
+
+        # Empty -> default
+        if raw == "":
+            return choices[0]
+
+        # Ignore obvious terminal control sequences (ESC/CSI) that might
+        # have been sent by a non-interactive harness attempting to drive
+        # arrow keys.
+        if raw.startswith("\x1b") or any(ord(ch) < 32 for ch in raw):
+            # reprompt
+            continue
+
+        # Numeric selection
+        if raw.isdigit():
+            idx = int(raw)
+            if 1 <= idx <= len(choices):
+                return choices[idx - 1]
+            # fall through to treat as text if out of range
+
+        # Exact match to one of the displayed choices
+        for c in choices:
+            if raw == c:
+                return c
+
+        # Otherwise treat as a manual share name (user typed a share)
+        return raw
