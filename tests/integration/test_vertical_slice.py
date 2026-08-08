@@ -152,9 +152,9 @@ def test_local_vertical_slice(tmp_path: Path) -> None:
 
     # ── Step 7: cache path structure ─────────────────────────────────────────
 
-    # Must be under cache_root/ps2/<game_id>/
-    assert cached_file.parent.parent.parent == cache_root
-    assert cached_file.parent.parent.name == "ps2"
+    # Must be directly under cache_root/ps2/, preserving the source basename.
+    assert cached_file.parent == cache_root / "ps2"
+    assert cached_file.name == "Final Fantasy X.iso"
 
     # Must NOT be inside the local roms directory
     assert not str(cached_file).startswith(str(local_roms))

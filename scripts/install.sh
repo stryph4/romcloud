@@ -47,6 +47,16 @@ done
 
 echo "Installing ROMCloud to ${ROMCLOUD_HOME} ..."
 
+# ── verify required dependencies ──────────────────────────────────────────────
+MISSING_DEPS=()
+command -v python3 &>/dev/null || MISSING_DEPS+=("python3")
+command -v pip3 &>/dev/null || MISSING_DEPS+=("pip3")
+if [[ ${#MISSING_DEPS[@]} -gt 0 ]]; then
+    echo "ERROR: missing required dependencies: ${MISSING_DEPS[*]}" >&2
+    echo "Install python3 and pip3, then re-run this installer." >&2
+    exit 1
+fi
+
 # ── create directory structure ────────────────────────────────────────────────
 mkdir -p "${APP_DIR}" "${BIN_DIR}" "${CONFIG_DIR}" "${DATA_DIR}" "${LOGS_DIR}"
 mkdir -p "${CACHE_ROOT}/.partial"
@@ -54,12 +64,8 @@ mkdir -p "${CACHE_ROOT}/.partial"
 echo "  Created directory structure."
 
 # ── install Python package ────────────────────────────────────────────────────
-if command -v pip3 &>/dev/null; then
-    pip3 install --target="${APP_DIR}" --upgrade --quiet "${PROJECT_DIR}"
-    echo "  Installed Python package to ${APP_DIR}."
-else
-    echo "  WARNING: pip3 not found. Copy source manually or install pip."
-fi
+pip3 install --target="${APP_DIR}" --upgrade --quiet "${PROJECT_DIR}"
+echo "  Installed Python package to ${APP_DIR}."
 
 # ── write version file ────────────────────────────────────────────────────────
 if [[ -f "${PROJECT_DIR}/version.json" ]]; then
@@ -67,11 +73,14 @@ if [[ -f "${PROJECT_DIR}/version.json" ]]; then
 fi
 
 # ── write CLI wrapper ─────────────────────────────────────────────────────────
-cat > "${BIN_DIR}/romcloud" << WRAPPER
-#!/bin/bash
-export PYTHONPATH="${APP_DIR}:\${PYTHONPATH:-}"
-exec python3 -m romcloud.cli.main "\$@"
-WRAPPER
+# Built with printf (not an unquoted heredoc) so runtime-only tokens such as
+# "$@" and "${PYTHONPATH:-}" are never subject to expansion by the installer's
+# own shell — only APP_DIR is substituted, via %s.
+{
+    printf '#!/bin/bash\n'
+    printf 'export PYTHONPATH="%s:${PYTHONPATH:-}"\n' "${APP_DIR}"
+    printf 'exec python3 -m romcloud.cli.main "$@"\n'
+} > "${BIN_DIR}/romcloud"
 chmod +x "${BIN_DIR}/romcloud"
 echo "  Wrote CLI wrapper: ${BIN_DIR}/romcloud"
 
@@ -140,10 +149,12 @@ else
 fi
 
 # ── add to PATH on Batocera (via custom.sh) ───────────────────────────────────
-CUSTOM_SH="/userdata/system/custom.sh"
+CUSTOM_SH="${CUSTOM_SH:-/userdata/system/custom.sh}"
 if [[ -f "${CUSTOM_SH}" ]] || [[ -d "$(dirname "${CUSTOM_SH}")" ]]; then
     if ! grep -qF "romcloud/bin" "${CUSTOM_SH}" 2>/dev/null; then
-        echo "export PATH=\"${BIN_DIR}:\$PATH\"" >> "${CUSTOM_SH}"
+        # Single-quoted format string: "$PATH" is written literally so it is
+        # expanded at custom.sh runtime, not by the installer.
+        printf 'export PATH="%s:$PATH"\n' "${BIN_DIR}" >> "${CUSTOM_SH}"
         echo "  Added ${BIN_DIR} to PATH in ${CUSTOM_SH}"
     else
         echo "  PATH entry already present in ${CUSTOM_SH}."

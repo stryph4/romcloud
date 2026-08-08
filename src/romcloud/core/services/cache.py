@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
+from romcloud.core.cache_paths import resolve_cache_path
 from romcloud.core.exceptions import (
     CacheError,
     GameNotFoundError,
@@ -27,7 +28,6 @@ from romcloud.core.exceptions import (
     InsufficientSpaceError,
 )
 from romcloud.core.models.cache import CacheEntry, CachePolicy, CacheStatus
-from romcloud.core.models.game import Game
 from romcloud.core.services.transfer import TransferService
 from romcloud.infrastructure.logging import get_logger
 from romcloud.infrastructure.repositories.cache import CacheRepository
@@ -87,12 +87,11 @@ class CacheService:
         entry = self._cache_repo.get(game_id)
         assert entry is not None  # guaranteed by is_cached
         game = self._game_repo.get(game_id)
-        if game is None:
+        if game is None or game.primary_asset is None:
             return None
-        primary = game.primary_asset
-        if primary is None:
-            return None
-        return str(Path(entry.cache_path) / primary.filename)
+        # entry.cache_path already points at the exact asset (file or
+        # directory) — see romcloud.core.cache_paths.
+        return entry.cache_path
 
     def status_summary(self) -> dict:
         """Return a summary dict suitable for CLI display."""
@@ -134,22 +133,28 @@ class CacheService:
             entry = self._cache_repo.get(game_id)
             assert entry is not None
             self._touch_accessed(game_id)
-            return self._launch_path(entry, self._game_repo.get(game_id))
+            return entry.cache_path
 
         game = self._game_repo.get(game_id)
         if game is None:
             raise GameNotFoundError(f"Game not found in catalog: {game_id}")
 
+        primary = game.primary_asset
+        if primary is None:
+            raise CacheError(f"Game {game_id!r} has no cacheable assets")
+
         needed = game.total_size_bytes or 0
         self._ensure_space(needed)
+
+        # cache_path is fully determined by (system, primary asset's relative
+        # path) — see romcloud.core.cache_paths — so it is already correct
+        # even before the transfer completes.
+        cache_path = str(resolve_cache_path(self._cache_root, game.system, primary.relative_path))
 
         # Create or update the entry to TRANSFERRING.
         existing = self._cache_repo.get(game_id)
         if existing is None:
-            entry = CacheEntry.create(
-                game_id=game_id,
-                cache_path=str(self._cache_root / game.system / game_id),
-            )
+            entry = CacheEntry.create(game_id=game_id, cache_path=cache_path)
             self._cache_repo.save(entry)
         else:
             self._cache_repo.update_status(game_id, CacheStatus.TRANSFERRING)
@@ -157,14 +162,14 @@ class CacheService:
         try:
             final_path = self._transfer.transfer(game, on_progress)
             actual_size = _dir_size(Path(final_path))
+            self._cache_repo.update_cache_path(game_id, final_path)
             self._cache_repo.update_status(game_id, CacheStatus.COMPLETE)
             self._cache_repo.update_size(game_id, actual_size)
             self._touch_accessed(game_id)
 
-            # Re-read entry with updated cache_path.
             updated_entry = self._cache_repo.get(game_id)
             assert updated_entry is not None
-            return self._launch_path(updated_entry, game)
+            return updated_entry.cache_path
 
         except Exception:
             self._cache_repo.update_status(game_id, CacheStatus.FAILED)
@@ -271,12 +276,6 @@ class CacheService:
 
     def _touch_accessed(self, game_id: str) -> None:
         self._cache_repo.update_last_accessed(game_id, datetime.now(timezone.utc))
-
-    @staticmethod
-    def _launch_path(entry: CacheEntry, game: Optional[Game]) -> str:
-        if game is None or game.primary_asset is None:
-            return entry.cache_path
-        return str(Path(entry.cache_path) / game.primary_asset.filename)
 
     @staticmethod
     def _remove_files(entry: CacheEntry) -> None:

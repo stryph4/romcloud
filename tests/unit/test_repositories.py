@@ -124,6 +124,13 @@ class TestCacheRepository:
         cache_repo.update_status(game.id, CacheStatus.COMPLETE)
         assert cache_repo.get(game.id).status == CacheStatus.COMPLETE
 
+    def test_update_cache_path(self, game_repo, cache_repo):
+        game = self._add_game(game_repo)
+        entry = CacheEntry.create(game.id, "/cache/placeholder")
+        cache_repo.save(entry)
+        cache_repo.update_cache_path(game.id, "/cache/ps2/Game.iso")
+        assert cache_repo.get(game.id).cache_path == "/cache/ps2/Game.iso"
+
     def test_set_pinned(self, game_repo, cache_repo):
         game = self._add_game(game_repo)
         entry = CacheEntry.create(game.id, "/cache/test")

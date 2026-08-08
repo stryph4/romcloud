@@ -159,3 +159,75 @@ class TestEviction:
         evicted = cache_service.evict()
         assert game.id not in evicted
         assert cache_service.is_cached(game.id)
+
+
+class TestCacheCollisionSafety:
+    """The cache path invariant: cache_root/system/<relative path> must never collide."""
+
+    def test_identical_filenames_across_two_systems_do_not_collide(
+        self, cache_service, game_repo, tmp_path
+    ):
+        source_root = tmp_path / "source"
+        (source_root / "ps2").mkdir(parents=True)
+        (source_root / "snes").mkdir(parents=True)
+        (source_root / "ps2" / "Game.rom").write_bytes(b"ps2_content" * 20)
+        (source_root / "snes" / "Game.rom").write_bytes(b"snes_content" * 20)
+
+        ps2_asset = GameAsset(
+            "Game.rom",
+            "ps2/Game.rom",
+            size_bytes=(source_root / "ps2" / "Game.rom").stat().st_size,
+            is_primary=True,
+        )
+        snes_asset = GameAsset(
+            "Game.rom",
+            "snes/Game.rom",
+            size_bytes=(source_root / "snes" / "Game.rom").stat().st_size,
+            is_primary=True,
+        )
+        ps2_game = Game.create("ps2", "Game", "local", str(source_root), [ps2_asset])
+        snes_game = Game.create("snes", "Game", "local", str(source_root), [snes_asset])
+        game_repo.save(ps2_game)
+        game_repo.save(snes_game)
+
+        ps2_path = cache_service.cache_game(ps2_game.id)
+        snes_path = cache_service.cache_game(snes_game.id)
+
+        assert ps2_path != snes_path
+        assert Path(ps2_path).read_bytes() == b"ps2_content" * 20
+        assert Path(snes_path).read_bytes() == b"snes_content" * 20
+        assert cache_service.is_cached(ps2_game.id)
+        assert cache_service.is_cached(snes_game.id)
+
+    def test_identical_filenames_across_two_subdirectories_do_not_collide(
+        self, cache_service, game_repo, tmp_path
+    ):
+        source_root = tmp_path / "source"
+        (source_root / "ps2" / "discs" / "1").mkdir(parents=True)
+        (source_root / "ps2" / "discs" / "2").mkdir(parents=True)
+        (source_root / "ps2" / "discs" / "1" / "Game.iso").write_bytes(b"disc_one" * 20)
+        (source_root / "ps2" / "discs" / "2" / "Game.iso").write_bytes(b"disc_two" * 20)
+
+        disc1_asset = GameAsset(
+            "Game.iso",
+            "ps2/discs/1/Game.iso",
+            size_bytes=(source_root / "ps2" / "discs" / "1" / "Game.iso").stat().st_size,
+            is_primary=True,
+        )
+        disc2_asset = GameAsset(
+            "Game.iso",
+            "ps2/discs/2/Game.iso",
+            size_bytes=(source_root / "ps2" / "discs" / "2" / "Game.iso").stat().st_size,
+            is_primary=True,
+        )
+        disc1_game = Game.create("ps2", "Disc 1", "local", str(source_root), [disc1_asset])
+        disc2_game = Game.create("ps2", "Disc 2", "local", str(source_root), [disc2_asset])
+        game_repo.save(disc1_game)
+        game_repo.save(disc2_game)
+
+        disc1_path = cache_service.cache_game(disc1_game.id)
+        disc2_path = cache_service.cache_game(disc2_game.id)
+
+        assert disc1_path != disc2_path
+        assert Path(disc1_path).read_bytes() == b"disc_one" * 20
+        assert Path(disc2_path).read_bytes() == b"disc_two" * 20

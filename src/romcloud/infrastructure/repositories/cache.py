@@ -54,6 +54,13 @@ class CacheRepository:
                 (status.value, game_id),
             )
 
+    def update_cache_path(self, game_id: str, cache_path: str) -> None:
+        with self._db.connect() as conn:
+            conn.execute(
+                "UPDATE cache_entries SET cache_path = ? WHERE game_id = ?",
+                (cache_path, game_id),
+            )
+
     def update_size(self, game_id: str, size_bytes: int) -> None:
         with self._db.connect() as conn:
             conn.execute(
