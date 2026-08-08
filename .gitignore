@@ -21,3 +21,4 @@ MANIFEST
 .mypy_cache/
 .ruff_cache/
 .tox/
+romcloud-src/
