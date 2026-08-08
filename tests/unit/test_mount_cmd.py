@@ -181,7 +181,7 @@ class TestInstall:
         monkeypatch.setattr(
             mount_cmd_module.mount_service,
             "install_service",
-            lambda romcloud_bin: captured.setdefault("bin", romcloud_bin) or Path("/svc/romcloud-mount"),
+            lambda romcloud_bin: captured.setdefault("bin", romcloud_bin) or Path("/svc/romcloud_mount"),
         )
 
         result = _invoke(["install"], _fake_config(smb=_fake_smb(), romcloud_home="/opt/romcloud"))

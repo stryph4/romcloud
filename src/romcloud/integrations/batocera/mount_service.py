@@ -5,10 +5,9 @@ extension point for running a script at boot: any executable script placed
 under ``/userdata/system/services/`` that responds to ``start``/``stop``/
 ``status`` arguments can be registered with ``batocera-services enable
 <name>``. This module generates and installs exactly one such script,
-``romcloud-mount``.
+``romcloud_mount``.
 
 Boot safety ("ROMCloud may fail; Batocera must not")
-------------------------------------------------------
 Real Batocera 42 hardware testing showed that a service's ``start`` action
 blocking on DNS/network/Tailscale/CIFS reachability can hang or disrupt
 boot. The generated script therefore:
@@ -40,12 +39,14 @@ from romcloud.infrastructure.logging import get_logger
 
 log = get_logger("batocera.mount_service")
 
-SERVICE_NAME = "romcloud-mount"
+SERVICE_NAME = "romcloud_mount"
+LEGACY_SERVICE_NAME = "romcloud-mount"
 SERVICE_SCRIPT_PATH = Path(f"/userdata/system/services/{SERVICE_NAME}")
+LEGACY_SERVICE_PATH = Path(f"/userdata/system/services/{LEGACY_SERVICE_NAME}")
 
 
 def generate_service_script(romcloud_bin: str) -> str:
-    """Return the content of the `romcloud-mount` custom-service script.
+    """Return the content of the `romcloud_mount` custom-service script.
 
     *romcloud_bin* is the absolute path to the installed `romcloud` CLI
     wrapper (see `scripts/install.sh`), which already execs the venv's own
@@ -101,6 +102,23 @@ def install_service(romcloud_bin: str, *, service_path: Path = SERVICE_SCRIPT_PA
     service_path.chmod(0o755)
     log.info("Wrote service script: %s", service_path)
 
+    # If an old legacy service file exists and appears to be the
+    # ROMCloud-generated script, remove it so Batocera doesn't warn about
+    # invalid service names. Only remove when the file content matches the
+    # expected ROMCloud header to avoid touching unrelated files.
+    if LEGACY_SERVICE_PATH.exists():
+            try:
+                content = LEGACY_SERVICE_PATH.read_text(encoding="utf-8")
+            except Exception:
+                content = ""
+
+            if "ROMCloud SMB source mount" in content or "romcloud mount boot-start" in content:
+                try:
+                    LEGACY_SERVICE_PATH.unlink()
+                    log.info("Removed legacy service script: %s", LEGACY_SERVICE_PATH)
+                except Exception:
+                    log.warning("Failed to remove legacy service script: %s", LEGACY_SERVICE_PATH)
+
     try:
         subprocess.run(
             ["batocera-services", "enable", SERVICE_NAME],
@@ -133,12 +151,33 @@ def remove_service(*, service_path: Path = SERVICE_SCRIPT_PATH) -> bool:
     except FileNotFoundError:
         pass
 
-    if not service_path.exists():
-        return False
-    service_path.unlink()
-    log.info("Removed service script: %s", service_path)
-    return True
+    removed = False
+    if service_path.exists():
+        try:
+            service_path.unlink()
+            log.info("Removed service script: %s", service_path)
+            removed = True
+        except Exception:
+            log.warning("Failed to remove service script: %s", service_path)
+
+    # Also remove legacy path if it's the ROMCloud-owned script.
+    if LEGACY_SERVICE_PATH.exists():
+        try:
+            content = LEGACY_SERVICE_PATH.read_text(encoding="utf-8")
+        except Exception:
+            content = ""
+
+        if "ROMCloud SMB source mount" in content or "romcloud mount boot-start" in content:
+            try:
+                LEGACY_SERVICE_PATH.unlink()
+                log.info("Removed legacy service script: %s", LEGACY_SERVICE_PATH)
+                removed = True
+            except Exception:
+                log.warning("Failed to remove legacy service script: %s", LEGACY_SERVICE_PATH)
+
+    return removed
 
 
 def is_service_installed(*, service_path: Path = SERVICE_SCRIPT_PATH) -> bool:
-    return service_path.exists()
+    # Consider either the canonical or legacy service script as "installed".
+    return service_path.exists() or LEGACY_SERVICE_PATH.exists()
