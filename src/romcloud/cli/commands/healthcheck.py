@@ -7,7 +7,7 @@ from pathlib import Path
 
 import click
 
-from romcloud.cli.main import get_container
+from romcloud.cli.context import get_container
 
 
 def _fmt_bytes(n: int) -> str:

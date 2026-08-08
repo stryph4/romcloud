@@ -5,7 +5,7 @@ from __future__ import annotations
 import click
 
 from romcloud.core.exceptions import ProviderNotReachableError, ROMCloudError
-from romcloud.cli.main import get_container
+from romcloud.cli.context import get_container
 
 
 @click.command("refresh")

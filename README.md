@@ -99,8 +99,10 @@ Located at `/userdata/system/romcloud/config/romcloud.toml`:
 
 ```toml
 [source]
-provider = "local"           # "local" or "smb"
-rom_root = "/mnt/nas/ROMs"
+provider = "local"           # always "local" — an SMB share is mounted
+                              # locally first (see `romcloud mount`) and
+                              # read through the same local filesystem code
+rom_root = "/mnt/nas/ROMs"    # local path, or the SMB share's mount point
 
 [cache]
 path = "/userdata/romcloud-cache"
@@ -113,6 +115,12 @@ path = "/userdata/roms"
 [logging]
 level = "INFO"
 ```
+
+`romcloud configure` asks for a **source type** — `local` (local disk/USB)
+or `smb` (a network share) — not a low-level provider choice. Selecting
+`smb` additionally writes a `[smb]` section (server/share/username) used by
+`romcloud mount` to mount the share at `rom_root`; ROMCloud always reads
+ROMs through the local filesystem.
 
 SMB credentials are stored separately in `config/credentials.toml` (mode 600):
 

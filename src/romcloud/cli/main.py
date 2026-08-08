@@ -9,17 +9,11 @@ from romcloud.infrastructure.config import load_config, default_config_path
 from romcloud.infrastructure.logging import configure_logging
 from romcloud.core.exceptions import ConfigurationNotFoundError, ROMCloudError
 
+# Re-exported for backward compatibility — command modules should import
+# from romcloud.cli.context directly (see that module for why).
+from romcloud.cli.context import get_container
 
-# ── shared context helper ─────────────────────────────────────────────────────
-
-
-def get_container(ctx: click.Context):
-    """Return the Container from Click context, building it on first access."""
-    if "container" not in ctx.obj:
-        from romcloud.bootstrap.container import Container
-        config = ctx.obj["config"]
-        ctx.obj["container"] = Container(config)
-    return ctx.obj["container"]
+__all__ = ["cli", "get_container"]
 
 
 # ── root command group ────────────────────────────────────────────────────────

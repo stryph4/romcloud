@@ -42,9 +42,20 @@ _DEFAULT_LOCAL_ROMS = Path("/userdata/roms")
 @dataclass(frozen=True)
 class SourceConfig:
     provider: str
-    """``"local"`` or ``"smb"``."""
+    """Storage provider implementation to use — currently always ``"local"``.
+
+    ROMCloud has exactly one implemented storage provider
+    (:class:`~romcloud.core.providers.local.LocalFilesystemProvider`). A
+    network SMB/CIFS share is mounted locally first (see
+    :mod:`romcloud.infrastructure.mount`) and then read through this same
+    local provider — ``rom_root`` is its mount point. The native
+    ``"smb"`` provider remains an unimplemented stub reserved for future
+    direct-SMB support; configs loaded with ``provider = "smb"`` are
+    transparently normalized to ``"local"`` (see :func:`load_config`).
+    """
     rom_root: str
-    """Absolute path (local) or share-relative path (SMB) for the ROM root."""
+    """Absolute local filesystem path to the ROM root — either a plain
+    local/USB directory, or the local mount point of an SMB share."""
 
 
 @dataclass(frozen=True)
@@ -106,12 +117,43 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
 def _parse(data: dict, path: Path) -> AppConfig:  # noqa: C901
     try:
         src = data["source"]
-        source = SourceConfig(
-            provider=src["provider"],
-            rom_root=src["rom_root"],
-        )
+        provider = src["provider"]
+        rom_root = src["rom_root"]
     except KeyError as exc:
         raise ConfigurationError(f"Missing required config key: {exc}") from exc
+
+    smb = None
+    if "smb" in data:
+        s = data["smb"]
+        try:
+            smb = SMBConfig(
+                server=s["server"],
+                share=s["share"],
+                username=s.get("username", "guest"),
+                port=int(s.get("port", 445)),
+            )
+        except KeyError as exc:
+            raise ConfigurationError(f"Missing required [smb] key: {exc}") from exc
+
+    if provider == "smb":
+        # Legacy configs (written before the mounted-SMB model) used
+        # provider = "smb" to mean "read ROMs from this SMB source" — but
+        # the native SMBProvider is still an unimplemented stub, and
+        # activating it here would crash every command with
+        # NotImplementedError. At runtime an SMB source always means a
+        # locally-mounted share read via LocalFilesystemProvider, so
+        # normalize transparently as long as we have enough [smb] detail
+        # to actually mount it; otherwise fail clearly instead of crashing
+        # deep inside an unrelated command.
+        if smb is None:
+            raise ConfigurationError(
+                f"{path}: source.provider = \"smb\" but no [smb] section is "
+                "present, so there is nothing to mount. Run `romcloud configure` "
+                "again to fix this."
+            )
+        provider = "local"
+
+    source = SourceConfig(provider=provider, rom_root=rom_root)
 
     cache_raw = data.get("cache", {})
     cache = CacheConfig(
@@ -135,16 +177,6 @@ def _parse(data: dict, path: Path) -> AppConfig:  # noqa: C901
         level=log_raw.get("level", "INFO"),
         path=log_raw.get("path"),
     )
-
-    smb = None
-    if "smb" in data:
-        s = data["smb"]
-        smb = SMBConfig(
-            server=s["server"],
-            share=s["share"],
-            username=s.get("username", "guest"),
-            port=int(s.get("port", 445)),
-        )
 
     return AppConfig(
         source=source,

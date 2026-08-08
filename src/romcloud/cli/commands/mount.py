@@ -17,7 +17,7 @@ from pathlib import Path
 
 import click
 
-from romcloud.cli.main import get_container
+from romcloud.cli.context import get_container
 from romcloud.core.exceptions import ROMCloudError
 from romcloud.infrastructure import mount
 from romcloud.infrastructure.credentials import load_smb_password, write_cifs_credentials_file

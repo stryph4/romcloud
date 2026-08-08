@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import click
 
-from romcloud.cli.main import get_container
+from romcloud.cli.context import get_container
 from romcloud.integrations.batocera import es_config
 
 
