@@ -21,7 +21,7 @@ LOCAL_ROMS="${LOCAL_ROMS:-/userdata/roms}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-APP_DIR="${ROMCLOUD_HOME}/app"
+VENV_DIR="${ROMCLOUD_HOME}/venv"
 BIN_DIR="${ROMCLOUD_HOME}/bin"
 CONFIG_DIR="${ROMCLOUD_HOME}/config"
 DATA_DIR="${ROMCLOUD_HOME}/data"
@@ -32,7 +32,7 @@ for arg in "$@"; do
     case "$arg" in
         --prefix=*)
             ROMCLOUD_HOME="${arg#*=}"
-            APP_DIR="${ROMCLOUD_HOME}/app"
+            VENV_DIR="${ROMCLOUD_HOME}/venv"
             BIN_DIR="${ROMCLOUD_HOME}/bin"
             CONFIG_DIR="${ROMCLOUD_HOME}/config"
             DATA_DIR="${ROMCLOUD_HOME}/data"
@@ -48,24 +48,52 @@ done
 echo "Installing ROMCloud to ${ROMCLOUD_HOME} ..."
 
 # ── verify required dependencies ──────────────────────────────────────────────
-MISSING_DEPS=()
-command -v python3 &>/dev/null || MISSING_DEPS+=("python3")
-command -v pip3 &>/dev/null || MISSING_DEPS+=("pip3")
-if [[ ${#MISSING_DEPS[@]} -gt 0 ]]; then
-    echo "ERROR: missing required dependencies: ${MISSING_DEPS[*]}" >&2
-    echo "Install python3 and pip3, then re-run this installer." >&2
+# Only python3 is required globally. ROMCloud (and pip itself, if needed) live
+# entirely inside a private virtual environment — nothing is installed into
+# Batocera's system Python, and no global pip3 is required.
+if ! command -v python3 &>/dev/null; then
+    echo "ERROR: missing required dependency: python3" >&2
+    echo "Install python3, then re-run this installer." >&2
     exit 1
 fi
 
 # ── create directory structure ────────────────────────────────────────────────
-mkdir -p "${APP_DIR}" "${BIN_DIR}" "${CONFIG_DIR}" "${DATA_DIR}" "${LOGS_DIR}"
+mkdir -p "${BIN_DIR}" "${CONFIG_DIR}" "${DATA_DIR}" "${LOGS_DIR}"
 mkdir -p "${CACHE_ROOT}/.partial"
 
 echo "  Created directory structure."
 
+# ── create isolated virtual environment ───────────────────────────────────────
+# Idempotent: reuse an existing venv rather than recreating it, so re-running
+# the installer doesn't discard whatever is already installed.
+if [[ -x "${VENV_DIR}/bin/python" ]]; then
+    echo "  Virtual environment already exists at ${VENV_DIR} — reusing."
+else
+    if ! python3 -m venv "${VENV_DIR}"; then
+        echo "ERROR: failed to create virtual environment at ${VENV_DIR}" >&2
+        exit 1
+    fi
+    echo "  Created virtual environment: ${VENV_DIR}"
+fi
+
+# Some python3 -m venv builds (observed on Batocera 42) don't ship pip because
+# there is no global pip3 to seed them with. Bootstrap it with the venv's own
+# Python if it's missing.
+if ! "${VENV_DIR}/bin/python" -m pip --version &>/dev/null; then
+    if ! "${VENV_DIR}/bin/python" -m ensurepip --upgrade; then
+        echo "ERROR: failed to bootstrap pip inside ${VENV_DIR}" >&2
+        exit 1
+    fi
+    echo "  Bootstrapped pip inside the virtual environment."
+fi
+
 # ── install Python package ────────────────────────────────────────────────────
-pip3 install --target="${APP_DIR}" --upgrade --quiet "${PROJECT_DIR}"
-echo "  Installed Python package to ${APP_DIR}."
+# Installed with the venv's own python -m pip — never the system pip/python.
+if ! "${VENV_DIR}/bin/python" -m pip install --upgrade --quiet "${PROJECT_DIR}"; then
+    echo "ERROR: failed to install ROMCloud into ${VENV_DIR}" >&2
+    exit 1
+fi
+echo "  Installed ROMCloud into ${VENV_DIR}."
 
 # ── write version file ────────────────────────────────────────────────────────
 if [[ -f "${PROJECT_DIR}/version.json" ]]; then
@@ -74,24 +102,28 @@ fi
 
 # ── write CLI wrapper ─────────────────────────────────────────────────────────
 # Built with printf (not an unquoted heredoc) so runtime-only tokens such as
-# "$@" and "${PYTHONPATH:-}" are never subject to expansion by the installer's
-# own shell — only APP_DIR is substituted, via %s.
+# "$@" are never subject to expansion by the installer's own shell — only the
+# venv python path is substituted, via %s. Execs the venv's python directly,
+# so ROMCloud never depends on (or touches) Batocera's system Python.
 {
     printf '#!/bin/bash\n'
-    printf 'export PYTHONPATH="%s:${PYTHONPATH:-}"\n' "${APP_DIR}"
-    printf 'exec python3 -m romcloud.cli.main "$@"\n'
+    printf 'exec "%s" -m romcloud.cli.main "$@"\n' "${VENV_DIR}/bin/python"
 } > "${BIN_DIR}/romcloud"
 chmod +x "${BIN_DIR}/romcloud"
 echo "  Wrote CLI wrapper: ${BIN_DIR}/romcloud"
 
 # ── write Batocera launch wrapper ─────────────────────────────────────────────
 # The wrapper is a Python script that receives the exact argv EmulationStation
-# would pass to emulatorlauncher and handles .romcloud interception.
+# would pass to emulatorlauncher and handles .romcloud interception. Its
+# shebang points directly at the venv's python (substituted via printf, the
+# only non-literal line); ROMCloud is already importable there, so no
+# PYTHONPATH/sys.path hacks are needed.
 # Verified command format on Batocera 42:
 #   emulatorlauncher %CONTROLLERSCONFIG% -system %SYSTEM% -rom %ROM% \
 #       -gameinfoxml %GAMEINFOXML% -systemname %SYSTEMNAME%
-cat > "${BIN_DIR}/romcloud-run" << 'LAUNCHER'
-#!/usr/bin/env python3
+{
+    printf '#!%s\n' "${VENV_DIR}/bin/python"
+    cat << 'LAUNCHER'
 """romcloud-run — Batocera 42+ EmulationStation launch wrapper.
 
 Receives the exact argv that EmulationStation would pass to emulatorlauncher.
@@ -105,14 +137,11 @@ Example <command> for es_systems.cfg:
 """
 import sys as _sys
 
-_APP = "/userdata/system/romcloud/app"
-if _APP not in _sys.path:
-    _sys.path.insert(0, _APP)
-
 from romcloud.integrations.batocera.launcher import run_launcher_wrapper
 
 run_launcher_wrapper(_sys.argv)
 LAUNCHER
+} > "${BIN_DIR}/romcloud-run"
 chmod +x "${BIN_DIR}/romcloud-run"
 echo "  Wrote launch wrapper: ${BIN_DIR}/romcloud-run"
 
