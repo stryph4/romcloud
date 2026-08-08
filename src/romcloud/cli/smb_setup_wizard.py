@@ -31,6 +31,11 @@ from romcloud.core.services.smb_discovery import (
     SystemDetectionResult,
 )
 from romcloud.ui.prompts import prompt_password
+import sys
+from typing import Sequence
+
+
+_ADVANCED_LABEL = "Advanced: enter share manually"
 
 _MANUAL_ENTRY_LABEL = "Enter share name manually (advanced)"
 
@@ -108,17 +113,23 @@ def run_smb_setup_wizard(discovery: SMBDiscoveryService) -> Optional[SMBSetupRes
         if manual_only:
             share = click.prompt("Share name")
         else:
+            # Attempt an interactive up/down selector using simple key reads
             click.echo("\nSelect an SMB share:")
-            for s in shares:
-                click.echo(f"  {s.name}")
-            choices = [s.name for s in shares] + [_MANUAL_ENTRY_LABEL]
-            selection = click.prompt(
-                "Share",
-                type=click.Choice(choices),
-                default=shares[0].name,
-                show_choices=False,
-            )
-            if selection == _MANUAL_ENTRY_LABEL:
+            choices = [s.name for s in shares] + [_ADVANCED_LABEL]
+            # Prefer interactive selector when running in a real TTY and
+            # Click's getchar is available (no curses dependency).
+            selection = None
+            try:
+                if sys.stdin.isatty():
+                    selection = _interactive_select(choices)
+            except Exception:
+                selection = None
+
+            if selection is None:
+                # Fallback to a numbered prompt for non-interactive terminals.
+                selection = _numbered_select(choices)
+
+            if selection == _ADVANCED_LABEL:
                 share = click.prompt("Share name")
             else:
                 share = selection
@@ -150,3 +161,72 @@ def run_smb_setup_wizard(discovery: SMBDiscoveryService) -> Optional[SMBSetupRes
 
         if not click.confirm("Try a different share?", default=True):
             return None
+
+
+def _interactive_select(choices: Sequence[str]) -> Optional[str]:
+    """Interactive up/down selector using single-character reads.
+
+    Returns the chosen string, or None if interaction is not possible or
+    the user cancelled.
+    """
+    # Ensure we have a TTY
+    if not sys.stdin.isatty():
+        return None
+
+    # Initial index
+    index = 0
+
+    # Print initial menu
+    for i, c in enumerate(choices):
+        prefix = ">" if i == index else " "
+        click.echo(f"{prefix} {c}")
+
+    while True:
+        ch = click.getchar(echo=False)
+        if not ch:
+            continue
+        # Ctrl-C
+        if ch == "\x03":
+            raise KeyboardInterrupt
+        # Enter confirms
+        if ch in ("\r", "\n"):
+            return choices[index]
+        # Escape sequences for arrows: ESC [ A/B
+        if ch == "\x1b":
+            # Peek next two chars
+            ch2 = click.getchar(echo=False)
+            if ch2 == "[":
+                ch3 = click.getchar(echo=False)
+                if ch3 == "A":
+                    index = (index - 1) % len(choices)
+                elif ch3 == "B":
+                    index = (index + 1) % len(choices)
+                else:
+                    # ignore other sequences
+                    pass
+            else:
+                # Single ESC -> cancel
+                return None
+        elif ch.lower() in ("k",):
+            index = (index - 1) % len(choices)
+        elif ch.lower() in ("j",):
+            index = (index + 1) % len(choices)
+        else:
+            # ignore other keys
+            pass
+
+        # Re-render menu: move cursor up N lines and rewrite
+        # Move cursor up by number of choices
+        click.echo(f"\x1b[{len(choices)}A", nl=False)
+        for i, c in enumerate(choices):
+            prefix = ">" if i == index else " "
+            # Clear line then write
+            click.echo(f"\x1b[2K{prefix} {c}")
+
+
+def _numbered_select(choices: Sequence[str]) -> str:
+    click.echo("")
+    for i, c in enumerate(choices, start=1):
+        click.echo(f"{i}) {c}")
+    choice = click.prompt("Select share", type=click.IntRange(1, len(choices)), default=1)
+    return choices[int(choice) - 1]

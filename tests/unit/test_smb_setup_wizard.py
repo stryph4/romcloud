@@ -214,3 +214,65 @@ class TestDecliningUseThisLibrary:
 
         assert result.exit_code == 0, result.output
         assert "CANCELLED" in result.output
+
+
+class TestInteractiveSelector:
+    def test_arrow_key_selection(self, monkeypatch):
+        # Select second entry by sending Down arrow then Enter
+        discovery = FakeDiscovery(
+            shares=ListSharesResult(ok=True, shares=(ShareInfo("one"), ShareInfo("two"))),
+            validations={
+                "two": ShareValidationResult(ok=True, share="two", top_level_entries=("psx",))
+            },
+        )
+        runner = CliRunner()
+        # Prepare input: server, username, password, Down-arrow, Enter, confirm
+        user_input = "omnivault\nstryph\nhunter2\n" + "\x1b[B" + "\n" + "y\n"
+        # Force the wizard to think stdin is a TTY
+        import romcloud.cli.smb_setup_wizard as wiz
+
+        monkeypatch.setattr(wiz.sys.stdin, "isatty", lambda: True, raising=False)
+
+        result = runner.invoke(_make_command(discovery), input=user_input)
+
+        assert result.exit_code == 0, result.output
+        assert "RESULT:omnivault:two:" in result.output
+
+    def test_numbered_fallback_when_not_tty(self, monkeypatch):
+        discovery = FakeDiscovery(
+            shares=ListSharesResult(ok=True, shares=(ShareInfo("a"), ShareInfo("b"))),
+            validations={"b": ShareValidationResult(ok=True, share="b", top_level_entries=())},
+        )
+        runner = CliRunner()
+        # Non-tty -> choose option 2
+        monkeypatch.setattr("romcloud.cli.smb_setup_wizard.sys.stdin.isatty", lambda: False)
+        result = runner.invoke(_make_command(discovery), input="omnivault\nstryph\nhunter2\n2\ny\n")
+        assert result.exit_code == 0
+        assert "RESULT:omnivault:b:" in result.output
+
+    def test_advanced_manual_from_interactive(self, monkeypatch):
+        from romcloud.cli.smb_setup_wizard import _ADVANCED_LABEL
+
+        discovery = FakeDiscovery(
+            shares=ListSharesResult(ok=True, shares=(ShareInfo("Roms"),)),
+            validations={"Custom": ShareValidationResult(ok=True, share="Custom", top_level_entries=())},
+        )
+        runner = CliRunner()
+        # Move down once to the Advanced option (it's the second item), then Enter
+        monkeypatch.setattr("romcloud.cli.smb_setup_wizard.sys.stdin.isatty", lambda: True)
+        user_input = "omnivault\nstryph\nhunter2\n\x1b[B\nCustom\ny\n"
+        result = runner.invoke(_make_command(discovery), input=user_input)
+        assert result.exit_code == 0
+        assert "RESULT:omnivault:Custom:" in result.output
+
+    def test_interactive_cancel_returns_none(self, monkeypatch):
+        discovery = FakeDiscovery(
+            shares=ListSharesResult(ok=True, shares=(ShareInfo("a"), ShareInfo("b"))),
+        )
+        runner = CliRunner()
+        monkeypatch.setattr("romcloud.cli.smb_setup_wizard.sys.stdin.isatty", lambda: True)
+        # Send ESC to cancel
+        user_input = "omnivault\nstryph\nhunter2\n\x1b\n"
+        result = runner.invoke(_make_command(discovery), input=user_input)
+        assert result.exit_code == 0
+        assert "CANCELLED" in result.output
