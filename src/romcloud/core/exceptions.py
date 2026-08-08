@@ -97,3 +97,22 @@ class LaunchError(ROMCloudError):
 
 class GameNotCachedError(LaunchError):
     """Game is not cached and the source is unreachable — cannot launch."""
+
+
+# ── Update ────────────────────────────────────────────────────────────────────
+
+
+class UpdateError(ROMCloudError):
+    """Self-update failed."""
+
+
+class UpdateDownloadError(UpdateError):
+    """Downloading the update archive, or querying GitHub for commit info, failed."""
+
+
+class UpdateArchiveError(UpdateError):
+    """The downloaded archive is malformed, or unsafe to extract."""
+
+
+class UpdateInstallError(UpdateError):
+    """Installing the updated package into the virtual environment failed."""
