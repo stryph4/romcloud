@@ -98,6 +98,15 @@ ROMCloud does not require every system to exist in the remote library. Only syst
   shares, detects system folders, and only persists configuration after
   confirmation.
 
+- Versioning: ROMCloud's semantic version is sourced from the installed
+  package metadata (the same source used by `romcloud --version` and
+  `importlib.metadata`). The updater records build metadata (e.g. commit SHA)
+  in `version.json` separately; avoid duplicating hardcoded version strings.
+
+- UI status: a full graphical cache-miss progress/management UI is NOT
+  implemented yet. The current terminal/TUI progress is a convenience
+  fallback and is not intended to represent the final graphical UX.
+
 ---
 
 ## Support ROMCloud
@@ -274,6 +283,20 @@ romcloud mount start
 romcloud mount stop
 romcloud mount status
 ```
+
+**Mount service details**
+
+- Canonical service path: `/userdata/system/services/romcloud_mount`.
+- The service `start` routes to `romcloud mount boot-start`.
+- `boot-start` launches a detached background worker that performs SMB
+  waiting and mounting; the service itself does not block Batocera's boot.
+- Principle: "ROMCloud may fail; Batocera must not." The installer and
+  boot service avoid interfering with Batocera's critical startup path.
+
+**Installer `custom.sh` behavior**
+
+- ROMCloud does not modify, source, or depend on `/userdata/system/custom.sh`.
+- This is intentional to avoid affecting unrelated user or system startup logic.
 
 A native direct-SMB provider is planned for the future. The current architecture intentionally keeps mounting separate from the storage-provider layer so direct SMB can be added later without rewriting catalog/cache logic.
 
