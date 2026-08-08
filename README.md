@@ -88,6 +88,29 @@ ROMCloud does not require every system to exist in the remote library. Only syst
 
 ---
 
+## Release note (v0.2.1)
+
+- Bugfix: `curses` is now imported lazily. Systems without the `curses`
+  module (minimal Batocera images) continue to run the CLI; the TUI will
+  fall back to a plain-text progress display or print a clear message.
+- Guided SMB discovery/setup (implemented in `SMBDiscoveryService`) was
+  added in v0.2.0; it validates server/credentials, enumerates accessible
+  shares, detects system folders, and only persists configuration after
+  confirmation.
+
+---
+
+## Support ROMCloud
+
+ROMCloud is free and open source, but developing and testing it has real
+costs. If ROMCloud is useful to you and you'd like to support continued
+development, testing, and maintenance, optional donations are appreciated.
+
+Donations are optional — ROMCloud's core functionality remains free and
+open source. (PayPal/support link placeholder)
+
+---
+
 ## Features
 
 ### Transparent EmulationStation integration
