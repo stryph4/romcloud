@@ -38,6 +38,64 @@ class TestSmbPasswordToml:
         assert load_smb_password(path) == 'pa"ss\\word'
 
 
+class TestLegacySmbCredentialsMigration:
+    def test_current_credentials_preserve_password_and_remove_legacy(self, tmp_path: Path):
+        current = tmp_path / "credentials.toml"
+        legacy = tmp_path / "smb.credentials"
+
+        write_smb_password(current, "current-secret")
+        legacy.write_text('[smb]\npassword = "legacy-secret"\n', encoding="utf-8")
+        legacy.chmod(0o600)
+
+        assert load_smb_password(current) == "current-secret"
+        assert not legacy.exists()
+        assert current.stat().st_mode & 0o777 == 0o600
+        assert load_smb_password(current) == "current-secret"
+
+    def test_legacy_only_migrates_into_canonical_file(self, tmp_path: Path):
+        current = tmp_path / "credentials.toml"
+        legacy = tmp_path / "smb.credentials"
+
+        legacy.write_text('[smb]\npassword = "legacy-secret"\n', encoding="utf-8")
+        legacy.chmod(0o600)
+
+        assert load_smb_password(current) == "legacy-secret"
+        assert current.exists()
+        assert current.stat().st_mode & 0o777 == 0o600
+        assert not legacy.exists()
+        assert load_smb_password(current) == "legacy-secret"
+
+    def test_failed_migration_leaves_legacy_file_in_place(self, tmp_path: Path):
+        current = tmp_path / "credentials.toml"
+        legacy = tmp_path / "smb.credentials"
+
+        legacy.write_text("not romcloud legacy format", encoding="utf-8")
+
+        assert load_smb_password(current) is None
+        assert legacy.exists()
+        assert not current.exists()
+
+    def test_unrelated_same_named_file_is_preserved(self, tmp_path: Path):
+        current = tmp_path / "credentials.toml"
+        legacy = tmp_path / "smb.credentials"
+
+        legacy.write_text('[other]\nvalue = "keep me"\n', encoding="utf-8")
+
+        assert load_smb_password(current) is None
+        assert legacy.exists()
+
+    def test_repeated_migration_is_idempotent(self, tmp_path: Path):
+        current = tmp_path / "credentials.toml"
+        legacy = tmp_path / "smb.credentials"
+
+        legacy.write_text('password = "legacy-secret"\n', encoding="utf-8")
+
+        assert load_smb_password(current) == "legacy-secret"
+        assert load_smb_password(current) == "legacy-secret"
+        assert current.exists()
+        assert not legacy.exists()
+
+
 class TestCifsCredentialsFile:
     def test_content_format(self, tmp_path: Path):
         path = tmp_path / "smb-cifs-credentials"

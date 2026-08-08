@@ -2,6 +2,10 @@
 
 Credentials (e.g. SMB password) are stored in a separate TOML file at mode
 0600, never in the main config.  This file is never logged.
+
+Legacy Batocera installs may still have ``smb.credentials`` alongside the
+canonical ``credentials.toml``. This module owns the migration path for that
+legacy file and keeps the derived ``smb-cifs-credentials`` helper separate.
 """
 
 from __future__ import annotations
@@ -25,23 +29,27 @@ else:
             tomllib = None  # type: ignore[assignment]
 
 
+_LEGACY_CREDENTIALS_FILENAME = "smb.credentials"
+
+
 def load_smb_password(credentials_path: Path) -> Optional[str]:
     """Read the SMB password from the credentials file.
 
     Returns None if no credentials file exists or no password is set.
     Never raises; logs warnings via the standard library.
     """
-    if not credentials_path.exists():
-        return None
-    if tomllib is None:
+    if credentials_path.exists():
+        password = _read_toml_smb_password(credentials_path)
+        _cleanup_legacy_credentials(credentials_path)
+        return password
+
+    legacy_path = _legacy_credentials_path(credentials_path)
+    legacy_password = _read_legacy_password(legacy_path)
+    if legacy_password is None:
         return None
 
-    try:
-        with credentials_path.open("rb") as fh:
-            data = tomllib.load(fh)
-        return data.get("smb", {}).get("password")
-    except Exception:  # noqa: BLE001
-        return None
+    write_smb_password(credentials_path, legacy_password)
+    return legacy_password
 
 
 def write_smb_password(credentials_path: Path, password: str) -> None:
@@ -52,6 +60,7 @@ def write_smb_password(credentials_path: Path, password: str) -> None:
     content += f'password = "{escaped}"\n'
 
     atomic_write_text(credentials_path, content, mode=stat.S_IRUSR | stat.S_IWUSR)
+    _cleanup_legacy_credentials(credentials_path)
 
 
 def cifs_credentials_path(main_credentials_path: Path) -> Path:
@@ -82,3 +91,49 @@ def write_cifs_credentials_file(
     content = "\n".join(lines) + "\n"
 
     atomic_write_text(path, content, mode=stat.S_IRUSR | stat.S_IWUSR)
+
+
+def _legacy_credentials_path(credentials_path: Path) -> Path:
+    return credentials_path.with_name(_LEGACY_CREDENTIALS_FILENAME)
+
+
+def _read_toml_smb_password(credentials_path: Path) -> Optional[str]:
+    if tomllib is None:
+        return None
+
+    try:
+        with credentials_path.open("rb") as fh:
+            data = tomllib.load(fh)
+        return _password_from_mapping(data)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _read_legacy_password(legacy_path: Path) -> Optional[str]:
+    if not legacy_path.exists():
+        return None
+
+    return _read_toml_smb_password(legacy_path)
+
+
+def _password_from_mapping(data) -> Optional[str]:
+    if not isinstance(data, dict):
+        return None
+
+    smb_data = data.get("smb")
+    if isinstance(smb_data, dict):
+        password = smb_data.get("password")
+        if isinstance(password, str) and password:
+            return password
+
+    password = data.get("password")
+    if isinstance(password, str) and password:
+        return password
+
+    return None
+
+
+def _cleanup_legacy_credentials(credentials_path: Path) -> None:
+    legacy_path = _legacy_credentials_path(credentials_path)
+    if _read_legacy_password(legacy_path) is not None:
+        legacy_path.unlink(missing_ok=True)
