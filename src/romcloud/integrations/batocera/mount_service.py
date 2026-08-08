@@ -5,9 +5,25 @@ extension point for running a script at boot: any executable script placed
 under ``/userdata/system/services/`` that responds to ``start``/``stop``/
 ``status`` arguments can be registered with ``batocera-services enable
 <name>``. This module generates and installs exactly one such script,
-``romcloud-mount``, which just shells out to ``romcloud mount
-start|stop|status`` (see :mod:`romcloud.cli.commands.mount`) so all the
-actual mount logic lives in one place, testable without a Batocera install.
+``romcloud-mount``.
+
+Boot safety ("ROMCloud may fail; Batocera must not")
+------------------------------------------------------
+Real Batocera 42 hardware testing showed that a service's ``start`` action
+blocking on DNS/network/Tailscale/CIFS reachability can hang or disrupt
+boot. The generated script therefore:
+
+- Routes ``start`` to ``romcloud mount boot-start`` — which never blocks;
+  it only spawns a detached background worker and returns immediately (see
+  :mod:`romcloud.infrastructure.mount_worker`).
+- Wraps both ``start`` and ``stop`` with ``|| true`` and an explicit
+  ``exit 0``, so that *even if* the ``romcloud`` command itself fails
+  outright (missing venv, broken Python, malformed config, etc.), the
+  service script itself always reports success to Batocera's service
+  supervisor. The worst possible outcome is "cloud games unavailable" —
+  never a blocked or failed boot.
+- Uses ``set -uo pipefail`` (not ``-e``), so an unexpected failure
+  mid-script can never abort it in a way that skips the final ``exit 0``.
 
 This module does not touch Tailscale configuration in any way — reachability
 waiting (see :mod:`romcloud.infrastructure.mount`) is transport-agnostic; it
@@ -42,16 +58,23 @@ def generate_service_script(romcloud_bin: str) -> str:
         "#\n"
         "# One-time enablement after install:\n"
         f"#   batocera-services enable {SERVICE_NAME}\n"
-        "set -euo pipefail\n"
+        "#\n"
+        "# `start` must never block or fail Batocera's boot sequence — it only\n"
+        "# triggers a detached background worker (see `romcloud mount boot-start`)\n"
+        "# and always reports success here, regardless of whether the mount\n"
+        "# ultimately succeeds. ROMCloud may fail; Batocera must not.\n"
+        "set -uo pipefail\n"
         "\n"
         f'ROMCLOUD_BIN="{romcloud_bin}"\n'
         "\n"
         'case "${1:-}" in\n'
         "    start)\n"
-        '        exec "${ROMCLOUD_BIN}" mount start\n'
+        '        "${ROMCLOUD_BIN}" mount boot-start || true\n'
+        "        exit 0\n"
         "        ;;\n"
         "    stop)\n"
-        '        exec "${ROMCLOUD_BIN}" mount stop\n'
+        '        "${ROMCLOUD_BIN}" mount stop || true\n'
+        "        exit 0\n"
         "        ;;\n"
         "    status)\n"
         '        exec "${ROMCLOUD_BIN}" mount status\n'

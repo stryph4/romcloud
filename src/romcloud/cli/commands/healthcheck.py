@@ -75,6 +75,17 @@ def healthcheck_cmd(ctx: click.Context) -> None:
     data_path = Path(config.data_path)
     check("Data directory writable", _can_write(data_path), str(data_path))
 
+    # Mounted SMB source (only relevant for the mounted-SMB deployment model).
+    if config.smb is not None:
+        from romcloud.infrastructure import mount_worker
+
+        try:
+            romcloud_home = mount_worker.romcloud_home_from_config(config)
+            diag = mount_worker.get_diagnostics(romcloud_home, config)
+            check("SMB source mounted", diag.mounted, "" if diag.mounted else diag.label)
+        except Exception as exc:  # noqa: BLE001 — healthcheck must never crash
+            check("SMB source mounted", False, f"error checking status: {exc}")
+
     click.echo("─" * 50)
     if ok:
         click.echo("  All checks passed.")

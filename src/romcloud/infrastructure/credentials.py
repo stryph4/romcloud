@@ -56,6 +56,13 @@ def write_smb_password(credentials_path: Path, password: str) -> None:
     credentials_path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600
 
 
+def cifs_credentials_path(main_credentials_path: Path) -> Path:
+    """Standard location for the ``mount.cifs``-format credentials file,
+    derived from the main (TOML) credentials file's own path — kept
+    alongside it so both are covered by the same directory permissions."""
+    return main_credentials_path.parent / "smb-cifs-credentials"
+
+
 def write_cifs_credentials_file(
     path: Path,
     username: str,

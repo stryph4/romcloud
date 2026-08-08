@@ -1,0 +1,236 @@
+"""Unit tests for the `romcloud mount` CLI commands.
+
+Focuses on the boot-safety hardening: `boot-start` must never block or
+raise (even if config/container access itself fails), `stop`/`remove` must
+terminate any running worker, `install` must never depend on PATH, and
+`status` must surface the richer worker/failure diagnostics. Underlying
+mount/worker logic is exercised in test_mount.py / test_mount_worker.py;
+here we only verify the CLI wiring via monkeypatching.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from types import SimpleNamespace
+
+from click.testing import CliRunner
+
+import romcloud.cli.commands.mount as mount_cmd_module
+from romcloud.cli.commands.mount import mount_group
+from romcloud.infrastructure.mount_worker import MountDiagnostics
+
+
+def _fake_smb(server="nas.local", share="ROMs", username="alice", port=445):
+    return SimpleNamespace(server=server, share=share, username=username, port=port)
+
+
+def _fake_config(*, smb=None, rom_root="/mnt/roms", romcloud_home="/opt/romcloud"):
+    home = Path(romcloud_home)
+    return SimpleNamespace(
+        source=SimpleNamespace(rom_root=rom_root),
+        smb=smb,
+        credentials_path=home / "config" / "credentials.toml",
+        data_path=str(home / "data"),
+    )
+
+
+def _invoke(args, config):
+    return CliRunner().invoke(mount_group, args, obj={"config": config})
+
+
+class TestBootStart:
+    def test_already_mounted_skips_spawn(self, monkeypatch):
+        monkeypatch.setattr(mount_cmd_module.mount, "is_target_mounted", lambda *a, **k: True)
+        spawned = []
+        monkeypatch.setattr(mount_cmd_module.mount_worker, "spawn_worker", lambda *a, **k: spawned.append(1))
+
+        result = _invoke(["boot-start"], _fake_config(smb=_fake_smb()))
+
+        assert result.exit_code == 0, result.output
+        assert "Already mounted" in result.output
+        assert spawned == []
+
+    def test_worker_already_running_skips_spawn(self, monkeypatch):
+        monkeypatch.setattr(mount_cmd_module.mount, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mount_cmd_module.mount_worker, "is_worker_running", lambda *a, **k: 4242)
+        spawned = []
+        monkeypatch.setattr(mount_cmd_module.mount_worker, "spawn_worker", lambda *a, **k: spawned.append(1))
+
+        result = _invoke(["boot-start"], _fake_config(smb=_fake_smb()))
+
+        assert result.exit_code == 0, result.output
+        assert "4242" in result.output
+        assert spawned == []
+
+    def test_spawns_worker_and_returns_immediately(self, monkeypatch):
+        monkeypatch.setattr(mount_cmd_module.mount, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mount_cmd_module.mount_worker, "is_worker_running", lambda *a, **k: None)
+        monkeypatch.setattr(mount_cmd_module.mount_worker, "spawn_worker", lambda *a, **k: 9999)
+
+        result = _invoke(["boot-start"], _fake_config(smb=_fake_smb()))
+
+        assert result.exit_code == 0, result.output
+        assert "background" in result.output.lower()
+        assert "9999" in result.output
+
+    def test_no_smb_configured_is_a_clean_noop(self, monkeypatch):
+        called = []
+        monkeypatch.setattr(mount_cmd_module.mount, "is_target_mounted", lambda *a, **k: called.append(1))
+
+        result = _invoke(["boot-start"], _fake_config(smb=None))
+
+        assert result.exit_code == 0, result.output
+        assert called == []
+
+    def test_never_raises_even_if_mount_check_fails(self, monkeypatch):
+        """Core rule: ROMCloud may fail; Batocera must not — boot-start must
+        never propagate an exception, no matter what breaks underneath."""
+
+        def _boom(*a, **k):
+            raise RuntimeError("disk on fire")
+
+        monkeypatch.setattr(mount_cmd_module.mount, "is_target_mounted", _boom)
+
+        result = _invoke(["boot-start"], _fake_config(smb=_fake_smb()))
+
+        assert result.exit_code == 0
+        assert result.exception is None
+        assert "warning" in result.output.lower()
+
+    def test_never_raises_even_if_config_access_fails(self, monkeypatch):
+        def _boom(ctx):
+            raise RuntimeError("container build failed")
+
+        monkeypatch.setattr(mount_cmd_module, "get_container", _boom)
+
+        result = CliRunner().invoke(mount_group, ["boot-start"], obj={"config": _fake_config(smb=_fake_smb())})
+
+        assert result.exit_code == 0
+        assert result.exception is None
+
+
+class TestWorkerCommand:
+    def test_invokes_run_worker_and_uses_its_exit_code(self, monkeypatch):
+        monkeypatch.setattr(mount_cmd_module.mount_worker, "run_worker", lambda *a, **k: 0)
+        result = _invoke(["worker"], _fake_config(smb=_fake_smb()))
+        assert result.exit_code == 0
+
+    def test_worker_is_hidden_from_help(self):
+        assert mount_group.commands["worker"].hidden is True
+
+
+class TestStop:
+    def test_stops_worker_then_unmounts(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(mount_cmd_module.mount_worker, "stop_worker", lambda *a, **k: calls.append("stop_worker"))
+        monkeypatch.setattr(
+            mount_cmd_module.mount, "unmount_cifs_source", lambda *a, **k: calls.append("unmount") or True
+        )
+
+        result = _invoke(["stop"], _fake_config(smb=_fake_smb()))
+
+        assert result.exit_code == 0, result.output
+        assert calls == ["stop_worker", "unmount"]
+        assert "Unmounted" in result.output
+
+    def test_not_mounted_reports_clearly(self, monkeypatch):
+        monkeypatch.setattr(mount_cmd_module.mount_worker, "stop_worker", lambda *a, **k: False)
+        monkeypatch.setattr(mount_cmd_module.mount, "unmount_cifs_source", lambda *a, **k: False)
+
+        result = _invoke(["stop"], _fake_config(smb=_fake_smb()))
+
+        assert result.exit_code == 0, result.output
+        assert "Was not mounted" in result.output
+
+    def test_no_smb_configured_is_a_clean_noop(self):
+        result = _invoke(["stop"], _fake_config(smb=None))
+        assert result.exit_code == 0
+        assert "nothing to mount" in result.output
+
+
+class TestRemove:
+    def test_stops_worker_and_cleans_state_when_smb_configured(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(mount_cmd_module.mount_worker, "stop_worker", lambda *a, **k: calls.append("stop"))
+        monkeypatch.setattr(
+            mount_cmd_module.mount_worker, "cleanup_runtime_state", lambda *a, **k: calls.append("cleanup")
+        )
+        monkeypatch.setattr(mount_cmd_module.mount_service, "remove_service", lambda: True)
+
+        result = _invoke(["remove"], _fake_config(smb=_fake_smb()))
+
+        assert result.exit_code == 0, result.output
+        assert calls == ["stop", "cleanup"]
+        assert "Removed boot service" in result.output
+
+    def test_skips_worker_cleanup_when_not_configured(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(mount_cmd_module.mount_worker, "stop_worker", lambda *a, **k: calls.append("stop"))
+        monkeypatch.setattr(mount_cmd_module.mount_service, "remove_service", lambda: False)
+
+        result = _invoke(["remove"], _fake_config(smb=None))
+
+        assert result.exit_code == 0, result.output
+        assert calls == []
+        assert "nothing to do" in result.output.lower()
+
+
+class TestInstall:
+    def test_uses_deterministic_bin_path_not_shutil_which(self, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(
+            mount_cmd_module.mount_service,
+            "install_service",
+            lambda romcloud_bin: captured.setdefault("bin", romcloud_bin) or Path("/svc/romcloud-mount"),
+        )
+
+        result = _invoke(["install"], _fake_config(smb=_fake_smb(), romcloud_home="/opt/romcloud"))
+
+        assert result.exit_code == 0, result.output
+        assert captured["bin"] == str(Path("/opt/romcloud") / "bin" / "romcloud")
+
+
+class TestStatus:
+    def test_shows_rich_diagnostics(self, monkeypatch):
+        diag = MountDiagnostics(
+            configured=True,
+            mounted=False,
+            worker_pid=555,
+            last_state="failed",
+            last_detail="SMB authentication failed",
+            last_timestamp="2026-08-08T00:00:00Z",
+        )
+        monkeypatch.setattr(mount_cmd_module.mount_worker, "get_diagnostics", lambda *a, **k: diag)
+
+        result = _invoke(["status"], _fake_config(smb=_fake_smb()))
+
+        assert result.exit_code == 0, result.output
+        assert "555" in result.output
+        assert "SMB authentication failed" in result.output
+
+    def test_no_smb_configured(self):
+        result = _invoke(["status"], _fake_config(smb=None))
+        assert result.exit_code == 0
+        assert "nothing to mount" in result.output
+
+
+class TestExistingStartBehaviorIntact:
+    def test_start_still_blocks_and_reports_mounted(self, monkeypatch):
+        monkeypatch.setattr(mount_cmd_module, "load_smb_password", lambda *a, **k: "hunter2")
+        monkeypatch.setattr(mount_cmd_module, "write_cifs_credentials_file", lambda *a, **k: None)
+        monkeypatch.setattr(
+            mount_cmd_module.mount,
+            "mount_cifs_source",
+            lambda **k: SimpleNamespace(mounted=True, already_mounted=False, detail="mounted"),
+        )
+
+        result = _invoke(["start"], _fake_config(smb=_fake_smb()))
+
+        assert result.exit_code == 0, result.output
+        assert "Mounted." in result.output
+
+    def test_start_requires_password(self, monkeypatch):
+        monkeypatch.setattr(mount_cmd_module, "load_smb_password", lambda *a, **k: None)
+        result = _invoke(["start"], _fake_config(smb=_fake_smb()))
+        assert result.exit_code != 0
+        assert "no SMB password stored" in result.output

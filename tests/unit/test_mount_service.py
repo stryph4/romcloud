@@ -1,7 +1,9 @@
 """Unit tests for romcloud.integrations.batocera.mount_service.
 
-Covers: generated service script content (dispatches start/stop/status to
-`romcloud mount ...`), install/remove file handling, correct permissions,
+Covers: generated service script content (dispatches `start` to the
+non-blocking `romcloud mount boot-start`, `stop`/`status` to their matching
+subcommands; `start`/`stop` always exit 0 so a ROMCloud failure can never
+fail Batocera boot), install/remove file handling, correct permissions,
 and graceful tolerance of a missing `batocera-services` binary.
 """
 
@@ -17,12 +19,37 @@ class TestGenerateServiceScript:
         content = mount_service.generate_service_script("/userdata/system/romcloud/bin/romcloud")
         assert content.startswith("#!/bin/bash\n")
 
-    def test_dispatches_to_romcloud_mount_subcommands(self):
+    def test_start_dispatches_to_boot_start_not_blocking_start(self):
+        """`start` must route through the non-blocking `boot-start`, never
+        the blocking `mount start` — real-hardware testing showed the latter
+        can hang Batocera boot."""
         content = mount_service.generate_service_script("/path/to/romcloud")
         assert 'ROMCLOUD_BIN="/path/to/romcloud"' in content
-        assert '"${ROMCLOUD_BIN}" mount start' in content
+        assert '"${ROMCLOUD_BIN}" mount boot-start' in content
+
+    def test_stop_and_status_dispatch_correctly(self):
+        content = mount_service.generate_service_script("/path/to/romcloud")
         assert '"${ROMCLOUD_BIN}" mount stop' in content
         assert '"${ROMCLOUD_BIN}" mount status' in content
+
+    def test_start_and_stop_always_exit_zero(self):
+        """Even if the romcloud command itself fails, `start`/`stop` must
+        still report success to Batocera's service supervisor —
+        "ROMCloud may fail; Batocera must not."""
+        content = mount_service.generate_service_script("/path/to/romcloud")
+        start_block = content.split('start)')[1].split(';;')[0]
+        stop_block = content.split('stop)')[1].split(';;')[0]
+        assert "|| true" in start_block
+        assert "exit 0" in start_block
+        assert "|| true" in stop_block
+        assert "exit 0" in stop_block
+
+    def test_does_not_use_errexit(self):
+        """`set -e` could abort the script before reaching the safety-net
+        `exit 0` — must not be used."""
+        content = mount_service.generate_service_script("/path/to/romcloud")
+        set_line = next(line for line in content.splitlines() if line.startswith("set "))
+        assert set_line == "set -uo pipefail"
 
     def test_unknown_argument_prints_usage_and_fails(self):
         content = mount_service.generate_service_script("/path/to/romcloud")

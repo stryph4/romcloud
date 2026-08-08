@@ -177,20 +177,13 @@ else
     echo "  Config already exists at ${CONFIG_FILE} — not overwritten."
 fi
 
-# ── add to PATH on Batocera (via custom.sh) ───────────────────────────────────
-CUSTOM_SH="${CUSTOM_SH:-/userdata/system/custom.sh}"
-if [[ -f "${CUSTOM_SH}" ]] || [[ -d "$(dirname "${CUSTOM_SH}")" ]]; then
-    if ! grep -qF "romcloud/bin" "${CUSTOM_SH}" 2>/dev/null; then
-        # Single-quoted format string: "$PATH" is written literally so it is
-        # expanded at custom.sh runtime, not by the installer.
-        printf 'export PATH="%s:$PATH"\n' "${BIN_DIR}" >> "${CUSTOM_SH}"
-        echo "  Added ${BIN_DIR} to PATH in ${CUSTOM_SH}"
-    else
-        echo "  PATH entry already present in ${CUSTOM_SH}."
-    fi
-fi
-
 # ── summary ───────────────────────────────────────────────────────────────────
+# Deliberately does NOT modify /userdata/system/custom.sh. custom.sh is
+# foreign Batocera/user-addon startup state (real-hardware testing showed it
+# sources a large number of unrelated startup scripts and is not safe for
+# ROMCloud to append to, source, or regenerate). The installed CLI is not on
+# PATH by default — call it by its full path, shown below, or add it to your
+# own shell profile if you want it on PATH.
 echo ""
 echo "ROMCloud installed successfully."
 echo ""
@@ -199,12 +192,17 @@ echo "  Config:    ${CONFIG_FILE}"
 echo "  Cache:     ${CACHE_ROOT}"
 echo "  Catalog:   ${DATA_DIR}/catalog.db"
 echo ""
+echo "Note: ${BIN_DIR} was NOT added to PATH (ROMCloud never modifies"
+echo "      /userdata/system/custom.sh or other Batocera startup files)."
+echo "      Call the CLI by its full path, e.g.:"
+echo "        ${BIN_DIR}/romcloud healthcheck"
+echo ""
 echo "Next steps:"
 echo "  1. Edit ${CONFIG_FILE} to point at your ROM source."
-echo "     (Or run: romcloud configure)"
-echo "  2. Run:   romcloud healthcheck"
-echo "  3. Run:   romcloud refresh"
+echo "     (Or run: ${BIN_DIR}/romcloud configure)"
+echo "  2. Run:   ${BIN_DIR}/romcloud healthcheck"
+echo "  3. Run:   ${BIN_DIR}/romcloud refresh"
 echo ""
 echo "Batocera / EmulationStation integration:"
 echo "  SPIKE — see src/romcloud/integrations/batocera/es_config.py"
-echo "  Run: romcloud healthcheck  (includes integration status)"
+echo "  Run: ${BIN_DIR}/romcloud healthcheck  (includes integration status)"

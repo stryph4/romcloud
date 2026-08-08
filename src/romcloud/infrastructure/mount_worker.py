@@ -1,0 +1,422 @@
+"""Background mount worker — the boot-safe, non-blocking half of the SMB
+mount integration.
+
+Core rule: **"ROMCloud may fail; Batocera must not."** Real-hardware testing
+showed that calling the blocking mount logic (:mod:`romcloud.infrastructure.mount`)
+directly from a Batocera custom service's ``start`` action can hang/disrupt
+boot — the service framework runs ``start`` synchronously as part of the
+boot sequence, and DNS/network/Tailscale/CIFS can all take a long time (or
+never) to become ready.
+
+The fix implemented here: the service's ``start`` action
+(``romcloud mount boot-start`` — see :mod:`romcloud.cli.commands.mount``)
+never waits on anything. It only:
+
+1. Checks whether the source is already mounted (fast, local) — done if so.
+2. Checks whether a worker is already running (fast, local) — done if so.
+3. Spawns *this module's* worker (``romcloud mount worker``) as a fully
+   detached background process (new session, stdin closed, stdout/stderr to
+   a ROMCloud-owned log file) and returns immediately, without waiting for
+   it.
+
+The worker itself does the actual waiting (bounded by a finite timeout —
+never indefinite) and mounting, entirely in the background, guarded by an
+atomic single-instance lock (``os.O_CREAT | os.O_EXCL`` — no ``flock(1)`` or
+other external tool required, so it works on a stripped-down Batocera).
+Any failure (missing NAS, wrong password, DNS/network/Tailscale down,
+mount.cifs failure, malformed config) is caught, logged clearly (never with
+credentials), and results in a clean worker exit — never a crash, never a
+hang, never anything visible to Batocera's boot sequence.
+
+This module owns exactly these ROMCloud-specific files under
+``{romcloud_home}``:
+
+- ``run/mount-worker.pid``           — single-instance lock (contains the PID)
+- ``run/mount-worker.status.json``   — last known state, for diagnostics
+- ``logs/mount-worker.log``          — the spawned worker's stdout/stderr
+"""
+
+from __future__ import annotations
+
+import errno
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable, Optional
+
+from romcloud.core.exceptions import ROMCloudError
+from romcloud.infrastructure import mount as mountlib
+from romcloud.infrastructure.credentials import (
+    cifs_credentials_path,
+    load_smb_password,
+    write_cifs_credentials_file,
+)
+from romcloud.infrastructure.logging import get_logger
+
+log = get_logger("mount.worker")
+
+DEFAULT_WAIT_TIMEOUT = 300.0  # 5 minutes — finite; never waits forever.
+DEFAULT_WAIT_INTERVAL = 5.0
+
+
+# ── path helpers ──────────────────────────────────────────────────────────────
+
+
+def romcloud_home_from_config(config) -> Path:
+    """Derive ``ROMCLOUD_HOME`` (e.g. ``/userdata/system/romcloud``) from the
+    loaded config — mirrors ``AppConfig.credentials_path``'s derivation."""
+    return Path(config.data_path).parent
+
+
+def run_dir(romcloud_home: Path) -> Path:
+    return romcloud_home / "run"
+
+
+def lock_path(romcloud_home: Path) -> Path:
+    return run_dir(romcloud_home) / "mount-worker.pid"
+
+
+def status_path(romcloud_home: Path) -> Path:
+    return run_dir(romcloud_home) / "mount-worker.status.json"
+
+
+def worker_log_path(romcloud_home: Path) -> Path:
+    return romcloud_home / "logs" / "mount-worker.log"
+
+
+# ── status persistence (diagnostics) ─────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class WorkerStatusInfo:
+    state: str  # "waiting" | "success" | "failed"
+    timestamp: str
+    detail: str = ""
+
+
+def read_worker_status(romcloud_home: Path) -> Optional[WorkerStatusInfo]:
+    path = status_path(romcloud_home)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return WorkerStatusInfo(
+        state=str(data.get("state", "unknown")),
+        timestamp=str(data.get("timestamp", "")),
+        detail=str(data.get("detail", "")),
+    )
+
+
+def _write_worker_status(romcloud_home: Path, state: str, detail: str = "") -> None:
+    path = status_path(romcloud_home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "state": state,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "detail": detail,
+    }
+    try:
+        path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    except OSError:
+        # Diagnostics are best-effort; never let a status write failure
+        # affect the worker's actual outcome.
+        log.warning("Could not write worker status file at %s", path)
+
+
+# ── single-instance lock, with stale-lock recovery ───────────────────────────
+
+
+class WorkerAlreadyRunning(Exception):
+    """Raised internally when another worker already holds the lock."""
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, just owned by someone else
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return False
+        return True
+    return True
+
+
+def is_worker_running(romcloud_home: Path) -> Optional[int]:
+    """Return the running worker's PID, or None.
+
+    If the lock file references a PID that's no longer alive (a stale lock
+    left behind by a crash/reboot), it is removed automatically — recovery
+    is always safe since a dead PID can never be misidentified as "our"
+    live process.
+    """
+    path = lock_path(romcloud_home)
+    if not path.exists():
+        return None
+
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+        pid = int(raw)
+    except (OSError, ValueError):
+        log.info("Removing unreadable/corrupt mount-worker lock at %s", path)
+        path.unlink(missing_ok=True)
+        return None
+
+    if _pid_alive(pid):
+        return pid
+
+    log.info("Removing stale mount-worker lock (pid %d is no longer running)", pid)
+    path.unlink(missing_ok=True)
+    return None
+
+
+class _WorkerLock:
+    """Atomic (``O_CREAT|O_EXCL``) PID lock file — no ``flock(1)`` dependency,
+    so this works even on a stripped-down Batocera image."""
+
+    def __init__(self, romcloud_home: Path) -> None:
+        self._romcloud_home = romcloud_home
+        self._path = lock_path(romcloud_home)
+        self._acquired = False
+
+    def __enter__(self) -> "_WorkerLock":
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        # One stale-lock recovery pass before attempting to acquire it.
+        is_worker_running(self._romcloud_home)
+        try:
+            fd = os.open(str(self._path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            raise WorkerAlreadyRunning() from None
+        with os.fdopen(fd, "w") as fh:
+            fh.write(str(os.getpid()))
+        self._acquired = True
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if self._acquired:
+            self._path.unlink(missing_ok=True)
+        return False
+
+
+def stop_worker(
+    romcloud_home: Path,
+    *,
+    grace_period: float = 3.0,
+    poll_interval: float = 0.2,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> bool:
+    """Terminate a running worker (if any) and clean up its lock file.
+
+    SIGTERM first, then SIGKILL if it hasn't exited within *grace_period*.
+    Returns True if a (live) worker was found and stopped.
+    """
+    pid = is_worker_running(romcloud_home)
+    if pid is None:
+        return False
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        lock_path(romcloud_home).unlink(missing_ok=True)
+        return False
+
+    deadline = clock() + grace_period
+    while clock() < deadline:
+        if not _pid_alive(pid):
+            break
+        sleep(poll_interval)
+    else:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    lock_path(romcloud_home).unlink(missing_ok=True)
+    log.info("Stopped mount worker (pid %d)", pid)
+    return True
+
+
+def cleanup_runtime_state(romcloud_home: Path) -> None:
+    """Remove ROMCloud's own transient runtime files (lock + status).
+
+    Deliberately does not remove the worker log file — it's useful
+    diagnostic history, not live state, and keeping it costs nothing.
+    Never touches anything outside ``run/``.
+    """
+    lock_path(romcloud_home).unlink(missing_ok=True)
+    status_path(romcloud_home).unlink(missing_ok=True)
+
+
+# ── spawning the detached background worker ──────────────────────────────────
+
+
+def spawn_worker(
+    romcloud_home: Path,
+    *,
+    python_executable: Optional[str] = None,
+    popen: Callable[..., "subprocess.Popen"] = subprocess.Popen,
+) -> int:
+    """Launch ``romcloud mount worker`` as a fully detached background
+    process and return its PID immediately — never waits for it.
+
+    Uses ``sys.executable`` (the current venv's own python) by default, so
+    this has no dependency on the ``romcloud`` wrapper being on ``PATH``.
+    """
+    run_dir(romcloud_home).mkdir(parents=True, exist_ok=True)
+    log_path = worker_log_path(romcloud_home)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    executable = python_executable or sys.executable
+    log_file = open(log_path, "ab")
+    try:
+        proc = popen(
+            [executable, "-m", "romcloud.cli.main", "mount", "worker"],
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=log_file,
+            start_new_session=True,
+        )
+    finally:
+        log_file.close()
+    return proc.pid
+
+
+# ── the worker loop itself (runs inside the detached background process) ────
+
+
+def run_worker(
+    romcloud_home: Path,
+    config,
+    *,
+    wait_timeout: float = DEFAULT_WAIT_TIMEOUT,
+    wait_interval: float = DEFAULT_WAIT_INTERVAL,
+) -> int:
+    """Run the mount worker to completion — this call *blocks*, and is meant
+    to execute only inside a detached background process (see
+    :func:`spawn_worker`), never on Batocera's boot path directly.
+
+    Never raises: every failure mode (no [smb] section, no password, DNS/
+    network/Tailscale down, mount.cifs failure, unexpected error) is caught,
+    logged clearly (never with credentials), recorded to the status file,
+    and results in a clean return — "the worst result is cloud games
+    unavailable."
+    """
+    try:
+        with _WorkerLock(romcloud_home):
+            return _run_worker_locked(romcloud_home, config, wait_timeout, wait_interval)
+    except WorkerAlreadyRunning:
+        log.info("A mount worker is already running — exiting without doing anything.")
+        return 0
+
+
+def _run_worker_locked(romcloud_home: Path, config, wait_timeout: float, wait_interval: float) -> int:
+    mount_point = config.source.rom_root
+
+    try:
+        if mountlib.is_target_mounted(mount_point):
+            _write_worker_status(romcloud_home, "success", "already mounted")
+            log.info("%s is already mounted — worker exiting.", mount_point)
+            return 0
+
+        if config.smb is None:
+            _write_worker_status(romcloud_home, "failed", "no [smb] section configured")
+            log.warning("Mount worker started but no [smb] section is configured — exiting.")
+            return 0
+
+        password = load_smb_password(config.credentials_path)
+        if not password:
+            _write_worker_status(romcloud_home, "failed", "no SMB password stored")
+            log.warning("Mount worker: no SMB password stored (run `romcloud configure`) — exiting.")
+            return 0
+
+        _write_worker_status(
+            romcloud_home, "waiting", f"waiting for {config.smb.server}:{config.smb.port}"
+        )
+
+        creds_path = cifs_credentials_path(config.credentials_path)
+        write_cifs_credentials_file(creds_path, config.smb.username, password)
+
+        outcome = mountlib.mount_cifs_source(
+            server=config.smb.server,
+            share=config.smb.share,
+            mount_point=mount_point,
+            credentials_path=creds_path,
+            port=config.smb.port,
+            wait_timeout=wait_timeout,
+            wait_interval=wait_interval,
+        )
+        _write_worker_status(romcloud_home, "success", outcome.detail)
+        log.info("Mount worker succeeded: %s", outcome.detail)
+        return 0
+
+    except ROMCloudError as exc:
+        # Exceptions raised anywhere in romcloud.infrastructure.mount are
+        # already credential-safe (the password is never embedded in them).
+        _write_worker_status(romcloud_home, "failed", str(exc))
+        log.error("Mount worker failed: %s", exc)
+        return 0
+    except Exception as exc:  # noqa: BLE001 — the worker must never crash loudly
+        _write_worker_status(romcloud_home, "failed", f"unexpected error: {exc}")
+        log.exception("Mount worker crashed unexpectedly")
+        return 0
+
+
+# ── combined diagnostics (for `mount status` / `healthcheck`) ───────────────
+
+
+@dataclass(frozen=True)
+class MountDiagnostics:
+    configured: bool
+    mounted: bool
+    worker_pid: Optional[int]
+    last_state: Optional[str]
+    last_detail: str
+    last_timestamp: str
+
+    @property
+    def label(self) -> str:
+        if not self.configured:
+            return "not configured"
+        if self.mounted:
+            return "mounted"
+        if self.worker_pid is not None:
+            return "waiting for source (worker running)"
+        if self.last_state == "failed":
+            return "not mounted — last attempt failed"
+        if self.last_state == "waiting":
+            return "not mounted — worker exited while waiting"
+        return "not mounted"
+
+
+def get_diagnostics(romcloud_home: Path, config) -> MountDiagnostics:
+    """Combine live mount state, worker liveness, and last recorded status
+    into a single, clear diagnostic snapshot."""
+    if config.smb is None:
+        return MountDiagnostics(
+            configured=False, mounted=False, worker_pid=None,
+            last_state=None, last_detail="", last_timestamp="",
+        )
+
+    mounted = mountlib.is_target_mounted(config.source.rom_root)
+    worker_pid = is_worker_running(romcloud_home)
+    status = read_worker_status(romcloud_home)
+
+    return MountDiagnostics(
+        configured=True,
+        mounted=mounted,
+        worker_pid=worker_pid,
+        last_state=status.state if status else None,
+        last_detail=status.detail if status else "",
+        last_timestamp=status.timestamp if status else "",
+    )

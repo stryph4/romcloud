@@ -11,10 +11,14 @@ real Batocera install:
 - The generated `romcloud` and `romcloud-run` wrappers must exec the venv's
   python directly, and must preserve runtime `"$@"` (not expand it during
   installation).
-- The `custom.sh` PATH line must preserve runtime `$PATH`.
+- The installer must NEVER touch `/userdata/system/custom.sh` (foreign
+  Batocera/user-addon startup state) — no append, no source, no overwrite.
+  The CLI is not added to any PATH; the installer prints its full path
+  clearly instead (see real-hardware findings: sourcing custom.sh manually
+  triggers a large number of unrelated startup scripts).
 - Missing `python3` must fail the install clearly and non-zero.
-- Re-running the installer must remain idempotent (config, venv, and the
-  custom.sh PATH entry are all preserved/deduplicated).
+- Re-running the installer must remain idempotent (config and venv are
+  preserved, not recreated/reset).
 """
 
 from __future__ import annotations
@@ -50,7 +54,6 @@ def _run_install(
 @dataclass
 class InstalledLayout:
     home: Path
-    custom_sh: Path
     result: subprocess.CompletedProcess[str]
 
     @property
@@ -69,17 +72,15 @@ def installed(tmp_path_factory: pytest.TempPathFactory) -> InstalledLayout:
     # Mirrors the production layout (.../romcloud/bin) since the installer's
     # own idempotency check greps for the literal substring "romcloud/bin".
     home = base / "romcloud"
-    custom_sh = base / "custom.sh"
     result = _run_install(
         {
             "ROMCLOUD_HOME": str(home),
             "CACHE_ROOT": str(base / "cache"),
             "LOCAL_ROMS": str(base / "roms"),
-            "CUSTOM_SH": str(custom_sh),
         }
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    return InstalledLayout(home=home, custom_sh=custom_sh, result=result)
+    return InstalledLayout(home=home, result=result)
 
 
 # ── venv creation & package install ──────────────────────────────────────────
@@ -151,7 +152,6 @@ def test_install_succeeds_without_global_pip3(
             "ROMCLOUD_HOME": str(home),
             "CACHE_ROOT": str(tmp_path / "cache"),
             "LOCAL_ROMS": str(tmp_path / "roms"),
-            "CUSTOM_SH": str(tmp_path / "custom.sh"),
         },
         path=path_without_pip,
     )
@@ -194,7 +194,6 @@ def test_bootstraps_pip_when_venv_lacks_it(tmp_path: Path) -> None:
             "ROMCLOUD_HOME": str(home),
             "CACHE_ROOT": str(tmp_path / "cache"),
             "LOCAL_ROMS": str(tmp_path / "roms"),
-            "CUSTOM_SH": str(tmp_path / "custom.sh"),
         }
     )
     assert result.returncode == 0, result.stdout + result.stderr
@@ -244,7 +243,6 @@ def test_wrapper_argv_passthrough(tmp_path: Path) -> None:
             "ROMCLOUD_HOME": str(home),
             "CACHE_ROOT": str(tmp_path / "cache"),
             "LOCAL_ROMS": str(tmp_path / "roms"),
-            "CUSTOM_SH": str(tmp_path / "custom.sh"),
         }
     )
     assert result.returncode == 0, result.stdout + result.stderr
@@ -272,26 +270,53 @@ def test_wrapper_argv_passthrough(tmp_path: Path) -> None:
     ]
 
 
-def test_custom_sh_path_line_preserves_runtime_path(installed: InstalledLayout) -> None:
-    """The custom.sh PATH line must contain a literal $PATH, not the installer's PATH."""
-    content = installed.custom_sh.read_text()
-    expected = f'export PATH="{installed.bin_dir}:$PATH"'
-    assert expected in content
+def test_custom_sh_is_never_touched(installed: InstalledLayout) -> None:
+    """Regression: real-hardware testing showed sourcing custom.sh manually
+    triggers a large number of unrelated Batocera/user-addon startup scripts
+    (and a missing-file error) — it must be treated as foreign-owned state.
+    The installer must never append to, source, or overwrite it."""
+    content = INSTALL_SH.read_text()
+    for line in content.splitlines():
+        stripped = line.strip()
+        if "custom.sh" not in stripped:
+            continue
+        assert stripped.startswith("#") or stripped.startswith('echo "'), (
+            f"Unexpected non-comment/echo reference to custom.sh: {line!r}"
+        )
 
 
-def test_custom_sh_path_line_expands_at_runtime(installed: InstalledLayout, tmp_path: Path) -> None:
-    """Sourcing custom.sh must prepend the bin dir to whatever PATH is active then."""
-    result = subprocess.run(
-        [
-            "bash",
-            "-c",
-            f'export PATH=/some/other/dir; source "{installed.custom_sh}"; printf "%s" "$PATH"',
-        ],
-        capture_output=True,
-        text=True,
+def test_custom_sh_env_var_is_ignored_and_file_left_untouched(tmp_path: Path) -> None:
+    """Even if a stray CUSTOM_SH env var is set (e.g. leftover from an old
+    shell session), the installer must not read it or touch any file."""
+    fake_custom_sh = tmp_path / "custom.sh"
+    fake_custom_sh.write_text("# unrelated batocera/user-addon startup content\n")
+
+    home = tmp_path / "romcloud"
+    result = _run_install(
+        {
+            "ROMCLOUD_HOME": str(home),
+            "CACHE_ROOT": str(tmp_path / "cache"),
+            "LOCAL_ROMS": str(tmp_path / "roms"),
+            "CUSTOM_SH": str(fake_custom_sh),
+        }
     )
-    assert result.returncode == 0, result.stderr
-    assert result.stdout == f"{installed.bin_dir}:/some/other/dir"
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert fake_custom_sh.read_text() == "# unrelated batocera/user-addon startup content\n"
+
+
+def test_cli_not_added_to_any_path(installed: InstalledLayout) -> None:
+    """No PATH-modification mechanism is used at all."""
+    assert "export PATH" not in installed.result.stdout
+
+
+def test_summary_shows_full_cli_path_clearly(installed: InstalledLayout) -> None:
+    """Since the CLI isn't on PATH, the installer must make the full path
+    to invoke it obvious in its own output."""
+    output = installed.result.stdout
+    romcloud_bin = str(installed.bin_dir / "romcloud")
+    assert romcloud_bin in output
+    assert "was NOT added to PATH" in output
+    assert "custom.sh" in output  # explains *why*, for a curious SSH user
 
 
 # ── dependency checks ──────────────────────────────────────────────────────────
@@ -326,7 +351,6 @@ def test_missing_python3_fails_clearly(path_without_python: str, tmp_path: Path)
             "ROMCLOUD_HOME": str(home),
             "CACHE_ROOT": str(tmp_path / "cache"),
             "LOCAL_ROMS": str(tmp_path / "roms"),
-            "CUSTOM_SH": str(tmp_path / "custom.sh"),
         },
         path=path_without_python,
     )
@@ -346,8 +370,8 @@ def test_no_global_pip3_dependency_check(installed: InstalledLayout) -> None:
 
 
 def test_rerun_is_idempotent(installed: InstalledLayout) -> None:
-    """Re-running the installer must not touch existing config, recreate the
-    venv, or duplicate the PATH line."""
+    """Re-running the installer must not touch existing config or recreate
+    the venv."""
     config_file = installed.home / "config" / "romcloud.toml"
     config_file.write_text("# user customized\n")
 
@@ -359,11 +383,9 @@ def test_rerun_is_idempotent(installed: InstalledLayout) -> None:
             "ROMCLOUD_HOME": str(installed.home),
             "CACHE_ROOT": str(installed.home.parent / "cache"),
             "LOCAL_ROMS": str(installed.home.parent / "roms"),
-            "CUSTOM_SH": str(installed.custom_sh),
         }
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Virtual environment already exists" in result.stdout
     assert config_file.read_text() == "# user customized\n"
     assert venv_marker.exists(), "existing venv must be reused, not recreated"
-    assert installed.custom_sh.read_text().count("romcloud/bin") == 1
