@@ -36,7 +36,10 @@ Design constraints:
 
 from __future__ import annotations
 
-import curses
+try:
+    import curses
+except Exception:
+    curses = None  # type: ignore[assignment]
 import sys
 import threading
 import time
@@ -163,7 +166,10 @@ def run_progress_transfer(cache_service: CacheService, game: Game) -> str:
 
     if sys.stdout.isatty():
         try:
-            curses.wrapper(_render_progress, state)
+            if curses is not None:
+                curses.wrapper(_render_progress, state)
+            else:
+                _plain_progress(state)
         except Exception:  # noqa: BLE001
             # curses failed (e.g. TERM unset) — fall back to plain text.
             _plain_progress(state)

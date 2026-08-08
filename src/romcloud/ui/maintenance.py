@@ -10,7 +10,10 @@ Intended to be launched as a Batocera Port script:
 
 from __future__ import annotations
 
-import curses
+try:
+    import curses
+except Exception:
+    curses = None  # type: ignore[assignment]
 import sys
 from typing import Callable, Optional
 
@@ -21,7 +24,10 @@ def run_maintenance_ui(container) -> None:  # type: ignore[no-untyped-def]
         print("Maintenance UI requires an interactive terminal.")
         return
     try:
-        curses.wrapper(_main_menu, container)
+        if curses is not None:
+            curses.wrapper(_main_menu, container)
+        else:
+            print("Maintenance UI requires the curses module, which is not available on this system.")
     except KeyboardInterrupt:
         pass
 
