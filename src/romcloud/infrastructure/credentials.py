@@ -6,11 +6,12 @@ Credentials (e.g. SMB password) are stored in a separate TOML file at mode
 
 from __future__ import annotations
 
-import os
 import stat
 import sys
 from pathlib import Path
 from typing import Optional
+
+from romcloud.infrastructure.atomic_file import atomic_write_text
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -44,16 +45,13 @@ def load_smb_password(credentials_path: Path) -> Optional[str]:
 
 
 def write_smb_password(credentials_path: Path, password: str) -> None:
-    """Write the SMB password to the credentials file with mode 0600."""
-    credentials_path.parent.mkdir(parents=True, exist_ok=True)
-
+    """Atomically write the SMB password to the credentials file, mode 0600."""
     content = "[smb]\n"
     # Simple escaping: TOML basic strings need backslash and quote escaping.
     escaped = password.replace("\\", "\\\\").replace('"', '\\"')
     content += f'password = "{escaped}"\n'
 
-    credentials_path.write_text(content, encoding="utf-8")
-    credentials_path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600
+    atomic_write_text(credentials_path, content, mode=stat.S_IRUSR | stat.S_IWUSR)
 
 
 def cifs_credentials_path(main_credentials_path: Path) -> Path:
@@ -76,21 +74,11 @@ def write_cifs_credentials_file(
     (rather than passing ``username=...,password=...`` as a ``-o`` option)
     means it never appears in ``ps`` output, shell history, or logs.
 
-    Always written with mode 0600.
+    Always written atomically with mode 0600.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-
     lines = [f"username={username}", f"password={password}"]
     if domain:
         lines.append(f"domain={domain}")
     content = "\n".join(lines) + "\n"
 
-    # Create/truncate with restrictive permissions from the start, rather than
-    # writing world/group-readable content and chmod'ing afterwards.
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(content)
-    finally:
-        pass
-    path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600, in case an existing file had looser perms
+    atomic_write_text(path, content, mode=stat.S_IRUSR | stat.S_IWUSR)

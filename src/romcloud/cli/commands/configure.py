@@ -6,6 +6,7 @@ from pathlib import Path
 
 import click
 
+from romcloud.cli.smb_setup_wizard import run_smb_setup_wizard
 from romcloud.infrastructure.config import (
     AppConfig,
     CacheConfig,
@@ -17,6 +18,7 @@ from romcloud.infrastructure.config import (
     write_config,
 )
 from romcloud.infrastructure.credentials import write_smb_password
+from romcloud.infrastructure.smb_discovery_client import build_default_smb_discovery_service
 
 
 @click.command("configure")
@@ -100,29 +102,32 @@ def configure_cmd(
     # Persisted regardless of how the source is actually read at runtime — the
     # mount manager (`romcloud mount ...`) needs this to mount the share at
     # rom_root; the storage provider used to read ROMs is always local.
+    #
+    # Nothing here is written to disk yet — see the "build and write" section
+    # below. Discovery/validation happens entirely in memory; existing
+    # configuration and credentials are left untouched unless the *entire*
+    # wizard (including cache settings below) completes and the final
+    # confirmation succeeds.
     smb_cfg = None
+    smb_password: str | None = None
     if source_type == "smb":
         if not non_interactive:
-            server = click.prompt("SMB server hostname or IP")
-            share = click.prompt("SMB share name")
-            username = click.prompt("SMB username", default="guest")
-        else:
-            server = "localhost"
-            share = "ROMs"
-            username = "guest"
-        smb_cfg = SMBConfig(server=server, share=share, username=username)
-
-        # Store password separately with restricted permissions.
-        if not non_interactive:
-            password = click.prompt(
-                "SMB password (stored in credentials.toml, not echoed here)",
-                hide_input=True,
-                default="",
+            click.echo()
+            discovery = build_default_smb_discovery_service()
+            setup_result = run_smb_setup_wizard(discovery)
+            if setup_result is None:
+                click.echo("\nSetup cancelled — existing configuration left unchanged.")
+                ctx.exit(1)
+                return
+            smb_cfg = SMBConfig(
+                server=setup_result.server,
+                share=setup_result.share,
+                username=setup_result.username,
+                port=setup_result.port,
             )
-            if password:
-                creds_path = config_path.parent / "credentials.toml"
-                write_smb_password(creds_path, password)
-                click.echo(f"  Credentials written to {creds_path} (mode 0600)")
+            smb_password = setup_result.password
+        else:
+            smb_cfg = SMBConfig(server="localhost", share="ROMs", username="guest")
 
     # ── cache ─────────────────────────────────────────────────────────────────
     if cache_root is None and not non_interactive:
@@ -147,6 +152,13 @@ def configure_cmd(
     # just means the share is mounted at rom_root first (see `romcloud mount`)
     # — the native SMBProvider stub remains unimplemented and is never
     # selected here.
+    #
+    # Everything below only happens after every prompt/confirmation above has
+    # succeeded — config is written first, then credentials, each atomically
+    # (write-temp-then-rename): a crash or failure partway through never
+    # leaves a partial file, and if anything above failed/was cancelled we
+    # never reach here at all, so the previous configuration and credentials
+    # remain exactly as they were.
     _default_home = config_path.parent.parent
     config = AppConfig(
         source=SourceConfig(provider="local", rom_root=rom_root),
@@ -162,6 +174,12 @@ def configure_cmd(
 
     written = write_config(config, str(config_path))
     click.echo(f"\nConfiguration written to {written}")
+
+    if smb_password:
+        creds_path = config_path.parent / "credentials.toml"
+        write_smb_password(creds_path, smb_password)
+        click.echo(f"Credentials written to {creds_path} (mode 0600)")
+
     if smb_cfg is not None:
         click.echo(
             "Run `romcloud mount start` to mount the SMB share, then "
@@ -169,3 +187,4 @@ def configure_cmd(
         )
     else:
         click.echo("Run `romcloud healthcheck` to verify the setup.")
+

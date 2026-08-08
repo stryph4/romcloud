@@ -28,6 +28,7 @@ else:
             ) from exc
 
 from romcloud.core.exceptions import ConfigurationError, ConfigurationNotFoundError
+from romcloud.infrastructure.atomic_file import atomic_write_text
 
 # ── defaults ──────────────────────────────────────────────────────────────────
 
@@ -189,9 +190,13 @@ def _parse(data: dict, path: Path) -> AppConfig:  # noqa: C901
 
 
 def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
-    """Serialize *config* to TOML and write to disk.
+    """Serialize *config* to TOML and atomically write to disk.
 
-    Never overwrites credentials — those are managed separately.
+    Never overwrites credentials — those are managed separately. Uses
+    atomic file replacement (write-temp-then-rename) so a crash mid-write
+    can never leave a corrupt/partial ``romcloud.toml`` behind — the
+    existing file is left completely untouched until the new content is
+    fully written.
     """
     path = Path(config_path) if config_path else default_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -241,7 +246,7 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
             f"port = {config.smb.port}\n",
         ]
 
-    path.write_text("".join(lines), encoding="utf-8")
+    atomic_write_text(path, "".join(lines))
     return path
 
 

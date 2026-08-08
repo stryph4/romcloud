@@ -168,6 +168,64 @@ Example:
 LocalFilesystemProvider
 ```
 
+#### Guided setup (default)
+
+`romcloud configure` no longer asks you to type a share name blindly. Instead
+it discovers what you can actually access, and only lets you pick from
+shares it has already proven it can reach:
+
+```text
+Server: omnivault
+Username: stryph
+Password: ********
+
+Connecting...
+Connected.
+
+Select an SMB share:
+  Roms
+  Media
+  Downloads
+> Roms
+
+Validating //omnivault/Roms...
+Connected to //omnivault/Roms
+
+Detected systems:
+
+  ✓ dreamcast
+  ✓ gamecube
+  ✓ ps2
+  ✓ psp
+  ✓ psx
+  ✓ saturn
+  ✓ wii
+  ✓ xbox
+  ✓ xbox360
+
+9 systems detected.
+
+Use this library? [Y/n]
+```
+
+Core rule: *if ROMCloud lets you select a share, it has already proven it can
+access it.* Nothing is written to `romcloud.toml` or the credentials file
+until this entire flow succeeds and you confirm — if you cancel at any
+point, or a step fails, your existing configuration and credentials are left
+completely unchanged.
+
+If share enumeration is unavailable (e.g. the `smbclient` tool isn't
+installed), ROMCloud automatically falls back to manual share entry — typed
+share names still go through the exact same validation and system-detection
+pipeline before anything is saved.
+
+Password entry shows `*` per character on terminals that support it, and
+falls back to fully hidden input (never plaintext) otherwise.
+
+The reusable discovery/setup logic lives in
+`romcloud.core.services.smb_discovery.SMBDiscoveryService` — it is not tied
+to the CLI, so a future graphical setup UI can use it unchanged.
+
 Example configuration:
 
 ```toml
@@ -182,7 +240,8 @@ username = "your-user"
 port = 445
 ```
 
-The SMB password is stored separately from `romcloud.toml`.
+The SMB password is stored separately from `romcloud.toml`, atomically, with
+mode 0600.
 
 ROMCloud can install and manage a Batocera mount service:
 
@@ -194,6 +253,12 @@ romcloud mount status
 ```
 
 A native direct-SMB provider is planned for the future. The current architecture intentionally keeps mounting separate from the storage-provider layer so direct SMB can be added later without rewriting catalog/cache logic.
+
+**Assumption requiring real hardware validation:** share discovery/validation
+shells out to the `smbclient` CLI (Samba client tools), the same family as
+the `cifs-utils` package already relied on for mounting. This has not yet
+been confirmed as present on a stock Batocera 42 image — if absent, ROMCloud
+falls back to manual share entry automatically.
 
 ---
 
