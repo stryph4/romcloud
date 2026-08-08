@@ -8,8 +8,10 @@ from __future__ import annotations
 
 from click.testing import CliRunner
 
+from romcloud.cli.main import cli
 from romcloud.cli.commands.healthcheck import healthcheck_cmd
 from romcloud.infrastructure.config import AppConfig, CacheConfig, SMBConfig, SourceConfig
+from romcloud.infrastructure.config import write_config
 from romcloud.infrastructure.mount_worker import MountDiagnostics
 
 
@@ -77,3 +79,47 @@ class TestMountDiagnosticLine:
         assert not isinstance(result.exception, RuntimeError)
         assert "SMB source mounted" in result.output
         assert "error checking status" in result.output
+
+
+class TestStartupMigrationFromHealthcheck:
+    def test_healthcheck_triggers_legacy_credentials_migration_idempotently(self, tmp_path, monkeypatch):
+        home = tmp_path / "romcloud"
+        config_dir = home / "config"
+        source_root = home / "roms"
+        source_root.mkdir(parents=True)
+        data_root = home / "data"
+        data_root.mkdir(parents=True)
+        cache_root = home / "cache"
+        cache_root.mkdir(parents=True)
+        local_roms = home / "local_roms"
+        local_roms.mkdir(parents=True)
+
+        config = AppConfig(
+            source=SourceConfig(provider="local", rom_root=str(source_root)),
+            cache=CacheConfig(path=str(cache_root)),
+            local_roms_path=str(local_roms),
+            data_path=str(data_root),
+            smb=SMBConfig(server="nas.local", share="ROMs", username="alice"),
+        )
+        config_dir.mkdir(parents=True)
+        cfg_path = config_dir / "romcloud.toml"
+        write_config(config, str(cfg_path))
+
+        legacy = cfg_path.parent / "smb.credentials"
+        legacy.write_text('[smb]\npassword = "legacy-secret"\n', encoding="utf-8")
+        legacy.chmod(0o600)
+
+        diag = MountDiagnostics(
+            configured=True, mounted=True, worker_pid=None,
+            last_state="success", last_detail="ok", last_timestamp="x",
+        )
+        monkeypatch.setattr("romcloud.infrastructure.mount_worker.get_diagnostics", lambda *a, **k: diag)
+
+        runner = CliRunner()
+        result1 = runner.invoke(cli, ["--config", str(cfg_path), "healthcheck"])
+        result2 = runner.invoke(cli, ["--config", str(cfg_path), "healthcheck"])
+
+        assert result1.exit_code == 0, result1.output
+        assert result2.exit_code == 0, result2.output
+        assert not legacy.exists()
+        assert (cfg_path.parent / "credentials.toml").exists()

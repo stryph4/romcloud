@@ -38,18 +38,31 @@ def load_smb_password(credentials_path: Path) -> Optional[str]:
     Returns None if no credentials file exists or no password is set.
     Never raises; logs warnings via the standard library.
     """
-    if credentials_path.exists():
-        password = _read_toml_smb_password(credentials_path)
-        _cleanup_legacy_credentials(credentials_path)
-        return password
+    return _read_toml_smb_password(credentials_path)
 
+
+def migrate_legacy_smb_credentials(credentials_path: Path) -> bool:
+    """Migrate or clean up a legacy ``smb.credentials`` file.
+
+    Returns True when a legacy file was successfully migrated or removed.
+    The function is best-effort, local-only, and safe to call repeatedly.
+    """
     legacy_path = _legacy_credentials_path(credentials_path)
     legacy_password = _read_legacy_password(legacy_path)
     if legacy_password is None:
-        return None
+        return False
 
-    write_smb_password(credentials_path, legacy_password)
-    return legacy_password
+    if credentials_path.exists():
+        legacy_path.unlink(missing_ok=True)
+        return True
+
+    try:
+        write_smb_password(credentials_path, legacy_password)
+    except Exception:  # noqa: BLE001
+        return False
+
+    legacy_path.unlink(missing_ok=True)
+    return True
 
 
 def write_smb_password(credentials_path: Path, password: str) -> None:
@@ -60,7 +73,6 @@ def write_smb_password(credentials_path: Path, password: str) -> None:
     content += f'password = "{escaped}"\n'
 
     atomic_write_text(credentials_path, content, mode=stat.S_IRUSR | stat.S_IWUSR)
-    _cleanup_legacy_credentials(credentials_path)
 
 
 def cifs_credentials_path(main_credentials_path: Path) -> Path:
@@ -131,9 +143,3 @@ def _password_from_mapping(data) -> Optional[str]:
         return password
 
     return None
-
-
-def _cleanup_legacy_credentials(credentials_path: Path) -> None:
-    legacy_path = _legacy_credentials_path(credentials_path)
-    if _read_legacy_password(legacy_path) is not None:
-        legacy_path.unlink(missing_ok=True)

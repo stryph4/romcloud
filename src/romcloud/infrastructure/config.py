@@ -29,6 +29,7 @@ else:
 
 from romcloud.core.exceptions import ConfigurationError, ConfigurationNotFoundError
 from romcloud.infrastructure.atomic_file import atomic_write_text
+from romcloud.infrastructure.credentials import migrate_legacy_smb_credentials
 
 # ── defaults ──────────────────────────────────────────────────────────────────
 
@@ -112,7 +113,9 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
     except Exception as exc:
         raise ConfigurationError(f"Failed to parse config {path}: {exc}") from exc
 
-    return _parse(data, path)
+    config = _parse(data, path)
+    migrate_legacy_smb_credentials(config.credentials_path)
+    return config
 
 
 def _parse(data: dict, path: Path) -> AppConfig:  # noqa: C901

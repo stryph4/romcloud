@@ -11,6 +11,7 @@ import stat
 from pathlib import Path
 
 from romcloud.infrastructure.credentials import (
+    migrate_legacy_smb_credentials,
     load_smb_password,
     write_cifs_credentials_file,
     write_smb_password,
@@ -47,6 +48,7 @@ class TestLegacySmbCredentialsMigration:
         legacy.write_text('[smb]\npassword = "legacy-secret"\n', encoding="utf-8")
         legacy.chmod(0o600)
 
+        assert migrate_legacy_smb_credentials(current) is True
         assert load_smb_password(current) == "current-secret"
         assert not legacy.exists()
         assert current.stat().st_mode & 0o777 == 0o600
@@ -59,6 +61,7 @@ class TestLegacySmbCredentialsMigration:
         legacy.write_text('[smb]\npassword = "legacy-secret"\n', encoding="utf-8")
         legacy.chmod(0o600)
 
+        assert migrate_legacy_smb_credentials(current) is True
         assert load_smb_password(current) == "legacy-secret"
         assert current.exists()
         assert current.stat().st_mode & 0o777 == 0o600
@@ -71,6 +74,7 @@ class TestLegacySmbCredentialsMigration:
 
         legacy.write_text("not romcloud legacy format", encoding="utf-8")
 
+        assert migrate_legacy_smb_credentials(current) is False
         assert load_smb_password(current) is None
         assert legacy.exists()
         assert not current.exists()
@@ -81,6 +85,7 @@ class TestLegacySmbCredentialsMigration:
 
         legacy.write_text('[other]\nvalue = "keep me"\n', encoding="utf-8")
 
+        assert migrate_legacy_smb_credentials(current) is False
         assert load_smb_password(current) is None
         assert legacy.exists()
 
@@ -90,8 +95,9 @@ class TestLegacySmbCredentialsMigration:
 
         legacy.write_text('password = "legacy-secret"\n', encoding="utf-8")
 
+        assert migrate_legacy_smb_credentials(current) is True
         assert load_smb_password(current) == "legacy-secret"
-        assert load_smb_password(current) == "legacy-secret"
+        assert migrate_legacy_smb_credentials(current) is False
         assert current.exists()
         assert not legacy.exists()
 
