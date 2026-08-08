@@ -85,7 +85,7 @@ class TestHappyPath:
         runner = CliRunner()
         result = runner.invoke(
             _make_command(discovery),
-            input="omnivault\nstryph\nhunter2\nRoms\ny\n",
+            input="omnivault\nstryph\nhunter2\n1\ny\n",
         )
 
         assert result.exit_code == 0, result.output
@@ -162,8 +162,6 @@ class TestManualShareFallback:
 
 class TestManualEntryFromMenu:
     def test_selecting_manual_entry_option_from_share_menu(self):
-        from romcloud.cli.smb_setup_wizard import _MANUAL_ENTRY_LABEL
-
         discovery = FakeDiscovery(
             shares=ListSharesResult(ok=True, shares=(ShareInfo("Roms"),)),
             validations={"CustomShare": ShareValidationResult(ok=True, share="CustomShare", top_level_entries=())},
@@ -171,7 +169,7 @@ class TestManualEntryFromMenu:
         runner = CliRunner()
         result = runner.invoke(
             _make_command(discovery),
-            input=f"omnivault\nstryph\nhunter2\n{_MANUAL_ENTRY_LABEL}\nCustomShare\ny\n",
+            input="omnivault\nstryph\nhunter2\n2\nCustomShare\ny\n",
         )
 
         assert result.exit_code == 0, result.output
@@ -193,7 +191,7 @@ class TestShareValidationFailureThenRetryDeclined:
         runner = CliRunner()
         result = runner.invoke(
             _make_command(discovery),
-            input="omnivault\nstryph\nhunter2\nRoms\nn\n",
+            input="omnivault\nstryph\nhunter2\n1\nn\n",
         )
 
         assert result.exit_code == 0, result.output
@@ -209,89 +207,49 @@ class TestDecliningUseThisLibrary:
         runner = CliRunner()
         result = runner.invoke(
             _make_command(discovery),
-            input="omnivault\nstryph\nhunter2\nRoms\nn\nn\n",
+            input="omnivault\nstryph\nhunter2\n1\nn\nn\n",
         )
 
         assert result.exit_code == 0, result.output
         assert "CANCELLED" in result.output
 
 
-class TestInteractiveSelector:
-    def test_arrow_key_selection(self, monkeypatch):
-        # Select second entry by sending Down arrow then Enter
+class TestNumberedSelector:
+    def test_numeric_selection_chooses_discovered_share(self):
         discovery = FakeDiscovery(
             shares=ListSharesResult(ok=True, shares=(ShareInfo("one"), ShareInfo("two"))),
-            validations={
-                "two": ShareValidationResult(ok=True, share="two", top_level_entries=("psx",))
-            },
+            validations={"two": ShareValidationResult(ok=True, share="two", top_level_entries=("psx",))},
         )
         runner = CliRunner()
-        # Prepare input: server, username, password, Down-arrow, Enter, confirm
-        user_input = "omnivault\nstryph\nhunter2\n" + "\x1b[B" + "\n" + "y\n"
-        # Simulate interactive selection by patching the selector function
-        import romcloud.cli.smb_setup_wizard as wiz
-
-        # Ensure system stdin reports as a TTY during the invocation
-        monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
-
-        def _fake_interactive(choices):
-            # verify choices list contains our shares + advanced option
-            assert choices[0] == "one"
-            assert "two" in choices
-            return "two"
-
-        monkeypatch.setattr(wiz, "_interactive_select", _fake_interactive)
-        result = runner.invoke(_make_command(discovery), input=user_input)
+        result = runner.invoke(_make_command(discovery), input="omnivault\nstryph\nhunter2\n2\ny\n")
 
         assert result.exit_code == 0, result.output
         assert "RESULT:omnivault:two:" in result.output
 
-    def test_numbered_fallback_when_not_tty(self, monkeypatch):
+    def test_invalid_numeric_input_reprompts_cleanly(self):
         discovery = FakeDiscovery(
             shares=ListSharesResult(ok=True, shares=(ShareInfo("a"), ShareInfo("b"))),
             validations={"b": ShareValidationResult(ok=True, share="b", top_level_entries=())},
         )
         runner = CliRunner()
-        # Non-tty -> choose option 2
-        monkeypatch.setattr("romcloud.cli.smb_setup_wizard.sys.stdin.isatty", lambda: False)
-        result = runner.invoke(_make_command(discovery), input="omnivault\nstryph\nhunter2\n2\ny\n")
-        assert result.exit_code == 0
+        result = runner.invoke(_make_command(discovery), input="omnivault\nstryph\nhunter2\n99\n2\ny\n")
+
+        assert result.exit_code == 0, result.output
         assert "RESULT:omnivault:b:" in result.output
 
-    def test_advanced_manual_from_interactive(self, monkeypatch):
-        from romcloud.cli.smb_setup_wizard import _ADVANCED_LABEL
-
-        discovery = FakeDiscovery(
-            shares=ListSharesResult(ok=True, shares=(ShareInfo("Roms"),)),
-            validations={"Custom": ShareValidationResult(ok=True, share="Custom", top_level_entries=())},
-        )
-        runner = CliRunner()
-        # Move down once to the Advanced option (it's the second item), then Enter
-        import romcloud.cli.smb_setup_wizard as wiz
-
-        monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
-        from romcloud.cli.smb_setup_wizard import _ADVANCED_LABEL
-        monkeypatch.setattr(wiz, "_interactive_select", lambda choices: _ADVANCED_LABEL)
-        user_input = "omnivault\nstryph\nhunter2\nCustom\ny\n"
-        result = runner.invoke(_make_command(discovery), input=user_input)
-        assert result.exit_code == 0
-        assert "RESULT:omnivault:Custom:" in result.output
-
-    def test_interactive_cancel_returns_none(self, monkeypatch):
+    def test_ctrl_c_cancels_cleanly(self, monkeypatch):
         discovery = FakeDiscovery(
             shares=ListSharesResult(ok=True, shares=(ShareInfo("a"), ShareInfo("b"))),
         )
         runner = CliRunner()
+
         import romcloud.cli.smb_setup_wizard as wiz
 
-        # Simulate user cancelling the interactive selector
-        monkeypatch.setattr(wiz.sys.stdin, "isatty", lambda: True, raising=False)
+        def _raise_abort(choices):
+            raise click.Abort()
 
-        def _raise_cancel(choices):
-            raise KeyboardInterrupt
+        monkeypatch.setattr(wiz, "_numbered_select", _raise_abort)
+        result = runner.invoke(_make_command(discovery), input="omnivault\nstryph\nhunter2\n")
 
-        monkeypatch.setattr(wiz, "_interactive_select", _raise_cancel)
-        user_input = "omnivault\nstryph\nhunter2\n"
-        result = runner.invoke(_make_command(discovery), input=user_input)
-        assert result.exit_code == 0
+        assert result.exit_code == 0, result.output
         assert "CANCELLED" in result.output
