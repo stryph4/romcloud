@@ -22,3 +22,4 @@ MANIFEST
 .ruff_cache/
 .tox/
 romcloud-src/
+romcloud-src-backup.tar.gz
