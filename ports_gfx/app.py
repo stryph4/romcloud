@@ -8,6 +8,13 @@ venv) — the failure is deferred to the point where the UI is actually
 launched, where it can be reported clearly instead of via a module-import
 traceback at ``python -m ports_gfx`` startup.
 
+Rendering is fully resolution-responsive: the window opens full-screen at
+whatever the current display reports (720p/1080p/4K TVs, Steam Deck-class
+handhelds, unusual aspect ratios), and every position/size, font, and
+focus-navigation decision is derived from that actual size via
+``layout.compute_layout``/``layout.find_next_focus_index`` — nothing here
+is a fixed pixel coordinate. See ``layout.py`` for the geometry itself.
+
 Everything above the lazy pygame import (menu contents, result formatting)
 is plain Python and unit-tested directly; the render/event loop itself is
 not (mirrors how ``romcloud.ui.progress``/``romcloud.ui.maintenance`` leave
@@ -20,6 +27,7 @@ import sys
 from typing import Optional
 
 from ports_gfx.client import BackendResult, call_backend
+from ports_gfx.layout import Layout, compute_layout, find_next_focus_index
 from ports_gfx.menu import EXIT_ACTION, MenuItem, MenuState
 
 MENU_ITEMS: tuple[MenuItem, ...] = (
@@ -31,14 +39,20 @@ MENU_ITEMS: tuple[MenuItem, ...] = (
 )
 
 _BG_COLOR = (18, 18, 24)
+_CARD_BG = (40, 40, 50)
 _FG_COLOR = (230, 230, 230)
 _SELECTED_BG = (60, 90, 160)
 _ERROR_COLOR = (220, 90, 90)
 _HINT_COLOR = (150, 150, 150)
 
-_WINDOW_SIZE = (960, 540)
-_FONT_SIZE = 28
+# Fallback used only if the display driver reports a nonsensical size
+# (e.g. a headless/dummy driver) — never a "design resolution" the real
+# layout is scaled against.
+_FALLBACK_SIZE = (1280, 720)
+_MIN_SANE_DIMENSION = 240
+
 _TARGET_FPS = 30
+_HINT_TEXT = "Up/Down/Left/Right select   Enter confirm   Esc exit"
 
 
 def format_result(action: str, result: BackendResult) -> str:
@@ -74,15 +88,66 @@ def run_app(romcloud_bin: str) -> int:
         return 1
 
 
+def _detect_screen_size(pygame) -> tuple[int, int]:  # noqa: ANN001
+    """Current display resolution, defensively clamped.
+
+    Some drivers (e.g. a headless/dummy SDL video driver) can report a
+    zero or nonsensical size; fall back to a safe default rather than
+    ever computing a layout against a degenerate (0, 0) screen.
+    """
+    try:
+        info = pygame.display.Info()
+        w, h = info.current_w, info.current_h
+    except Exception:  # noqa: BLE001
+        w, h = _FALLBACK_SIZE
+
+    if w < _MIN_SANE_DIMENSION or h < _MIN_SANE_DIMENSION:
+        return _FALLBACK_SIZE
+    return w, h
+
+
+def _open_display(pygame, screen_w: int, screen_h: int):  # noqa: ANN001
+    """Open a full-screen window at *(screen_w, screen_h)*, falling back
+    to a windowed surface of the same size if full-screen mode itself
+    fails to initialize (e.g. an unusual/unsupported SDL video driver)."""
+    try:
+        return pygame.display.set_mode((screen_w, screen_h), pygame.FULLSCREEN)
+    except Exception:  # noqa: BLE001
+        return pygame.display.set_mode((screen_w, screen_h))
+
+
+def _build_fonts(pygame, layout: Layout):  # noqa: ANN001
+    return {
+        "title": pygame.font.SysFont(None, layout.fonts.title),
+        "body": pygame.font.SysFont(None, layout.fonts.body),
+        "hint": pygame.font.SysFont(None, layout.fonts.hint),
+    }
+
+
+def _direction_for_key(pygame, key: int) -> Optional[tuple[int, int]]:  # noqa: ANN001
+    if key in (pygame.K_UP, pygame.K_w):
+        return (0, -1)
+    if key in (pygame.K_DOWN, pygame.K_s):
+        return (0, 1)
+    if key in (pygame.K_LEFT, pygame.K_a):
+        return (-1, 0)
+    if key in (pygame.K_RIGHT, pygame.K_d):
+        return (1, 0)
+    return None
+
+
 def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module, imported lazily
     pygame.init()
     try:
-        screen = pygame.display.set_mode(_WINDOW_SIZE)
+        screen_w, screen_h = _detect_screen_size(pygame)
+        screen = _open_display(pygame, screen_w, screen_h)
         pygame.display.set_caption("ROMCloud")
-        font = pygame.font.SysFont(None, _FONT_SIZE)
-        clock = pygame.time.Clock()
 
         state = MenuState(list(MENU_ITEMS))
+        layout = compute_layout(screen_w, screen_h, len(state.items))
+        fonts = _build_fonts(pygame, layout)
+        clock = pygame.time.Clock()
+
         message: Optional[str] = None
         message_is_error = False
 
@@ -91,12 +156,17 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
+                elif event.type == pygame.VIDEORESIZE:
+                    screen_w, screen_h = event.w, event.h
+                    layout = compute_layout(screen_w, screen_h, len(state.items))
+                    fonts = _build_fonts(pygame, layout)
                 elif event.type == pygame.KEYDOWN:
-                    if event.key in (pygame.K_UP, pygame.K_w):
-                        state.move_up()
-                        message = None
-                    elif event.key in (pygame.K_DOWN, pygame.K_s):
-                        state.move_down()
+                    direction = _direction_for_key(pygame, event.key)
+                    if direction is not None:
+                        new_index = find_next_focus_index(
+                            layout.card_rects, state.selected_index, *direction
+                        )
+                        state.select(new_index)
                         message = None
                     elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
                         item = state.selected_item
@@ -109,7 +179,7 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
                     elif event.key == pygame.K_ESCAPE:
                         running = False
 
-            _render(pygame, screen, font, state, message, message_is_error)
+            _render(pygame, screen, fonts, layout, state, message, message_is_error)
             clock.tick(_TARGET_FPS)
 
         return 0
@@ -117,25 +187,35 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
         pygame.quit()
 
 
-def _render(pygame, screen, font, state: MenuState, message: Optional[str], message_is_error: bool) -> None:  # noqa: ANN001
+def _render(  # noqa: ANN001
+    pygame,
+    screen,
+    fonts: dict,
+    layout: Layout,
+    state: MenuState,
+    message: Optional[str],
+    message_is_error: bool,
+) -> None:
     screen.fill(_BG_COLOR)
 
-    title = font.render("ROMCloud", True, _FG_COLOR)
-    screen.blit(title, (40, 30))
+    title = fonts["title"].render("ROMCloud", True, _FG_COLOR)
+    screen.blit(title, (layout.safe_area.x, layout.safe_area.y))
 
-    for i, item in enumerate(state.items):
-        y = 100 + i * 44
-        if i == state.selected_index:
-            pygame.draw.rect(screen, _SELECTED_BG, (30, y - 6, 400, 38))
-        label = font.render(item.label, True, _FG_COLOR)
-        screen.blit(label, (44, y))
+    for i, (item, rect) in enumerate(zip(state.items, layout.card_rects)):
+        color = _SELECTED_BG if i == state.selected_index else _CARD_BG
+        pygame.draw.rect(screen, color, (rect.x, rect.y, rect.w, rect.h), border_radius=6)
+        label = fonts["body"].render(item.label, True, _FG_COLOR)
+        label_rect = label.get_rect(center=rect.center)
+        screen.blit(label, label_rect)
 
     if message:
+        max_chars = max(1, layout.message_rect.w // 8)
         color = _ERROR_COLOR if message_is_error else _FG_COLOR
-        text = font.render(message[:100], True, color)
-        screen.blit(text, (40, 420))
+        text = fonts["body"].render(message[:max_chars], True, color)
+        screen.blit(text, (layout.message_rect.x, layout.message_rect.y))
 
-    hint = font.render("Up/Down select   Enter confirm   Esc exit", True, _HINT_COLOR)
-    screen.blit(hint, (40, 480))
+    hint = fonts["hint"].render(_HINT_TEXT, True, _HINT_COLOR)
+    screen.blit(hint, (layout.hint_rect.x, layout.hint_rect.y))
 
     pygame.display.flip()
+

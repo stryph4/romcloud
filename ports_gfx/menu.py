@@ -1,8 +1,9 @@
-"""Pure menu navigation state — no pygame, no I/O, fully unit-testable.
+"""Pure menu state — no pygame, no I/O, no layout/geometry.
 
-Kept separate from ``app.py`` (the pygame render/event loop) so the actual
-navigation logic can be tested without pygame installed — pygame is only
-ever present on Batocera's system Python, never in ROMCloud's dev/test venv.
+Selection is a plain index into ``items``. *How* that index changes in
+response to a directional key press is entirely the responsibility of
+``layout.find_next_focus_index``, which reasons about the actual rendered
+widget rects rather than array order — see ``app.py``'s event loop.
 """
 
 from __future__ import annotations
@@ -29,12 +30,7 @@ EXIT_ACTION = "exit"
 
 
 class MenuState:
-    """Tracks which menu item is currently selected.
-
-    Navigation wraps around at both ends (moving up from the first item
-    selects the last, and vice versa) — a common, predictable convention
-    for D-pad/controller-driven menus.
-    """
+    """Tracks which menu item is currently selected."""
 
     def __init__(self, items: Sequence[MenuItem]) -> None:
         if not items:
@@ -54,8 +50,8 @@ class MenuState:
     def selected_item(self) -> MenuItem:
         return self._items[self._selected]
 
-    def move_up(self) -> None:
-        self._selected = (self._selected - 1) % len(self._items)
+    def select(self, index: int) -> None:
+        """Set the selected index directly (e.g. from geometric focus
+        navigation) — clamped to the valid range."""
+        self._selected = max(0, min(index, len(self._items) - 1))
 
-    def move_down(self) -> None:
-        self._selected = (self._selected + 1) % len(self._items)

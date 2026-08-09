@@ -1,4 +1,9 @@
-"""Unit tests for `ports_gfx.menu` — pure navigation state, no pygame."""
+"""Unit tests for `ports_gfx.menu` — pure selection state, no pygame.
+
+Navigation itself (which index a directional key press should select) is
+tested separately in `test_ports_gfx_layout.py`, since it's derived from
+actual rendered rects, not array order — see `layout.find_next_focus_index`.
+"""
 
 from __future__ import annotations
 
@@ -28,29 +33,26 @@ class TestInitialState:
             MenuState([])
 
 
-class TestNavigation:
-    def test_move_down_advances_selection(self):
+class TestSelect:
+    def test_select_changes_current_item(self):
         state = MenuState(_items())
-        state.move_down()
-        assert state.selected_index == 1
-        assert state.selected_item.label == "Refresh Catalog"
+        state.select(2)
+        assert state.selected_index == 2
+        assert state.selected_item.label == "Health Check"
 
-    def test_move_up_from_first_wraps_to_last(self):
+    def test_select_clamps_below_zero(self):
         state = MenuState(_items())
-        state.move_up()
-        assert state.selected_index == len(_items()) - 1
-        assert state.selected_item.action == EXIT_ACTION
-
-    def test_move_down_from_last_wraps_to_first(self):
-        state = MenuState(_items())
-        for _ in range(len(_items()) - 1):
-            state.move_down()
-        assert state.selected_item.action == EXIT_ACTION
-        state.move_down()
+        state.select(-5)
         assert state.selected_index == 0
+
+    def test_select_clamps_above_last_index(self):
+        state = MenuState(_items())
+        state.select(999)
+        assert state.selected_index == len(_items()) - 1
 
     def test_items_returns_a_copy(self):
         state = MenuState(_items())
         items = state.items
         items.append(MenuItem("Extra", "extra"))
         assert len(state.items) == len(_items())
+
