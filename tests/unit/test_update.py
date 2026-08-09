@@ -312,6 +312,32 @@ class TestCheckForUpdate:
         result = upd.check_for_update(tmp_path, opener=opener)
         assert result.update_available is True
 
+    def test_unknown_commit_matching_version_reports_up_to_date(self, tmp_path):
+        upd.write_build_info(
+            tmp_path,
+            upd.BuildInfo(version="9.9.9", commit=None, commit_short=None, build_date="x", source="s"),
+        )
+        archive = _make_archive_bytes(sha=_SHA, version="9.9.9")
+        opener = _make_opener(_full_payloads(archive_bytes=archive))
+
+        result = upd.check_for_update(tmp_path, opener=opener)
+
+        assert result.update_available is False
+        assert not any(tmp_path.glob("romcloud-update-*"))
+
+    def test_unknown_commit_mismatched_version_reports_update_available(self, tmp_path):
+        upd.write_build_info(
+            tmp_path,
+            upd.BuildInfo(version="1.0.0", commit=None, commit_short=None, build_date="x", source="s"),
+        )
+        archive = _make_archive_bytes(sha=_SHA, version="2.0.0")
+        opener = _make_opener(_full_payloads(archive_bytes=archive))
+
+        result = upd.check_for_update(tmp_path, opener=opener)
+
+        assert result.update_available is True
+        assert not any(tmp_path.glob("romcloud-update-*"))
+
     def test_check_only_mode_never_downloads_or_writes(self, tmp_path):
         """--check must be read-only: no archive download, no version.json write."""
         calls: list = []

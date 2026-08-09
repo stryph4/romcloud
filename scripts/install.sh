@@ -102,9 +102,101 @@ fi
 echo "  Installed ROMCloud into ${VENV_DIR}."
 
 # ── write version file ────────────────────────────────────────────────────────
-if [[ -f "${PROJECT_DIR}/version.json" ]]; then
-    cp "${PROJECT_DIR}/version.json" "${ROMCLOUD_HOME}/version.json"
-fi
+# Persist build metadata without inventing a commit SHA. Prefer explicit
+# installer input, then git when available, then the previously installed
+# metadata when this is a same-version reinstall/repair. If none of those
+# sources are available, the commit stays unknown.
+ROMCLOUD_BUILD_COMMIT="${ROMCLOUD_BUILD_COMMIT:-}"
+ROMCLOUD_HOME="${ROMCLOUD_HOME}" PROJECT_DIR="${PROJECT_DIR}" ROMCLOUD_BUILD_COMMIT="${ROMCLOUD_BUILD_COMMIT}" "${VENV_DIR}/bin/python" <<'PY'
+import json
+import os
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+
+import romcloud
+
+project_dir = Path(os.environ["PROJECT_DIR"])
+romcloud_home = Path(os.environ["ROMCLOUD_HOME"])
+explicit_commit = os.environ.get("ROMCLOUD_BUILD_COMMIT") or None
+version = romcloud.__version__
+
+
+def _read_commit(path: Path) -> str | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    commit = data.get("commit")
+    if isinstance(commit, str) and commit:
+        return commit
+    return None
+
+
+def _is_commit_sha(value: str | None) -> bool:
+    return bool(value) and len(value) == 40 and all(ch in "0123456789abcdefABCDEF" for ch in value)
+
+
+def _git_commit() -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project_dir), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+    commit = result.stdout.strip()
+    return commit if _is_commit_sha(commit) else None
+
+
+existing_info = None
+existing_path = romcloud_home / "version.json"
+if existing_path.exists():
+    try:
+        existing_info = json.loads(existing_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        existing_info = None
+
+commit = None
+source = "installer:unknown"
+
+if _is_commit_sha(explicit_commit):
+    commit = explicit_commit
+    source = "installer:explicit"
+else:
+    git_commit = _git_commit()
+    if git_commit is not None:
+        commit = git_commit
+        source = "installer:git"
+    else:
+        project_commit = _read_commit(project_dir / "version.json")
+        if _is_commit_sha(project_commit):
+            commit = project_commit
+            source = "installer:source-metadata"
+        elif isinstance(existing_info, dict) and existing_info.get("version") == version:
+            preserved_commit = existing_info.get("commit")
+            if _is_commit_sha(preserved_commit):
+                commit = preserved_commit
+                source = "installer:preserved"
+
+payload = {
+    "version": version,
+    "commit": commit,
+    "commit_short": commit[:12] if commit else None,
+    "build_date": datetime.now(timezone.utc).isoformat(),
+    "source": source,
+}
+
+path = romcloud_home / "version.json"
+path.parent.mkdir(parents=True, exist_ok=True)
+tmp_path = path.with_name(f".{path.name}.tmp")
+tmp_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+tmp_path.replace(path)
+PY
 
 # ── write CLI wrapper ─────────────────────────────────────────────────────────
 # Built with printf (not an unquoted heredoc) so runtime-only tokens such as

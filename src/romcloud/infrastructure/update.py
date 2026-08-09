@@ -324,8 +324,39 @@ def check_for_update(
     """Check whether a newer commit is available, without installing anything."""
     current = read_build_info(romcloud_home)
     latest = get_latest_commit(repo, branch, opener=opener)
-    update_available = current is None or current.commit != latest.sha
+    if current is None:
+        update_available = True
+    elif current.commit is None:
+        if current.version == "unknown":
+            update_available = True
+        else:
+            latest_version = _read_latest_project_version(
+                romcloud_home, repo=repo, latest=latest, opener=opener
+            )
+            update_available = current.version != latest_version
+    else:
+        update_available = current.commit != latest.sha
     return CheckResult(current=current, latest_commit=latest, update_available=update_available)
+
+
+def _read_latest_project_version(
+    romcloud_home: Path,
+    *,
+    repo: str,
+    latest: CommitInfo,
+    opener: OpenerType,
+) -> str:
+    tmp_root = _make_temp_dir(romcloud_home)
+    try:
+        archive_path = tmp_root / "romcloud-update.zip"
+        download_file(archive_download_url(repo, latest.sha), archive_path, opener=opener)
+
+        extract_dir = tmp_root / "extracted"
+        safe_extract_zip(archive_path, extract_dir)
+        project_root = find_extracted_project_root(extract_dir)
+        return read_project_version(project_root)
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
 
 
 def _make_temp_dir(romcloud_home: Path) -> Path:

@@ -23,6 +23,7 @@ real Batocera install:
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import subprocess
@@ -81,6 +82,20 @@ def installed(tmp_path_factory: pytest.TempPathFactory) -> InstalledLayout:
     )
     assert result.returncode == 0, result.stdout + result.stderr
     return InstalledLayout(home=home, result=result)
+
+
+def _read_version_info(home: Path) -> dict:
+    return json.loads((home / "version.json").read_text(encoding="utf-8"))
+
+
+def _installed_version(home: Path) -> str:
+    result = subprocess.run(
+        [str(home / "venv" / "bin" / "python"), "-c", "import romcloud; print(romcloud.__version__)"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
 
 
 # ── venv creation & package install ──────────────────────────────────────────
@@ -389,6 +404,81 @@ def test_rerun_is_idempotent(installed: InstalledLayout) -> None:
     assert "Virtual environment already exists" in result.stdout
     assert config_file.read_text() == "# user customized\n"
     assert venv_marker.exists(), "existing venv must be reused, not recreated"
+
+
+@pytest.fixture(scope="module")
+def path_without_git() -> str:
+    """A PATH with git removed, while keeping python3 available."""
+    fake_bin = Path(tempfile.mkdtemp(prefix="romcloud-fakebin-nogit-"))
+    for real_dir in ("/usr/bin", "/bin"):
+        real_path = Path(real_dir)
+        if not real_path.is_dir():
+            continue
+        for entry in real_path.iterdir():
+            if entry.name == "git":
+                continue
+            link = fake_bin / entry.name
+            if not link.exists():
+                try:
+                    link.symlink_to(entry)
+                except OSError:
+                    pass
+    return str(fake_bin)
+
+
+def test_source_archive_install_without_git_keeps_commit_unknown(
+    path_without_git: str, tmp_path: Path
+) -> None:
+    home = tmp_path / "romcloud"
+    result = _run_install(
+        {
+            "ROMCLOUD_HOME": str(home),
+            "CACHE_ROOT": str(tmp_path / "cache"),
+            "LOCAL_ROMS": str(tmp_path / "roms"),
+        },
+        path=path_without_git,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    info = _read_version_info(home)
+    assert info["version"] == _installed_version(home)
+    assert info["commit"] is None
+    assert info["commit_short"] is None
+    assert info["source"] == "installer:unknown"
+
+
+def test_reinstall_preserves_existing_commit_metadata_without_git(
+    path_without_git: str, tmp_path: Path
+) -> None:
+    home = tmp_path / "romcloud"
+    explicit_commit = "a" * 40
+
+    first = _run_install(
+        {
+            "ROMCLOUD_HOME": str(home),
+            "CACHE_ROOT": str(tmp_path / "cache"),
+            "LOCAL_ROMS": str(tmp_path / "roms"),
+            "ROMCLOUD_BUILD_COMMIT": explicit_commit,
+        },
+        path=path_without_git,
+    )
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert _read_version_info(home)["commit"] == explicit_commit
+
+    second = _run_install(
+        {
+            "ROMCLOUD_HOME": str(home),
+            "CACHE_ROOT": str(tmp_path / "cache"),
+            "LOCAL_ROMS": str(tmp_path / "roms"),
+        },
+        path=path_without_git,
+    )
+    assert second.returncode == 0, second.stdout + second.stderr
+
+    info = _read_version_info(home)
+    assert info["commit"] == explicit_commit
+    assert info["commit_short"] == explicit_commit[:12]
+    assert info["source"] == "installer:preserved"
 
 
 # ── graphical Ports UI (runs under Batocera's system Python, not the venv) ───
