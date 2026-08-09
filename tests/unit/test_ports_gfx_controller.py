@@ -207,8 +207,10 @@ class TestRawFallback:
 
         confirm = FakeEvent(type=pygame.JOYBUTTONDOWN, instance_id=1, button=0)
         back = FakeEvent(type=pygame.JOYBUTTONDOWN, instance_id=1, button=1)
+        other = FakeEvent(type=pygame.JOYBUTTONDOWN, instance_id=1, button=3)
         assert manager.handle_event(confirm) == Action.CONFIRM
         assert manager.handle_event(back) == Action.BACK
+        assert manager.handle_event(other) is None
 
     def test_raw_hat_navigates(self):
         pygame = make_fake_pygame(joysticks={0: FakeJoystick(guid="g2")}, controller_indices=frozenset())
@@ -441,6 +443,50 @@ class TestControllerProfiles:
 
         event = FakeEvent(type=pygame.JOYBUTTONDOWN, instance_id=1, button=7)
         assert manager.handle_event(event) == Action.DOWN
+
+
+class TestSteamDeckProfile:
+    def test_builtin_profile_is_selected_by_guid_for_raw_buttons(self):
+        pygame = make_fake_pygame(
+            joysticks={0: FakeJoystick(name="Steam Deck", guid="03000000de2800000512000010010000")},
+            controller_indices=frozenset(),
+        )
+        manager = ControllerManager(pygame)
+        manager.handle_event(_added_event(pygame, 0))
+
+        assert manager.handle_event(FakeEvent(type=pygame.JOYBUTTONDOWN, instance_id=1, button=3)) == Action.CONFIRM
+        assert manager.handle_event(FakeEvent(type=pygame.JOYBUTTONDOWN, instance_id=1, button=4)) == Action.BACK
+        assert manager.handle_event(FakeEvent(type=pygame.JOYBUTTONDOWN, instance_id=1, button=16)) == Action.UP
+        assert manager.handle_event(FakeEvent(type=pygame.JOYBUTTONDOWN, instance_id=1, button=17)) == Action.DOWN
+        assert manager.handle_event(FakeEvent(type=pygame.JOYBUTTONDOWN, instance_id=1, button=18)) == Action.LEFT
+        assert manager.handle_event(FakeEvent(type=pygame.JOYBUTTONDOWN, instance_id=1, button=19)) == Action.RIGHT
+        assert manager.handle_event(FakeEvent(type=pygame.JOYBUTTONDOWN, instance_id=1, button=12)) == Action.MENU
+        assert manager.handle_event(FakeEvent(type=pygame.JOYBUTTONDOWN, instance_id=1, button=11)) is None
+
+    def test_builtin_profile_ignores_hat_motion_for_navigation(self):
+        pygame = make_fake_pygame(
+            joysticks={0: FakeJoystick(name="Steam Deck", guid="03000000de2800000512000010010000")},
+            controller_indices=frozenset(),
+        )
+        manager = ControllerManager(pygame, deadzone=0.5)
+        manager.handle_event(_added_event(pygame, 0))
+
+        assert manager.handle_event(FakeEvent(type=pygame.JOYAXISMOTION, instance_id=1, axis=0, value=30000)) == Action.RIGHT
+        assert manager.handle_event(FakeEvent(type=pygame.JOYHATMOTION, instance_id=1, value=(0, 1))) is None
+        assert manager.snapshots()[0].held_direction == (1, 0)
+
+    def test_custom_mapping_overrides_builtin_profile(self):
+        def loader(key):
+            return {"button": {"3": "back"}} if key == "guid:03000000de2800000512000010010000" else None
+
+        pygame = make_fake_pygame(
+            joysticks={0: FakeJoystick(name="Steam Deck", guid="03000000de2800000512000010010000")},
+            controller_indices=frozenset(),
+        )
+        manager = ControllerManager(pygame, load_mapping=loader)
+        manager.handle_event(_added_event(pygame, 0))
+
+        assert manager.handle_event(FakeEvent(type=pygame.JOYBUTTONDOWN, instance_id=1, button=3)) == Action.BACK
 
 
 class TestDuplicateJoyControllerEvents:

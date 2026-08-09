@@ -97,18 +97,28 @@ class ControllerProfile:
     name: str
     button_actions: dict[int, Action] = field(default_factory=dict)
     axis_names: dict[int, str] = field(default_factory=dict)
+    ignore_hat_motion: bool = False
 
 
-# Built-in profiles, keyed by SDL GUID string. Intentionally empty: a
-# profile must only be added here once a real device's raw button/axis/hat
-# numbering has actually been captured (run with
-# ``ROMCLOUD_PORTS_GFX_INPUT_DEBUG=1`` — see ``input_debug.py`` — and read
-# the resulting log), never guessed from a similar-looking GUID or an
-# unrelated project's mapping string. Until then, every controller —
-# including the Steam Deck's built-in pad — works through the generic raw
-# fallback above plus per-user remapping, same as any other unrecognized
-# device.
-CONTROLLER_PROFILES: dict[str, ControllerProfile] = {}
+# Built-in profiles, keyed by SDL GUID string. Each entry is only added
+# after the raw numbering has been verified from a real device capture
+# (see ``input_debug.py``), never guessed from a similar-looking GUID or an
+# unrelated project's mapping string.
+CONTROLLER_PROFILES: dict[str, ControllerProfile] = {
+    "03000000de2800000512000010010000": ControllerProfile(
+        name="Steam Deck",
+        button_actions={
+            3: Action.CONFIRM,
+            4: Action.BACK,
+            16: Action.UP,
+            17: Action.DOWN,
+            18: Action.LEFT,
+            19: Action.RIGHT,
+            12: Action.MENU,
+        },
+        ignore_hat_motion=True,
+    )
+}
 
 
 def _attr_map(pygame, names: dict[str, "object"]) -> dict[int, "object"]:  # noqa: ANN001
@@ -526,6 +536,8 @@ class ControllerManager:
             except (ValueError, KeyError):
                 direction = None
         if direction is None:
+            if device.profile is not None and device.profile.ignore_hat_motion:
+                return None
             direction = direction_from_hat(hat_x, hat_y)
 
         if direction == device.repeater.held_direction:
