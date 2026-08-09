@@ -52,12 +52,46 @@ class TestFormatResult:
         result = BackendResult(ok=True, data={"ok": True, "games_total": 5})
         line = format_result("status", result)
         assert line.startswith("status:")
-        assert "games_total" in line
+        assert "games=5" in line
+        assert "cached=0" in line
+        assert "pinned=0" in line
 
     def test_failure_shows_error_message(self):
         result = BackendResult(ok=False, error="connection refused")
         line = format_result("healthcheck", result)
         assert line == "Error: connection refused"
+
+    def test_status_result_formats_source_summary(self):
+        result = BackendResult(
+            ok=True,
+            data={
+                "source_type": "SMB",
+                "source_description": "nas.local:ROMs",
+                "games_total": 12,
+                "cached": 3,
+                "pinned": 1,
+            },
+        )
+        line = format_result("status", result)
+        assert "SMB" in line
+        assert "nas.local:ROMs" in line
+        assert "games=12" in line
+        assert "cached=3" in line
+        assert "pinned=1" in line
+
+    def test_healthcheck_result_formats_source_summary(self):
+        result = BackendResult(
+            ok=True,
+            data={
+                "source_type": "Local filesystem",
+                "source_description": "/userdata/roms",
+                "source_reachable": True,
+            },
+        )
+        line = format_result("healthcheck", result)
+        assert "Local filesystem" in line
+        assert "/userdata/roms" in line
+        assert "reachable" in line
 
 
 class TestClassifyMessageKind:

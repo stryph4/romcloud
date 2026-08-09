@@ -5,6 +5,7 @@ from __future__ import annotations
 import click
 
 from romcloud.cli.context import get_container
+from romcloud.infrastructure.source_display import source_display_summary
 
 
 def _fmt_bytes(n: int) -> str:
@@ -23,7 +24,9 @@ def _fmt_bytes(n: int) -> str:
 def status_cmd(ctx: click.Context, system: str | None) -> None:
     """Show catalog and cache summary."""
     container = get_container(ctx)
+    source = source_display_summary(container.config)
 
+    click.echo(f"\n  Source:  {source['source_type']}" + (f" ({source['source_description']})" if source.get("source_description") else ""))
     # Catalog stats.
     games = container.catalog.list_games(system)
     click.echo(f"\n{'─' * 50}")

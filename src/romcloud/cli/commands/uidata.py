@@ -29,6 +29,7 @@ import json
 import click
 
 from romcloud.cli.context import get_container
+from romcloud.infrastructure.source_display import source_display_summary
 
 
 def _emit(ctx: click.Context, payload: dict) -> None:
@@ -61,11 +62,13 @@ def uidata_status(ctx: click.Context) -> None:
         container = get_container(ctx)
         games = container.catalog.list_games()
         summary = container.cache.status_summary()
-        return {
+        payload = {
             "games_total": len(games),
             "cached": summary["complete"],
             "pinned": summary["pinned"],
         }
+        payload.update(source_display_summary(container.config))
+        return payload
 
     _run_action(ctx, build)
 
@@ -97,10 +100,12 @@ def uidata_healthcheck(ctx: click.Context) -> None:
         container = get_container(ctx)
         config = container.config
         reachable = container.provider.is_reachable(config.source.rom_root)
-        return {
+        payload = {
             "source_provider": config.source.provider,
             "source_reachable": reachable,
         }
+        payload.update(source_display_summary(config))
+        return payload
 
     _run_action(ctx, build)
 

@@ -88,6 +88,22 @@ ROMCloud does not require every system to exist in the remote library. Only syst
 
 ---
 
+## Release note (v0.6.0)
+
+- Improvement: the graphical Ports UI and the related `romcloud uidata`
+  health/status endpoints now report the configured user-facing source
+  type (`SMB` vs `Local filesystem`) instead of exposing only the
+  internal provider implementation. For SMB configurations the UI now
+  also carries safe metadata (`server`, `share`, and mount point) without
+  any credentials.
+- The direct `romcloud status` / `romcloud healthcheck` commands now use
+  the same source label, so the CLI and graphical UI present the same
+  user-facing terminology.
+- No provider semantics changed: SMB-backed sources still use the
+  mounted local filesystem path and `LocalFilesystemProvider` internally.
+
+---
+
 ## Release note (v0.5.0)
 
 - New capability: the graphical Ports UI is now an actionable maintenance
@@ -213,6 +229,9 @@ Batocera system Python (pygame/SDL)          ROMCloud's isolated venv
   single JSON object from its stdout. This is a deliberate, enforced process
   boundary — see `ports_gfx/client.py` and
   `src/romcloud/cli/commands/uidata.py`.
+- The graphical dashboard now shows the configured source type (`SMB` or
+  `Local filesystem`) and safe SMB metadata instead of the internal
+  provider implementation name.
 - Install is entirely best-effort: if no system Python with `pygame`
   importable is found, the graphical Ports UI is simply not installed and
   the rest of ROMCloud (CLI, curses TUI, mount service, etc.) is completely

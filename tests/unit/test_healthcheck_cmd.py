@@ -37,6 +37,7 @@ class TestMountDiagnosticLine:
     def test_absent_when_no_smb_configured(self, tmp_path):
         result = _invoke(_build_config(tmp_path, smb=None))
         assert "SMB source mounted" not in result.output
+        assert "Source reachable (Local filesystem)" in result.output
 
     def test_shown_and_passing_when_mounted(self, tmp_path, monkeypatch):
         diag = MountDiagnostics(
@@ -48,6 +49,7 @@ class TestMountDiagnosticLine:
         config = _build_config(tmp_path, smb=SMBConfig(server="nas.local", share="ROMs"))
         result = _invoke(config)
 
+        assert "Source reachable (SMB)" in result.output
         assert "SMB source mounted" in result.output
         assert "✓  SMB source mounted" in result.output
 
@@ -61,6 +63,7 @@ class TestMountDiagnosticLine:
         config = _build_config(tmp_path, smb=SMBConfig(server="nas.local", share="ROMs"))
         result = _invoke(config)
 
+        assert "Source reachable (SMB)" in result.output
         assert "✗  SMB source mounted" in result.output
         assert "last attempt failed" in result.output
         assert result.exit_code != 0
@@ -77,6 +80,7 @@ class TestMountDiagnosticLine:
         # A failed check legitimately exits 1 (normal `ctx.exit`, not a crash) —
         # what must never happen is the RuntimeError itself propagating out.
         assert not isinstance(result.exception, RuntimeError)
+        assert "Source reachable (SMB)" in result.output
         assert "SMB source mounted" in result.output
         assert "error checking status" in result.output
 

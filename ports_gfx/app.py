@@ -110,6 +110,24 @@ def format_result(action: str, result: BackendResult) -> str:
     """
     if not result.ok:
         return f"Error: {result.error}"
+    if action in ("status", "healthcheck"):
+        source_type = result.data.get("source_type")
+        source_description = result.data.get("source_description")
+        source_bits = [bit for bit in (source_type, source_description) if bit]
+        source_prefix = " | ".join(source_bits)
+        if action == "status":
+            stats = [
+                f"games={result.data.get('games_total', 0)}",
+                f"cached={result.data.get('cached', 0)}",
+                f"pinned={result.data.get('pinned', 0)}",
+            ]
+            body = f"{' | '.join(source_bits)} | {' '.join(stats)}" if source_prefix else " ".join(stats)
+            return f"{action}: {body}"
+        reachable = result.data.get("source_reachable")
+        body = f"{source_prefix} | {'reachable' if reachable else 'unreachable'}" if source_prefix else (
+            "reachable" if reachable else "unreachable"
+        )
+        return f"{action}: {body}"
     return f"{action}: {result.data}"
 
 

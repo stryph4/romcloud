@@ -8,6 +8,7 @@ from pathlib import Path
 import click
 
 from romcloud.cli.context import get_container
+from romcloud.infrastructure.source_display import source_display_summary
 
 
 def _fmt_bytes(n: int) -> str:
@@ -20,6 +21,7 @@ def healthcheck_cmd(ctx: click.Context) -> None:
     """Verify source reachability, cache space, and config integrity."""
     container = get_container(ctx)
     config = container.config
+    source = source_display_summary(config)
 
     ok = True
 
@@ -39,9 +41,9 @@ def healthcheck_cmd(ctx: click.Context) -> None:
     # Source reachability.
     reachable = container.provider.is_reachable(config.source.rom_root)
     check(
-        f"Source reachable ({config.source.provider})",
+        f"Source reachable ({source['source_type']})",
         reachable,
-        config.source.rom_root if not reachable else "",
+        source["source_description"] if not reachable else "",
     )
 
     # Local ROM directory.

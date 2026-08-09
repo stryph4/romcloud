@@ -14,7 +14,7 @@ import json
 from click.testing import CliRunner
 
 from romcloud.cli.main import cli
-from romcloud.infrastructure.config import AppConfig, CacheConfig, SourceConfig, write_config
+from romcloud.infrastructure.config import AppConfig, CacheConfig, SMBConfig, SourceConfig, write_config
 
 
 def _build_config(tmp_path, smb=None):
@@ -66,6 +66,28 @@ class TestStatus:
         assert payload["games_total"] == 0
         assert payload["cached"] == 0
         assert payload["pinned"] == 0
+        assert payload["source_type"] == "Local filesystem"
+        assert payload["source_internal_provider"] == "local"
+        assert payload["source_description"] == str(tmp_path / "roms")
+
+    def test_emits_smb_source_summary_when_smb_configured(self, tmp_path):
+        config = _build_config(tmp_path, smb=SMBConfig(server="nas.local", share="ROMs", username="alice"))
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        cfg_path = config_dir / "romcloud.toml"
+        write_config(config, str(cfg_path))
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ["--config", str(cfg_path), "uidata", "status"])
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output.strip())
+        assert payload["ok"] is True
+        assert payload["source_type"] == "SMB"
+        assert payload["source_internal_provider"] == "local"
+        assert payload["source_server"] == "nas.local"
+        assert payload["source_share"] == "ROMs"
+        assert payload["source_description"] == "nas.local:ROMs"
 
 
 class TestRefresh:
@@ -88,8 +110,29 @@ class TestHealthcheck:
         assert result.exit_code == 0, result.output
         payload = json.loads(result.output.strip())
         assert payload["ok"] is True
-        assert payload["source_provider"] == "local"
+        assert payload["source_type"] == "Local filesystem"
+        assert payload["source_internal_provider"] == "local"
+        assert payload["source_description"] == str(tmp_path / "roms")
         assert payload["source_reachable"] is True
+
+    def test_emits_smb_labels_and_metadata_when_smb_configured(self, tmp_path):
+        config = _build_config(tmp_path, smb=SMBConfig(server="nas.local", share="ROMs", username="alice"))
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        cfg_path = config_dir / "romcloud.toml"
+        write_config(config, str(cfg_path))
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ["--config", str(cfg_path), "uidata", "healthcheck"])
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output.strip())
+        assert payload["ok"] is True
+        assert payload["source_type"] == "SMB"
+        assert payload["source_internal_provider"] == "local"
+        assert payload["source_server"] == "nas.local"
+        assert payload["source_share"] == "ROMs"
+        assert payload["source_description"] == "nas.local:ROMs"
 
 
 class TestCacheStatus:
