@@ -27,6 +27,9 @@ class MenuItem:
 
 
 EXIT_ACTION = "exit"
+CONTROLLER_TEST_ACTION = "controller-test"
+"""Sentinel action the UI layer interprets as "switch to the Controller
+Test/diagnostics screen" rather than dispatching to the backend."""
 
 
 class MenuState:

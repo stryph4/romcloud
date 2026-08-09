@@ -88,6 +88,27 @@ ROMCloud does not require every system to exist in the remote library. Only syst
 
 ---
 
+## Release note (v0.4.0)
+
+- New capability: the graphical Ports UI is now usable end-to-end with a
+  controller, a touchscreen, or a physical keyboard — normal use no longer
+  requires a mouse. See "Controller, touch, and on-screen keyboard input"
+  above for the full details.
+- Added a unified semantic input layer (`ports_gfx.actions`/
+  `input_manager`) so every screen/widget reacts to high-level actions
+  (`UP`/`DOWN`/`LEFT`/`RIGHT`/`CONFIRM`/`BACK`/`MENU`/text-entry actions)
+  instead of raw pygame key/button constants.
+- Added SDL logical game-controller support with GUID-based identity,
+  hot-plug/disconnect handling, analog-stick deadzone + held-input repeat
+  timing, a raw-button fallback for unrecognized pads, and a new
+  Controller Test/diagnostics screen with basic per-action remapping.
+- Added a ROMCloud-owned on-screen keyboard foundation (not yet wired into
+  a live screen — reusable infrastructure for the upcoming setup wizard).
+- No backend/subprocess-JSON boundary changes; `ports_gfx` still never
+  imports `romcloud`.
+
+---
+
 ## Release note (v0.3.3)
 
 - Bugfix: `romcloud update` now reconciles the *entire* installed
@@ -173,6 +194,48 @@ Batocera system Python (pygame/SDL)          ROMCloud's isolated venv
 on `PATH`, and verifies `import pygame` succeeds under it. This has not yet
 been re-confirmed against a fresh Batocera 42 image by this exact detection
 logic (only the underlying pygame/SDL versions were confirmed present).
+
+---
+
+## Controller, touch, and on-screen keyboard input (v0.4.0)
+
+The graphical Ports UI is now fully usable without a mouse or physical
+keyboard:
+
+- **Controller** — D-pad and the left analog stick both navigate; `A`/
+  `Enter` confirms, `B`/`Esc` goes back, `Start` opens/returns to the menu.
+  Controllers are recognized through SDL's own logical "game controller"
+  mapping database (Xbox, PlayStation, Switch-style, and most generic
+  SDL-recognized pads work automatically) rather than a hardcoded raw
+  button layout; an unrecognized pad falls back to a small default raw
+  mapping, itself overridable per-controller. Controller identity for
+  saved mappings is the SDL GUID (falling back to the device name) — never
+  the transient joystick index, which is reused across hot-plug events.
+  Connecting/disconnecting a controller while ROMCloud is running never
+  crashes the UI.
+- **Touch** — every menu card is directly tappable; a tap both focuses and
+  activates it in one step, no D-pad emulation required. Hit-testing always
+  uses the actual rendered widget positions for the current resolution.
+- **Physical keyboard** — arrow keys/WASD navigate, Enter/Space confirms,
+  Escape goes back, unchanged from earlier releases.
+- **Controller Test** — a new menu entry showing the detected controller's
+  name, GUID, live button/stick activity, and a basic per-action remap
+  flow (select an action, press a button on the controller to bind it);
+  custom mappings are stored per-controller under
+  `${ROMCLOUD_HOME}/ports-gfx-state/`, a location a reinstall/update never
+  wipes (unlike `ports-gfx/`, which is recopied wholesale on every
+  install/update).
+- **On-screen keyboard foundation** — a ROMCloud-owned OSK (letters,
+  numbers, symbols, space, backspace, shift/caps, confirm, cancel, and a
+  masked-password show/hide toggle) usable by controller or touch, with
+  physical keyboard text entry still working at the same time. Not yet
+  wired into a live screen — it is reusable infrastructure for the
+  upcoming graphical setup wizard, not a user-facing feature on its own
+  yet.
+
+All input handling lives entirely inside `ports_gfx` — nothing was added
+to ROMCloud's backend (`romcloud uidata` contract, subprocess/JSON
+boundary, and the venv/system-Python split are all unchanged).
 
 ---
 
