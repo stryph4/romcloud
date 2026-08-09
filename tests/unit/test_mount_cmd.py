@@ -241,7 +241,7 @@ class TestStartupMigrationFromMountStatus:
         write_config(config, str(cfg_path))
 
         legacy = cfg_path.parent / "smb.credentials"
-        legacy.write_text('[smb]\npassword = "legacy-secret"\n', encoding="utf-8")
+        legacy.write_text('username=testuser\npassword=testpass\n', encoding="utf-8")
         legacy.chmod(0o600)
 
         diag = MountDiagnostics(

@@ -125,7 +125,42 @@ def _read_legacy_password(legacy_path: Path) -> Optional[str]:
     if not legacy_path.exists():
         return None
 
-    return _read_toml_smb_password(legacy_path)
+    password = _read_toml_smb_password(legacy_path)
+    if password is not None:
+        return password
+
+    return _read_legacy_cifs_password(legacy_path)
+
+
+def _read_legacy_cifs_password(legacy_path: Path) -> Optional[str]:
+    try:
+        raw = legacy_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    values: dict[str, str] = {}
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if "=" not in stripped:
+            return None
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key not in {"username", "password"}:
+            return None
+        if key in values:
+            return None
+        values[key] = value
+
+    if set(values) != {"username", "password"}:
+        return None
+
+    password = values["password"]
+    if not password:
+        return None
+    return password
 
 
 def _password_from_mapping(data) -> Optional[str]:
