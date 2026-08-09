@@ -18,10 +18,20 @@ describes and looks like::
       <game>
         <path>./ROMCloud.sh</path>
         <name>ROMCloud</name>
-        <image>/userdata/system/romcloud/ports-gfx/ports_gfx/assets/icon.png</image>
+        <image>./images/ROMCloud.png</image>
       </game>
       ...
     </gameList>
+
+The `<image>` path is relative to `gamelist.xml`'s own directory (i.e. the
+Ports ROM folder itself, `/userdata/roms/ports`), pointing at a copy of the
+artwork placed under that folder's own `images/` subdirectory — never an
+absolute path into ROMCloud's install tree. This is the layout every
+observed working Batocera Ports project uses (verified against
+RetroGameSets/RGSX's `ports/RGSX/update_gamelist.py`, whose `RGSX_ENTRY`
+uses `"image": "./images/RGSX.png"` alongside `ports/images/RGSX.png` on
+disk — see `romcloud.integrations.batocera.ports_gamelist_config` for
+where ROMCloud's own icon gets copied there).
 
 Matching / update semantics
 ----------------------------

@@ -14,7 +14,7 @@ from romcloud.integrations.batocera.ports_gamelist import (
     upsert_romcloud_entry,
 )
 
-_ICON = "/userdata/system/romcloud/ports-gfx/ports_gfx/assets/icon.png"
+_ICON = "./images/ROMCloud.png"
 
 _EXISTING_WITH_UNRELATED = """<?xml version="1.0"?>
 <gameList>
@@ -140,3 +140,21 @@ class TestIdempotency:
         second = upsert_romcloud_entry(first.xml, image=_ICON)
 
         assert second.xml == first.xml
+
+
+class TestMigratesOldAbsoluteImagePath:
+    def test_old_absolute_ports_gfx_path_replaced_with_relative_path(self):
+        existing_xml = """<?xml version="1.0"?>
+<gameList>
+  <game>
+    <path>./ROMCloud.sh</path>
+    <name>ROMCloud</name>
+    <image>/userdata/system/romcloud/ports-gfx/ports_gfx/assets/icon.png</image>
+  </game>
+</gameList>
+"""
+        result = upsert_romcloud_entry(existing_xml, image=_ICON)
+
+        assert result.created is False
+        assert "/userdata/system/romcloud" not in result.xml
+        assert f"<image>{_ICON}</image>" in result.xml

@@ -264,8 +264,11 @@ def reconcile_es_override(config_path: Path) -> Optional[bool]:
 
 def reconcile_ports_gamelist(ports_ui: PortsUiResult, ports_dir: Path) -> Optional[bool]:
     """If the ROMCloud Ports entry (``ROMCloud.sh``) was installed this run,
-    ensure it has a matching `gamelist.xml` entry so EmulationStation shows
-    it with the bundled icon.
+    copy its bundled icon into the Ports artwork directory
+    (``<ports_dir>/images/ROMCloud.png``) and ensure `gamelist.xml` has a
+    matching entry referencing it by relative path — the layout verified
+    against RetroGameSets/RGSX (see
+    :mod:`romcloud.integrations.batocera.ports_gamelist_config`).
 
     Returns ``None`` if not applicable (no Ports entry installed this run —
     e.g. no system Python with pygame, or the ports directory doesn't
@@ -274,12 +277,19 @@ def reconcile_ports_gamelist(ports_ui: PortsUiResult, ports_dir: Path) -> Option
     """
     if ports_ui.port_entry_path is None or ports_ui.ports_gfx_dir is None:
         return None
-    try:
-        from romcloud.integrations.batocera import ports_gamelist_config
 
-        icon_path = ports_ui.ports_gfx_dir / "assets" / "icon.png"
+    from romcloud.integrations.batocera import ports_gamelist_config
+
+    source_icon = ports_ui.ports_gfx_dir / "assets" / "icon.png"
+    if source_icon.exists():
+        try:
+            ports_gamelist_config.sync_icon(source_icon=source_icon, ports_dir=ports_dir)
+        except Exception:  # noqa: BLE001 — best-effort; the gamelist entry itself still gets written below
+            log.warning("Failed to sync ROMCloud Ports icon artwork", exc_info=True)
+
+    try:
         ports_gamelist_config.reconcile(
-            image_path=icon_path,
+            image=ports_gamelist_config.ROMCLOUD_IMAGE_RELATIVE_PATH,
             gamelist_path=ports_dir / "gamelist.xml",
         )
         return True

@@ -2,7 +2,19 @@
 
 Delegates all XML transformation to the pure functions in
 :mod:`romcloud.integrations.batocera.ports_gamelist`; this module only owns
-reading the real (optional) on-disk file and writing it back atomically.
+reading the real (optional) on-disk file and writing it back atomically,
+plus copying ROMCloud's bundled icon into the Ports artwork directory that
+`<image>` is resolved against.
+
+Layout verified against RetroGameSets/RGSX (a known-working Batocera Ports
+project — see ``ports/RGSX/update_gamelist.py``'s ``RGSX_ENTRY`` and the
+file layout documented in its README): artwork lives in an ``images/``
+folder *alongside* `gamelist.xml` itself (i.e. directly under
+``/userdata/roms/ports``, not inside ROMCloud's own install tree), and the
+`<image>` element is a relative path into it (``./images/RGSX.png`` for
+RGSX; ``./images/ROMCloud.png`` here). An absolute path into
+``/userdata/system/romcloud/...`` — ROMCloud's previous approach — is not
+how EmulationStation reliably resolves Ports artwork on real hardware.
 """
 
 from __future__ import annotations
@@ -21,16 +33,46 @@ log = get_logger("batocera.ports_gamelist")
 
 DEFAULT_GAMELIST_PATH = Path("/userdata/roms/ports/gamelist.xml")
 
+ROMCLOUD_IMAGE_FILENAME = "ROMCloud.png"
+ROMCLOUD_IMAGE_RELATIVE_PATH = f"./images/{ROMCLOUD_IMAGE_FILENAME}"
+"""`<image>` value written into the gamelist entry — relative to
+`gamelist.xml`'s own directory, matching the RGSX-verified convention."""
+
+
+def sync_icon(*, source_icon: Path, ports_dir: Path, filename: str = ROMCLOUD_IMAGE_FILENAME) -> bool:
+    """Copy *source_icon* (ROMCloud's bundled icon) into
+    ``<ports_dir>/images/<filename>`` — the location `<image>` in
+    `gamelist.xml` is actually resolved against.
+
+    Atomic (write-temp-then-rename) and idempotent: skips the write
+    entirely if the destination already holds identical bytes. Every other
+    file already present in ``<ports_dir>/images`` is left untouched.
+    Returns ``True`` if the file was created/updated, ``False`` if it was
+    already up to date.
+    """
+    data = source_icon.read_bytes()
+    dest = ports_dir / "images" / filename
+    if dest.exists() and dest.read_bytes() == data:
+        return False
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = dest.with_name(f".{dest.name}.tmp")
+    tmp_path.write_bytes(data)
+    tmp_path.replace(dest)
+    return True
+
 
 def reconcile(
     *,
-    image_path: Path,
+    image: str = ROMCLOUD_IMAGE_RELATIVE_PATH,
     gamelist_path: Path = DEFAULT_GAMELIST_PATH,
     rom_path: str = ROMCLOUD_ROM_PATH,
     name: str = ROMCLOUD_GAME_NAME,
 ) -> bool:
     """Ensure the ROMCloud port entry exists in *gamelist_path*, pointing its
-    `<image>` at *image_path*.
+    `<image>` at *image* (a gamelist-relative path string — see
+    :data:`ROMCLOUD_IMAGE_RELATIVE_PATH` — never a filesystem `Path`, so a
+    leading ``./`` is preserved verbatim rather than normalized away).
 
     Idempotent: only writes the file when its content actually changes.
     Every other `<game>` entry — and every other field on the ROMCloud
@@ -45,7 +87,7 @@ def reconcile(
             log.warning("Failed to read %s: %s", gamelist_path, exc)
             existing_xml = None
 
-    result = upsert_romcloud_entry(existing_xml, image=str(image_path), rom_path=rom_path, name=name)
+    result = upsert_romcloud_entry(existing_xml, image=image, rom_path=rom_path, name=name)
 
     if existing_xml == result.xml:
         return False

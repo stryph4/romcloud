@@ -32,6 +32,8 @@ def _make_ports_gfx_source(project_root: Path, *, marker: str = "v1") -> Path:
     (source / "__init__.py").write_text("")
     (source / "client.py").write_text(f"# {marker}\n")
     (source / "app.py").write_text(f"# {marker}\n")
+    (source / "assets").mkdir(parents=True, exist_ok=True)
+    (source / "assets" / "icon.png").write_bytes(f"fake-png-{marker}".encode())
     return source
 
 
@@ -350,7 +352,8 @@ class TestReconcilePortsGamelist:
 
     def test_reconciled_when_port_entry_installed(self, tmp_path: Path) -> None:
         ports_gfx_target = tmp_path / "ports-gfx" / "ports_gfx"
-        ports_gfx_target.mkdir(parents=True)
+        (ports_gfx_target / "assets").mkdir(parents=True)
+        (ports_gfx_target / "assets" / "icon.png").write_bytes(b"fake-png-bytes")
         ports_dir = tmp_path / "ports"
         ports_dir.mkdir()
         port_entry_path = ports_dir / "ROMCloud.sh"
@@ -368,7 +371,8 @@ class TestReconcilePortsGamelist:
         assert result is True
         content = (ports_dir / "gamelist.xml").read_text()
         assert "<path>./ROMCloud.sh</path>" in content
-        assert str(ports_gfx_target / "assets" / "icon.png") in content
+        assert "<image>./images/ROMCloud.png</image>" in content
+        assert (ports_dir / "images" / "ROMCloud.png").read_bytes() == b"fake-png-bytes"
 
     def test_preserves_unrelated_entries_when_reconciled(self, tmp_path: Path) -> None:
         ports_gfx_target = tmp_path / "ports-gfx" / "ports_gfx"
@@ -438,7 +442,8 @@ class TestReconcileInstall:
         assert report.ports_gamelist is True
         gamelist_content = (ports_dir / "gamelist.xml").read_text()
         assert "<path>./ROMCloud.sh</path>" in gamelist_content
-        assert "assets/icon.png" in gamelist_content
+        assert "<image>./images/ROMCloud.png</image>" in gamelist_content
+        assert (ports_dir / "images" / "ROMCloud.png").exists()
 
     def test_repeated_reconciliation_is_harmless(self, tmp_path: Path, monkeypatch) -> None:
         from romcloud.integrations.batocera import mount_service, es_config
