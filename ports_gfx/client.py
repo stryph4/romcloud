@@ -24,6 +24,10 @@ from typing import Any, Callable
 RunFunc = Callable[..., "subprocess.CompletedProcess[str]"]
 
 DEFAULT_TIMEOUT = 20.0
+REFRESH_TIMEOUT = 120.0
+ACTION_TIMEOUTS: dict[str, float] = {
+    "refresh": REFRESH_TIMEOUT,
+}
 
 
 @dataclass(frozen=True)
@@ -39,7 +43,7 @@ def call_backend(
     romcloud_bin: str,
     action: str,
     *,
-    timeout: float = DEFAULT_TIMEOUT,
+    timeout: float | None = None,
     run: RunFunc = subprocess.run,
 ) -> BackendResult:
     """Invoke ``<romcloud_bin> uidata <action>`` and parse its JSON stdout.
@@ -47,12 +51,14 @@ def call_backend(
     *run* is injectable (defaults to :func:`subprocess.run`) so this can be
     unit-tested without a real ``romcloud`` binary or subprocess.
     """
+    effective_timeout = DEFAULT_TIMEOUT if timeout is None else timeout
+    effective_timeout = ACTION_TIMEOUTS.get(action, effective_timeout)
     try:
         proc = run(
             [romcloud_bin, "uidata", action],
             capture_output=True,
             text=True,
-            timeout=timeout,
+            timeout=effective_timeout,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return BackendResult(ok=False, error=str(exc))

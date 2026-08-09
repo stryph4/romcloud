@@ -35,6 +35,7 @@ class TestSuccessfulCall:
         assert captured["argv"] == ["/opt/romcloud/bin/romcloud", "uidata", "status"]
         assert captured["kwargs"]["capture_output"] is True
         assert captured["kwargs"]["text"] is True
+        assert captured["kwargs"]["timeout"] == 20.0
 
     def test_uses_last_line_if_extra_output_present(self):
         def fake_run(argv, **kwargs):
@@ -44,6 +45,18 @@ class TestSuccessfulCall:
 
         assert result.ok is True
         assert result.data == {"ok": True, "x": 1}
+
+    def test_refresh_uses_longer_default_timeout(self):
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["kwargs"] = kwargs
+            return _FakeCompletedProcess(stdout='{"ok": true, "added": 0}\n')
+
+        result = call_backend("romcloud", "refresh", run=fake_run)
+
+        assert result.ok is True
+        assert captured["kwargs"]["timeout"] == 120.0
 
 
 class TestBackendReportedFailure:
@@ -69,13 +82,30 @@ class TestTransportFailures:
         assert "no such file" in result.error
 
     def test_timeout_is_reported_not_raised(self):
+        captured = {}
+
         def fake_run(argv, **kwargs):
+            captured["timeout"] = kwargs.get("timeout")
             raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout", 1))
 
-        result = call_backend("romcloud", "healthcheck", run=fake_run, timeout=1)
+        result = call_backend("romcloud", "refresh", run=fake_run)
 
         assert result.ok is False
         assert result.data == {}
+        assert captured["timeout"] == 120.0
+        assert "120" in result.error
+
+    def test_explicit_timeout_override_still_wins(self):
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["timeout"] = kwargs.get("timeout")
+            return _FakeCompletedProcess(stdout='{"ok": true}\n')
+
+        result = call_backend("romcloud", "status", run=fake_run, timeout=1)
+
+        assert result.ok is True
+        assert captured["timeout"] == 1
 
     def test_unexpected_exception_is_reported_not_raised(self):
         def fake_run(argv, **kwargs):
