@@ -88,6 +88,26 @@ ROMCloud does not require every system to exist in the remote library. Only syst
 
 ---
 
+## Release note (v0.3.3)
+
+- Bugfix: `romcloud update` now reconciles the *entire* installed
+  application, not only the backend package. Previously, updating left the
+  graphical Ports UI, wrappers, and any previously-enabled Batocera mount
+  service/EmulationStation override files stale — a UI or integration
+  change required manually downloading a source archive and re-running
+  `scripts/install.sh`. `romcloud update` alone is now sufficient.
+- The artifact-writing logic (`romcloud`/`romcloud-run` wrappers, the
+  graphical Ports UI payload, the Batocera mount service script, the
+  EmulationStation override) is now implemented once, in
+  `romcloud.infrastructure.installer`, and shared by both
+  `scripts/install.sh` and `romcloud update` — a fresh install and a later
+  self-update always produce byte-identical artifacts from the same source
+  revision.
+- See "Self-updater" above for the full reconciliation/failure-semantics
+  details.
+
+---
+
 ## Release note (v0.2.1)
 
 - Bugfix: `curses` is now imported lazily. Systems without the `curses`
@@ -401,8 +421,23 @@ The updater:
 - downloads an archive pinned to that exact commit
 - safely extracts it
 - upgrades the existing persistent Python environment
-- preserves ROMCloud configuration and data
-- records the installed build in `version.json`
+- reconciles every ROMCloud-managed runtime artifact against that same
+  archive — the `romcloud`/`romcloud-run` wrappers, the graphical Ports UI
+  (`ports_gfx`, `romcloud-ports`, the Batocera Port entry script), and, only
+  if already enabled, the Batocera mount service script and ROMCloud's
+  EmulationStation override
+- records the installed build (version + exact commit) in `version.json`
+
+This means `romcloud update` keeps the *entire* installed application
+current, not only the backend package — after a UI/wrapper/integration
+change ships, running `romcloud update` is enough; there is no need to
+manually download a source archive to `/tmp` or re-run `scripts/install.sh`.
+The `romcloud`/`romcloud-run` wrappers are required: if reconciling them
+fails, the whole update is reported as failed and the previous install
+stays authoritative. Everything else (the graphical Ports UI, the mount
+service, the EmulationStation override) is reconciled best-effort — a
+missing/incompatible system Python or an unconfigured integration is a
+normal state, not a failure ("ROMCloud may fail; Batocera must not").
 
 The updater does not replace your ROMCloud home directory wholesale.
 
@@ -414,8 +449,12 @@ It preserves:
 - cache
 - logs
 - proxies
-- EmulationStation integration
-- mount integration
+
+> Upgrading from a version older than this reconciliation behavior may
+> require running `romcloud update` twice: the first run upgrades the
+> backend package (using that older version's own updater logic), and the
+> second run — now using the upgraded updater — performs the full artifact
+> reconciliation described above.
 
 ---
 

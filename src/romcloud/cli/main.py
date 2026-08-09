@@ -37,8 +37,10 @@ def cli(ctx: click.Context, config_path: str | None, debug: bool) -> None:
     ctx.obj["config_path"] = config_path or str(default_config_path())
     ctx.obj["debug"] = debug
 
-    # Load config eagerly (except for `configure` which creates it).
-    if ctx.invoked_subcommand not in ("configure", "update"):
+    # Load config eagerly (except for `configure` which creates it, `update`
+    # which may run before any config exists, and `_reconcile-install` which
+    # is a self-contained internal step with its own explicit paths).
+    if ctx.invoked_subcommand not in ("configure", "update", "_reconcile-install"):
         try:
             config = load_config(config_path)
             ctx.obj["config"] = config
@@ -68,6 +70,7 @@ from romcloud.cli.commands.update import update_cmd
 from romcloud.cli.commands.es import es_group
 from romcloud.cli.commands.mount import mount_group
 from romcloud.cli.commands.uidata import uidata_group
+from romcloud.cli.commands.reconcile import reconcile_install_cmd
 
 cli.add_command(configure_cmd, name="configure")
 cli.add_command(refresh_cmd, name="refresh")
@@ -80,6 +83,7 @@ cli.add_command(update_cmd, name="update")
 cli.add_command(es_group, name="es")
 cli.add_command(mount_group, name="mount")
 cli.add_command(uidata_group, name="uidata")
+cli.add_command(reconcile_install_cmd, name="_reconcile-install")
 
 
 if __name__ == "__main__":

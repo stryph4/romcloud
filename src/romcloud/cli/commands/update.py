@@ -1,10 +1,13 @@
 """romcloud update — self-update mechanism (no git required).
 
 Downloads the latest source from GitHub (a plain zip archive — no `git`
-dependency) and upgrades the existing persistent venv in place via
-``<venv python> -m pip install --upgrade <extracted project>``. Never
-touches ``romcloud.toml``, credentials, the catalog database, the cache,
-logs, generated proxies, or Batocera service/integration files — see
+dependency), upgrades the existing persistent venv in place via
+``<venv python> -m pip install --upgrade <extracted project>``, and then
+reconciles ROMCloud's own runtime artifacts (CLI/launch wrappers, the
+graphical Ports UI, and — only if previously enabled — the Batocera mount
+service script and EmulationStation override) against that same source
+revision. Never touches ``romcloud.toml``, credentials, the catalog
+database, the cache, or logs — see
 :mod:`romcloud.infrastructure.update` for the full design.
 """
 
@@ -83,4 +86,6 @@ def update_cmd(ctx: click.Context, check_only: bool, repo: str | None, branch: s
         return
 
     click.echo(f"Updated ROMCloud to {result.new.version} ({result.new.commit_short}).")
+    if result.reconcile_log:
+        click.echo(result.reconcile_log)
 

@@ -30,7 +30,6 @@ BIN_DIR="${ROMCLOUD_HOME}/bin"
 CONFIG_DIR="${ROMCLOUD_HOME}/config"
 DATA_DIR="${ROMCLOUD_HOME}/data"
 LOGS_DIR="${ROMCLOUD_HOME}/logs"
-PORTS_GFX_DIR="${ROMCLOUD_HOME}/ports-gfx"
 
 # ── parse args ────────────────────────────────────────────────────────────────
 for arg in "$@"; do
@@ -42,7 +41,6 @@ for arg in "$@"; do
             CONFIG_DIR="${ROMCLOUD_HOME}/config"
             DATA_DIR="${ROMCLOUD_HOME}/data"
             LOGS_DIR="${ROMCLOUD_HOME}/logs"
-            PORTS_GFX_DIR="${ROMCLOUD_HOME}/ports-gfx"
             ;;
         --help|-h)
             echo "Usage: bash install.sh [--prefix=PATH]"
@@ -198,102 +196,26 @@ tmp_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 tmp_path.replace(path)
 PY
 
-# ── write CLI wrapper ─────────────────────────────────────────────────────────
-# Built with printf (not an unquoted heredoc) so runtime-only tokens such as
-# "$@" are never subject to expansion by the installer's own shell — only the
-# venv python path is substituted, via %s. Execs the venv's python directly,
-# so ROMCloud never depends on (or touches) Batocera's system Python.
-{
-    printf '#!/bin/bash\n'
-    printf 'exec "%s" -m romcloud.cli.main "$@"\n' "${VENV_DIR}/bin/python"
-} > "${BIN_DIR}/romcloud"
-chmod +x "${BIN_DIR}/romcloud"
-echo "  Wrote CLI wrapper: ${BIN_DIR}/romcloud"
-
-# ── write Batocera launch wrapper ─────────────────────────────────────────────
-# The wrapper is a Python script that receives the exact argv EmulationStation
-# would pass to emulatorlauncher and handles .romcloud interception. Its
-# shebang points directly at the venv's python (substituted via printf, the
-# only non-literal line); ROMCloud is already importable there, so no
-# PYTHONPATH/sys.path hacks are needed.
-# Verified command format on Batocera 42:
-#   emulatorlauncher %CONTROLLERSCONFIG% -system %SYSTEM% -rom %ROM% \
-#       -gameinfoxml %GAMEINFOXML% -systemname %SYSTEMNAME%
-{
-    printf '#!%s\n' "${VENV_DIR}/bin/python"
-    cat << 'LAUNCHER'
-"""romcloud-run — Batocera 42+ EmulationStation launch wrapper.
-
-Receives the exact argv that EmulationStation would pass to emulatorlauncher.
-
-  - Non-.romcloud ROM:  exec emulatorlauncher with original argv unchanged.
-  - .romcloud proxy:    resolve/cache the real ROM, replace only the -rom
-                        value, exec emulatorlauncher with all other args intact.
-
-Example <command> for es_systems.cfg:
-    /userdata/system/romcloud/bin/romcloud-run %CONTROLLERSCONFIG% -system %SYSTEM% -rom %ROM% -gameinfoxml %GAMEINFOXML% -systemname %SYSTEMNAME%
-"""
-import sys as _sys
-
-from romcloud.integrations.batocera.launcher import run_launcher_wrapper
-
-run_launcher_wrapper(_sys.argv)
-LAUNCHER
-} > "${BIN_DIR}/romcloud-run"
-chmod +x "${BIN_DIR}/romcloud-run"
-echo "  Wrote launch wrapper: ${BIN_DIR}/romcloud-run"
-
-# ── graphical Ports UI (runs under Batocera's SYSTEM Python, not the venv) ────
-# Batocera 42 ships pygame/SDL in its own system Python (confirmed: pygame
-# 2.5.2 / SDL 2.32.8). ROMCloud's isolated venv deliberately never installs
-# pygame and never enables --system-site-packages, so the graphical Ports
-# app (`ports_gfx/`, pure Python + pygame, zero `romcloud` imports) is
-# copied — not pip-installed — to its own directory and run directly with
-# that system Python. It talks to the venv-only ROMCloud backend solely via
-# `romcloud uidata <action>` (JSON over a subprocess call) — see
-# ports_gfx/client.py and romcloud/cli/commands/uidata.py for that contract.
+# ── reconcile managed runtime artifacts ───────────────────────────────────────
+# Writes/refreshes the `romcloud`/`romcloud-run` wrappers and the optional
+# graphical Ports UI (`ports_gfx`, `romcloud-ports`, the Batocera Port entry
+# script), and — only if already present from a prior install — the
+# Batocera mount service script and ROMCloud's EmulationStation override.
+# Implemented once in romcloud.infrastructure.installer and shared with
+# `romcloud update`, so a fresh install and a later self-update always
+# produce byte-identical artifacts from the same source revision.
 #
-# This entire step is best-effort: if no system Python with pygame is found,
-# the graphical Ports UI is simply not installed. The CLI/backend install
-# above has already succeeded regardless — ROMCloud may fail to get a
-# graphical UI; it must not fail to install at all.
-SYSTEM_PYTHON="${ROMCLOUD_SYSTEM_PYTHON:-}"
-if [[ -z "${SYSTEM_PYTHON}" ]]; then
-    if [[ -x /usr/bin/python3 ]]; then
-        SYSTEM_PYTHON="/usr/bin/python3"
-    elif command -v python3 &>/dev/null; then
-        SYSTEM_PYTHON="$(command -v python3)"
-    fi
-fi
-
-PORTS_GFX_INSTALLED=0
-if [[ -n "${SYSTEM_PYTHON}" ]] && "${SYSTEM_PYTHON}" -c "import pygame" &>/dev/null; then
-    rm -rf "${PORTS_GFX_DIR:?}/ports_gfx"
-    mkdir -p "${PORTS_GFX_DIR}"
-    cp -r "${PROJECT_DIR}/ports_gfx" "${PORTS_GFX_DIR}/ports_gfx"
-
-    {
-        printf '#!/bin/bash\n'
-        printf 'export ROMCLOUD_BIN="%s"\n' "${BIN_DIR}/romcloud"
-        printf 'export PYTHONPATH="%s${PYTHONPATH:+:$PYTHONPATH}"\n' "${PORTS_GFX_DIR}"
-        printf 'exec "%s" -m ports_gfx "$@"\n' "${SYSTEM_PYTHON}"
-    } > "${BIN_DIR}/romcloud-ports"
-    chmod +x "${BIN_DIR}/romcloud-ports"
-    echo "  Wrote graphical Ports wrapper: ${BIN_DIR}/romcloud-ports (system python: ${SYSTEM_PYTHON})"
-    PORTS_GFX_INSTALLED=1
-
-    if [[ -d "${ROMCLOUD_PORTS_DIR}" ]]; then
-        {
-            printf '#!/bin/bash\n'
-            printf 'exec "%s" "$@"\n' "${BIN_DIR}/romcloud-ports"
-        } > "${ROMCLOUD_PORTS_DIR}/ROMCloud.sh"
-        chmod +x "${ROMCLOUD_PORTS_DIR}/ROMCloud.sh"
-        echo "  Installed Batocera Port entry: ${ROMCLOUD_PORTS_DIR}/ROMCloud.sh"
-    else
-        echo "  Note: ${ROMCLOUD_PORTS_DIR} not found — skipped Batocera Port entry."
-    fi
-else
-    echo "  Skipping graphical Ports UI: no system Python with pygame found (CLI/TUI unaffected)."
+# The `romcloud`/`romcloud-run` wrappers are required — this step failing
+# fails the whole install. Everything else (Ports UI, mount service, ES
+# override) is best-effort and never fails this step: "ROMCloud may fail;
+# Batocera must not".
+if ! "${VENV_DIR}/bin/python" -m romcloud.cli.main _reconcile-install \
+        --romcloud-home "${ROMCLOUD_HOME}" \
+        --project-root "${PROJECT_DIR}" \
+        --ports-dir "${ROMCLOUD_PORTS_DIR}" \
+        --system-python "${ROMCLOUD_SYSTEM_PYTHON:-}"; then
+    echo "ERROR: failed to write ROMCloud runtime artifacts (wrappers)" >&2
+    exit 1
 fi
 
 # ── write default config (only if none exists) ────────────────────────────────
@@ -358,9 +280,9 @@ echo "Batocera / EmulationStation integration:"
 echo "  SPIKE — see src/romcloud/integrations/batocera/es_config.py"
 echo "  Run: ${BIN_DIR}/romcloud healthcheck  (includes integration status)"
 echo ""
-if [[ "${PORTS_GFX_INSTALLED}" -eq 1 ]]; then
+if [[ -x "${BIN_DIR}/romcloud-ports" ]]; then
     echo "Graphical Ports UI:"
-    echo "  Installed — runs under Batocera's system Python (${SYSTEM_PYTHON})."
+    echo "  Installed — runs under Batocera's system Python."
     echo "  Launch:    ${BIN_DIR}/romcloud-ports"
 else
     echo "Graphical Ports UI: not installed (no system Python with pygame found)."

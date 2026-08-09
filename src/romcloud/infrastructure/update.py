@@ -20,16 +20,28 @@ Design
    path stays inside the extraction directory first (no path traversal).
 4. Upgrade the existing persistent venv in place:
    ``<venv python> -m pip install --upgrade <extracted project>``.
-5. Only on success, persist the new :class:`BuildInfo` — a failed install
-   leaves the previous ``version.json`` (and therefore the previously
-   installed package) as the source of truth, so a failed update is never
+5. Reconcile every ROMCloud-managed runtime artifact (the ``romcloud``/
+   ``romcloud-run`` wrappers, the graphical Ports UI, and — only if
+   previously enabled — the Batocera mount service script and the
+   EmulationStation override) against that same extracted source tree, via
+   :mod:`romcloud.infrastructure.installer` (shared with
+   ``scripts/install.sh`` so neither duplicates this logic). The wrappers
+   are required — a failure there fails the whole update; every other
+   artifact is reconciled best-effort ("ROMCloud may fail; Batocera must
+   not").
+6. Only once both the venv upgrade *and* the required wrapper reconciliation
+   succeed, persist the new :class:`BuildInfo` — any earlier failure leaves
+   the previous ``version.json`` (and therefore the previously installed
+   backend/wrappers) as the source of truth, so a failed update is never
    reported as installed.
-6. The temp directory is always removed (success or failure).
+7. The temp directory is always removed (success or failure).
 
-Nothing in this module ever touches ``romcloud.toml``, ``credentials.toml``,
-the cache root, the local ROMs directory, the catalog database, logs, or
-any Batocera service/integration file — the venv (via pip) and
-``version.json`` are the only things ever written.
+This module never touches ``romcloud.toml``, ``credentials.toml``, the
+cache root, the local ROMs directory, the catalog database, or logs — those
+are exclusively user/runtime state. It *does* rewrite the ``romcloud``/
+``romcloud-run`` wrappers, ``version.json``, and — only where already
+present/configured — the graphical Ports UI payload, the Batocera mount
+service script, and ROMCloud's own EmulationStation override file.
 """
 
 from __future__ import annotations
@@ -63,6 +75,7 @@ from romcloud.core.exceptions import (
     UpdateDownloadError,
     UpdateInstallError,
 )
+from romcloud.infrastructure.installer import DEFAULT_PORTS_DIR as _DEFAULT_PORTS_DIR
 from romcloud.infrastructure.logging import get_logger
 
 log = get_logger("update")
@@ -112,6 +125,10 @@ class CheckResult:
 class UpdateResult:
     previous: Optional[BuildInfo]
     new: BuildInfo
+    reconcile_log: str = ""
+    """Captured stdout/stderr from reconciling installer-managed runtime
+    artifacts (wrappers, graphical Ports UI, previously-enabled Batocera
+    integrations) — see :func:`perform_update`."""
 
 
 # ── GitHub API / download ────────────────────────────────────────────────────
@@ -377,13 +394,24 @@ def perform_update(
     branch: str = DEFAULT_BRANCH,
     opener: OpenerType = urllib.request.urlopen,
     runner: RunnerType = subprocess.run,
+    ports_dir: Optional[Path] = None,
+    system_python: Optional[str] = None,
 ) -> UpdateResult:
-    """Download the latest commit's archive and upgrade the persistent venv.
+    """Download the latest commit's archive, upgrade the persistent venv,
+    and reconcile every ROMCloud-managed runtime artifact (wrappers,
+    graphical Ports UI, previously-enabled Batocera integrations) against
+    that exact same source revision.
 
     Never leaves a partially-upgraded install recorded as current: the new
-    :class:`BuildInfo` is only written after ``pip install --upgrade``
-    succeeds. The temporary download/extraction directory is always removed,
-    on success or failure.
+    :class:`BuildInfo` is only written after both the venv upgrade *and*
+    reconciling the required core wrappers succeed — a failure in either
+    leaves the previous ``version.json`` (and therefore the previously
+    installed backend/wrappers) as the source of truth, so a failed update
+    is never reported as installed. Reconciling optional artifacts (the
+    graphical Ports UI, the mount service script, the EmulationStation
+    override) is best-effort and never fails the update — "ROMCloud may
+    fail; Batocera must not". The temporary download/extraction directory is
+    always removed, on success or failure.
     """
     previous = read_build_info(romcloud_home)
     latest = get_latest_commit(repo, branch, opener=opener)
@@ -407,6 +435,33 @@ def perform_update(
             detail = (result.stderr or result.stdout or "unknown pip error").strip()
             raise UpdateInstallError(f"Failed to install update into the venv: {detail}")
 
+        resolved_ports_dir = Path(ports_dir) if ports_dir else _DEFAULT_PORTS_DIR
+        log.info("Reconciling installed runtime artifacts from %s", project_root)
+        reconcile_result = runner(
+            [
+                str(venv_python),
+                "-m",
+                "romcloud.cli.main",
+                "_reconcile-install",
+                "--romcloud-home",
+                str(romcloud_home),
+                "--project-root",
+                str(project_root),
+                "--ports-dir",
+                str(resolved_ports_dir),
+                "--system-python",
+                system_python or "",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        reconcile_log = (reconcile_result.stdout or "") + (reconcile_result.stderr or "")
+        if reconcile_result.returncode != 0:
+            detail = reconcile_log.strip() or "unknown reconciliation error"
+            raise UpdateInstallError(
+                f"Backend upgraded, but failed to reconcile installed runtime artifacts: {detail}"
+            )
+
         new_info = BuildInfo(
             version=read_project_version(project_root),
             commit=latest.sha,
@@ -416,6 +471,6 @@ def perform_update(
         )
         write_build_info(romcloud_home, new_info)
         log.info("Updated ROMCloud to %s (%s)", new_info.version, new_info.commit_short)
-        return UpdateResult(previous=previous, new=new_info)
+        return UpdateResult(previous=previous, new=new_info, reconcile_log=reconcile_log.strip())
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)

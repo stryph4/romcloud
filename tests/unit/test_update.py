@@ -386,17 +386,47 @@ class TestPerformUpdateSuccess:
         archive = _make_archive_bytes(sha=_SHA)
         opener = _make_opener(_full_payloads(archive_bytes=archive))
 
-        captured = {}
+        calls = []
 
         def runner(argv, **kwargs):
-            captured["argv"] = argv
+            calls.append(argv)
             return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
         upd.perform_update(home, venv_python, opener=opener, runner=runner)
 
-        assert captured["argv"][0] == str(venv_python)
-        assert captured["argv"][1:4] == ["-m", "pip", "install"]
-        assert "--upgrade" in captured["argv"]
+        pip_argv = calls[0]
+        assert pip_argv[0] == str(venv_python)
+        assert pip_argv[1:4] == ["-m", "pip", "install"]
+        assert "--upgrade" in pip_argv
+
+    def test_reconcile_invoked_after_pip_with_venv_python_and_project_root(self, tmp_path):
+        home = tmp_path / "romcloud"
+        venv_python = home / "venv" / "bin" / "python"
+        archive = _make_archive_bytes(sha=_SHA)
+        opener = _make_opener(_full_payloads(archive_bytes=archive))
+
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        upd.perform_update(
+            home, venv_python, opener=opener, runner=runner,
+            ports_dir=tmp_path / "ports", system_python="/fake/system-python",
+        )
+
+        assert len(calls) == 2
+        reconcile_argv = calls[1]
+        assert reconcile_argv[0] == str(venv_python)
+        assert reconcile_argv[1:4] == ["-m", "romcloud.cli.main", "_reconcile-install"]
+        assert "--romcloud-home" in reconcile_argv
+        assert str(home) in reconcile_argv
+        assert "--project-root" in reconcile_argv
+        assert "--ports-dir" in reconcile_argv
+        assert str(tmp_path / "ports") in reconcile_argv
+        assert "--system-python" in reconcile_argv
+        assert "/fake/system-python" in reconcile_argv
 
 
 class TestPerformUpdateFailedDownload:
@@ -571,8 +601,18 @@ class TestNoGitAvailable:
         archive = _make_archive_bytes(sha=_SHA, version="3.3.3")
         opener = _make_opener(_full_payloads(archive_bytes=archive))
 
+        # The fake archive is a minimal version-only stub package (no CLI
+        # module) — real for the pip-install step under test, but not a full
+        # enough ROMCloud checkout to run the reconcile subprocess against.
+        # Reconciliation itself is covered separately/in-process; here only
+        # bypass it so this test stays focused on "pip install needs no git".
+        def runner(argv, **kwargs):
+            if "pip" in argv:
+                return real_subprocess.run(argv, **kwargs)
+            return real_subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
         result = upd.perform_update(
-            home, venv_dir / "bin" / "python", opener=opener, runner=real_subprocess.run
+            home, venv_dir / "bin" / "python", opener=opener, runner=runner
         )
         assert result.new.version == "3.3.3"
 
