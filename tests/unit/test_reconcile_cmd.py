@@ -127,7 +127,7 @@ class TestReconcileInstallCmd:
         assert "Skipping graphical Ports UI" in result.output
 
     def test_required_wrapper_failure_exits_nonzero(self, tmp_path: Path, monkeypatch) -> None:
-        import romcloud.infrastructure.installer as installer_module
+        import romcloud.lifecycle.install as installer_module
 
         def _boom(bin_dir, venv_python):
             raise OSError("disk full")

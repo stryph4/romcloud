@@ -19,8 +19,8 @@ from romcloud.infrastructure.database import Database
 from romcloud.infrastructure.repositories.game import GameRepository
 from romcloud.infrastructure.repositories.cache import CacheRepository
 from romcloud.infrastructure.repositories.proxy import ProxyRepository
-from romcloud.core.providers.local import LocalFilesystemProvider
-from romcloud.core.services.catalog import CatalogService
+from romcloud.infrastructure.providers.local import LocalFilesystemProvider
+from romcloud.integrations.batocera.catalog import CatalogService
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -221,7 +221,7 @@ class TestHealthcheckWithPartialSource:
         """Healthcheck must pass even when only a subset of Batocera system
         folders exist in the source root."""
         from romcloud.infrastructure.config import AppConfig, SourceConfig, CacheConfig, LoggingConfig
-        from romcloud.core.providers.local import LocalFilesystemProvider
+        from romcloud.infrastructure.providers.local import LocalFilesystemProvider
 
         source = tmp_path / "source"
         (source / "nes").mkdir(parents=True)  # only nes, nothing else

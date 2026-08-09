@@ -25,7 +25,7 @@ Assumption requiring real Batocera hardware validation
 This assumes the ``smbclient`` binary (Samba client tools) is present on
 Batocera 42 in addition to the ``cifs-utils`` package already relied upon
 for mounting. If it is *not* present, share enumeration and validation
-degrade gracefully (:data:`~romcloud.core.services.smb_discovery.SMBErrorKind.TOOL_UNAVAILABLE`)
+degrade gracefully (:data:`~romcloud.services.smb_discovery.SMBErrorKind.TOOL_UNAVAILABLE`)
 and the CLI wizard falls back to manual share entry — but manual entry's
 own validation step also requires ``smbclient`` today. This should be
 confirmed on real hardware; see README for the noted assumption.
@@ -41,7 +41,7 @@ import tempfile
 from pathlib import Path
 from typing import Callable
 
-from romcloud.core.services.smb_discovery import (
+from romcloud.services.smb_discovery import (
     AuthResult,
     ListSharesResult,
     SMBCredentials,
@@ -257,7 +257,7 @@ def parse_directory_listing(stdout: str) -> list[str]:
 
 
 class SmbclientTransport:
-    """Concrete :class:`~romcloud.core.services.smb_discovery.SMBTransport`
+    """Concrete :class:`~romcloud.services.smb_discovery.SMBTransport`
     implementation, backed by the ``smbclient`` CLI."""
 
     def __init__(self, *, runner: RunnerType = subprocess.run, timeout: float = _DEFAULT_TIMEOUT) -> None:
@@ -353,6 +353,6 @@ def _tool_error_detail(kind: SMBErrorKind) -> str:
 def build_default_smb_discovery_service():
     """Factory for the real, subprocess-backed discovery service — used by
     the CLI wizard and (in future) a graphical setup UI."""
-    from romcloud.core.services.smb_discovery import SMBDiscoveryService
+    from romcloud.services.smb_discovery import SMBDiscoveryService
 
     return SMBDiscoveryService(transport=SmbclientTransport())

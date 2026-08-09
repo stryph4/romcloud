@@ -4,7 +4,7 @@ runtime artifacts.
 Hidden — shared by ``scripts/install.sh`` (fresh install / manual repair)
 and ``romcloud update`` (self-update) so neither one duplicates this logic.
 All the actual reconciliation logic lives in
-:mod:`romcloud.infrastructure.installer`; this module is only the thin CLI
+:mod:`romcloud.lifecycle.install`; this module is only the thin CLI
 wrapper around it, invoked as a subprocess of the (already installed or
 just-upgraded) venv's own python — so it always runs the exact same source
 revision that just got installed/upgraded.
@@ -16,7 +16,7 @@ from pathlib import Path
 
 import click
 
-from romcloud.infrastructure import installer
+from romcloud.lifecycle import install as installer
 
 
 @click.command("_reconcile-install", hidden=True)

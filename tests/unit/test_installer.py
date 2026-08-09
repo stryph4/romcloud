@@ -1,6 +1,6 @@
-"""Unit tests for romcloud.infrastructure.installer — the shared
+"""Unit tests for romcloud.lifecycle.install — the shared
 install/update artifact reconciliation logic used by both scripts/install.sh
-and romcloud.infrastructure.update.perform_update.
+and romcloud.lifecycle.update.perform_update.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from romcloud.infrastructure import installer as inst
+from romcloud.lifecycle import install as inst
 
 
 def _write_fake_system_python(path: Path, *, has_pygame: bool) -> Path:

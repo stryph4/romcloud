@@ -21,8 +21,8 @@ from romcloud.core.cue_parser import resolve_cue_dependencies
 from romcloud.core.exceptions import GameNotFoundError, ProxyError, ProxyNotOwnedError
 from romcloud.core.models.game import Game, GameAsset, derive_title
 from romcloud.core.models.proxy import ProxyRecord
-from romcloud.core.providers.base import RemoteEntry, StorageProvider
-from romcloud.core.systems import BATOCERA_SYSTEMS
+from romcloud.core.storage import RemoteEntry, StorageProvider
+from romcloud.integrations.batocera.systems import BATOCERA_SYSTEMS
 from romcloud.infrastructure.logging import get_logger
 from romcloud.infrastructure.repositories.game import GameRepository
 from romcloud.infrastructure.repositories.proxy import ProxyRepository

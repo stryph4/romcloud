@@ -14,9 +14,9 @@ that system's source root>``
   containing ``..`` traversal segments) is rejected rather than silently
   resolved, so it can never write outside the cache root.
 
-Both :class:`~romcloud.core.services.transfer.TransferService` (final and
+Both :class:`~romcloud.services.transfer.TransferService` (final and
 ``.partial`` staging paths) and
-:class:`~romcloud.core.services.cache.CacheService` (placeholder cache path)
+:class:`~romcloud.services.cache.CacheService` (placeholder cache path)
 use this module so the on-disk layout stays consistent everywhere.
 """
 

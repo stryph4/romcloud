@@ -1,23 +1,18 @@
-"""Local filesystem storage provider.
-
-Handles any source that is already mounted and accessible as a normal
-POSIX path — internal drives, USB sticks, NFS mounts, etc.
-"""
+"""Local filesystem storage provider."""
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Callable, Optional
 
 from romcloud.core.exceptions import ProviderError, ProviderNotReachableError, TransferError
-from romcloud.core.providers.base import RemoteEntry, StorageProvider
+from romcloud.core.storage import RemoteEntry, StorageProvider
 
-_CHUNK = 1024 * 1024  # 1 MiB read/write chunk
+_CHUNK = 1024 * 1024
 
 
 class LocalFilesystemProvider(StorageProvider):
-    """Storage provider backed by the local (or mounted) filesystem."""
+    """Storage provider backed by the local or mounted filesystem."""
 
     PROVIDER_ID = "local"
 
@@ -25,12 +20,8 @@ class LocalFilesystemProvider(StorageProvider):
     def provider_id(self) -> str:
         return self.PROVIDER_ID
 
-    # ── reachability ──────────────────────────────────────────────────────────
-
     def is_reachable(self, root: str) -> bool:
         return Path(root).is_dir()
-
-    # ── directory listing ─────────────────────────────────────────────────────
 
     def list_systems(self, rom_root: str) -> list[str]:
         root = Path(rom_root)
@@ -48,7 +39,7 @@ class LocalFilesystemProvider(StorageProvider):
             raise ProviderError(f"System path not found: {system_path}")
 
         entries: list[RemoteEntry] = []
-        for entry in sorted(system_path.iterdir(), key=lambda e: e.name.lower()):
+        for entry in sorted(system_path.iterdir(), key=lambda item: item.name.lower()):
             if entry.name.startswith("."):
                 continue
             entries.append(
@@ -61,12 +52,8 @@ class LocalFilesystemProvider(StorageProvider):
             )
         return entries
 
-    # ── size ──────────────────────────────────────────────────────────────────
-
     def get_size(self, path: str) -> Optional[int]:
         return _entry_size(Path(path))
-
-    # ── metadata ──────────────────────────────────────────────────────────────
 
     def read_text(self, path: str) -> str:
         try:
@@ -74,35 +61,21 @@ class LocalFilesystemProvider(StorageProvider):
         except OSError as exc:
             raise ProviderError(f"Cannot read {path}: {exc}") from exc
 
-    # ── transfer ──────────────────────────────────────────────────────────────
-
     def transfer_to(
         self,
         source_path: str,
         dest_path: str,
         on_progress: Optional[Callable[[int, int], None]] = None,
     ) -> None:
-        """Copy source_path to dest_path on the local filesystem.
-
-        Resume behaviour:
-        - For files: if dest already exists with the same size, skip.
-        - For directories: process each file inside and skip already-complete files.
-        """
         src = Path(source_path)
         dst = Path(dest_path)
-
         if not src.exists():
             raise ProviderError(f"Source does not exist: {source_path}")
-
         dst.parent.mkdir(parents=True, exist_ok=True)
-
         if src.is_dir():
             _copy_dir(src, dst, on_progress)
         else:
             _copy_file(src, dst, on_progress)
-
-
-# ── helpers ───────────────────────────────────────────────────────────────────
 
 
 def _entry_size(path: Path) -> Optional[int]:
@@ -110,7 +83,7 @@ def _entry_size(path: Path) -> Optional[int]:
         if path.is_file():
             return path.stat().st_size
         if path.is_dir():
-            return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+            return sum(file.stat().st_size for file in path.rglob("*") if file.is_file())
     except OSError:
         pass
     return None
@@ -122,8 +95,6 @@ def _copy_file(
     on_progress: Optional[Callable[[int, int], None]],
 ) -> None:
     total = src.stat().st_size
-
-    # Resume: skip if destination already has the correct size.
     if dst.exists() and dst.stat().st_size == total:
         if on_progress:
             on_progress(total, total)
@@ -131,13 +102,13 @@ def _copy_file(
 
     try:
         copied = 0
-        with src.open("rb") as fsrc, dst.open("wb") as fdst:
+        with src.open("rb") as source, dst.open("wb") as destination:
             while True:
-                buf = fsrc.read(_CHUNK)
-                if not buf:
+                buffer = source.read(_CHUNK)
+                if not buffer:
                     break
-                fdst.write(buf)
-                copied += len(buf)
+                destination.write(buffer)
+                copied += len(buffer)
                 if on_progress:
                     on_progress(copied, total)
     except OSError as exc:
@@ -149,37 +120,30 @@ def _copy_dir(
     dst: Path,
     on_progress: Optional[Callable[[int, int], None]],
 ) -> None:
-    all_files = [f for f in src.rglob("*") if f.is_file()]
-    total = sum(f.stat().st_size for f in all_files)
+    all_files = [file for file in src.rglob("*") if file.is_file()]
+    total = sum(file.stat().st_size for file in all_files)
     copied_so_far = 0
-
     dst.mkdir(parents=True, exist_ok=True)
 
     for file in sorted(all_files):
-        rel = file.relative_to(src)
-        dest_file = dst / rel
-        dest_file.parent.mkdir(parents=True, exist_ok=True)
-
+        destination_file = dst / file.relative_to(src)
+        destination_file.parent.mkdir(parents=True, exist_ok=True)
         file_total = file.stat().st_size
-
-        # Resume individual file if it is already complete.
-        if dest_file.exists() and dest_file.stat().st_size == file_total:
+        if destination_file.exists() and destination_file.stat().st_size == file_total:
             copied_so_far += file_total
             if on_progress:
                 on_progress(copied_so_far, total)
             continue
 
         try:
-            file_copied = 0
-            with file.open("rb") as fsrc, dest_file.open("wb") as fdst:
+            with file.open("rb") as source, destination_file.open("wb") as destination:
                 while True:
-                    buf = fsrc.read(_CHUNK)
-                    if not buf:
+                    buffer = source.read(_CHUNK)
+                    if not buffer:
                         break
-                    fdst.write(buf)
-                    file_copied += len(buf)
-                    copied_so_far += len(buf)
+                    destination.write(buffer)
+                    copied_so_far += len(buffer)
                     if on_progress:
                         on_progress(copied_so_far, total)
         except OSError as exc:
-            raise TransferError(f"Copy failed {file} → {dest_file}: {exc}") from exc
+            raise TransferError(f"Copy failed {file} → {destination_file}: {exc}") from exc

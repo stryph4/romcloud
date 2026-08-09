@@ -48,7 +48,7 @@ from typing import Callable, Optional
 
 from romcloud.core.exceptions import ROMCloudError
 from romcloud.core.models.game import Game
-from romcloud.core.services.cache import CacheService
+from romcloud.services.cache import CacheService
 
 # ── timing constants ──────────────────────────────────────────────────────────
 

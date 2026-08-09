@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from romcloud.core.models.game import Game, GameAsset
-from romcloud.core.services.transfer import TransferService
+from romcloud.services.transfer import TransferService
 from romcloud.core.exceptions import TransferValidationError
 
 
@@ -53,7 +53,7 @@ class TestTransferService:
     def test_transfers_single_file(self, simple_game, cache_dir):
         game, source_root = simple_game
         svc = TransferService(provider=__import__(
-            "romcloud.core.providers.local", fromlist=["LocalFilesystemProvider"]
+            "romcloud.infrastructure.providers.local", fromlist=["LocalFilesystemProvider"]
         ).LocalFilesystemProvider(), cache_root=str(cache_dir))
 
         final = svc.transfer(game)
@@ -64,7 +64,7 @@ class TestTransferService:
 
     def test_staged_to_final(self, simple_game, cache_dir):
         """Transfer must go through .partial before reaching final path."""
-        from romcloud.core.providers.local import LocalFilesystemProvider
+        from romcloud.infrastructure.providers.local import LocalFilesystemProvider
         game, _ = simple_game
         svc = TransferService(provider=LocalFilesystemProvider(), cache_root=str(cache_dir))
 
@@ -78,7 +78,7 @@ class TestTransferService:
     def test_final_path_is_system_relative_path(self, simple_game, cache_dir):
         """Final path mirrors the asset's relative path under the system —
         not a game_id container — so the source basename is preserved."""
-        from romcloud.core.providers.local import LocalFilesystemProvider
+        from romcloud.infrastructure.providers.local import LocalFilesystemProvider
         game, _ = simple_game
         svc = TransferService(provider=LocalFilesystemProvider(), cache_root=str(cache_dir))
 
@@ -87,7 +87,7 @@ class TestTransferService:
         assert final == expected
 
     def test_progress_callback(self, simple_game, cache_dir):
-        from romcloud.core.providers.local import LocalFilesystemProvider
+        from romcloud.infrastructure.providers.local import LocalFilesystemProvider
         game, _ = simple_game
         svc = TransferService(provider=LocalFilesystemProvider(), cache_root=str(cache_dir))
 
@@ -97,7 +97,7 @@ class TestTransferService:
         assert calls[-1][0] > 0
 
     def test_validation_fails_wrong_size(self, tmp_path, cache_dir):
-        from romcloud.core.providers.local import LocalFilesystemProvider
+        from romcloud.infrastructure.providers.local import LocalFilesystemProvider
         source_root = tmp_path / "source"
         (source_root / "ps2").mkdir(parents=True)
         (source_root / "ps2" / "game.iso").write_bytes(b"x" * 100)
@@ -115,7 +115,7 @@ class TestTransferService:
             svc.transfer(game)
 
     def test_staging_preserved_after_error(self, tmp_path, cache_dir):
-        from romcloud.core.providers.local import LocalFilesystemProvider
+        from romcloud.infrastructure.providers.local import LocalFilesystemProvider
         source_root = tmp_path / "source"
         (source_root / "ps2").mkdir(parents=True)
         (source_root / "ps2" / "game.iso").write_bytes(b"x" * 100)
@@ -132,7 +132,7 @@ class TestTransferService:
         assert staging.exists()
 
     def test_transfers_directory(self, dir_game, cache_dir):
-        from romcloud.core.providers.local import LocalFilesystemProvider
+        from romcloud.infrastructure.providers.local import LocalFilesystemProvider
         game, _ = dir_game
         svc = TransferService(provider=LocalFilesystemProvider(), cache_root=str(cache_dir))
 
@@ -152,7 +152,7 @@ class TestTransferService:
         per-game config lookup would silently fail — the user's configured
         emulator/core/shader overrides would not apply.
         """
-        from romcloud.core.providers.local import LocalFilesystemProvider
+        from romcloud.infrastructure.providers.local import LocalFilesystemProvider
         game, _ = simple_game
         svc = TransferService(provider=LocalFilesystemProvider(), cache_root=str(cache_dir))
 
@@ -168,7 +168,7 @@ class TestTransferService:
 
     def test_resume_skips_complete_files(self, simple_game, cache_dir):
         """Second transfer call with same game resumes without re-copying."""
-        from romcloud.core.providers.local import LocalFilesystemProvider
+        from romcloud.infrastructure.providers.local import LocalFilesystemProvider
         game, _ = simple_game
         provider = LocalFilesystemProvider()
         svc = TransferService(provider=provider, cache_root=str(cache_dir))
@@ -195,7 +195,7 @@ class TestTransferService:
 
     def test_no_collision_across_systems_with_same_filename(self, tmp_path, cache_dir):
         """Two systems with an identically-named ROM must not collide in the cache."""
-        from romcloud.core.providers.local import LocalFilesystemProvider
+        from romcloud.infrastructure.providers.local import LocalFilesystemProvider
 
         source_root = tmp_path / "source"
         (source_root / "ps2").mkdir(parents=True)
@@ -219,7 +219,7 @@ class TestTransferService:
 
     def test_no_collision_across_subdirectories_within_one_system(self, tmp_path, cache_dir):
         """Two subdirectories of the same system with identical filenames must not collide."""
-        from romcloud.core.providers.local import LocalFilesystemProvider
+        from romcloud.infrastructure.providers.local import LocalFilesystemProvider
 
         source_root = tmp_path / "source"
         (source_root / "ps2" / "discs" / "1").mkdir(parents=True)
@@ -248,7 +248,7 @@ class TestMultiAssetCueBinTransfer:
 
     @staticmethod
     def _make_cue_game(tmp_path, num_tracks=3):
-        from romcloud.core.providers.local import LocalFilesystemProvider
+        from romcloud.infrastructure.providers.local import LocalFilesystemProvider
 
         source_root = tmp_path / "source"
         (source_root / "psx").mkdir(parents=True)

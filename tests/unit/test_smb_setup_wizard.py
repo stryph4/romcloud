@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 import click
 from click.testing import CliRunner
 
-from romcloud.core.services.smb_discovery import (
+from romcloud.services.smb_discovery import (
     AuthResult,
     ListSharesResult,
     ShareInfo,
@@ -105,7 +105,7 @@ class TestServerUnreachable:
 
 class TestAuthenticationFailure:
     def test_auth_failure_cancels(self):
-        from romcloud.core.services.smb_discovery import SMBErrorKind
+        from romcloud.services.smb_discovery import SMBErrorKind
 
         discovery = FakeDiscovery(auth=AuthResult(ok=False, error_kind=SMBErrorKind.AUTH_FAILED, detail="bad creds"))
         runner = CliRunner()
@@ -120,7 +120,7 @@ class TestAuthenticationFailure:
 
 class TestManualShareFallback:
     def test_falls_back_to_manual_entry_when_enumeration_unavailable(self):
-        from romcloud.core.services.smb_discovery import SMBErrorKind
+        from romcloud.services.smb_discovery import SMBErrorKind
 
         discovery = FakeDiscovery(
             shares=ListSharesResult(ok=False, error_kind=SMBErrorKind.TOOL_UNAVAILABLE, detail="no smbclient"),
@@ -139,7 +139,7 @@ class TestManualShareFallback:
     def test_manual_share_still_goes_through_validation(self):
         """Even in the manual fallback path, the share must be validated —
         there is no second, weaker path that skips validation."""
-        from romcloud.core.services.smb_discovery import SMBErrorKind
+        from romcloud.services.smb_discovery import SMBErrorKind
 
         discovery = FakeDiscovery(
             shares=ListSharesResult(ok=False, error_kind=SMBErrorKind.TOOL_UNAVAILABLE),
@@ -178,7 +178,7 @@ class TestManualEntryFromMenu:
 
 class TestShareValidationFailureThenRetryDeclined:
     def test_declining_retry_after_validation_failure_cancels(self):
-        from romcloud.core.services.smb_discovery import SMBErrorKind
+        from romcloud.services.smb_discovery import SMBErrorKind
 
         discovery = FakeDiscovery(
             shares=ListSharesResult(ok=True, shares=(ShareInfo("Roms"),)),

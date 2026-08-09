@@ -29,7 +29,7 @@ requires a real SMB server in the standard test suite.
 This module does NOT implement a native SMBProvider or any direct SMB file
 streaming — the end result of a successful setup is still the existing
 mounted-SMB architecture: ``//server/share`` mounted at a local path and
-read through :class:`~romcloud.core.providers.local.LocalFilesystemProvider`
+read through :class:`~romcloud.infrastructure.providers.local.LocalFilesystemProvider`
 (see :mod:`romcloud.infrastructure.mount`).
 """
 
@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, Protocol, Tuple
 
-from romcloud.core.systems import BATOCERA_SYSTEMS
+from romcloud.integrations.batocera.systems import BATOCERA_SYSTEMS
 from romcloud.infrastructure.mount import ReachabilityResult, check_reachable
 
 DEFAULT_SMB_PORT = 445
@@ -145,7 +145,7 @@ class ShareValidationResult:
 @dataclass(frozen=True)
 class SystemDetectionResult:
     """Which top-level share entries look like recognized Batocera system
-    folders, per :data:`romcloud.core.systems.BATOCERA_SYSTEMS` — the same
+    folders, per :data:`romcloud.integrations.batocera.systems.BATOCERA_SYSTEMS` — the same
     mapping already used for catalog scanning, so detection here can never
     drift from what will actually be recognized once the share is mounted
     and scanned for real."""

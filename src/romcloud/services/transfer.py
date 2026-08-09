@@ -40,7 +40,7 @@ from typing import Callable, Optional
 from romcloud.core.cache_paths import resolve_cache_path
 from romcloud.core.exceptions import TransferError, TransferValidationError
 from romcloud.core.models.game import Game
-from romcloud.core.providers.base import StorageProvider
+from romcloud.core.storage import StorageProvider
 from romcloud.infrastructure.logging import get_logger
 
 log = get_logger("transfer")

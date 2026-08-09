@@ -1,23 +1,14 @@
-"""SMB storage provider (stub — not yet implemented).
-
-This module reserves the SMB provider slot in the architecture.
-Implement when the local vertical slice is stable and tested.
-"""
+"""SMB storage provider placeholder for a future direct-SMB adapter."""
 
 from __future__ import annotations
 
 from typing import Callable, Optional
 
-from romcloud.core.exceptions import ProviderError
-from romcloud.core.providers.base import RemoteEntry, StorageProvider
+from romcloud.core.storage import RemoteEntry, StorageProvider
 
 
 class SMBProvider(StorageProvider):
-    """Storage provider backed by an SMB/CIFS share.
-
-    .. note::
-        This is a placeholder.  Requires ``smbprotocol`` (extra: ``smb``).
-    """
+    """Unimplemented storage provider backed directly by an SMB share."""
 
     PROVIDER_ID = "smb"
 

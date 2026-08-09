@@ -1,13 +1,13 @@
 """Mounted-source management — generic Linux/CIFS mount handling.
 
-Deliberately independent of :class:`~romcloud.core.providers.base.StorageProvider`:
+Deliberately independent of :class:`~romcloud.core.storage.StorageProvider`:
 today's hardware source is a CIFS share mounted at a local path and read by
-:class:`~romcloud.core.providers.local.LocalFilesystemProvider` — mounting is
+:class:`~romcloud.infrastructure.providers.local.LocalFilesystemProvider` — mounting is
 an *operational* concern (is the share attached to the filesystem yet?), not
 a *storage-provider* concern (how do I list/read files?). Keeping the two
 separated means a future native ``SMBProvider`` (talking SMB directly, no
 mount required) can replace this module entirely without any change to
-:mod:`~romcloud.core.services.catalog` or :mod:`~romcloud.core.services.cache`.
+:mod:`~romcloud.integrations.batocera.catalog` or :mod:`~romcloud.services.cache`.
 
 Batocera 42 does not ship the ``mountpoint`` command, so mount-state
 detection is done by parsing ``/proc/mounts`` — a facility guaranteed to

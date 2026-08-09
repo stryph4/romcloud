@@ -24,7 +24,7 @@ Design
    ``romcloud-run`` wrappers, the graphical Ports UI, and — only if
    previously enabled — the Batocera mount service script and the
    EmulationStation override) against that same extracted source tree, via
-   :mod:`romcloud.infrastructure.installer` (shared with
+    :mod:`romcloud.lifecycle.install` (shared with
    ``scripts/install.sh`` so neither duplicates this logic). The wrappers
    are required — a failure there fails the whole update; every other
    artifact is reconciled best-effort ("ROMCloud may fail; Batocera must
@@ -75,7 +75,7 @@ from romcloud.core.exceptions import (
     UpdateDownloadError,
     UpdateInstallError,
 )
-from romcloud.infrastructure.installer import DEFAULT_PORTS_DIR as _DEFAULT_PORTS_DIR
+from romcloud.lifecycle.install import DEFAULT_PORTS_DIR as _DEFAULT_PORTS_DIR
 from romcloud.infrastructure.logging import get_logger
 
 log = get_logger("update")

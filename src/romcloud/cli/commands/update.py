@@ -8,7 +8,7 @@ graphical Ports UI, and — only if previously enabled — the Batocera mount
 service script and EmulationStation override) against that same source
 revision. Never touches ``romcloud.toml``, credentials, the catalog
 database, the cache, or logs — see
-:mod:`romcloud.infrastructure.update` for the full design.
+:mod:`romcloud.lifecycle.update` for the full design.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from pathlib import Path
 import click
 
 from romcloud.core.exceptions import ROMCloudError
-from romcloud.infrastructure.update import (
+from romcloud.lifecycle.update import (
     DEFAULT_BRANCH,
     DEFAULT_REPO,
     check_for_update,

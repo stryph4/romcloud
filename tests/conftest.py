@@ -10,10 +10,10 @@ from romcloud.infrastructure.repositories.game import GameRepository
 from romcloud.infrastructure.repositories.cache import CacheRepository
 from romcloud.infrastructure.repositories.proxy import ProxyRepository
 from romcloud.core.models.cache import CachePolicy
-from romcloud.core.providers.local import LocalFilesystemProvider
-from romcloud.core.services.transfer import TransferService
-from romcloud.core.services.cache import CacheService
-from romcloud.core.services.catalog import CatalogService
+from romcloud.infrastructure.providers.local import LocalFilesystemProvider
+from romcloud.services.transfer import TransferService
+from romcloud.services.cache import CacheService
+from romcloud.integrations.batocera.catalog import CatalogService
 
 
 @pytest.fixture

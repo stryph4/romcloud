@@ -1,7 +1,7 @@
 """Interactive SMB source setup wizard — presentation layer only.
 
 All actual discovery/authentication/validation logic lives in
-:class:`romcloud.core.services.smb_discovery.SMBDiscoveryService`. This
+:class:`romcloud.services.smb_discovery.SMBDiscoveryService`. This
 module only prompts the user and renders results with Click — it must
 never perform SMB I/O directly, so a future graphical UI can reuse the same
 service without any duplicated logic.
@@ -21,7 +21,7 @@ from typing import Optional
 
 import click
 
-from romcloud.core.services.smb_discovery import (
+from romcloud.services.smb_discovery import (
     DEFAULT_SMB_PORT,
     SMBCredentials,
     SMBDiscoveryService,

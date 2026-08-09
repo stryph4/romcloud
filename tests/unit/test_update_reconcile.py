@@ -5,7 +5,7 @@ integrations) — not just the venv/package.
 The pip-install step is always faked (never spawns a real venv); the
 reconcile step is routed through the real `_reconcile-install` CLI command
 in-process via Click's CliRunner, so these tests exercise the actual
-reconciliation logic (romcloud.infrastructure.installer) end-to-end without
+reconciliation logic (romcloud.lifecycle.install) end-to-end without
 needing a real venv or system Python.
 """
 
@@ -23,7 +23,7 @@ from click.testing import CliRunner
 
 from romcloud.cli.commands.reconcile import reconcile_install_cmd
 from romcloud.core.exceptions import UpdateInstallError
-from romcloud.infrastructure import update as upd
+from romcloud.lifecycle import update as upd
 
 _SHA = "abc123def456" + "0" * 28
 

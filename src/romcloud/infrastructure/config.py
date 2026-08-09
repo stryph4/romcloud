@@ -47,7 +47,7 @@ class SourceConfig:
     """Storage provider implementation to use — currently always ``"local"``.
 
     ROMCloud has exactly one implemented storage provider
-    (:class:`~romcloud.core.providers.local.LocalFilesystemProvider`). A
+    (:class:`~romcloud.infrastructure.providers.local.LocalFilesystemProvider`). A
     network SMB/CIFS share is mounted locally first (see
     :mod:`romcloud.infrastructure.mount`) and then read through this same
     local provider — ``rom_root`` is its mount point. The native

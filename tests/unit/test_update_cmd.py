@@ -13,7 +13,7 @@ from click.testing import CliRunner
 import romcloud.cli.commands.update as update_cmd_module
 from romcloud.cli.commands.update import update_cmd
 from romcloud.core.exceptions import UpdateDownloadError, UpdateInstallError
-from romcloud.infrastructure.update import BuildInfo, CheckResult, CommitInfo, UpdateResult
+from romcloud.lifecycle.update import BuildInfo, CheckResult, CommitInfo, UpdateResult
 
 
 def _run(args):

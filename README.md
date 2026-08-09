@@ -220,7 +220,7 @@ ROMCloud does not require every system to exist in the remote library. Only syst
 - The artifact-writing logic (`romcloud`/`romcloud-run` wrappers, the
   graphical Ports UI payload, the Batocera mount service script, the
   EmulationStation override) is now implemented once, in
-  `romcloud.infrastructure.installer`, and shared by both
+  `romcloud.lifecycle.install`, and shared by both
   `scripts/install.sh` and `romcloud update` — a fresh install and a later
   self-update always produce byte-identical artifacts from the same source
   revision.
@@ -563,7 +563,7 @@ Password entry shows `*` per character on terminals that support it, and
 falls back to fully hidden input (never plaintext) otherwise.
 
 The reusable discovery/setup logic lives in
-`romcloud.core.services.smb_discovery.SMBDiscoveryService`; both the CLI and
+`romcloud.services.smb_discovery.SMBDiscoveryService`; both the CLI and
 graphical setup bridge use it rather than implementing SMB access in pygame.
 
 Example configuration:

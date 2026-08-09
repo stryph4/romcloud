@@ -1,4 +1,4 @@
-"""Unit tests for romcloud.infrastructure.update — the self-updater.
+"""Unit tests for romcloud.lifecycle.update — the self-updater.
 
 All network and subprocess I/O is faked (injected opener/runner) so these
 tests run fully offline and never touch a real venv or GitHub. See
@@ -20,7 +20,7 @@ from romcloud.core.exceptions import (
     UpdateDownloadError,
     UpdateInstallError,
 )
-from romcloud.infrastructure import update as upd
+from romcloud.lifecycle import update as upd
 
 
 # ── test helpers ──────────────────────────────────────────────────────────────

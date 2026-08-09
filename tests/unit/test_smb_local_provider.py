@@ -18,8 +18,8 @@ import pytest
 
 from romcloud.bootstrap.container import Container
 from romcloud.core.exceptions import ConfigurationError
-from romcloud.core.providers.local import LocalFilesystemProvider
-from romcloud.core.providers.smb import SMBProvider
+from romcloud.infrastructure.providers.local import LocalFilesystemProvider
+from romcloud.infrastructure.providers.smb import SMBProvider
 from romcloud.infrastructure.config import (
     AppConfig,
     CacheConfig,
@@ -144,7 +144,7 @@ class TestHealthcheckDoesNotInvokeSmbProvider:
         def _boom(*args, **kwargs):
             raise AssertionError("SMBProvider must never be constructed")
 
-        monkeypatch.setattr("romcloud.core.providers.smb.SMBProvider.__init__", _boom)
+        monkeypatch.setattr("romcloud.infrastructure.providers.smb.SMBProvider.__init__", _boom)
 
         # This is exactly what `romcloud healthcheck` calls.
         assert container.provider.is_reachable(str(source_root)) is True

@@ -5,7 +5,7 @@ path (the same value ``ports_gfx`` receives everywhere else — see
 ``client.py``) — never a ``romcloud`` import. State is kept in a sibling
 ``ports-gfx-state`` directory next to the installer-managed ``ports-gfx``
 tree, specifically so that a reinstall/update (which wipes and recopies
-``ports-gfx/ports_gfx`` — see ``romcloud.infrastructure.installer``) never
+``ports-gfx/ports_gfx`` — see ``romcloud.lifecycle.install``) never
 destroys a user's custom controller mapping.
 """
 

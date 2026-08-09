@@ -9,7 +9,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from romcloud.core.services.smb_discovery import SMBCredentials, SMBErrorKind, SMBServerTarget
+from romcloud.services.smb_discovery import SMBCredentials, SMBErrorKind, SMBServerTarget
 from romcloud.infrastructure.smb_discovery_client import (
     SmbclientTransport,
     _write_auth_file,

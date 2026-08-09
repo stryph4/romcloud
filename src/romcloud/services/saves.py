@@ -1,6 +1,6 @@
 """Save sync service (stub for v0.1).
 
-Save synchronisation reuses the same :class:`~romcloud.core.providers.base.StorageProvider`
+Save synchronisation reuses the same :class:`~romcloud.core.storage.StorageProvider`
 abstraction as ROM caching.  Save data is NOT disposable — divergent saves are
 always preserved before overwriting.
 

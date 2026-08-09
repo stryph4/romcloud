@@ -201,7 +201,7 @@ PY
 # graphical Ports UI (`ports_gfx`, `romcloud-ports`, the Batocera Port entry
 # script), and — only if already present from a prior install — the
 # Batocera mount service script and ROMCloud's EmulationStation override.
-# Implemented once in romcloud.infrastructure.installer and shared with
+# Implemented once in romcloud.lifecycle.install and shared with
 # `romcloud update`, so a fresh install and a later self-update always
 # produce byte-identical artifacts from the same source revision.
 #

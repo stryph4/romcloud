@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from romcloud.core.services.catalog import CatalogService
+from romcloud.integrations.batocera.catalog import CatalogService
 from romcloud.core.exceptions import ProxyError
 
 

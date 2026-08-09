@@ -30,7 +30,7 @@ from pathlib import Path
 import click
 
 from romcloud.cli.context import get_container
-from romcloud.core.services.graphical_setup import (
+from romcloud.lifecycle.setup import (
     apply_setup,
     discover_shares,
     setup_state,

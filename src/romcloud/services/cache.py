@@ -29,7 +29,7 @@ from romcloud.core.exceptions import (
 )
 from romcloud.core.models.cache import CacheEntry, CachePolicy, CacheStatus
 from romcloud.core.models.game import Game
-from romcloud.core.services.transfer import TransferService
+from romcloud.services.transfer import TransferService
 from romcloud.infrastructure.logging import get_logger
 from romcloud.infrastructure.repositories.cache import CacheRepository
 from romcloud.infrastructure.repositories.game import GameRepository

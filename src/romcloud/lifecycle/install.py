@@ -1,7 +1,7 @@
 """Shared install/update artifact reconciliation.
 
 Both the bootstrap installer (``scripts/install.sh``) and the self-updater
-(:func:`romcloud.infrastructure.update.perform_update`) need to write the
+(:func:`romcloud.lifecycle.update.perform_update`) need to write the
 exact same set of managed runtime artifacts: the ``romcloud``/``romcloud-run``
 wrappers, the optional graphical Ports UI payload (including its
 EmulationStation Ports ``gamelist.xml`` entry/icon), and — only if

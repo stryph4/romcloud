@@ -16,6 +16,8 @@ from __future__ import annotations
 from pathlib import Path
 
 PORTS_GFX_ROOT = Path(__file__).resolve().parents[2] / "ports_gfx"
+BACKEND_ROOT = Path(__file__).resolve().parents[2] / "src" / "romcloud"
+PYPROJECT_PATH = Path(__file__).resolve().parents[2] / "pyproject.toml"
 
 
 def _source_files() -> list[Path]:
@@ -34,6 +36,22 @@ class TestNoRomcloudImports:
                     break
 
         assert offenders == []
+
+
+class TestNoPortsGfxImports:
+    def test_backend_never_imports_ports_gfx_package(self):
+        offenders = []
+        for path in sorted(BACKEND_ROOT.glob("**/*.py")):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if line.strip().startswith(("import ports_gfx", "from ports_gfx")):
+                    offenders.append(str(path))
+                    break
+
+        assert offenders == []
+
+    def test_ports_gfx_is_excluded_from_backend_package_discovery(self):
+        pyproject = PYPROJECT_PATH.read_text(encoding="utf-8")
+        assert 'where = ["src"]' in pyproject
 
 
 class TestSubprocessOnlyBackendBoundary:

@@ -1,4 +1,4 @@
-"""Unit tests for `romcloud.core.services.smb_discovery`.
+"""Unit tests for `romcloud.services.smb_discovery`.
 
 Uses a fake :class:`SMBTransport` — no real network, no real SMB server,
 no subprocess calls. Covers the presentation-agnostic service layer:
@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from romcloud.core.services.smb_discovery import (
+from romcloud.services.smb_discovery import (
     AuthResult,
     ListSharesResult,
     SMBCredentials,

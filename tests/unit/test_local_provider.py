@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from pathlib import Path
 
-from romcloud.core.providers.local import LocalFilesystemProvider
+from romcloud.infrastructure.providers.local import LocalFilesystemProvider
 from romcloud.core.exceptions import ProviderError, ProviderNotReachableError, TransferError
 
 

@@ -16,18 +16,18 @@ from __future__ import annotations
 from typing import Optional
 
 from romcloud.core.models.cache import CachePolicy
-from romcloud.core.providers.base import StorageProvider
-from romcloud.core.providers.local import LocalFilesystemProvider
-from romcloud.core.services.cache import CacheService
-from romcloud.core.services.catalog import CatalogService
-from romcloud.core.services.saves import SaveSyncService
-from romcloud.core.services.transfer import TransferService
+from romcloud.core.storage import StorageProvider
+from romcloud.infrastructure.providers.local import LocalFilesystemProvider
+from romcloud.integrations.batocera.catalog import CatalogService
 from romcloud.infrastructure.config import AppConfig
 from romcloud.infrastructure.database import Database
 from romcloud.infrastructure.repositories.cache import CacheRepository
 from romcloud.infrastructure.repositories.game import GameRepository
 from romcloud.infrastructure.repositories.proxy import ProxyRepository
 from romcloud.core.exceptions import ConfigurationError
+from romcloud.services.cache import CacheService
+from romcloud.services.saves import SaveSyncService
+from romcloud.services.transfer import TransferService
 
 
 class Container:
@@ -145,8 +145,8 @@ class Container:
     # ── helpers ───────────────────────────────────────────────────────────────
 
     def _build_smb_provider(self) -> StorageProvider:
-        from romcloud.core.providers.smb import SMBProvider
         from romcloud.infrastructure.credentials import load_smb_password
+        from romcloud.infrastructure.providers.smb import SMBProvider
 
         smb_cfg = self._config.smb
         if smb_cfg is None:

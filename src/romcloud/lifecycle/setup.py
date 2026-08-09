@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from romcloud.bootstrap.container import Container
-from romcloud.core.services.smb_discovery import SMBCredentials, SMBServerTarget
+from romcloud.services.smb_discovery import SMBCredentials, SMBServerTarget
 from romcloud.infrastructure.atomic_file import atomic_write_text
 from romcloud.infrastructure.config import (
     AppConfig,

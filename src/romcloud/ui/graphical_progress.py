@@ -47,7 +47,7 @@ from typing import Callable, Optional
 
 from romcloud.core.exceptions import ROMCloudError
 from romcloud.core.models.game import Game
-from romcloud.core.services.cache import CacheService
+from romcloud.services.cache import CacheService
 from romcloud.infrastructure.mount_worker import romcloud_home_from_config
 
 LAUNCH_PROGRESS_WRAPPER_NAME = "romcloud-launch-progress"

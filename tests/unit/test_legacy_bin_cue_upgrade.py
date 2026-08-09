@@ -32,7 +32,7 @@ import pytest
 
 from romcloud.core.models.game import Game, GameAsset
 from romcloud.core.models.proxy import ProxyRecord
-from romcloud.core.services.catalog import CatalogService
+from romcloud.integrations.batocera.catalog import CatalogService
 
 
 CUE_TEXT = 'FILE "Game (Track 1).bin" BINARY\nFILE "Game (Track 2).bin" BINARY\n'

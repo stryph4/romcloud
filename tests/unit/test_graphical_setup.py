@@ -6,9 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from romcloud.core.services import graphical_setup
-from romcloud.core.services.graphical_setup import SetupRequest
-from romcloud.core.services.smb_discovery import (
+from romcloud.lifecycle import setup as graphical_setup
+from romcloud.lifecycle.setup import SetupRequest
+from romcloud.services.smb_discovery import (
     AuthResult,
     ListSharesResult,
     SMBErrorKind,
