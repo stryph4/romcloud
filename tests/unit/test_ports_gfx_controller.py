@@ -6,6 +6,7 @@ from __future__ import annotations
 from ports_gfx.actions import Action
 from ports_gfx.controller import (
     ControllerManager,
+    ControllerProfile,
     direction_from_axes,
     direction_from_hat,
     get_identity,
@@ -337,3 +338,145 @@ class TestSnapshotFields:
         assert snap.axis_x == 1.0
         assert snap.last_action == Action.RIGHT
         assert snap.instance_id == 1
+
+
+class TestRawPrimaryOnRecognizedGameController:
+    """Raw JOY* events must always be handled, even for a device SDL
+    recognizes as a game controller — this is the actual Batocera hardware
+    fix: pygame.controller detects the pad but its CONTROLLER* events don't
+    reliably arrive, so raw joystick events must still drive navigation."""
+
+    def test_joy_hat_navigates_on_recognized_game_controller(self):
+        pygame = make_fake_pygame(joysticks={0: FakeJoystick(guid="gc1")}, controller_indices=frozenset({0}))
+        manager = ControllerManager(pygame)
+        manager.handle_event(_added_event(pygame, 0, use_controller=True))
+
+        hat_up = FakeEvent(type=pygame.JOYHATMOTION, instance_id=1, value=(0, 1))
+        assert manager.handle_event(hat_up) == Action.UP
+
+    def test_joy_axis_navigates_past_deadzone_on_recognized_game_controller(self):
+        pygame = make_fake_pygame(joysticks={0: FakeJoystick(guid="gc2")}, controller_indices=frozenset({0}))
+        manager = ControllerManager(pygame, deadzone=0.5)
+        manager.handle_event(_added_event(pygame, 0, use_controller=True))
+
+        small = FakeEvent(type=pygame.JOYAXISMOTION, instance_id=1, axis=0, value=5000)
+        assert manager.handle_event(small) is None
+
+        big = FakeEvent(type=pygame.JOYAXISMOTION, instance_id=1, axis=0, value=30000)
+        assert manager.handle_event(big) == Action.RIGHT
+
+    def test_joy_axis_repeat_and_release_on_recognized_game_controller(self):
+        pygame = make_fake_pygame(joysticks={0: FakeJoystick(guid="gc2b")}, controller_indices=frozenset({0}))
+        manager = ControllerManager(pygame, deadzone=0.5)
+        manager.handle_event(_added_event(pygame, 0, use_controller=True))
+        manager.handle_event(FakeEvent(type=pygame.JOYAXISMOTION, instance_id=1, axis=1, value=-30000))
+
+        assert manager.update(0.1) == []
+        assert manager.update(0.4) == [Action.UP]
+
+        manager.handle_event(FakeEvent(type=pygame.JOYAXISMOTION, instance_id=1, axis=1, value=0))
+        assert manager.update(1.0) == []
+
+    def test_joy_button_down_uses_generic_raw_fallback_on_recognized_game_controller(self):
+        pygame = make_fake_pygame(joysticks={0: FakeJoystick(guid="gc3")}, controller_indices=frozenset({0}))
+        manager = ControllerManager(pygame)
+        manager.handle_event(_added_event(pygame, 0, use_controller=True))
+
+        confirm = FakeEvent(type=pygame.JOYBUTTONDOWN, instance_id=1, button=0)
+        assert manager.handle_event(confirm) == Action.CONFIRM
+
+    def test_joy_button_up_clears_held_direction_on_recognized_game_controller(self):
+        profile = ControllerProfile(name="Test Pad", button_actions={7: Action.UP})
+        pygame = make_fake_pygame(joysticks={0: FakeJoystick(guid="gc4")}, controller_indices=frozenset({0}))
+        manager = ControllerManager(pygame, profiles={"gc4": profile})
+        manager.handle_event(_added_event(pygame, 0, use_controller=True))
+
+        down = FakeEvent(type=pygame.JOYBUTTONDOWN, instance_id=1, button=7)
+        assert manager.handle_event(down) == Action.UP
+
+        up = FakeEvent(type=pygame.JOYBUTTONUP, instance_id=1, button=7)
+        manager.handle_event(up)
+        assert manager.update(1.0) == []
+
+
+class TestControllerProfiles:
+    """GUID-keyed raw button/axis overrides, injected via the ``profiles``
+    constructor param — isolated from any real built-in profile table."""
+
+    def test_profile_selected_by_guid_maps_unusual_raw_button(self):
+        profile = ControllerProfile(name="Known Pad", button_actions={42: Action.MENU})
+        pygame = make_fake_pygame(joysticks={0: FakeJoystick(guid="known-guid")}, controller_indices=frozenset())
+        manager = ControllerManager(pygame, profiles={"known-guid": profile})
+        manager.handle_event(_added_event(pygame, 0))
+
+        event = FakeEvent(type=pygame.JOYBUTTONDOWN, instance_id=1, button=42)
+        assert manager.handle_event(event) == Action.MENU
+
+    def test_profile_selected_by_guid_maps_unusual_raw_axis(self):
+        profile = ControllerProfile(name="Known Pad", axis_names={2: "x"})
+        pygame = make_fake_pygame(joysticks={0: FakeJoystick(guid="known-guid-2")}, controller_indices=frozenset())
+        manager = ControllerManager(pygame, deadzone=0.5, profiles={"known-guid-2": profile})
+        manager.handle_event(_added_event(pygame, 0))
+
+        event = FakeEvent(type=pygame.JOYAXISMOTION, instance_id=1, axis=2, value=30000)
+        assert manager.handle_event(event) == Action.RIGHT
+
+    def test_unknown_guid_without_profile_leaves_unusual_raw_axis_unmapped(self):
+        pygame = make_fake_pygame(joysticks={0: FakeJoystick(guid="no-profile-guid")}, controller_indices=frozenset())
+        manager = ControllerManager(pygame, deadzone=0.5)
+        manager.handle_event(_added_event(pygame, 0))
+
+        event = FakeEvent(type=pygame.JOYAXISMOTION, instance_id=1, axis=2, value=30000)
+        assert manager.handle_event(event) is None
+
+    def test_custom_mapping_overrides_profile(self):
+        profile = ControllerProfile(name="Known Pad", button_actions={7: Action.UP})
+
+        def loader(key):
+            return {"button": {"7": "down"}} if key == "guid:known-guid-3" else None
+
+        pygame = make_fake_pygame(joysticks={0: FakeJoystick(guid="known-guid-3")}, controller_indices=frozenset())
+        manager = ControllerManager(pygame, load_mapping=loader, profiles={"known-guid-3": profile})
+        manager.handle_event(_added_event(pygame, 0))
+
+        event = FakeEvent(type=pygame.JOYBUTTONDOWN, instance_id=1, button=7)
+        assert manager.handle_event(event) == Action.DOWN
+
+
+class TestDuplicateJoyControllerEvents:
+    """SDL emits both a raw JOY* event and a mirrored CONTROLLER* event for
+    the same physical press on a recognized game controller — once the raw
+    stream has been observed, the mirrored one must be ignored so one
+    physical input never produces two actions."""
+
+    def test_mirrored_controller_button_after_joy_button_is_suppressed(self):
+        pygame = make_fake_pygame(joysticks={0: FakeJoystick(guid="dup1")}, controller_indices=frozenset({0}))
+        manager = ControllerManager(pygame)
+        manager.handle_event(_added_event(pygame, 0, use_controller=True))
+
+        joy_confirm = FakeEvent(type=pygame.JOYBUTTONDOWN, instance_id=1, button=0)
+        assert manager.handle_event(joy_confirm) == Action.CONFIRM
+
+        mirrored = FakeEvent(type=pygame.CONTROLLERBUTTONDOWN, instance_id=1, button=pygame.CONTROLLER_BUTTON_A)
+        assert manager.handle_event(mirrored) is None
+
+    def test_mirrored_controller_axis_after_joy_axis_is_suppressed(self):
+        pygame = make_fake_pygame(joysticks={0: FakeJoystick(guid="dup2")}, controller_indices=frozenset({0}))
+        manager = ControllerManager(pygame, deadzone=0.5)
+        manager.handle_event(_added_event(pygame, 0, use_controller=True))
+
+        joy_axis = FakeEvent(type=pygame.JOYAXISMOTION, instance_id=1, axis=0, value=30000)
+        assert manager.handle_event(joy_axis) == Action.RIGHT
+
+        mirrored = FakeEvent(
+            type=pygame.CONTROLLERAXISMOTION, instance_id=1, axis=pygame.CONTROLLER_AXIS_LEFTX, value=30000
+        )
+        assert manager.handle_event(mirrored) is None
+
+    def test_controller_event_still_works_before_any_joy_event_seen(self):
+        pygame = make_fake_pygame(joysticks={0: FakeJoystick(guid="dup3")}, controller_indices=frozenset({0}))
+        manager = ControllerManager(pygame)
+        manager.handle_event(_added_event(pygame, 0, use_controller=True))
+
+        confirm = FakeEvent(type=pygame.CONTROLLERBUTTONDOWN, instance_id=1, button=pygame.CONTROLLER_BUTTON_A)
+        assert manager.handle_event(confirm) == Action.CONFIRM

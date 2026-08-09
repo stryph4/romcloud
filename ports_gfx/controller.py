@@ -2,28 +2,43 @@
 
 Design
 ------
-Prefers SDL's logical "game controller" abstraction (exposed by pygame as
-``pygame.controller``, wrapping ``SDL_GameController``) over raw joystick
-button/axis indices. SDL ships a community-maintained controller database
-mapping thousands of physical HID layouts (Xbox, PlayStation, Switch-style,
-and many generic/no-name pads) onto one standard logical layout — ``A``/
-``B``/``X``/``Y``, a D-pad, ``LEFTX``/``LEFTY`` for the left stick, etc.
-Consuming that logical layout (via the *names* of pygame's own
-``CONTROLLER_*`` constants, read off whatever ``pygame`` module is passed
-in) means this module never hardcodes a raw button number for a specific
-pad model.
+Raw joystick input (SDL's original ``JOYBUTTONDOWN``/``JOYBUTTONUP``/
+``JOYAXISMOTION``/``JOYHATMOTION`` events, exposed by pygame as
+``pygame.joystick``) is the **primary** Batocera compatibility path: real
+Batocera 42 hardware testing found that ``pygame.controller``
+(``SDL_GameController``) detects a connected pad but does not reliably
+deliver its higher-level ``CONTROLLER*`` events, leaving the UI
+unresponsive even though the device is visible. Raw joystick events, by
+contrast, are always emitted by SDL for any opened joystick — so every
+device is opened via ``pygame.joystick.Joystick`` first and its raw events
+are always handled, regardless of whether SDL also recognizes it as a
+"game controller".
 
-If a connected joystick is *not* SDL-recognized as a game controller (or
-this pygame build lacks the ``controller`` module entirely — some minimal
-SDL builds omit it), a small raw-index fallback is used instead — enabled
-per-controller, and always overridable via a persisted custom mapping (see
-``controller_config.py``), never the primary design.
+``pygame.controller``/``CONTROLLER*`` events remain a **secondary** input
+source — useful on builds/devices where they *do* work, and for pads whose
+raw button/axis numbering isn't otherwise known. They are still translated
+via the logical ``CONTROLLER_BUTTON_*``/``CONTROLLER_AXIS_*`` constant
+names (never a hardcoded number). To avoid dispatching the same physical
+input twice when SDL emits both event families for one press (game
+controllers are always joystick devices too), a device stops honoring its
+``CONTROLLER*`` stream the first time a raw ``JOY*`` event is observed for
+it — raw events always win and are never suppressed.
 
-Controller identity for persistence/mapping purposes is the SDL GUID when
-available (stable across reconnects and even across machines for the same
-model), falling back to the device name string when a GUID can't be read —
-never the transient per-session joystick/instance index, which is reused
-and reassigned across hot-plug events and therefore useless as a key.
+Raw button/axis numbering for a *specific* pad model can be supplied via a
+:class:`ControllerProfile`, looked up by SDL GUID and isolated from the
+generic dispatch logic (see :data:`CONTROLLER_PROFILES`) — but only ever
+added once real hardware capture confirms the numbers (see
+``input_debug.py``), never guessed. Everything else (an unrecognized
+controller with no profile) still works through the generic raw fallback
+plus per-user remapping (see ``controller_config.py``), which always takes
+priority over both a profile and the generic default.
+
+Controller identity for persistence/mapping/profile-lookup purposes is the
+SDL GUID when available (stable across reconnects and even across machines
+for the same model), falling back to the device name string when a GUID
+can't be read — never the transient per-session joystick/instance index,
+which is reused and reassigned across hot-plug events and therefore
+useless as a key.
 """
 
 from __future__ import annotations
@@ -56,12 +71,44 @@ _LOGICAL_AXIS_NAMES: dict[str, str] = {
     "CONTROLLER_AXIS_LEFTY": "y",
 }
 
-# Raw joystick fallback for pads SDL doesn't recognize as a game
-# controller: a common-enough default (axis 0/1 = left stick, hat 0 =
-# D-pad, button 0/1 = confirm/back) that the Controller Test screen lets a
-# user override per-device via a persisted custom mapping.
+# Raw joystick fallback used generically for any pad — including one SDL
+# recognizes as a game controller, since raw JOY* events are now always the
+# primary path (see module docstring): a common-enough default (axis 0/1 =
+# left stick, button 0/1 = confirm/back) that the Controller Test screen
+# lets a user override per-device via a persisted custom mapping. A
+# per-model :class:`ControllerProfile` can supply a better default before
+# falling back to these.
 RAW_FALLBACK_AXIS_INDEX = {0: "x", 1: "y"}
 RAW_FALLBACK_BUTTON_ACTIONS: dict[int, Action] = {0: Action.CONFIRM, 1: Action.BACK}
+
+
+@dataclass(frozen=True)
+class ControllerProfile:
+    """Optional raw button/axis numbering for a *specific* pad model,
+    looked up by SDL GUID (see :data:`CONTROLLER_PROFILES`).
+
+    Deliberately isolated from the rest of ``ControllerManager``: adding,
+    editing, or removing a profile never touches the generic dispatch
+    logic. A profile only ever supplies a *default* — it sits between the
+    generic raw fallback and a user's persisted custom mapping, which
+    always wins regardless of whether a profile exists for the device.
+    """
+
+    name: str
+    button_actions: dict[int, Action] = field(default_factory=dict)
+    axis_names: dict[int, str] = field(default_factory=dict)
+
+
+# Built-in profiles, keyed by SDL GUID string. Intentionally empty: a
+# profile must only be added here once a real device's raw button/axis/hat
+# numbering has actually been captured (run with
+# ``ROMCLOUD_PORTS_GFX_INPUT_DEBUG=1`` — see ``input_debug.py`` — and read
+# the resulting log), never guessed from a similar-looking GUID or an
+# unrelated project's mapping string. Until then, every controller —
+# including the Steam Deck's built-in pad — works through the generic raw
+# fallback above plus per-user remapping, same as any other unrecognized
+# device.
+CONTROLLER_PROFILES: dict[str, ControllerProfile] = {}
 
 
 def _attr_map(pygame, names: dict[str, "object"]) -> dict[int, "object"]:  # noqa: ANN001
@@ -179,13 +226,20 @@ class ControllerSnapshot:
 class _DeviceState:
     identity: ControllerIdentity
     is_game_controller: bool
-    device: object
+    joystick: object
+    controller: Optional[object] = None
+    profile: Optional[ControllerProfile] = None
     custom_mapping: dict = field(default_factory=dict)
     repeater: HeldDirectionRepeater = field(default_factory=HeldDirectionRepeater)
     axis_x: float = 0.0
     axis_y: float = 0.0
     last_action: Optional[Action] = None
     using_custom_mapping: bool = False
+    seen_joy_event: bool = False
+    """Set the first time a raw ``JOY*`` event arrives for this device;
+    once ``True``, its ``CONTROLLER*`` event stream is treated as a
+    duplicate mirror of the same physical input and ignored (see
+    :meth:`ControllerManager.handle_event`)."""
 
 
 @dataclass(frozen=True)
@@ -213,11 +267,13 @@ class ControllerManager:
         deadzone: float = DEFAULT_DEADZONE,
         load_mapping: Optional[ConfigLoader] = None,
         save_mapping: Optional[ConfigSaver] = None,
+        profiles: Optional[dict[str, ControllerProfile]] = None,
     ) -> None:
         self._pygame = pygame
         self._deadzone = deadzone
         self._load_mapping = load_mapping or (lambda key: None)
         self._save_mapping = save_mapping or (lambda key, mapping: None)
+        self._profiles = CONTROLLER_PROFILES if profiles is None else profiles
         self._button_action_map = build_logical_button_action_map(pygame)
         self._axis_map = build_logical_axis_map(pygame)
         self._devices: dict[int, _DeviceState] = {}
@@ -227,29 +283,16 @@ class ControllerManager:
 
     def _open_device(self, device_index: int) -> None:
         pygame = self._pygame
-        controller_module = getattr(pygame, "controller", None)
-        is_game_controller = False
-        device = None
-
-        if controller_module is not None:
-            try:
-                if controller_module.is_controller(device_index):
-                    device = controller_module.Controller(device_index)
-                    is_game_controller = True
-            except Exception:  # noqa: BLE001 — degrade to raw joystick below
-                device = None
-                is_game_controller = False
-
-        if device is None:
-            try:
-                device = pygame.joystick.Joystick(device_index)
-                if hasattr(device, "init"):
-                    device.init()
-            except Exception:  # noqa: BLE001 — a device that can't even open is simply ignored
-                return
 
         try:
-            instance_id = device.get_instance_id()
+            joystick = pygame.joystick.Joystick(device_index)
+            if hasattr(joystick, "init"):
+                joystick.init()
+        except Exception:  # noqa: BLE001 — a device that can't even open is simply ignored
+            return
+
+        try:
+            instance_id = joystick.get_instance_id()
         except Exception:  # noqa: BLE001
             instance_id = device_index
 
@@ -260,12 +303,32 @@ class ControllerManager:
             # harmless duplicate "added" notification.
             return
 
-        identity = get_identity(device)
+        # pygame.controller is opened only as a *secondary*, best-effort
+        # handle — the raw joystick above is always the primary, required
+        # one (see module docstring).
+        is_game_controller = False
+        controller = None
+        controller_module = getattr(pygame, "controller", None)
+        if controller_module is not None:
+            try:
+                if controller_module.is_controller(device_index):
+                    is_game_controller = True
+                    try:
+                        controller = controller_module.Controller(device_index)
+                    except Exception:  # noqa: BLE001 — raw joystick handle above still works
+                        controller = None
+            except Exception:  # noqa: BLE001
+                is_game_controller = False
+
+        identity = get_identity(joystick)
         custom_mapping = self._load_mapping(identity.key) or {}
+        profile = self._profiles.get(identity.guid) if identity.guid else None
         self._devices[instance_id] = _DeviceState(
             identity=identity,
             is_game_controller=is_game_controller,
-            device=device,
+            joystick=joystick,
+            controller=controller,
+            profile=profile,
             custom_mapping=custom_mapping,
             using_custom_mapping=bool(custom_mapping),
         )
@@ -344,25 +407,55 @@ class ControllerManager:
         if device is None:
             return None
 
-        if event_type in (getattr(pygame, "CONTROLLERBUTTONDOWN", object()), getattr(pygame, "JOYBUTTONDOWN", object())):
-            return self._handle_button_down(instance_id, device, event.button)
+        joy_button_down = getattr(pygame, "JOYBUTTONDOWN", object())
+        joy_button_up = getattr(pygame, "JOYBUTTONUP", object())
+        joy_axis = getattr(pygame, "JOYAXISMOTION", object())
+        joy_hat = getattr(pygame, "JOYHATMOTION", object())
+        controller_button_down = getattr(pygame, "CONTROLLERBUTTONDOWN", object())
+        controller_button_up = getattr(pygame, "CONTROLLERBUTTONUP", object())
+        controller_axis = getattr(pygame, "CONTROLLERAXISMOTION", object())
 
-        if event_type in (getattr(pygame, "CONTROLLERBUTTONUP", object()), getattr(pygame, "JOYBUTTONUP", object())):
-            self._handle_button_up(device, event.button)
+        if event_type in (joy_button_down, joy_button_up, joy_axis, joy_hat):
+            # Raw joystick events are the primary path (see module
+            # docstring) — always processed, and they mark this device as
+            # one whose CONTROLLER* stream (if any) is now a duplicate.
+            device.seen_joy_event = True
+        elif event_type in (controller_button_down, controller_button_up, controller_axis) and device.seen_joy_event:
+            # This device's raw JOY* events already work; ignore the
+            # higher-level mirror of the same physical input rather than
+            # dispatching it twice.
             return None
 
-        if event_type == getattr(pygame, "CONTROLLERAXISMOTION", object()):
+        if event_type == joy_button_down:
+            return self._handle_button_down(instance_id, device, event.button, raw=True)
+        if event_type == controller_button_down:
+            return self._handle_button_down(instance_id, device, event.button, raw=False)
+
+        if event_type == joy_button_up:
+            self._handle_button_up(device, event.button, raw=True)
+            return None
+        if event_type == controller_button_up:
+            self._handle_button_up(device, event.button, raw=False)
+            return None
+
+        if event_type == joy_axis:
+            return self._handle_axis(device, self._resolve_raw_axis_name(device, event.axis), event.value)
+        if event_type == controller_axis:
             return self._handle_axis(device, self._axis_map.get(event.axis), event.value)
 
-        if event_type == getattr(pygame, "JOYAXISMOTION", object()) and not device.is_game_controller:
-            return self._handle_axis(device, RAW_FALLBACK_AXIS_INDEX.get(event.axis), event.value)
-
-        if event_type == getattr(pygame, "JOYHATMOTION", object()) and not device.is_game_controller:
+        if event_type == joy_hat:
             return self._handle_hat(instance_id, device, event.value)
 
         return None
 
-    def _resolve_button_action(self, device: _DeviceState, button: int) -> Optional[Action]:
+    def _resolve_raw_axis_name(self, device: _DeviceState, axis_index: int) -> Optional[str]:
+        if device.profile is not None:
+            name = device.profile.axis_names.get(axis_index)
+            if name is not None:
+                return name
+        return RAW_FALLBACK_AXIS_INDEX.get(axis_index)
+
+    def _resolve_button_action(self, device: _DeviceState, button: int, *, raw: bool) -> Optional[Action]:
         custom = device.custom_mapping.get("button", {})
         custom_value = custom.get(str(button))
         if custom_value is not None:
@@ -370,14 +463,22 @@ class ControllerManager:
                 return Action(custom_value)
             except ValueError:
                 pass
-        if device.is_game_controller:
-            return self._button_action_map.get(button)
-        return RAW_FALLBACK_BUTTON_ACTIONS.get(button)
 
-    def _handle_button_down(self, instance_id: int, device: _DeviceState, button: int) -> Optional[Action]:
+        if raw:
+            if device.profile is not None:
+                profile_action = device.profile.button_actions.get(button)
+                if profile_action is not None:
+                    return profile_action
+            return RAW_FALLBACK_BUTTON_ACTIONS.get(button)
+
+        return self._button_action_map.get(button)
+
+    def _handle_button_down(
+        self, instance_id: int, device: _DeviceState, button: int, *, raw: bool
+    ) -> Optional[Action]:
         if self._capture_remap(instance_id, "button", str(button)):
             return None
-        action = self._resolve_button_action(device, button)
+        action = self._resolve_button_action(device, button, raw=raw)
         if action is None:
             return None
         device.last_action = action
@@ -385,8 +486,8 @@ class ControllerManager:
             device.repeater.press(ACTION_DIRECTIONS[action])
         return action
 
-    def _handle_button_up(self, device: _DeviceState, button: int) -> None:
-        action = self._resolve_button_action(device, button)
+    def _handle_button_up(self, device: _DeviceState, button: int, *, raw: bool) -> None:
+        action = self._resolve_button_action(device, button, raw=raw)
         if action in ACTION_DIRECTIONS and device.repeater.held_direction == ACTION_DIRECTIONS[action]:
             device.repeater.release()
 
