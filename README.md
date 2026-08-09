@@ -105,7 +105,54 @@ ROMCloud does not require every system to exist in the remote library. Only syst
 
 - UI status: a full graphical cache-miss progress/management UI is NOT
   implemented yet. The current terminal/TUI progress is a convenience
-  fallback and is not intended to represent the final graphical UX.
+  fallback and is not intended to represent the final graphical UX. A
+  graphical **Ports** menu is now available — see "Graphical Ports UI"
+  below; the cache-miss transfer screen itself is still curses/plain-text
+  only.
+
+---
+
+## Graphical Ports UI (v0.3.0)
+
+ROMCloud now ships an optional graphical menu (Catalog Status, Refresh
+Catalog, Health Check, Cache Status) launched as a Batocera **Port**
+(`/userdata/roms/ports/ROMCloud.sh`), instead of only the controller-friendly
+curses menu.
+
+**Why it runs outside ROMCloud's venv:** Batocera 42 ships pygame/SDL in its
+own system Python (confirmed on real hardware: pygame 2.5.2 / SDL 2.32.8),
+but ROMCloud's isolated venv deliberately never installs pygame and never
+enables `--system-site-packages` (that would leak Batocera's entire system
+site-packages into ROMCloud's dependency tree). Instead:
+
+```text
+Batocera system Python (pygame/SDL)          ROMCloud's isolated venv
+        │                                            │
+        ▼                                            ▼
+   ports_gfx/  ── subprocess ──►  romcloud uidata <action>  ── JSON ──► catalog / cache / config
+   (no romcloud imports)                (hidden CLI command group)
+```
+
+- `ports_gfx/` is a small, self-contained, pure-Python + pygame source tree
+  that **never imports anything from the `romcloud` package**. It is copied
+  (not pip-installed) by `scripts/install.sh` to
+  `${ROMCLOUD_HOME}/ports-gfx/ports_gfx` and run directly with the detected
+  system Python — completely independent of the venv.
+- The only way `ports_gfx` reaches ROMCloud's backend is by shelling out to
+  `romcloud uidata <action>` (a hidden CLI command group) and parsing a
+  single JSON object from its stdout. This is a deliberate, enforced process
+  boundary — see `ports_gfx/client.py` and
+  `src/romcloud/cli/commands/uidata.py`.
+- Install is entirely best-effort: if no system Python with `pygame`
+  importable is found, the graphical Ports UI is simply not installed and
+  the rest of ROMCloud (CLI, curses TUI, mount service, etc.) is completely
+  unaffected.
+
+**Assumption requiring real hardware validation:** the installer looks for
+`/usr/bin/python3` first, then falls back to whatever `python3` resolves to
+on `PATH`, and verifies `import pygame` succeeds under it. This has not yet
+been re-confirmed against a fresh Batocera 42 image by this exact detection
+logic (only the underlying pygame/SDL versions were confirmed present).
 
 ---
 

@@ -67,6 +67,7 @@ from romcloud.cli.commands.saves import saves_group
 from romcloud.cli.commands.update import update_cmd
 from romcloud.cli.commands.es import es_group
 from romcloud.cli.commands.mount import mount_group
+from romcloud.cli.commands.uidata import uidata_group
 
 cli.add_command(configure_cmd, name="configure")
 cli.add_command(refresh_cmd, name="refresh")
@@ -78,6 +79,7 @@ cli.add_command(saves_group, name="saves")
 cli.add_command(update_cmd, name="update")
 cli.add_command(es_group, name="es")
 cli.add_command(mount_group, name="mount")
+cli.add_command(uidata_group, name="uidata")
 
 
 if __name__ == "__main__":

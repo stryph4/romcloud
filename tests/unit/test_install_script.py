@@ -389,3 +389,126 @@ def test_rerun_is_idempotent(installed: InstalledLayout) -> None:
     assert "Virtual environment already exists" in result.stdout
     assert config_file.read_text() == "# user customized\n"
     assert venv_marker.exists(), "existing venv must be reused, not recreated"
+
+
+# ── graphical Ports UI (runs under Batocera's system Python, not the venv) ───
+#
+# Real hardware fact: Batocera 42 ships pygame 2.5.2 / SDL 2.32.8 in its OWN
+# system Python. ROMCloud's venv must never gain a pygame dependency (no pip
+# install, no --system-site-packages) — the graphical Ports app is instead
+# copied (not pip-installed) to its own directory and run directly with the
+# detected system Python. These tests use small fake "system python" stub
+# scripts so the outcome never depends on whether pygame actually happens to
+# be installed on the machine running the test suite.
+
+
+def _write_fake_system_python(tmp_path: Path, *, has_pygame: bool) -> Path:
+    stub = tmp_path / ("fake-system-python-with-pygame" if has_pygame else "fake-system-python-no-pygame")
+    exit_code = "0" if has_pygame else "1"
+    stub.write_text(
+        "#!/bin/bash\n"
+        'if [[ "$1" == "-c" && "$2" == "import pygame" ]]; then\n'
+        f"    exit {exit_code}\n"
+        "fi\n"
+        'exec /usr/bin/python3 "$@"\n'
+    )
+    stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+    return stub
+
+
+class TestGraphicalPortsUiInstall:
+    def test_installed_when_system_python_has_pygame(self, tmp_path: Path) -> None:
+        home = tmp_path / "romcloud"
+        ports_dir = tmp_path / "ports"
+        ports_dir.mkdir()
+        fake_python = _write_fake_system_python(tmp_path, has_pygame=True)
+
+        result = _run_install(
+            {
+                "ROMCLOUD_HOME": str(home),
+                "CACHE_ROOT": str(tmp_path / "cache"),
+                "LOCAL_ROMS": str(tmp_path / "roms"),
+                "ROMCLOUD_SYSTEM_PYTHON": str(fake_python),
+                "ROMCLOUD_PORTS_DIR": str(ports_dir),
+            }
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "Wrote graphical Ports wrapper" in result.stdout
+
+        wrapper = home / "bin" / "romcloud-ports"
+        assert wrapper.exists()
+        content = wrapper.read_text()
+        assert f'exec "{fake_python}" -m ports_gfx "$@"' in content
+        assert f'export PYTHONPATH="{home}/ports-gfx' in content
+        assert f'export ROMCLOUD_BIN="{home}/bin/romcloud"' in content
+
+        assert (home / "ports-gfx" / "ports_gfx" / "client.py").exists()
+        assert (home / "ports-gfx" / "ports_gfx" / "app.py").exists()
+
+        ports_script = ports_dir / "ROMCloud.sh"
+        assert ports_script.exists()
+        assert f'exec "{wrapper}" "$@"' in ports_script.read_text()
+
+    def test_skipped_cleanly_when_system_python_lacks_pygame(self, tmp_path: Path) -> None:
+        home = tmp_path / "romcloud"
+        fake_python = _write_fake_system_python(tmp_path, has_pygame=False)
+
+        result = _run_install(
+            {
+                "ROMCLOUD_HOME": str(home),
+                "CACHE_ROOT": str(tmp_path / "cache"),
+                "LOCAL_ROMS": str(tmp_path / "roms"),
+                "ROMCLOUD_SYSTEM_PYTHON": str(fake_python),
+            }
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "Skipping graphical Ports UI" in result.stdout
+        assert not (home / "bin" / "romcloud-ports").exists()
+        assert not (home / "ports-gfx").exists()
+
+    def test_ports_dir_missing_skips_launcher_but_not_wrapper(self, tmp_path: Path) -> None:
+        home = tmp_path / "romcloud"
+        fake_python = _write_fake_system_python(tmp_path, has_pygame=True)
+        missing_ports_dir = tmp_path / "does-not-exist" / "ports"
+
+        result = _run_install(
+            {
+                "ROMCLOUD_HOME": str(home),
+                "CACHE_ROOT": str(tmp_path / "cache"),
+                "LOCAL_ROMS": str(tmp_path / "roms"),
+                "ROMCLOUD_SYSTEM_PYTHON": str(fake_python),
+                "ROMCLOUD_PORTS_DIR": str(missing_ports_dir),
+            }
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert (home / "bin" / "romcloud-ports").exists()
+        assert not missing_ports_dir.exists()
+        assert "skipped Batocera Port entry" in result.stdout
+
+    def test_ports_gfx_never_imports_romcloud_package(self) -> None:
+        """Enforced boundary: the copied source tree must never import the
+        `romcloud` package — it must be reachable purely via `romcloud
+        uidata <action>` subprocess calls."""
+        ports_gfx_dir = REPO_ROOT / "ports_gfx"
+        for py_file in ports_gfx_dir.glob("*.py"):
+            for line in py_file.read_text().splitlines():
+                stripped = line.strip()
+                assert not stripped.startswith("import romcloud"), f"{py_file} must not import romcloud"
+                assert not stripped.startswith("from romcloud"), f"{py_file} must not import romcloud"
+
+    def test_reinstall_is_idempotent_for_ports_gfx(self, tmp_path: Path) -> None:
+        home = tmp_path / "romcloud"
+        fake_python = _write_fake_system_python(tmp_path, has_pygame=True)
+        env = {
+            "ROMCLOUD_HOME": str(home),
+            "CACHE_ROOT": str(tmp_path / "cache"),
+            "LOCAL_ROMS": str(tmp_path / "roms"),
+            "ROMCLOUD_SYSTEM_PYTHON": str(fake_python),
+        }
+
+        first = _run_install(env)
+        assert first.returncode == 0, first.stdout + first.stderr
+
+        second = _run_install(env)
+        assert second.returncode == 0, second.stdout + second.stderr
+        assert (home / "ports-gfx" / "ports_gfx" / "client.py").exists()
