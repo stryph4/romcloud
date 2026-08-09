@@ -166,7 +166,11 @@ class CatalogService:
 
         First looks up the game_id in SQLite.  If the database entry is
         missing, falls back to reconstructing a :class:`Game` from the proxy
-        file's JSON payload.
+        file's JSON payload. Either way, if the resolved game's launch asset
+        is a ``.cue``, its companion-asset list is reconciled against the
+        *current* source before being returned — see
+        :meth:`_reconcile_cue_assets` for why this can't wait for the next
+        ``romcloud refresh``.
 
         Raises :class:`~romcloud.core.exceptions.ProxyError` if the file is
         not a valid ROMCloud proxy.
@@ -188,16 +192,65 @@ class CatalogService:
 
         # Primary: SQLite lookup.
         game = self._game_repo.get(game_id)
-        if game is not None:
+        if game is None:
+            # Fallback: reconstruct from proxy payload (DB may be missing/rebuilt).
+            log.warning(
+                "game_id %s not in DB — reconstructing from proxy file %s",
+                game_id,
+                proxy_path,
+            )
+            game = self._game_from_proxy_payload(game_id, payload)
+
+        return self._reconcile_cue_assets(game)
+
+    def _reconcile_cue_assets(self, game: Game) -> Game:
+        """Self-heal a legacy/stale companion-asset list at resolve time.
+
+        A catalog row created before cue-dependency parsing existed (or one
+        a `romcloud refresh` simply hasn't reprocessed yet since upgrading)
+        may still list the ``.cue`` as its *only* asset. Cache-hit
+        completeness only ever checks the assets a `Game` currently claims
+        to have (see `CacheService.is_cached`) — so if the catalog itself
+        doesn't yet know about the required companion tracks, a genuinely
+        incomplete legacy cache would be silently treated as a full hit at
+        launch, without waiting for a `romcloud refresh` to have run first.
+
+        This re-derives the cue's companions from the *current* source
+        (identical logic to fresh discovery — see `_build_cue_assets`) every
+        time a proxy is resolved, and persists the corrected asset list
+        in place (same `game.id` — pinning/cache history untouched) whenever
+        it differs from what's already catalogued. Any failure degrades to
+        returning the catalog's existing (possibly stale) assets rather than
+        blocking resolution — "ROMCloud may fail; Batocera must not".
+        """
+        primary = game.primary_asset
+        if primary is None or Path(primary.filename).suffix.lower() != _CUE_EXTENSION:
             return game
 
-        # Fallback: reconstruct from proxy payload (DB may be missing/rebuilt).
-        log.warning(
-            "game_id %s not in DB — reconstructing from proxy file %s",
-            game_id,
-            proxy_path,
-        )
-        return self._game_from_proxy_payload(game_id, payload)
+        try:
+            assets, _warnings = self._build_cue_assets(game.system, primary.relative_path)
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "Cue reconciliation failed for %s (%s) — using existing catalog assets",
+                game.id,
+                primary.relative_path,
+            )
+            return game
+
+        if assets is None or not _asset_paths_differ(game.assets, assets):
+            return game
+
+        game.assets = assets
+        try:
+            self._game_repo.save(game)
+            log.info(
+                "Reconciled stale legacy asset list for %r (%s) at resolve time",
+                game.title,
+                game.id,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("Failed to persist reconciled asset list for %s", game.id)
+        return game
 
     def remove_proxy(self, game_id: str) -> None:
         """Remove the proxy file and catalog entry for *game_id*.
@@ -259,9 +312,7 @@ class CatalogService:
             if Path(entry.name).suffix.lower() != _CUE_EXTENSION:
                 continue
 
-            game, cue_warnings = self._build_cue_game(
-                system, entry.relative_path, entry.name, entry.size_bytes
-            )
+            game, cue_warnings = self._build_cue_game(system, entry.relative_path)
             warnings.extend(cue_warnings)
             if game is None:
                 continue  # unreadable cue — falls through to plain file cataloguing below
@@ -296,9 +347,7 @@ class CatalogService:
 
             produced: list[Game] = []
             for cue_entry in nested_cue_entries:
-                game, cue_warnings = self._build_cue_game(
-                    system, cue_entry.relative_path, cue_entry.name, cue_entry.size_bytes
-                )
+                game, cue_warnings = self._build_cue_game(system, cue_entry.relative_path)
                 warnings.extend(cue_warnings)
                 if game is not None:
                     produced.append(game)
@@ -336,19 +385,44 @@ class CatalogService:
         return games, consumed_paths, warnings
 
     def _build_cue_game(
-        self,
-        system: str,
-        cue_relative_path: str,
-        cue_name: str,
-        cue_size_bytes: Optional[int],
+        self, system: str, cue_relative_path: str
     ) -> tuple[Optional[Game], list[str]]:
-        """Parse one ``.cue`` file into a logical Game (launch asset + every
-        referenced track as a required companion asset).
+        """Parse one ``.cue`` file into a brand-new logical Game (launch
+        asset + every referenced track as a required companion asset).
 
         Returns ``(None, warnings)`` if the cue itself cannot even be read —
         callers should fall back to cataloguing it as an ordinary single
         file rather than losing it entirely ("ROMCloud may fail; Batocera
         must not").
+        """
+        assets, warnings = self._build_cue_assets(system, cue_relative_path)
+        if assets is None:
+            return None, warnings
+
+        cue_name = Path(cue_relative_path).name
+        game = Game.create(
+            system=system,
+            title=derive_title(cue_name),
+            source_provider=self._provider.provider_id,
+            source_root=self._source_root,
+            assets=assets,
+        )
+        return game, warnings
+
+    def _build_cue_assets(
+        self, system: str, cue_relative_path: str
+    ) -> tuple[Optional[list[GameAsset]], list[str]]:
+        """Parse one ``.cue`` file into ``[primary, *companions]`` — the pure
+        asset-list computation shared by fresh discovery (:meth:`_build_cue_game`)
+        and stale-catalog reconciliation at resolve/launch time
+        (:meth:`_reconcile_cue_assets`), so both always derive companions the
+        same way instead of one path silently drifting from the other.
+
+        Always re-reads the cue and re-queries sizes from the *current*
+        source state — never trusts a caller-supplied/previously-catalogued
+        size, so a stale legacy record is never used to decide completeness.
+
+        Returns ``(None, warnings)`` if the cue itself cannot even be read.
         """
         warnings: list[str] = []
         source_path = str(Path(self._source_root) / cue_relative_path)
@@ -362,6 +436,7 @@ class CatalogService:
             )
             return None, warnings
 
+        cue_size = self._provider.get_size(source_path)
         result = resolve_cue_dependencies(cue_relative_path, cue_text)
 
         for w in result.warnings:
@@ -398,19 +473,12 @@ class CatalogService:
             )
 
         primary = GameAsset(
-            filename=cue_name,
+            filename=Path(cue_relative_path).name,
             relative_path=cue_relative_path,
-            size_bytes=cue_size_bytes,
+            size_bytes=cue_size,
             is_primary=True,
         )
-        game = Game.create(
-            system=system,
-            title=derive_title(cue_name),
-            source_provider=self._provider.provider_id,
-            source_root=self._source_root,
-            assets=[primary, *companions],
-        )
-        return game, warnings
+        return [primary, *companions], warnings
 
     def _prune_stale_entries(self, system: str, consumed_paths: set[str]) -> int:
         """Remove catalog/proxy entries that are now stale because their

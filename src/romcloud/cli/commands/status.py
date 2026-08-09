@@ -37,7 +37,10 @@ def status_cmd(ctx: click.Context, system: str | None) -> None:
         for game in games:
             entry = container.cache_repo.get(game.id)
             cached = ""
-            if entry and entry.is_complete:
+            # `container.cache.is_cached` (not just `entry.is_complete`) is
+            # the single source of truth — it also verifies every required
+            # asset (e.g. cue companions) is actually present on disk.
+            if entry and container.cache.is_cached(game.id):
                 cached = " [cached" + (" pinned" if entry.is_pinned else "") + "]"
             click.echo(f"  {game.title}{cached}")
     elif not system:

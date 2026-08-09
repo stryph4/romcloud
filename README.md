@@ -972,7 +972,12 @@ never catalogued as separate, independently-launchable games.
 - Existing catalogs migrate automatically: on the next `romcloud refresh`,
   any `.bin` track that used to be catalogued independently and is now
   referenced by a `.cue` has its now-stale proxy/catalog entry removed
-  (never the real ROM file on disk).
+  (never the real ROM file on disk). Migration does not even require a
+  `romcloud refresh` first — launching a game catalogued before cue
+  companion tracking existed re-derives its required assets from the
+  current `.cue` at launch time too, so a legacy single-file cache is
+  correctly treated as incomplete and repaired (only the missing companion
+  tracks are fetched) the first time it's launched after upgrading.
 - A cue-referenced file that's missing from the source is still catalogued
   (so `romcloud refresh`'s warnings and `romcloud healthcheck` reflect it
   clearly) but caching/launching that game fails safely — ROMCloud never

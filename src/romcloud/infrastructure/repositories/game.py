@@ -31,13 +31,29 @@ class GameRepository:
     # ── write ─────────────────────────────────────────────────────────────────
 
     def save(self, game: Game) -> None:
-        """Insert or replace a game and all its assets."""
+        """Insert a new game, or update an existing one, plus all its assets.
+
+        Deliberately uses ``INSERT ... ON CONFLICT DO UPDATE`` (a true SQL
+        UPDATE on conflict) rather than ``INSERT OR REPLACE``. The latter
+        deletes-then-reinserts the conflicting row at the SQLite level,
+        which would cascade-delete ``cache_entries``/``proxy_records`` rows
+        referencing this ``game_id`` (``ON DELETE CASCADE``) — silently
+        wiping pin state and cache/proxy ownership every time an existing
+        game's catalog data (e.g. its asset list) is updated in place.
+        """
         with self._db.connect() as conn:
             conn.execute(
                 """
-                INSERT OR REPLACE INTO games
+                INSERT INTO games
                     (id, system, title, source_provider, source_root, last_played, added_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    system          = excluded.system,
+                    title           = excluded.title,
+                    source_provider = excluded.source_provider,
+                    source_root     = excluded.source_root,
+                    last_played     = excluded.last_played,
+                    added_at        = excluded.added_at
                 """,
                 (
                     game.id,

@@ -59,6 +59,47 @@ class TestGameRepository:
         assert fetched is not None
         assert fetched.title == "Updated"
 
+    def test_save_on_existing_id_preserves_cache_entry_and_proxy_record(
+        self, game_repo, cache_repo, proxy_repo, db
+    ):
+        """Regression: `save()` on an existing game_id must be a true SQL
+        UPDATE, never a delete+reinsert — the games table is the FK parent
+        of cache_entries/proxy_records (ON DELETE CASCADE), so a naive
+        INSERT OR REPLACE would silently wipe pin state, cache history, and
+        proxy ownership every time a game's catalog data changes in place
+        (e.g. cue companion-asset reconciliation)."""
+        from datetime import datetime, timezone
+
+        from romcloud.core.models.cache import CacheEntry, CacheStatus
+        from romcloud.core.models.proxy import ProxyRecord
+
+        asset = GameAsset("Game.cue", "psx/Game.cue", size_bytes=10, is_primary=True)
+        game = Game.create("psx", "Game", "local", "/roms", [asset])
+        game_repo.save(game)
+
+        entry = CacheEntry.create(game.id, "/cache/psx/Game.cue")
+        entry.status = CacheStatus.COMPLETE
+        entry.is_pinned = True
+        cache_repo.save(entry)
+        proxy_repo.save(ProxyRecord.create(game.id, "/roms/psx/Game.romcloud"))
+
+        # Re-save the SAME id with a changed asset list (what refresh()/
+        # cue reconciliation does).
+        game.assets = [
+            asset,
+            GameAsset("Track1.bin", "psx/Track1.bin", size_bytes=5, is_primary=False),
+        ]
+        game_repo.save(game)
+
+        assert len(game_repo.get(game.id).assets) == 2
+
+        preserved_entry = cache_repo.get(game.id)
+        assert preserved_entry is not None
+        assert preserved_entry.status == CacheStatus.COMPLETE
+        assert preserved_entry.is_pinned is True
+
+        assert proxy_repo.get(game.id) is not None
+
     def test_get_nonexistent_returns_none(self, game_repo):
         assert game_repo.get("nonexistent-id") is None
 
