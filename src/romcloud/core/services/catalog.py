@@ -12,11 +12,12 @@ Responsibilities
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from romcloud.core.cue_parser import resolve_cue_dependencies
 from romcloud.core.exceptions import GameNotFoundError, ProxyError, ProxyNotOwnedError
 from romcloud.core.models.game import Game, GameAsset, derive_title
 from romcloud.core.models.proxy import ProxyRecord
@@ -30,12 +31,7 @@ log = get_logger("catalog")
 
 _PROXY_VERSION = "1"
 
-# Extensions that indicate the *entry point* for a game rather than a support file.
-# Bare files with unknown extensions are also treated as games.
-_DIRECTORY_EXTENSIONS: frozenset[str] = frozenset()  # directories are always entry points
-
-# Extensions whose files are *secondary* when a same-stem primary exists.
-_SECONDARY_EXTENSIONS: frozenset[str] = frozenset({".bin", ".img", ".sub", ".raw"})
+_CUE_EXTENSION = ".cue"
 
 
 @dataclass
@@ -44,10 +40,18 @@ class CatalogRefreshResult:
     skipped: int
     removed: int
     errors: list[tuple[str, str]]  # (system, error_message)
+    warnings: list[str] = field(default_factory=list)
+    """Non-fatal issues surfaced for visibility (e.g. a cue referencing a
+    missing companion file, a rejected path-traversal reference, a malformed
+    cue line) — these never block a refresh, unlike ``errors``."""
+    updated: int = 0
+    """Existing games whose companion-asset set changed (e.g. a
+    previously-independent .bin now recognised as part of a .cue set)."""
 
     def __str__(self) -> str:
         lines = [
             f"Added:   {self.added}",
+            f"Updated: {self.updated}",
             f"Skipped: {self.skipped}",
             f"Removed: {self.removed}",
         ]
@@ -55,6 +59,10 @@ class CatalogRefreshResult:
             lines.append(f"Errors:  {len(self.errors)}")
             for sys_, msg in self.errors:
                 lines.append(f"  [{sys_}] {msg}")
+        if self.warnings:
+            lines.append(f"Warnings: {len(self.warnings)}")
+            for msg in self.warnings:
+                lines.append(f"  {msg}")
         return "\n".join(lines)
 
 
@@ -82,18 +90,23 @@ class CatalogService:
     def refresh(self) -> CatalogRefreshResult:
         """Scan the remote ROM root; create proxy files for new games.
 
-        Already-tracked games are skipped (not duplicated).
-        Games whose source has disappeared are *not* automatically removed —
-        use ``prune()`` for that.
+        Already-tracked games are skipped (not duplicated). An existing game
+        whose companion-asset set has changed (e.g. a ``.bin`` that used to
+        be catalogued independently is now recognised as part of a ``.cue``
+        set) is updated in place, preserving its ``id``/pin state/history.
+        Games whose source has disappeared entirely are *not* automatically
+        removed — only stale entries superseded by a cue/directory grouping
+        change are pruned here (see ``removed``).
         """
-        added = skipped = removed = 0
+        added = skipped = removed = updated = 0
         errors: list[tuple[str, str]] = []
+        warnings: list[str] = []
 
         try:
             remote_systems = self._provider.list_systems(self._source_root)
         except Exception as exc:  # noqa: BLE001
             errors.append(("(root)", str(exc)))
-            return CatalogRefreshResult(added, skipped, removed, errors)
+            return CatalogRefreshResult(added, skipped, removed, errors, warnings=warnings, updated=updated)
 
         matched = [s for s in remote_systems if s in self._known_systems]
         unmatched = [s for s in remote_systems if s not in self._known_systems]
@@ -103,7 +116,15 @@ class CatalogService:
         for system in matched:
             try:
                 entries = self._provider.list_entries(self._source_root, system)
-                games = self._group_entries(system, entries)
+                games, consumed_paths, group_warnings = self._group_entries(system, entries)
+                warnings.extend(group_warnings)
+
+                # Prune stale entries *before* adding new ones: a superseded
+                # game can derive the exact same proxy filename as its
+                # replacement (e.g. both titled "Game"), and freeing that
+                # filename/ownership record first avoids a spurious
+                # collision inside `_write_proxy`.
+                removed += self._prune_stale_entries(system, consumed_paths)
 
                 for game in games:
                     primary = game.primary_asset
@@ -116,7 +137,17 @@ class CatalogService:
                         primary.relative_path,
                     )
                     if existing is not None:
-                        skipped += 1
+                        if _asset_paths_differ(existing.assets, game.assets):
+                            game.id = existing.id
+                            game.added_at = existing.added_at
+                            game.last_played = existing.last_played
+                            self._game_repo.save(game)
+                            updated += 1
+                            log.info(
+                                "Updated companion assets for %r [%s]", game.title, system
+                            )
+                        else:
+                            skipped += 1
                         continue
 
                     self._game_repo.save(game)
@@ -128,7 +159,7 @@ class CatalogService:
                 log.exception("Error scanning system %r", system)
                 errors.append((system, str(exc)))
 
-        return CatalogRefreshResult(added, skipped, removed, errors)
+        return CatalogRefreshResult(added, skipped, removed, errors, warnings=warnings, updated=updated)
 
     def resolve_proxy(self, proxy_path: str) -> Game:
         """Resolve a ``.romcloud`` proxy file to its :class:`~romcloud.core.models.game.Game`.
@@ -196,47 +227,228 @@ class CatalogService:
 
     # ── grouping ──────────────────────────────────────────────────────────────
 
-    def _group_entries(self, system: str, entries: list[RemoteEntry]) -> list[Game]:
-        """Convert raw directory entries into logical Game objects."""
-        games: list[Game] = []
-        skip_names: set[str] = set()   # secondary files to suppress
+    def _group_entries(
+        self, system: str, entries: list[RemoteEntry]
+    ) -> tuple[list[Game], set[str], list[str]]:
+        """Convert raw directory entries into logical Game objects.
 
-        # First pass: identify .cue primaries so we can suppress their .bin tracks.
-        cue_stems: set[str] = set()
-        m3u_names: set[str] = set()
+        Returns ``(games, consumed_paths, warnings)``:
+
+        - ``consumed_paths`` — asset ``relative_path`` values that are now
+          required companions of a cue-based game (or a directory now
+          represented by cue-based game(s) instead of one opaque blob).
+          These must never become independent games, and any *existing*
+          catalog entry at one of these exact paths is stale (see
+          ``_prune_stale_entries``). Matching is always by full relative
+          path, never by bare filename — two cue sets may legally share a
+          companion filename in different directories without colliding.
+        - ``warnings`` — human-readable, non-fatal issues (malformed cue
+          lines, rejected path-traversal references, missing referenced
+          assets) surfaced for visibility without aborting the scan.
+        """
+        games: list[Game] = []
+        consumed_paths: set[str] = set()
+        warnings: list[str] = []
+        handled_root_cue_names: set[str] = set()
+        superseded_dirs: set[str] = set()
+
+        # Pass 1: top-level .cue files are their own logical game.
         for entry in entries:
             if entry.is_directory or entry.name.startswith("."):
                 continue
-            stem = Path(entry.name).stem
-            ext = Path(entry.name).suffix.lower()
-            if ext == ".cue":
-                cue_stems.add(stem)
-            elif ext == ".m3u":
-                m3u_names.add(entry.name)
-
-        # Build skip set: .bin/.img files whose stem matches a .cue.
-        for entry in entries:
-            if entry.is_directory:
+            if Path(entry.name).suffix.lower() != _CUE_EXTENSION:
                 continue
-            stem = Path(entry.name).stem
-            ext = Path(entry.name).suffix.lower()
-            if ext in _SECONDARY_EXTENSIONS and stem in cue_stems:
-                skip_names.add(entry.name)
 
+            game, cue_warnings = self._build_cue_game(
+                system, entry.relative_path, entry.name, entry.size_bytes
+            )
+            warnings.extend(cue_warnings)
+            if game is None:
+                continue  # unreadable cue — falls through to plain file cataloguing below
+
+            games.append(game)
+            handled_root_cue_names.add(entry.name)
+            for asset in game.assets:
+                if not asset.is_primary:
+                    consumed_paths.add(asset.relative_path)
+
+        # Pass 2: directories containing their own .cue(s) — the "directory
+        # isolation" case (e.g. psx/Game A/Game A.cue). Each nested .cue
+        # becomes its own logical game instead of the whole directory being
+        # one opaque blob (which would cache/launch the directory itself,
+        # not the .cue Batocera actually needs).
+        for entry in entries:
+            if not entry.is_directory or entry.name.startswith("."):
+                continue
+            try:
+                nested = self._provider.list_entries(
+                    self._source_root, f"{system}/{entry.name}"
+                )
+            except Exception:  # noqa: BLE001 — fall back to opaque directory game
+                nested = []
+
+            nested_cue_entries = [
+                n for n in nested
+                if not n.is_directory and Path(n.name).suffix.lower() == _CUE_EXTENSION
+            ]
+            if not nested_cue_entries:
+                continue
+
+            produced: list[Game] = []
+            for cue_entry in nested_cue_entries:
+                game, cue_warnings = self._build_cue_game(
+                    system, cue_entry.relative_path, cue_entry.name, cue_entry.size_bytes
+                )
+                warnings.extend(cue_warnings)
+                if game is not None:
+                    produced.append(game)
+
+            if not produced:
+                continue  # every nested cue was unreadable — keep old opaque behaviour
+
+            games.extend(produced)
+            superseded_dirs.add(entry.relative_path)
+            for game in produced:
+                for asset in game.assets:
+                    if not asset.is_primary:
+                        consumed_paths.add(asset.relative_path)
+
+        # Pass 3: everything else — unrelated standalone files/directories
+        # keep the pre-existing discovery behaviour untouched.
         for entry in entries:
             if entry.name.startswith("."):
                 continue
             if entry.name.endswith(".romcloud"):
                 continue  # never re-catalog existing proxies
-            if entry.name in skip_names:
-                continue
 
             if entry.is_directory:
+                if entry.relative_path in superseded_dirs:
+                    continue
                 games.append(self._make_directory_game(system, entry))
             else:
+                if entry.name in handled_root_cue_names:
+                    continue
+                if entry.relative_path in consumed_paths:
+                    continue
                 games.append(self._make_file_game(system, entry))
 
-        return games
+        consumed_paths |= superseded_dirs
+        return games, consumed_paths, warnings
+
+    def _build_cue_game(
+        self,
+        system: str,
+        cue_relative_path: str,
+        cue_name: str,
+        cue_size_bytes: Optional[int],
+    ) -> tuple[Optional[Game], list[str]]:
+        """Parse one ``.cue`` file into a logical Game (launch asset + every
+        referenced track as a required companion asset).
+
+        Returns ``(None, warnings)`` if the cue itself cannot even be read —
+        callers should fall back to cataloguing it as an ordinary single
+        file rather than losing it entirely ("ROMCloud may fail; Batocera
+        must not").
+        """
+        warnings: list[str] = []
+        source_path = str(Path(self._source_root) / cue_relative_path)
+
+        try:
+            cue_text = self._provider.read_text(source_path)
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(
+                f"[{system}] could not read cue {cue_relative_path!r}: {exc} "
+                "— cataloguing as a plain file instead"
+            )
+            return None, warnings
+
+        result = resolve_cue_dependencies(cue_relative_path, cue_text)
+
+        for w in result.warnings:
+            warnings.append(
+                f"[{system}] {cue_relative_path}: {w.reason} "
+                f"(line {w.line_number}: {w.line.strip()!r})"
+            )
+        for r in result.rejected:
+            warnings.append(
+                f"[{system}] {cue_relative_path}: rejected reference "
+                f"{r.raw_reference!r} — {r.reason}"
+            )
+
+        companions: list[GameAsset] = []
+        seen_paths: set[str] = {cue_relative_path}
+        for dep in result.dependencies:
+            if dep.relative_path in seen_paths:
+                continue
+            seen_paths.add(dep.relative_path)
+
+            size = self._provider.get_size(str(Path(self._source_root) / dep.relative_path))
+            if size is None:
+                warnings.append(
+                    f"[{system}] {cue_relative_path}: referenced asset missing: "
+                    f"{dep.relative_path}"
+                )
+            companions.append(
+                GameAsset(
+                    filename=Path(dep.relative_path).name,
+                    relative_path=dep.relative_path,
+                    size_bytes=size,
+                    is_primary=False,
+                )
+            )
+
+        primary = GameAsset(
+            filename=cue_name,
+            relative_path=cue_relative_path,
+            size_bytes=cue_size_bytes,
+            is_primary=True,
+        )
+        game = Game.create(
+            system=system,
+            title=derive_title(cue_name),
+            source_provider=self._provider.provider_id,
+            source_root=self._source_root,
+            assets=[primary, *companions],
+        )
+        return game, warnings
+
+    def _prune_stale_entries(self, system: str, consumed_paths: set[str]) -> int:
+        """Remove catalog/proxy entries that are now stale because their
+        sole asset path is a required companion of a cue set (or a
+        directory now represented by cue-based game(s)).
+
+        Only ever removes ROMCloud-owned proxy files and DB rows — never
+        touches the real source ROM files.
+        """
+        if not consumed_paths:
+            return 0
+
+        removed = 0
+        for existing_game in self._game_repo.find_by_system(system):
+            primary = existing_game.primary_asset
+            if primary is None or primary.relative_path not in consumed_paths:
+                continue
+            try:
+                self.remove_proxy(existing_game.id)
+                if self._game_repo.get(existing_game.id) is None:
+                    removed += 1
+                    log.info(
+                        "Pruned stale catalog entry %r (%s) [%s] — now part of a cue set",
+                        existing_game.title,
+                        primary.relative_path,
+                        system,
+                    )
+                else:
+                    log.warning(
+                        "Stale entry %s had no owned proxy to remove — "
+                        "deleting catalog row directly",
+                        existing_game.id,
+                    )
+                    self._game_repo.delete(existing_game.id)
+                    removed += 1
+            except ProxyNotOwnedError as exc:
+                log.warning("Could not prune stale entry %s: %s", existing_game.id, exc)
+        return removed
 
     def _make_file_game(self, system: str, entry: RemoteEntry) -> Game:
         title = derive_title(entry.name)
@@ -331,3 +543,15 @@ def _safe_filename(title: str) -> str:
     """Strip characters that are problematic in filenames."""
     bad = r'\/:*?"<>|'
     return "".join(c if c not in bad else "_" for c in title)
+
+
+def _asset_paths_differ(old: list[GameAsset], new: list[GameAsset]) -> bool:
+    """True if the *set* of (relative_path, is_primary) pairs differs.
+
+    Used to detect that an existing catalog entry needs its companion
+    assets updated (e.g. a cue's referenced tracks were just discovered),
+    without triggering churn from mere size-field fluctuations.
+    """
+    old_keys = {(a.relative_path, a.is_primary) for a in old}
+    new_keys = {(a.relative_path, a.is_primary) for a in new}
+    return old_keys != new_keys

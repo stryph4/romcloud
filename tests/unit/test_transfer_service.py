@@ -240,3 +240,134 @@ class TestTransferService:
         assert disc2_final == str(cache_dir / "ps2" / "discs" / "2" / "Game.iso")
         assert Path(disc1_final).read_bytes() == b"disc_one" * 10
         assert Path(disc2_final).read_bytes() == b"disc_two" * 10
+
+
+class TestMultiAssetCueBinTransfer:
+    """BIN/CUE multi-asset transfer: all required companions cached, .cue
+    remains the launch path, progress aggregates across the whole game."""
+
+    @staticmethod
+    def _make_cue_game(tmp_path, num_tracks=3):
+        from romcloud.core.providers.local import LocalFilesystemProvider
+
+        source_root = tmp_path / "source"
+        (source_root / "psx").mkdir(parents=True)
+        cue_bytes = b"cue_sheet_data"
+        (source_root / "psx" / "Game.cue").write_bytes(cue_bytes)
+
+        assets = [
+            GameAsset("Game.cue", "psx/Game.cue", size_bytes=len(cue_bytes), is_primary=True)
+        ]
+        track_bytes = {}
+        for i in range(1, num_tracks + 1):
+            name = f"Game (Track {i}).bin"
+            content = bytes([i]) * (100 * i)
+            (source_root / "psx" / name).write_bytes(content)
+            track_bytes[name] = content
+            assets.append(
+                GameAsset(name, f"psx/{name}", size_bytes=len(content), is_primary=False)
+            )
+
+        game = Game.create("psx", "Game", "local", str(source_root), assets)
+        return game, source_root, track_bytes, LocalFilesystemProvider()
+
+    def test_cue_and_all_bins_are_cached(self, tmp_path, cache_dir):
+        game, source_root, track_bytes, provider = self._make_cue_game(tmp_path)
+        svc = TransferService(provider=provider, cache_root=str(cache_dir))
+
+        final = svc.transfer(game)
+        assert final == str(cache_dir / "psx" / "Game.cue")
+        assert Path(final).is_file()
+        for name, content in track_bytes.items():
+            cached = cache_dir / "psx" / name
+            assert cached.exists()
+            assert cached.read_bytes() == content
+
+    def test_launch_asset_is_the_cue_not_a_track(self, tmp_path, cache_dir):
+        game, source_root, _, provider = self._make_cue_game(tmp_path)
+        svc = TransferService(provider=provider, cache_root=str(cache_dir))
+        final = svc.transfer(game)
+        assert Path(final).name == "Game.cue"
+
+    def test_relative_paths_and_filenames_preserved_exactly(self, tmp_path, cache_dir):
+        game, source_root, track_bytes, provider = self._make_cue_game(tmp_path)
+        svc = TransferService(provider=provider, cache_root=str(cache_dir))
+        svc.transfer(game)
+        for asset in game.assets:
+            expected = cache_dir / "psx" / Path(asset.relative_path).name
+            assert expected.exists()
+            assert expected.name == asset.filename
+
+    def test_progress_aggregates_across_all_assets_without_reset(self, tmp_path, cache_dir):
+        """Percent/bytes must monotonically increase across the whole game —
+        never reset to 0 when a new track starts (no per-track flashing)."""
+        game, source_root, _, provider = self._make_cue_game(tmp_path)
+        svc = TransferService(provider=provider, cache_root=str(cache_dir))
+
+        calls: list[tuple[int, int]] = []
+        svc.transfer(game, on_progress=lambda d, t: calls.append((d, t)))
+
+        assert calls, "on_progress should have been called at least once"
+        grand_total = game.total_size_bytes
+        # total is constant across every callback (the whole-game grand total).
+        assert all(t == grand_total for _, t in calls)
+        # done is monotonically non-decreasing, and never resets to a small
+        # value after having reached a larger one.
+        seen_max = 0
+        for done, _ in calls:
+            assert done >= seen_max
+            seen_max = done
+        assert calls[-1][0] == grand_total
+
+    def test_partial_pre_existing_set_only_downloads_missing_assets(self, tmp_path, cache_dir):
+        """If the .cue and some tracks are already correctly cached, only
+        the missing tracks should be (re-)transferred."""
+        game, source_root, track_bytes, provider = self._make_cue_game(tmp_path, num_tracks=3)
+        svc = TransferService(provider=provider, cache_root=str(cache_dir))
+
+        # Pre-populate the final cache with the .cue and track 1 already correct.
+        (cache_dir / "psx").mkdir(parents=True)
+        (cache_dir / "psx" / "Game.cue").write_bytes((source_root / "psx" / "Game.cue").read_bytes())
+        (cache_dir / "psx" / "Game (Track 1).bin").write_bytes(
+            (source_root / "psx" / "Game (Track 1).bin").read_bytes()
+        )
+        # Corrupt/replace the source files for the already-cached assets so
+        # a real re-transfer would be detectable (different bytes).
+        (source_root / "psx" / "Game.cue").write_bytes(b"SHOULD NOT BE COPIED")
+
+        final = svc.transfer(game)
+
+        # The already-correct cached .cue must be untouched (repair-only-missing).
+        assert Path(final).read_bytes() != b"SHOULD NOT BE COPIED"
+        for i in (2, 3):
+            name = f"Game (Track {i}).bin"
+            assert (cache_dir / "psx" / name).read_bytes() == track_bytes[name]
+
+    def test_failure_of_one_track_prevents_launch(self, tmp_path, cache_dir):
+        """If one companion asset's source is missing, the whole transfer
+        must fail (no launch), leaving no valid-looking cached set."""
+        game, source_root, _, provider = self._make_cue_game(tmp_path, num_tracks=2)
+        # Delete one referenced track from the source after cataloguing.
+        (source_root / "psx" / "Game (Track 2).bin").unlink()
+
+        svc = TransferService(provider=provider, cache_root=str(cache_dir))
+        with pytest.raises(Exception):
+            svc.transfer(game)
+
+        # The cue itself may have been staged/promoted, but the game must
+        # not be considered a complete, launchable set.
+        assert not (cache_dir / "psx" / "Game (Track 2).bin").exists()
+
+    def test_partial_transfer_preserves_staging_for_resume(self, tmp_path, cache_dir):
+        game, source_root, _, provider = self._make_cue_game(tmp_path, num_tracks=2)
+        (source_root / "psx" / "Game (Track 2).bin").unlink()
+
+        svc = TransferService(provider=provider, cache_root=str(cache_dir))
+        with pytest.raises(Exception):
+            svc.transfer(game)
+
+        # Track 1 (and the cue) should have made it to staging/final since
+        # they were transferred before the missing track was reached.
+        assert (cache_dir / "psx" / "Game.cue").exists() or (
+            cache_dir / ".partial" / "psx" / "Game.cue"
+        ).exists()

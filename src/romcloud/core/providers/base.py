@@ -64,6 +64,17 @@ class StorageProvider(ABC):
         """
 
     @abstractmethod
+    def read_text(self, path: str) -> str:
+        """Return the decoded text contents of a small file at *path*.
+
+        Used for lightweight metadata inspection (e.g. parsing ``.cue``
+        dependency lists) — never for transferring full game assets.
+
+        Raises :class:`~romcloud.core.exceptions.ProviderError` if the file
+        cannot be read.
+        """
+
+    @abstractmethod
     def transfer_to(
         self,
         source_path: str,

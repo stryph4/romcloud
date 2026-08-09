@@ -28,6 +28,7 @@ from romcloud.core.exceptions import (
     InsufficientSpaceError,
 )
 from romcloud.core.models.cache import CacheEntry, CachePolicy, CacheStatus
+from romcloud.core.models.game import Game
 from romcloud.core.services.transfer import TransferService
 from romcloud.infrastructure.logging import get_logger
 from romcloud.infrastructure.repositories.cache import CacheRepository
@@ -59,11 +60,17 @@ class CacheService:
     # ── query ─────────────────────────────────────────────────────────────────
 
     def is_cached(self, game_id: str) -> bool:
-        """True if the game has a complete, valid cache entry."""
+        """True if the game has a complete, valid cache entry.
+
+        For a multi-asset logical game (e.g. .cue + .bin tracks), this is
+        only true when the launch asset *and every required companion
+        asset* are present (and size-valid where known) — a cue with one
+        missing track is treated as incomplete, never as a full hit.
+        """
         entry = self._cache_repo.get(game_id)
         if entry is None:
             return False
-        # Also verify the cached path still exists on disk.
+        # Also verify the recorded (primary asset) path still exists on disk.
         if not Path(entry.cache_path).exists():
             log.warning(
                 "Cache entry for %s points to missing path %s — invalidating",
@@ -72,7 +79,31 @@ class CacheService:
             )
             self._cache_repo.delete(game_id)
             return False
-        return entry.is_complete
+        if not entry.is_complete:
+            return False
+
+        game = self._game_repo.get(game_id)
+        if game is not None and not self._all_assets_present(game):
+            log.warning(
+                "Cache entry for %s is missing one or more required companion "
+                "assets — treating as incomplete",
+                game_id,
+            )
+            return False
+        return True
+
+    def _all_assets_present(self, game: Game) -> bool:
+        """True if every asset of *game* is present at its final cache path
+        (and size-correct, where the expected size is known)."""
+        for asset in game.assets:
+            path = resolve_cache_path(self._cache_root, game.system, asset.relative_path)
+            if not path.exists():
+                return False
+            if asset.size_bytes is not None:
+                actual = _dir_size(path)
+                if actual != asset.size_bytes:
+                    return False
+        return True
 
     def get_entry(self, game_id: str) -> Optional[CacheEntry]:
         return self._cache_repo.get(game_id)
@@ -161,7 +192,14 @@ class CacheService:
 
         try:
             final_path = self._transfer.transfer(game, on_progress)
-            actual_size = _dir_size(Path(final_path))
+            # Size recorded against the quota must cover *every* asset of
+            # the logical game (e.g. .cue + all .bin tracks), never just
+            # the primary/launch asset — otherwise multi-asset games would
+            # silently under-count against the cache quota.
+            actual_size = sum(
+                _dir_size(resolve_cache_path(self._cache_root, game.system, a.relative_path))
+                for a in game.assets
+            )
             self._cache_repo.update_cache_path(game_id, final_path)
             self._cache_repo.update_status(game_id, CacheStatus.COMPLETE)
             self._cache_repo.update_size(game_id, actual_size)
@@ -193,7 +231,8 @@ class CacheService:
                 f"or pass --force."
             )
 
-        self._remove_files(entry)
+        game = self._game_repo.get(game_id)
+        self._remove_files(entry, game)
         self._cache_repo.delete(game_id)
         log.info("Removed cache entry %s", game_id)
 
@@ -245,7 +284,8 @@ class CacheService:
             if entry.game_id in self._active_launches:
                 continue
 
-            self._remove_files(entry)
+            game = self._game_repo.get(entry.game_id)
+            self._remove_files(entry, game)
             self._cache_repo.delete(entry.game_id)
             evicted.append(entry.game_id)
             log.info("Evicted %s (LRU)", entry.game_id)
@@ -277,8 +317,24 @@ class CacheService:
     def _touch_accessed(self, game_id: str) -> None:
         self._cache_repo.update_last_accessed(game_id, datetime.now(timezone.utc))
 
-    @staticmethod
-    def _remove_files(entry: CacheEntry) -> None:
+    def _remove_files(self, entry: CacheEntry, game: Optional[Game]) -> None:
+        """Remove every on-disk asset belonging to this cache entry.
+
+        For a multi-asset logical game, every asset's exact path is removed
+        (never just the recorded primary/launch-asset path) so no companion
+        track is ever orphaned on disk. Falls back to the recorded
+        ``cache_path`` alone if the game record is unavailable.
+        """
+        if game is not None and game.assets:
+            for asset in game.assets:
+                p = resolve_cache_path(self._cache_root, game.system, asset.relative_path)
+                if p.exists():
+                    if p.is_dir():
+                        shutil.rmtree(p)
+                    else:
+                        p.unlink()
+            return
+
         p = Path(entry.cache_path)
         if p.exists():
             if p.is_dir():

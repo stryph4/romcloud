@@ -175,6 +175,52 @@ class TestRunGraphicalProgressTransfer:
         )
         assert result == "/cache/x.iso"
 
+    def test_multi_asset_game_uses_a_single_subprocess_session_with_aggregate_progress(
+        self, dummy_game
+    ):
+        """One cache-miss launch = one progress UI session, even when the
+        underlying transfer spans several assets (.cue + several .bin
+        tracks) — no per-track re-open/flash, and 'done' must never
+        decrease between events."""
+        proc = _FakeProcess()
+        popen_calls = []
+
+        def fake_popen(*a, **k):
+            popen_calls.append((a, k))
+            return proc
+
+        class _MultiAssetCacheService:
+            """Simulates TransferService's aggregated on_progress callback
+            across three assets (cumulative bytes, not reset per asset)."""
+
+            def cache_game(self, game_id, on_progress=None):
+                # cue: 0..100 of grand total 400
+                for d in (25, 50, 100):
+                    if on_progress:
+                        on_progress(d, 400)
+                # track 1: continues accumulating from 100..250
+                for d in (150, 200, 250):
+                    if on_progress:
+                        on_progress(d, 400)
+                # track 2: continues accumulating from 250..400
+                for d in (300, 400):
+                    if on_progress:
+                        on_progress(d, 400)
+                return "/cache/psx/Game.cue"
+
+        result = run_graphical_progress_transfer(
+            _MultiAssetCacheService(), dummy_game, launcher_bin="/x", popen=fake_popen
+        )
+
+        assert result == "/cache/psx/Game.cue"
+        assert len(popen_calls) == 1  # exactly one subprocess/session for the whole game
+
+        downloading_events = [e for e in proc.stdin.events if e.get("phase") == "downloading"]
+        done_values = [e["done"] for e in downloading_events]
+        assert done_values == sorted(done_values)  # monotonically non-decreasing
+        assert all(e["total"] == 400 for e in downloading_events)
+        assert done_values[-1] == 400
+
 
 class TestCloseSubprocess:
     def test_waits_then_returns_when_process_exits_promptly(self):

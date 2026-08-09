@@ -51,6 +51,9 @@ class SMBProvider(StorageProvider):
     def get_size(self, path: str) -> Optional[int]:
         raise NotImplementedError("SMB provider not yet implemented")
 
+    def read_text(self, path: str) -> str:
+        raise NotImplementedError("SMB provider not yet implemented")
+
     def transfer_to(
         self,
         source_path: str,

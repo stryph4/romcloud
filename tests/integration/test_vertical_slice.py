@@ -251,7 +251,7 @@ def test_cue_bin_game(tmp_path: Path) -> None:
     (source_root / "psx").mkdir(parents=True)
     cue_file = source_root / "psx" / "Crash Bandicoot.cue"
     bin_file = source_root / "psx" / "Crash Bandicoot.bin"
-    cue_file.write_bytes(b"cue_data")
+    cue_file.write_text('FILE "Crash Bandicoot.bin" BINARY\n')
     bin_file.write_bytes(b"bin_data" * 500)
 
     local_roms = tmp_path / "local_roms"
@@ -279,3 +279,208 @@ def test_cue_bin_game(tmp_path: Path) -> None:
     assert len(games) == 1
     assert games[0].title == "Crash Bandicoot"
     assert games[0].primary_asset.filename == "Crash Bandicoot.cue"
+    companions = [a for a in games[0].assets if not a.is_primary]
+    assert [a.relative_path for a in companions] == ["psx/Crash Bandicoot.bin"]
+    assert companions[0].size_bytes == len(b"bin_data" * 500)
+
+
+def test_cue_bin_end_to_end_cache_and_launch(tmp_path: Path) -> None:
+    """Full BIN/CUE vertical slice: catalog → cache every required asset →
+    cache-hit completeness → launch argv receives the cached .cue path with
+    only ``-rom`` replaced.
+    """
+    from romcloud.integrations.batocera.launcher import find_rom_path, replace_rom_path
+
+    source_root = tmp_path / "source_roms"
+    (source_root / "psx").mkdir(parents=True)
+    (source_root / "psx" / "Crash Bandicoot.cue").write_text(
+        'FILE "Crash Bandicoot (Track 1).bin" BINARY\n'
+        'FILE "Crash Bandicoot (Track 2).bin" BINARY\n'
+    )
+    (source_root / "psx" / "Crash Bandicoot (Track 1).bin").write_bytes(b"t1" * 1000)
+    (source_root / "psx" / "Crash Bandicoot (Track 2).bin").write_bytes(b"t2" * 2000)
+
+    local_roms = tmp_path / "local_roms"
+    local_roms.mkdir()
+    cache_root = tmp_path / "cache"
+    cache_root.mkdir()
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+
+    db = Database(str(data_dir / "catalog.db"))
+    db.initialize()
+    game_repo = GameRepository(db)
+    cache_repo = CacheRepository(db)
+    proxy_repo = ProxyRepository(db)
+
+    provider = LocalFilesystemProvider()
+    transfer_svc = TransferService(provider=provider, cache_root=str(cache_root))
+    cache_svc = CacheService(
+        cache_repo=cache_repo,
+        game_repo=game_repo,
+        transfer_service=transfer_svc,
+        cache_root=str(cache_root),
+        policy=CachePolicy.from_gb(10.0, 0.001),
+    )
+    catalog_svc = CatalogService(
+        provider=provider,
+        game_repo=game_repo,
+        proxy_repo=proxy_repo,
+        local_roms_root=str(local_roms),
+        source_root=str(source_root),
+    )
+
+    result = catalog_svc.refresh()
+    assert result.added == 1
+
+    proxies = list(local_roms.rglob("*.romcloud"))
+    game = catalog_svc.resolve_proxy(str(proxies[0]))
+    assert len(game.assets) == 3  # cue + 2 tracks
+
+    # Cache-miss: not cached yet.
+    assert not cache_svc.is_cached(game.id)
+
+    progress_events: list[tuple[int, int]] = []
+    launch_path = cache_svc.cache_game(game.id, on_progress=lambda d, t: progress_events.append((d, t)))
+
+    assert Path(launch_path).name == "Crash Bandicoot.cue"
+    assert Path(launch_path).exists()
+    for track in ("Crash Bandicoot (Track 1).bin", "Crash Bandicoot (Track 2).bin"):
+        assert (cache_root / "psx" / track).exists()
+
+    # Aggregate progress: total is constant, done monotonically increases to the grand total.
+    assert progress_events
+    grand_total = game.total_size_bytes
+    assert all(t == grand_total for _, t in progress_events)
+    assert progress_events[-1][0] == grand_total
+
+    # Full hit now — every required asset present.
+    assert cache_svc.is_cached(game.id)
+
+    # Simulate the launcher wrapper: only -rom is replaced, argv/order intact.
+    wrapper = "/userdata/system/romcloud/bin/romcloud-run"
+    original_argv = [
+        wrapper,
+        "%CONTROLLERSCONFIG%",
+        "-system", "psx",
+        "-rom", str(proxies[0]),
+        "-gameinfoxml", "/tmp/gamelist.xml",
+        "-systemname", "Sony PlayStation",
+    ]
+    patched_argv = replace_rom_path(original_argv, launch_path)
+
+    assert len(patched_argv) == len(original_argv)
+    assert find_rom_path(patched_argv) == launch_path
+    assert find_rom_path(patched_argv).endswith("Crash Bandicoot.cue")
+    differences = [
+        i for i, (a, b) in enumerate(zip(original_argv, patched_argv)) if a != b
+    ]
+    assert len(differences) == 1
+    assert original_argv[differences[0] - 1] == "-rom"
+
+
+def test_cue_bin_directory_scoped_layout_end_to_end(tmp_path: Path) -> None:
+    """Directory-isolated BIN/CUE layout: cache mirrors the source directory
+    exactly; two games with identically-named tracks never collide."""
+    source_root = tmp_path / "source_roms"
+    for name in ("Game A", "Game B"):
+        game_dir = source_root / "psx" / name
+        game_dir.mkdir(parents=True)
+        (game_dir / f"{name}.cue").write_text('FILE "Track 01.bin" BINARY\n')
+        (game_dir / "Track 01.bin").write_bytes(name.encode() * 200)
+
+    local_roms = tmp_path / "local_roms"
+    local_roms.mkdir()
+    cache_root = tmp_path / "cache"
+    cache_root.mkdir()
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+
+    db = Database(str(data_dir / "catalog.db"))
+    db.initialize()
+    game_repo = GameRepository(db)
+    cache_repo = CacheRepository(db)
+    proxy_repo = ProxyRepository(db)
+
+    provider = LocalFilesystemProvider()
+    transfer_svc = TransferService(provider=provider, cache_root=str(cache_root))
+    cache_svc = CacheService(
+        cache_repo=cache_repo,
+        game_repo=game_repo,
+        transfer_service=transfer_svc,
+        cache_root=str(cache_root),
+        policy=CachePolicy.from_gb(10.0, 0.001),
+    )
+    catalog_svc = CatalogService(
+        provider=provider,
+        game_repo=game_repo,
+        proxy_repo=proxy_repo,
+        local_roms_root=str(local_roms),
+        source_root=str(source_root),
+    )
+
+    result = catalog_svc.refresh()
+    assert result.added == 2
+
+    games = {g.title: g for g in game_repo.find_by_system("psx")}
+    path_a = cache_svc.cache_game(games["Game A"].id)
+    path_b = cache_svc.cache_game(games["Game B"].id)
+
+    assert path_a == str(cache_root / "psx" / "Game A" / "Game A.cue")
+    assert path_b == str(cache_root / "psx" / "Game B" / "Game B.cue")
+    assert (cache_root / "psx" / "Game A" / "Track 01.bin").read_bytes() == b"Game A" * 200
+    assert (cache_root / "psx" / "Game B" / "Track 01.bin").read_bytes() == b"Game B" * 200
+    assert cache_svc.is_cached(games["Game A"].id)
+    assert cache_svc.is_cached(games["Game B"].id)
+
+
+def test_cue_bin_full_cache_hit_bypasses_transfer(tmp_path: Path) -> None:
+    """A complete cue+bins cache hit must not invoke the transfer layer at all."""
+    source_root = tmp_path / "source_roms"
+    (source_root / "psx").mkdir(parents=True)
+    (source_root / "psx" / "Game.cue").write_text('FILE "Game.bin" BINARY\n')
+    (source_root / "psx" / "Game.bin").write_bytes(b"x" * 500)
+
+    local_roms = tmp_path / "local_roms"
+    local_roms.mkdir()
+    cache_root = tmp_path / "cache"
+    cache_root.mkdir()
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+
+    db = Database(str(data_dir / "catalog.db"))
+    db.initialize()
+    game_repo = GameRepository(db)
+    cache_repo = CacheRepository(db)
+    proxy_repo = ProxyRepository(db)
+
+    provider = LocalFilesystemProvider()
+    transfer_svc = TransferService(provider=provider, cache_root=str(cache_root))
+    cache_svc = CacheService(
+        cache_repo=cache_repo,
+        game_repo=game_repo,
+        transfer_service=transfer_svc,
+        cache_root=str(cache_root),
+        policy=CachePolicy.from_gb(10.0, 0.001),
+    )
+    catalog_svc = CatalogService(
+        provider=provider,
+        game_repo=game_repo,
+        proxy_repo=proxy_repo,
+        local_roms_root=str(local_roms),
+        source_root=str(source_root),
+    )
+    catalog_svc.refresh()
+    game = game_repo.find_by_system("psx")[0]
+
+    cache_svc.cache_game(game.id)
+    assert cache_svc.is_cached(game.id)
+
+    calls = []
+    transfer_svc.transfer = lambda *a, **k: calls.append(1) or (_ for _ in ()).throw(
+        AssertionError("transfer should not be called on a full cache hit")
+    )
+    cache_svc.cache_game(game.id)  # must short-circuit before touching transfer
+    assert calls == []
+
+

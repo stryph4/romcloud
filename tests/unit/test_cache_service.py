@@ -306,3 +306,144 @@ class TestRemoveAndEvictionSiblingSafety:
         assert cache_service.is_cached(game_b.id)
         # The shared system directory itself must not be removed.
         assert Path(path_a).parent.exists()
+
+
+class TestMultiAssetCueBinCache:
+    """BIN/CUE (multi-asset) cache-hit completeness, repair, and eviction
+    coherence."""
+
+    @staticmethod
+    def _make_cue_game(tmp_path, game_repo, num_tracks=2):
+        source_root = tmp_path / "source"
+        (source_root / "psx").mkdir(parents=True)
+        (source_root / "psx" / "Game.cue").write_bytes(b"cue_data")
+
+        assets = [GameAsset("Game.cue", "psx/Game.cue", size_bytes=8, is_primary=True)]
+        for i in range(1, num_tracks + 1):
+            name = f"Track {i}.bin"
+            content = bytes([i]) * 100
+            (source_root / "psx" / name).write_bytes(content)
+            assets.append(GameAsset(name, f"psx/{name}", size_bytes=len(content), is_primary=False))
+
+        game = Game.create("psx", "Game", "local", str(source_root), assets)
+        game_repo.save(game)
+        return game, source_root
+
+    def test_cache_game_caches_every_required_asset(self, cache_service, game_repo, tmp_path):
+        game, source_root = self._make_cue_game(tmp_path, game_repo)
+        launch_path = cache_service.cache_game(game.id)
+        assert Path(launch_path).name == "Game.cue"
+        for asset in game.assets:
+            cached = Path(cache_service._cache_root) / "psx" / asset.filename
+            assert cached.exists()
+
+    def test_full_cache_hit_requires_every_companion_present(
+        self, cache_service, game_repo, tmp_path
+    ):
+        game, source_root = self._make_cue_game(tmp_path, game_repo)
+        cache_service.cache_game(game.id)
+        assert cache_service.is_cached(game.id) is True
+
+        # Simulate a companion track disappearing (disk issue, manual delete, etc).
+        (Path(cache_service._cache_root) / "psx" / "Track 1.bin").unlink()
+
+        assert cache_service.is_cached(game.id) is False
+
+    def test_incomplete_set_not_treated_as_hit_even_if_launch_asset_present(
+        self, cache_service, game_repo, tmp_path
+    ):
+        game, source_root = self._make_cue_game(tmp_path, game_repo, num_tracks=3)
+        cache_service.cache_game(game.id)
+        (Path(cache_service._cache_root) / "psx" / "Track 3.bin").unlink()
+
+        assert cache_service.is_cached(game.id) is False
+        # The .cue (launch asset) is still there, but that alone is not a hit.
+        assert (Path(cache_service._cache_root) / "psx" / "Game.cue").exists()
+
+    def test_repair_only_downloads_missing_companion(
+        self, cache_service, game_repo, tmp_path
+    ):
+        game, source_root = self._make_cue_game(tmp_path, game_repo, num_tracks=2)
+        cache_service.cache_game(game.id)
+
+        cache_root = Path(cache_service._cache_root)
+        (cache_root / "psx" / "Track 2.bin").unlink()
+        # Corrupt the source .cue so we could detect an unwanted re-copy.
+        (source_root / "psx" / "Game.cue").write_bytes(b"CORRUPTED")
+
+        assert cache_service.is_cached(game.id) is False
+        launch_path = cache_service.cache_game(game.id)
+
+        assert Path(launch_path).read_bytes() != b"CORRUPTED"
+        assert (cache_root / "psx" / "Track 2.bin").exists()
+        assert cache_service.is_cached(game.id) is True
+
+    def test_full_cache_hit_is_fast_no_transfer_call(
+        self, cache_service, game_repo, tmp_path, monkeypatch
+    ):
+        game, source_root = self._make_cue_game(tmp_path, game_repo)
+        cache_service.cache_game(game.id)
+
+        called = []
+        monkeypatch.setattr(
+            cache_service._transfer, "transfer", lambda *a, **k: called.append(1)
+        )
+        path = cache_service.cache_game(game.id)
+        assert not called
+        assert Path(path).name == "Game.cue"
+
+    def test_remove_deletes_all_companion_assets(self, cache_service, game_repo, tmp_path):
+        game, source_root = self._make_cue_game(tmp_path, game_repo, num_tracks=2)
+        cache_service.cache_game(game.id)
+        cache_root = Path(cache_service._cache_root)
+
+        cache_service.remove(game.id)
+
+        for asset in game.assets:
+            assert not (cache_root / "psx" / asset.filename).exists()
+
+    def test_eviction_removes_all_companion_assets_together(
+        self, cache_service, cache_repo, game_repo, tmp_path
+    ):
+        from datetime import datetime, timedelta, timezone
+
+        game, source_root = self._make_cue_game(tmp_path, game_repo, num_tracks=2)
+        cache_service.cache_game(game.id)
+        cache_root = Path(cache_service._cache_root)
+
+        old_time = datetime.now(timezone.utc) - timedelta(days=30)
+        cache_repo.update_last_accessed(game.id, old_time)
+        cache_service._policy = CachePolicy(max_size_bytes=1, min_free_bytes=0)
+
+        evicted = cache_service.evict()
+
+        assert game.id in evicted
+        for asset in game.assets:
+            assert not (cache_root / "psx" / asset.filename).exists()
+
+    def test_active_launch_protects_whole_asset_set_from_eviction(
+        self, cache_service, cache_repo, game_repo, tmp_path
+    ):
+        game, source_root = self._make_cue_game(tmp_path, game_repo, num_tracks=2)
+        cache_service.cache_game(game.id)
+        cache_service.mark_launched(game.id)
+
+        cache_service._policy = CachePolicy(max_size_bytes=1, min_free_bytes=0)
+        evicted = cache_service.evict()
+
+        assert game.id not in evicted
+        assert cache_service.is_cached(game.id)
+
+    def test_recorded_size_covers_every_asset_not_just_launch_asset(
+        self, cache_service, cache_repo, game_repo, tmp_path
+    ):
+        """Cache-entry size accounting must cover the whole logical game
+        (.cue + every track), never just the primary/launch asset — an
+        undercount would silently break quota/LRU eviction."""
+        game, source_root = self._make_cue_game(tmp_path, game_repo, num_tracks=2)
+        cache_service.cache_game(game.id)
+
+        entry = cache_repo.get(game.id)
+        expected_total = sum(a.size_bytes for a in game.assets)
+        assert entry.size_bytes == expected_total
+        assert cache_repo.total_size() == expected_total

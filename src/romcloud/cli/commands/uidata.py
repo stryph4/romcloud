@@ -83,9 +83,11 @@ def uidata_refresh(ctx: click.Context) -> None:
         result = container.catalog.refresh()
         return {
             "added": result.added,
+            "updated": result.updated,
             "skipped": result.skipped,
             "removed": result.removed,
             "errors": [f"{system}: {message}" for system, message in result.errors],
+            "warnings": result.warnings,
         }
 
     _run_action(ctx, build)

@@ -945,13 +945,44 @@ The current implementation requires CIFS mounting.
 
 A future native `SMBProvider` should remove the need for users to understand or configure mount points.
 
-### Multi-disc / multi-asset games
+### Multi-disc / multi-asset games — BIN/CUE
 
-The transfer layer already understands assets, but cache bookkeeping is currently centered on the primary asset.
+BIN/CUE disc images are now fully supported: ROMCloud parses the `FILE` lines
+inside a `.cue` sheet, treats every referenced track as a required companion
+asset of that one logical game, and caches all of them (`.cue` + every
+`.bin`/`.wav`/etc track) before launch. Only the `.cue` is ever registered as
+a playable catalog entry / EmulationStation proxy — its referenced tracks are
+never catalogued as separate, independently-launchable games.
 
-Proper multi-disc support will require treating all game assets as one cache/eviction unit and preserving or generating `.m3u` playlists where appropriate.
+- Both flat layouts (`psx/Game.cue` + `psx/Game (Track 1).bin` side by side)
+  and directory-scoped layouts (`psx/Game A/Game A.cue` + `psx/Game A/Track
+  01.bin`) are supported. A directory-scoped set is cached into the cache
+  root preserving its exact subdirectory structure — companion assets are
+  never flattened into the system root, and two different games may safely
+  contain identically-named tracks in their own directories without
+  colliding (asset identity is the full relative path, never the bare
+  filename).
+- A cache hit only counts once the `.cue` **and every required track** are
+  present and size-valid; a `.cue` with one missing/corrupt track is treated
+  as incomplete, and only the missing tracks are re-fetched on repair (the
+  rest is left untouched).
+- The graphical (and terminal) transfer progress screen aggregates bytes and
+  percentage across the whole logical game, not per track — one launch opens
+  one progress session, regardless of how many files it contains.
+- Existing catalogs migrate automatically: on the next `romcloud refresh`,
+  any `.bin` track that used to be catalogued independently and is now
+  referenced by a `.cue` has its now-stale proxy/catalog entry removed
+  (never the real ROM file on disk).
+- A cue-referenced file that's missing from the source is still catalogued
+  (so `romcloud refresh`'s warnings and `romcloud healthcheck` reflect it
+  clearly) but caching/launching that game fails safely — ROMCloud never
+  hands emulatorlauncher a `.cue` with a missing track.
 
-This is intentionally deferred until the single-file path is fully hardened.
+**Not yet implemented:** `.m3u` multi-disc playlists and CCD/IMG/SUB-style
+descriptor+companion groups. The underlying data model (one launch asset +
+zero or more required companion assets) is generic enough to support them
+without another architectural change, but the format-specific dependency
+parsing for those has not been written yet.
 
 ### Save sync
 
@@ -1059,7 +1090,7 @@ The project is currently focused on:
 4. clean-machine testing
 5. management UI
 6. direct SMB support
-7. multi-disc support
+7. additional multi-disc formats (`.m3u`, CCD/IMG/SUB) — BIN/CUE is supported today
 8. save synchronization
 
 Contributions, testing, hardware reports, and ideas are welcome.

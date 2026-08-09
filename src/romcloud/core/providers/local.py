@@ -66,6 +66,14 @@ class LocalFilesystemProvider(StorageProvider):
     def get_size(self, path: str) -> Optional[int]:
         return _entry_size(Path(path))
 
+    # ── metadata ──────────────────────────────────────────────────────────────
+
+    def read_text(self, path: str) -> str:
+        try:
+            return Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise ProviderError(f"Cannot read {path}: {exc}") from exc
+
     # ── transfer ──────────────────────────────────────────────────────────────
 
     def transfer_to(

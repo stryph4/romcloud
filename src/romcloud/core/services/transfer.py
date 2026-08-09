@@ -18,6 +18,17 @@ in different systems or subdirectories never collide — see
 
 A power-loss or interruption leaves the staging path(s) in place.
 The next call picks up where it left off (resume logic is in the provider).
+
+Multi-asset games (e.g. .cue + .bin tracks)
+--------------------------------------------
+An asset already present and correctly sized at its *final* cache path is
+never re-staged/re-transferred — only genuinely missing or incomplete
+assets are fetched. This means a repair of a partially-cached logical game
+(e.g. the .cue exists but one .bin track was deleted) only downloads what's
+actually missing, and ``on_progress`` reports bytes/percentage aggregated
+across *all* of the game's assets (not reset to 0 for each new asset) so a
+UI session represents the whole logical-game transfer, not one track at a
+time.
 """
 
 from __future__ import annotations
@@ -55,28 +66,53 @@ class TransferService:
         The returned path is the primary asset's final location:
         ``{cache_root}/{system}/{relative path within that system}``.
 
-        Resume: if a previous transfer was interrupted, only missing/incomplete
-        assets are re-transferred.
+        Resume/repair: an asset already complete at its final cache path is
+        skipped entirely; only missing/incomplete assets are (re-)staged
+        and transferred. ``on_progress`` receives cumulative
+        ``(bytes_done, bytes_total)`` across the whole game, not per asset.
         """
         if not game.assets:
             raise TransferError(f"Game {game.id!r} has no assets to transfer")
 
         log.info("Starting transfer for %r (%s)", game.title, game.id)
 
+        grand_total = game.total_size_bytes or 0
+        cumulative_done = 0
+
         try:
             for asset in game.assets:
-                src = str(Path(game.source_root) / asset.relative_path)
+                final = self._final_path(game.system, asset.relative_path)
+                final_size = _existing_size(final)
+
+                if final_size is not None and (
+                    asset.size_bytes is None or final_size == asset.size_bytes
+                ):
+                    # Already fully cached (from a previous run, or another
+                    # asset of this same game) — repair only what's missing.
+                    cumulative_done += final_size
+                    if on_progress:
+                        on_progress(cumulative_done, grand_total or cumulative_done)
+                    continue
+
                 # Preserve the original filename verbatim, and mirror its
                 # relative location under the system — never flatten to a
                 # bare filename. Batocera's configgen matches per-game
                 # settings by filename (e.g. snes["Some Game.sfc"].*);
                 # renaming here would silently break any game-specific
                 # emulator/core overrides.
+                src = str(Path(game.source_root) / asset.relative_path)
                 dst = self._staging_path(game.system, asset.relative_path)
                 dst.parent.mkdir(parents=True, exist_ok=True)
 
+                base_done = cumulative_done
+
+                def _asset_progress(done: int, total: int, _base: int = base_done) -> None:
+                    if on_progress:
+                        on_progress(_base + done, grand_total or (_base + total))
+
                 log.debug("Transferring asset %s → %s", asset.relative_path, dst)
-                self._provider.transfer_to(src, str(dst), on_progress)
+                self._provider.transfer_to(src, str(dst), _asset_progress)
+                cumulative_done = base_done + (_existing_size(dst) or 0)
 
             self._validate(game)
 
@@ -98,10 +134,7 @@ class TransferService:
         total = 0
         for asset in game.assets:
             staged = self._staging_path(game.system, asset.relative_path)
-            if staged.is_file():
-                total += staged.stat().st_size
-            elif staged.is_dir():
-                total += sum(f.stat().st_size for f in staged.rglob("*") if f.is_file())
+            total += _existing_size(staged) or 0
         return total
 
     def discard_staging(self, game: Game) -> None:
@@ -124,19 +157,23 @@ class TransferService:
         return resolve_cache_path(self._cache_root, system, relative_path)
 
     def _validate(self, game: Game) -> None:
-        """Check that staged files match expected sizes where known."""
+        """Check that every asset ended up complete — either already
+        correct at its final path, or freshly staged with the expected size."""
         for asset in game.assets:
+            final = self._final_path(game.system, asset.relative_path)
+            final_size = _existing_size(final)
+            if final_size is not None and (
+                asset.size_bytes is None or final_size == asset.size_bytes
+            ):
+                continue  # already promoted from a previous run
+
             staged = self._staging_path(game.system, asset.relative_path)
             if not staged.exists():
                 raise TransferValidationError(
                     f"Asset missing after transfer: {asset.filename}"
                 )
             if asset.size_bytes is not None:
-                actual = (
-                    staged.stat().st_size
-                    if staged.is_file()
-                    else sum(f.stat().st_size for f in staged.rglob("*") if f.is_file())
-                )
+                actual = _existing_size(staged)
                 if actual != asset.size_bytes:
                     raise TransferValidationError(
                         f"Size mismatch for {asset.filename}: "
@@ -144,24 +181,39 @@ class TransferService:
                     )
 
     def _promote(self, game: Game) -> str:
-        """Move each staged asset to its final cache location atomically."""
+        """Move each freshly-staged asset to its final cache location.
+
+        An asset already complete at its final path (skipped during
+        transfer) is left untouched.
+        """
         final_primary: Optional[str] = None
 
         for asset in game.assets:
             staged = self._staging_path(game.system, asset.relative_path)
             final = self._final_path(game.system, asset.relative_path)
-            final.parent.mkdir(parents=True, exist_ok=True)
 
-            if final.exists():
-                if final.is_dir():
-                    shutil.rmtree(final)
-                else:
-                    final.unlink()
-
-            shutil.move(str(staged), str(final))
+            if staged.exists():
+                final.parent.mkdir(parents=True, exist_ok=True)
+                if final.exists():
+                    if final.is_dir():
+                        shutil.rmtree(final)
+                    else:
+                        final.unlink()
+                shutil.move(str(staged), str(final))
+            # else: asset was already complete at `final` — nothing to promote.
 
             if asset.is_primary or final_primary is None:
                 final_primary = str(final)
 
         assert final_primary is not None  # game.assets is non-empty (checked above)
         return final_primary
+
+
+def _existing_size(path: Path) -> Optional[int]:
+    """Return the on-disk size of *path* (file or directory tree), or None
+    if it does not exist."""
+    if path.is_file():
+        return path.stat().st_size
+    if path.is_dir():
+        return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+    return None
