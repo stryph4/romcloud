@@ -18,6 +18,7 @@ from ports_gfx.app import (
     _handle_menu_event,
     classify_message_kind,
     format_result,
+    initial_screen_for_status,
     operation_summary_message,
     start_operation,
 )
@@ -45,6 +46,22 @@ class TestMenuItems:
 
     def test_exit_is_the_last_item(self):
         assert MENU_ITEMS[-1].action == EXIT_ACTION
+
+
+class TestInitialScreen:
+    def test_fresh_install_opens_wizard(self):
+        status = BackendResult(ok=True, data={"state": "fresh"})
+        assert initial_screen_for_status(status) == "wizard"
+
+    def test_configured_install_opens_unchanged_dashboard(self):
+        status = BackendResult(ok=True, data={"state": "configured"})
+        assert initial_screen_for_status(status) == "menu"
+
+    def test_partial_or_broken_install_opens_repair_wizard(self):
+        partial = BackendResult(ok=True, data={"state": "partial"})
+        failed = BackendResult(ok=False, error="malformed response")
+        assert initial_screen_for_status(partial) == "wizard"
+        assert initial_screen_for_status(failed) == "wizard"
 
 
 class TestFormatResult:

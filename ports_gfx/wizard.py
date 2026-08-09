@@ -1,0 +1,348 @@
+"""Pure state and navigation for ROMCloud's graphical first-run wizard."""
+
+from __future__ import annotations
+
+from enum import Enum
+from typing import Any, Sequence
+
+from ports_gfx.actions import ACTION_DIRECTIONS, Action
+from ports_gfx.client import BackendResult, operation_result, start_backend_operation
+from ports_gfx.input_manager import InputEvent
+from ports_gfx.layout import Rect, find_next_focus_index
+from ports_gfx.operation import OperationRunner
+from ports_gfx.osk import OskState
+
+
+class WizardStep(Enum):
+    WELCOME = "welcome"
+    SOURCE = "source"
+    SERVER = "server"
+    USERNAME = "username"
+    PASSWORD = "password"
+    DISCOVER = "discover"
+    SHARE = "share"
+    DETECT = "detect"
+    SYSTEMS = "systems"
+    CACHE = "cache"
+    REVIEW = "review"
+    APPLY = "apply"
+    DONE = "done"
+
+
+STEPS = tuple(WizardStep)
+TEXT_STEPS = (WizardStep.SERVER, WizardStep.USERNAME, WizardStep.PASSWORD)
+CACHE_FIELDS = ("cache_root", "max_size_gb", "min_free_gb")
+
+
+class WizardState:
+    """Device-agnostic setup state. Secrets live only in this process."""
+
+    def __init__(self, status: BackendResult | None = None) -> None:
+        data = status.data if status and status.ok else {}
+        self.mode = str(data.get("state", "fresh"))
+        self.step = WizardStep.WELCOME
+        self.selected_index = 0
+        self.server = str(data.get("server", ""))
+        self.username = str(data.get("username", ""))
+        self.password = ""
+        self.share = str(data.get("share", ""))
+        self.rom_root = str(data.get("rom_root", "/userdata/romcloud-source"))
+        self.shares: list[dict[str, str]] = []
+        self.systems: list[str] = []
+        self.cache_root = str(data.get("cache_root", "/userdata/romcloud-cache"))
+        self.max_size_gb = float(data.get("max_size_gb", 50.0))
+        self.min_free_gb = float(data.get("min_free_gb", 5.0))
+        self.issues = [str(issue) for issue in data.get("issues", [])]
+        self.error = status.error if status and not status.ok else ""
+        self.osk: OskState | None = None
+        self.cache_osk_field: str | None = None
+        self.runner: OperationRunner | None = None
+        self.finished = False
+        self.applied_summary: dict[str, Any] = {}
+
+    @property
+    def step_number(self) -> int:
+        return STEPS.index(self.step) + 1
+
+    @property
+    def title(self) -> str:
+        titles = {
+            WizardStep.WELCOME: "Repair ROMCloud" if self.mode == "partial" else "Welcome to ROMCloud",
+            WizardStep.SOURCE: "Choose Source Type",
+            WizardStep.SERVER: "SMB Server",
+            WizardStep.USERNAME: "SMB Username",
+            WizardStep.PASSWORD: "SMB Password",
+            WizardStep.DISCOVER: "Discover Shares",
+            WizardStep.SHARE: "Select Share",
+            WizardStep.DETECT: "Detect Systems",
+            WizardStep.SYSTEMS: "Detected Systems",
+            WizardStep.CACHE: "Cache Settings",
+            WizardStep.REVIEW: "Review Setup",
+            WizardStep.APPLY: "Configure ROMCloud",
+            WizardStep.DONE: "Setup Complete",
+        }
+        return titles[self.step]
+
+    @property
+    def options(self) -> list[str]:
+        if self.step == WizardStep.WELCOME:
+            return ["Resume / Repair Setup" if self.mode == "partial" else "Start Setup"]
+        if self.step == WizardStep.SOURCE:
+            return ["SMB network share", "Local / external (coming later)"]
+        if self.step == WizardStep.SHARE:
+            return [share["name"] for share in self.shares]
+        if self.step == WizardStep.CACHE and self.osk is None:
+            return [
+                f"Location: {self.cache_root}",
+                f"Maximum size: {self.max_size_gb:g} GB",
+                f"Minimum free: {self.min_free_gb:g} GB",
+                "Continue",
+            ]
+        if self.step in (WizardStep.SYSTEMS, WizardStep.REVIEW, WizardStep.DONE):
+            return ["Continue" if self.step != WizardStep.DONE else "Finish"]
+        if self.step in (WizardStep.DISCOVER, WizardStep.DETECT, WizardStep.APPLY) and self.runner is None:
+            return ["Retry"]
+        return []
+
+    @property
+    def is_text_mode(self) -> bool:
+        return self.osk is not None
+
+    def widget_rects(self, default_rects: Sequence[Rect], osk_rects: Sequence[Rect]) -> Sequence[Rect]:
+        return osk_rects if self.osk is not None else default_rects
+
+    def enter_text_step(self, step: WizardStep) -> None:
+        self.step = step
+        initial = {
+            WizardStep.SERVER: self.server,
+            WizardStep.USERNAME: self.username,
+            WizardStep.PASSWORD: self.password,
+        }[step]
+        self.osk = OskState(initial_text=initial, masked=step == WizardStep.PASSWORD)
+        self.selected_index = self.osk.selected_index
+        self.error = ""
+
+    def handle_event(
+        self,
+        event: InputEvent,
+        rects: Sequence[Rect],
+        romcloud_bin: str,
+    ) -> None:
+        if self.osk is not None:
+            self._handle_osk(event, rects, romcloud_bin)
+            return
+
+        if event.touch_index is not None:
+            self.select(event.touch_index)
+
+        if event.action in ACTION_DIRECTIONS:
+            dx, dy = ACTION_DIRECTIONS[event.action]
+            self.select(find_next_focus_index(rects, self.selected_index, dx, dy))
+        elif event.action == Action.CONFIRM:
+            self._confirm(romcloud_bin)
+        elif event.action == Action.BACK:
+            self.back()
+
+    def _handle_osk(self, event: InputEvent, rects: Sequence[Rect], romcloud_bin: str) -> None:
+        assert self.osk is not None
+        if event.action == Action.TEXT_INPUT and event.text:
+            self.osk.insert_text(event.text)
+            return
+        if event.action == Action.TEXT_BACKSPACE:
+            self.osk.backspace()
+            return
+        if event.action == Action.BACK:
+            self._cancel_osk()
+            return
+        if event.touch_index is not None:
+            self.osk.select(event.touch_index)
+        if event.action in ACTION_DIRECTIONS:
+            dx, dy = ACTION_DIRECTIONS[event.action]
+            self.osk.select(find_next_focus_index(rects, self.osk.selected_index, dx, dy))
+            return
+        if event.action != Action.CONFIRM:
+            return
+
+        self.osk.activate(self.osk.selected_index)
+        if self.osk.cancelled:
+            self._cancel_osk()
+        elif self.osk.confirmed:
+            self._commit_osk(romcloud_bin)
+
+    def _commit_osk(self, romcloud_bin: str) -> None:
+        assert self.osk is not None
+        value = self.osk.text.strip() if self.step != WizardStep.PASSWORD else self.osk.text
+        if not value:
+            self.error = "A value is required."
+            self.osk.confirmed = False
+            return
+        if self.cache_osk_field is not None:
+            field = self.cache_osk_field
+            try:
+                if field == "cache_root":
+                    if not value.startswith("/"):
+                        raise ValueError("Cache location must be an absolute path.")
+                    if value == self.rom_root or value.startswith(f"{self.rom_root.rstrip('/')}/"):
+                        raise ValueError("Cache cannot be inside the ROM source.")
+                    self.cache_root = value
+                else:
+                    number = float(value)
+                    if number <= 0 and field == "max_size_gb":
+                        raise ValueError("Maximum size must be greater than zero.")
+                    if number < 0:
+                        raise ValueError("Minimum free space cannot be negative.")
+                    setattr(self, field, number)
+            except ValueError as exc:
+                self.error = str(exc)
+                self.osk.confirmed = False
+                return
+            self.cache_osk_field = None
+            self.osk = None
+            return
+
+        current = self.step
+        if current == WizardStep.SERVER:
+            self.server = value
+            self.enter_text_step(WizardStep.USERNAME)
+        elif current == WizardStep.USERNAME:
+            self.username = value
+            self.enter_text_step(WizardStep.PASSWORD)
+        elif current == WizardStep.PASSWORD:
+            self.password = value
+            self.osk = None
+            self._start_operation(WizardStep.DISCOVER, "setup-discover", romcloud_bin)
+
+    def _cancel_osk(self) -> None:
+        if self.cache_osk_field is not None:
+            self.cache_osk_field = None
+            self.osk = None
+            return
+        previous = {
+            WizardStep.SERVER: WizardStep.SOURCE,
+            WizardStep.USERNAME: WizardStep.SERVER,
+            WizardStep.PASSWORD: WizardStep.USERNAME,
+        }[self.step]
+        if previous in TEXT_STEPS:
+            self.enter_text_step(previous)
+        else:
+            self.osk = None
+            self.step = previous
+            self.selected_index = 0
+
+    def _confirm(self, romcloud_bin: str) -> None:
+        self.error = ""
+        if self.step == WizardStep.WELCOME:
+            self.step = WizardStep.SOURCE
+        elif self.step == WizardStep.SOURCE:
+            if self.selected_index == 0:
+                self.enter_text_step(WizardStep.SERVER)
+            else:
+                self.error = "Local and external sources are not available in this graphical setup yet."
+        elif self.step == WizardStep.DISCOVER:
+            self._start_operation(WizardStep.DISCOVER, "setup-discover", romcloud_bin)
+        elif self.step == WizardStep.SHARE and self.shares:
+            self.share = self.shares[self.selected_index]["name"]
+            self._start_operation(WizardStep.DETECT, "setup-validate", romcloud_bin)
+        elif self.step == WizardStep.DETECT:
+            self._start_operation(WizardStep.DETECT, "setup-validate", romcloud_bin)
+        elif self.step == WizardStep.SYSTEMS:
+            self.step = WizardStep.CACHE
+            self.selected_index = 0
+        elif self.step == WizardStep.CACHE:
+            if self.selected_index < len(CACHE_FIELDS):
+                self.cache_osk_field = CACHE_FIELDS[self.selected_index]
+                initial = str(getattr(self, self.cache_osk_field))
+                self.osk = OskState(initial_text=initial)
+            else:
+                if self.min_free_gb < 0 or self.max_size_gb <= 0:
+                    self.error = "Cache sizes are invalid."
+                else:
+                    self.step = WizardStep.REVIEW
+                    self.selected_index = 0
+        elif self.step == WizardStep.REVIEW:
+            self._start_operation(WizardStep.APPLY, "setup-apply", romcloud_bin)
+        elif self.step == WizardStep.APPLY:
+            self._start_operation(WizardStep.APPLY, "setup-apply", romcloud_bin)
+        elif self.step == WizardStep.DONE:
+            self.finished = True
+
+    def back(self) -> None:
+        if self.runner is not None:
+            self.runner.cancel()
+            self.runner = None
+        previous = {
+            WizardStep.SOURCE: WizardStep.WELCOME,
+            WizardStep.DISCOVER: WizardStep.PASSWORD,
+            WizardStep.SHARE: WizardStep.PASSWORD,
+            WizardStep.DETECT: WizardStep.SHARE,
+            WizardStep.SYSTEMS: WizardStep.SHARE,
+            WizardStep.CACHE: WizardStep.SYSTEMS,
+            WizardStep.REVIEW: WizardStep.CACHE,
+            WizardStep.APPLY: WizardStep.REVIEW,
+            WizardStep.DONE: WizardStep.REVIEW,
+        }.get(self.step)
+        if previous in TEXT_STEPS:
+            self.enter_text_step(previous)
+        elif previous is not None:
+            self.step = previous
+            self.selected_index = 0
+            self.error = ""
+
+    def select(self, index: int) -> None:
+        count = max(1, len(self.options))
+        self.selected_index = max(0, min(index, count - 1))
+
+    def update_direction(self, action: Action, rects: Sequence[Rect]) -> None:
+        if action not in ACTION_DIRECTIONS:
+            return
+        dx, dy = ACTION_DIRECTIONS[action]
+        if self.osk is not None:
+            self.osk.select(find_next_focus_index(rects, self.osk.selected_index, dx, dy))
+        else:
+            self.select(find_next_focus_index(rects, self.selected_index, dx, dy))
+
+    def poll(self) -> None:
+        if self.runner is None:
+            return
+        self.runner.poll()
+        if not self.runner.is_finished:
+            return
+        result = operation_result(self.runner)
+        self.runner = None
+        if not result.ok:
+            self.error = result.error
+            return
+
+        if self.step == WizardStep.DISCOVER:
+            self.shares = [dict(item) for item in result.data.get("shares", [])]
+            if not self.shares:
+                self.error = "No accessible shares were found."
+                return
+            self.step = WizardStep.SHARE
+            self.selected_index = 0
+        elif self.step == WizardStep.DETECT:
+            self.systems = [str(system) for system in result.data.get("systems", [])]
+            self.step = WizardStep.SYSTEMS
+            self.selected_index = 0
+        elif self.step == WizardStep.APPLY:
+            self.applied_summary = dict(result.data)
+            self.password = ""
+            self.step = WizardStep.DONE
+            self.selected_index = 0
+
+    def request_payload(self) -> dict[str, Any]:
+        return {
+            "server": self.server,
+            "share": self.share,
+            "username": self.username,
+            "password": self.password,
+            "rom_root": self.rom_root,
+            "cache_root": self.cache_root,
+            "max_size_gb": self.max_size_gb,
+            "min_free_gb": self.min_free_gb,
+        }
+
+    def _start_operation(self, step: WizardStep, action: str, romcloud_bin: str) -> None:
+        self.step = step
+        self.error = ""
+        self.runner = start_backend_operation(romcloud_bin, action, self.request_payload())

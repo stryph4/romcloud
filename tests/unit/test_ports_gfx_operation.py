@@ -75,6 +75,17 @@ class TestIncrementalOutputCapture:
         stderr_lines = [line for line in collected if line.stream == "stderr"]
         assert any(line.text == "oops" for line in stderr_lines)
 
+    def test_optional_stdin_is_sent_without_appearing_in_argv(self):
+        script = "import sys; print(sys.stdin.read())"
+        runner = OperationRunner(
+            [sys.executable, "-c", script],
+            stdin_text='{"password":"private"}',
+        )
+        runner.start()
+        collected = _drain_until_finished(runner)
+        assert [line.text for line in collected if line.stream == "stdout"] == ['{"password":"private"}']
+        assert "private" not in runner._argv  # noqa: SLF001 - credential boundary assertion
+
 
 class TestExitStates:
     def test_zero_exit_is_succeeded(self):

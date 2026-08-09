@@ -32,6 +32,7 @@ def _make_ports_gfx_source(project_root: Path, *, marker: str = "v1") -> Path:
     (source / "__init__.py").write_text("")
     (source / "client.py").write_text(f"# {marker}\n")
     (source / "app.py").write_text(f"# {marker}\n")
+    (source / "wizard.py").write_text(f"# {marker}\n")
     (source / "assets").mkdir(parents=True, exist_ok=True)
     (source / "assets" / "icon.png").write_bytes(f"fake-png-{marker}".encode())
     return source
@@ -114,6 +115,7 @@ class TestInstallPortsUi:
         assert result.installed is True
         assert result.error is None
         assert (ports_gfx_dir / "ports_gfx" / "client.py").exists()
+        assert (ports_gfx_dir / "ports_gfx" / "wizard.py").exists()
         assert result.wrapper_path == bin_dir / "romcloud-ports"
         assert f'exec "{fake_python}" -m ports_gfx "$@"' in result.wrapper_path.read_text()
         assert result.launch_progress_wrapper_path == bin_dir / "romcloud-launch-progress"

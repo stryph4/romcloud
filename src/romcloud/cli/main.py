@@ -37,10 +37,10 @@ def cli(ctx: click.Context, config_path: str | None, debug: bool) -> None:
     ctx.obj["config_path"] = config_path or str(default_config_path())
     ctx.obj["debug"] = debug
 
-    # Load config eagerly (except for `configure` which creates it, `update`
-    # which may run before any config exists, and `_reconcile-install` which
-    # is a self-contained internal step with its own explicit paths).
-    if ctx.invoked_subcommand not in ("configure", "update", "_reconcile-install"):
+    # Load config eagerly (except for commands which may run before one exists).
+    # Individual uidata actions load it when required; setup-status must be
+    # available to the graphical first-run UI on a completely fresh install.
+    if ctx.invoked_subcommand not in ("configure", "update", "_reconcile-install", "uidata"):
         try:
             config = load_config(config_path)
             ctx.obj["config"] = config

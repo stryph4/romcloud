@@ -25,10 +25,18 @@ graphical UI, not a user-facing command surface.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import click
 
 from romcloud.cli.context import get_container
+from romcloud.core.services.graphical_setup import (
+    apply_setup,
+    discover_shares,
+    setup_state,
+    validate_share,
+)
+from romcloud.infrastructure.config import load_config
 from romcloud.infrastructure.source_display import source_display_summary
 
 
@@ -53,12 +61,61 @@ def uidata_group() -> None:
     """Internal: JSON data endpoints for the graphical Ports UI."""
 
 
+def _load_context_config(ctx: click.Context):
+    config = load_config(ctx.obj["config_path"])
+    ctx.obj["config"] = config
+    return config
+
+
+def _read_request() -> dict:
+    raw = click.get_text_stream("stdin").read()
+    if not raw:
+        raise ValueError("Request body is required.")
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise ValueError("Request body must be a JSON object.")
+    return payload
+
+
+@uidata_group.command("setup-status")
+@click.pass_context
+def uidata_setup_status(ctx: click.Context) -> None:
+    """Report whether graphical setup is fresh, repairable, or complete."""
+
+    def build() -> dict:
+        return setup_state(Path(ctx.obj["config_path"]))
+
+    _run_action(ctx, build)
+
+
+@uidata_group.command("setup-discover")
+@click.pass_context
+def uidata_setup_discover(ctx: click.Context) -> None:
+    """Discover accessible SMB shares from a secret-bearing stdin request."""
+    _run_action(ctx, lambda: discover_shares(_read_request()))
+
+
+@uidata_group.command("setup-validate")
+@click.pass_context
+def uidata_setup_validate(ctx: click.Context) -> None:
+    """Validate a selected SMB share and report recognized systems."""
+    _run_action(ctx, lambda: validate_share(_read_request()))
+
+
+@uidata_group.command("setup-apply")
+@click.pass_context
+def uidata_setup_apply(ctx: click.Context) -> None:
+    """Apply, mount, scan, and integrate a validated graphical setup."""
+    _run_action(ctx, lambda: apply_setup(Path(ctx.obj["config_path"]), _read_request()))
+
+
 @uidata_group.command("status")
 @click.pass_context
 def uidata_status(ctx: click.Context) -> None:
     """Catalog + cache summary as JSON."""
 
     def build() -> dict:
+        _load_context_config(ctx)
         container = get_container(ctx)
         games = container.catalog.list_games()
         summary = container.cache.status_summary()
@@ -79,6 +136,7 @@ def uidata_refresh(ctx: click.Context) -> None:
     """Refresh the catalog from the configured source; result as JSON."""
 
     def build() -> dict:
+        _load_context_config(ctx)
         container = get_container(ctx)
         result = container.catalog.refresh()
         return {
@@ -99,6 +157,7 @@ def uidata_healthcheck(ctx: click.Context) -> None:
     """Source reachability as JSON (a lightweight subset of `romcloud healthcheck`)."""
 
     def build() -> dict:
+        _load_context_config(ctx)
         container = get_container(ctx)
         config = container.config
         reachable = container.provider.is_reachable(config.source.rom_root)
@@ -118,6 +177,7 @@ def uidata_cache_status(ctx: click.Context) -> None:
     """Cache summary as JSON."""
 
     def build() -> dict:
+        _load_context_config(ctx)
         container = get_container(ctx)
         summary = container.cache.status_summary()
         return {

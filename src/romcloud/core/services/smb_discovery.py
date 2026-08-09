@@ -14,9 +14,9 @@ Architecture
 ------------
 :class:`SMBDiscoveryService` is deliberately **not** aware of Click, stdin/
 stdout, prompts, or any other presentation concern — it is a plain service
-object, reusable by the CLI configure wizard today
-(:mod:`romcloud.cli.smb_setup_wizard`) and by a future graphical setup UI
-without any duplication of authentication/enumeration/validation logic.
+object, reused by both the CLI configure wizard
+(:mod:`romcloud.cli.smb_setup_wizard`) and graphical setup bridge without
+duplicating authentication/enumeration/validation logic.
 
 All actual network I/O is delegated to an injected :class:`SMBTransport`
 implementation (see :mod:`romcloud.infrastructure.smb_discovery_client` for

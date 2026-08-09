@@ -35,7 +35,7 @@ from ports_gfx.actions import ACTION_DIRECTIONS, Action
 from ports_gfx.client import BackendResult, call_backend
 from ports_gfx.input_debug import InputDebugLogger
 from ports_gfx.input_manager import InputEvent, InputManager
-from ports_gfx.layout import Layout, compute_layout, find_next_focus_index
+from ports_gfx.layout import Layout, Rect, compute_card_rects, compute_layout, find_next_focus_index
 from ports_gfx.menu import CONTROLLER_TEST_ACTION, EXIT_ACTION, MenuItem, MenuState
 from ports_gfx.operation import OperationRunner, OperationState
 from ports_gfx.operation_screen import (
@@ -47,6 +47,8 @@ from ports_gfx.operation_screen import (
     visible_window,
     wrap_lines,
 )
+from ports_gfx.osk import compute_osk_layout, compute_osk_text_rect
+from ports_gfx.wizard import WizardState, WizardStep
 
 MENU_ITEMS: tuple[MenuItem, ...] = (
     MenuItem("Catalog Status", "status"),
@@ -101,6 +103,7 @@ _MIN_SANE_DIMENSION = 240
 
 _TARGET_FPS = 30
 _HINT_TEXT = "Up/Down/Left/Right select   Enter confirm   Esc exit"
+_WIZARD_HINT = ""
 
 
 def format_result(action: str, result: BackendResult) -> str:
@@ -168,6 +171,13 @@ def operation_summary_message(operation: OperationScreenState) -> tuple[str, str
     detail = operation.runner.error
     suffix = f" ({detail})" if detail else ""
     return f"{operation.title}: failed{suffix}", "error"
+
+
+def initial_screen_for_status(status: BackendResult) -> str:
+    """Choose startup routing from the backend's structural setup state."""
+    if status.ok and status.data.get("state") == "configured":
+        return "menu"
+    return "wizard"
 
 
 def run_app(romcloud_bin: str) -> int:
@@ -276,6 +286,10 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
         pygame.display.set_caption("ROMCloud")
 
         state = MenuState(list(MENU_ITEMS))
+        setup_status = call_backend(romcloud_bin, "setup-status")
+        wizard: WizardState | None = None
+        if initial_screen_for_status(setup_status) == "wizard":
+            wizard = WizardState(setup_status)
         layout = compute_layout(screen_w, screen_h, len(state.items))
         fonts = _build_fonts(pygame, layout)
         clock = pygame.time.Clock()
@@ -298,7 +312,7 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
 
         controller_test = _ControllerTestScreenState()
         operation_screen: Optional[OperationScreenState] = None
-        current_screen = "menu"
+        current_screen = "wizard" if wizard is not None else "menu"
         message: Optional[str] = None
         message_kind = "info"
 
@@ -326,6 +340,8 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
 
                 if current_screen == "menu":
                     rects = layout.card_rects
+                elif current_screen == "wizard" and wizard is not None:
+                    rects = _wizard_rects(layout, wizard)
                 elif current_screen == OPERATION_SCREEN:
                     # The whole safe area is one big "tap anywhere" target
                     # — the operation screen's only touch interaction is
@@ -334,7 +350,12 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
                 else:
                     rects = ()
                 ievent = input_manager.handle_event(
-                    event, screen_w=screen_w, screen_h=screen_h, rects=rects, now=now,
+                    event,
+                    screen_w=screen_w,
+                    screen_h=screen_h,
+                    rects=rects,
+                    text_mode=current_screen == "wizard" and wizard is not None and wizard.is_text_mode,
+                    now=now,
                 )
 
                 if current_screen == "controller_test" and controller_test.remap_instance_id is not None:
@@ -360,6 +381,11 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
                     )
                     if new_operation is not None:
                         operation_screen = new_operation
+                elif current_screen == "wizard" and wizard is not None:
+                    if ievent.action == Action.BACK and wizard.step == WizardStep.WELCOME:
+                        running = False
+                    else:
+                        wizard.handle_event(ievent, rects, romcloud_bin)
                 elif current_screen == "controller_test":
                     current_screen = _handle_controller_test_event(
                         ievent, controller_test, input_manager,
@@ -376,10 +402,21 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
             # output) while the UI keeps rendering and waiting for input.
             if current_screen == OPERATION_SCREEN and operation_screen is not None:
                 operation_screen.poll()
+            elif current_screen == "wizard" and wizard is not None:
+                wizard.poll()
+                if wizard.finished:
+                    current_screen = "menu"
+                    wizard = None
+                    message = "Setup complete"
+                    message_kind = "success"
 
             if current_screen == "menu":
                 for action in input_manager.update(dt):
                     _apply_direction(state, layout, action)
+            elif current_screen == "wizard" and wizard is not None:
+                rects = _wizard_rects(layout, wizard)
+                for action in input_manager.update(dt):
+                    wizard.update_direction(action, rects)
 
             if current_screen == "menu":
                 _render_menu(pygame, screen, fonts, layout, state, message, message_kind)
@@ -387,6 +424,8 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
                 _render_controller_test(pygame, screen, fonts, layout, input_manager, controller_test)
             elif current_screen == OPERATION_SCREEN and operation_screen is not None:
                 _render_operation(pygame, screen, fonts, layout, operation_screen)
+            elif current_screen == "wizard" and wizard is not None:
+                _render_wizard(pygame, screen, fonts, layout, wizard)
 
         return 0
     finally:
@@ -608,6 +647,115 @@ def _render_operation(  # noqa: ANN001
     hint = fonts["hint"].render(hint_text, True, _HINT_COLOR)
     screen.blit(hint, (layout.hint_rect.x, layout.hint_rect.y))
 
+    pygame.display.flip()
+
+
+def _wizard_content_rect(layout: Layout) -> Rect:
+    top = layout.safe_area.y + layout.fonts.title + layout.fonts.hint + 20
+    bottom = layout.hint_rect.y - 8
+    return Rect(
+        x=layout.safe_area.x,
+        y=top,
+        w=layout.safe_area.w,
+        h=max(1, bottom - top),
+    )
+
+
+def _wizard_rects(layout: Layout, wizard: WizardState) -> list[Rect]:
+    content = _wizard_content_rect(layout)
+    if wizard.osk is not None:
+        return compute_osk_layout(content, wizard.osk.keys)
+    count = len(wizard.options)
+    if count == 0:
+        return []
+    columns = 1 if count <= 4 else min(3, count)
+    return compute_card_rects(content, count, columns)
+
+
+def _wizard_body_lines(wizard: WizardState) -> list[str]:
+    if wizard.step == WizardStep.WELCOME:
+        return wizard.issues or ["Set up an SMB-hosted ROM library."]
+    if wizard.step == WizardStep.SOURCE:
+        return ["Select where your ROM library is stored."]
+    if wizard.step == WizardStep.DISCOVER:
+        return ["Connecting and finding accessible shares..."] if wizard.runner else []
+    if wizard.step == WizardStep.DETECT:
+        return [f"Checking //{wizard.server}/{wizard.share}..."] if wizard.runner else []
+    if wizard.step == WizardStep.SYSTEMS:
+        if not wizard.systems:
+            return ["No recognized Batocera system folders were found."]
+        return [f"{len(wizard.systems)} systems: {', '.join(wizard.systems)}"]
+    if wizard.step == WizardStep.REVIEW:
+        return [
+            f"SMB: //{wizard.server}/{wizard.share}",
+            f"Systems: {len(wizard.systems)}",
+            f"Cache: {wizard.cache_root} ({wizard.max_size_gb:g} GB max)",
+        ]
+    if wizard.step == WizardStep.APPLY:
+        return ["Mounting, refreshing the catalog, and updating EmulationStation..."] if wizard.runner else []
+    if wizard.step == WizardStep.DONE:
+        return [
+            f"SMB source: //{wizard.applied_summary.get('server', wizard.server)}/{wizard.applied_summary.get('share', wizard.share)}",
+            f"Detected systems: {wizard.applied_summary.get('system_count', len(wizard.systems))}",
+            f"Cache size: {wizard.applied_summary.get('max_size_gb', wizard.max_size_gb):g} GB",
+            "ROMCloud is ready. Return to EmulationStation and restart or rescan it to show new games.",
+        ]
+    return []
+
+
+def _render_wizard(  # noqa: ANN001
+    pygame,
+    screen,
+    fonts: dict,
+    layout: Layout,
+    wizard: WizardState,
+) -> None:
+    screen.fill(_BG_COLOR)
+    title = fonts["title"].render(wizard.title, True, _FG_COLOR)
+    screen.blit(title, (layout.safe_area.x, layout.safe_area.y))
+
+    progress = fonts["hint"].render(f"Setup {wizard.step_number} of {len(tuple(WizardStep))}", True, _HINT_COLOR)
+    progress_rect = progress.get_rect(topright=(layout.safe_area.x + layout.safe_area.w, layout.safe_area.y))
+    screen.blit(progress, progress_rect)
+
+    content = _wizard_content_rect(layout)
+    if wizard.osk is not None:
+        text_rect = compute_osk_text_rect(content)
+        pygame.draw.rect(screen, _CARD_BG, (text_rect.x, text_rect.y, text_rect.w, text_rect.h), border_radius=6)
+        display_value = wizard.osk.displayed_text or " "
+        max_chars = max(1, text_rect.w // max(8, layout.fonts.body // 2))
+        value = fonts["body"].render(display_value[-max_chars:], True, _FG_COLOR)
+        screen.blit(value, (text_rect.x + 12, text_rect.y + max(4, (text_rect.h - value.get_height()) // 2)))
+        for index, (key, rect) in enumerate(zip(wizard.osk.keys, _wizard_rects(layout, wizard))):
+            color = _SELECTED_BG if index == wizard.osk.selected_index else _CARD_BG
+            pygame.draw.rect(screen, color, (rect.x, rect.y, rect.w, rect.h), border_radius=5)
+            label = fonts["body"].render(wizard.osk.key_label(key), True, _FG_COLOR)
+            screen.blit(label, label.get_rect(center=rect.center))
+    else:
+        y = content.y
+        line_h = layout.fonts.body + 7
+        max_chars = max(1, content.w // max(8, layout.fonts.body // 2))
+        for line in _wizard_body_lines(wizard):
+            for wrapped in wrap_lines([line], max_chars):
+                text = fonts["body"].render(wrapped, True, _FG_COLOR)
+                screen.blit(text, (content.x, y))
+                y += line_h
+
+        for index, (label_text, rect) in enumerate(zip(wizard.options, _wizard_rects(layout, wizard))):
+            color = _SELECTED_BG if index == wizard.selected_index else _CARD_BG
+            pygame.draw.rect(screen, color, (rect.x, rect.y, rect.w, rect.h), border_radius=6)
+            max_label_chars = max(1, rect.w // max(8, layout.fonts.body // 2))
+            label = fonts["body"].render(label_text[:max_label_chars], True, _FG_COLOR)
+            screen.blit(label, label.get_rect(center=rect.center))
+
+    if wizard.error:
+        max_chars = max(1, layout.message_rect.w // max(8, layout.fonts.body // 2))
+        error = fonts["body"].render(wizard.error[:max_chars], True, _ERROR_COLOR)
+        screen.blit(error, (layout.message_rect.x, layout.message_rect.y))
+
+    if _WIZARD_HINT:
+        hint = fonts["hint"].render(_WIZARD_HINT, True, _HINT_COLOR)
+        screen.blit(hint, (layout.hint_rect.x, layout.hint_rect.y))
     pygame.display.flip()
 
 

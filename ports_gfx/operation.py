@@ -73,6 +73,7 @@ class OperationRunner:
         *,
         popen: PopenFunc = subprocess.Popen,
         max_lines: int = DEFAULT_MAX_LINES,
+        stdin_text: str | None = None,
     ) -> None:
         self._argv = list(argv)
         self._popen = popen
@@ -84,6 +85,7 @@ class OperationRunner:
         self._returncode: Optional[int] = None
         self._error = ""
         self._started = False
+        self._stdin_text = stdin_text
 
     @property
     def state(self) -> OperationState:
@@ -114,13 +116,15 @@ class OperationRunner:
             return
         self._started = True
         try:
-            self._process = self._popen(
-                self._argv,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-            )
+            kwargs = {
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+                "bufsize": 1,
+            }
+            if self._stdin_text is not None:
+                kwargs["stdin"] = subprocess.PIPE
+            self._process = self._popen(self._argv, **kwargs)
         except OSError as exc:
             self._state = OperationState.FAILED
             self._error = str(exc)
@@ -131,6 +135,15 @@ class OperationRunner:
             return
 
         self._state = OperationState.RUNNING
+        if self._stdin_text is not None and self._process.stdin is not None:
+            try:
+                self._process.stdin.write(self._stdin_text)
+                self._process.stdin.close()
+            except OSError as exc:
+                self._process.terminate()
+                self._state = OperationState.FAILED
+                self._error = f"could not send request: {exc}"
+                return
         self._threads = [
             threading.Thread(target=self._pump, args=(self._process.stdout, "stdout"), daemon=True),
             threading.Thread(target=self._pump, args=(self._process.stderr, "stderr"), daemon=True),
@@ -164,6 +177,17 @@ class OperationRunner:
             drained.append(line)
             self._lines.append(line)
         return drained
+
+    def cancel(self) -> None:
+        """Terminate a running operation without blocking the UI thread."""
+        if self._state != OperationState.RUNNING or self._process is None:
+            return
+        try:
+            self._process.terminate()
+        except OSError:
+            pass
+        self._state = OperationState.FAILED
+        self._error = "cancelled"
 
     def poll(self) -> list[OperationLine]:
         """Call once per frame: drains whatever output has arrived so far

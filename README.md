@@ -14,7 +14,7 @@ The result:
 - Existing local ROMs continue to work normally.
 - Batocera remains the frontend — ROMCloud is the storage layer underneath it.
 
-> ROMCloud is currently under active development. The core launch/cache pipeline is working on real Batocera 42 hardware, but setup and UI are still being polished.
+> ROMCloud is currently under active development. The core launch/cache pipeline is working on real Batocera 42 hardware; the graphical first-run setup introduced in v0.9.0 still requires hardware validation across the supported display and input combinations.
 
 ---
 
@@ -85,6 +85,35 @@ Systems tested/generated in the current hardware setup include:
 - Xbox 360
 
 ROMCloud does not require every system to exist in the remote library. Only systems discovered in the catalog are managed.
+
+---
+
+## Release note (v0.9.0)
+
+- Launching **Ports → ROMCloud** on a fresh installation now opens a
+  fullscreen, controller-first setup wizard instead of requiring an SSH
+  session. Structurally valid existing installations continue directly to
+  the unchanged maintenance dashboard.
+- The supported graphical source flow is SMB: welcome, source selection,
+  server, username, masked password, share discovery and selection, system
+  detection, cache settings, review, mount/test, catalog and EmulationStation
+  integration, then completion. Local/USB setup remains available through
+  `romcloud configure` and is shown as unavailable in the graphical wizard.
+- Controller, touchscreen, and physical keyboard input all use the same
+  semantic navigation. Server, username, password, cache path, and numeric
+  cache values use ROMCloud's on-screen keyboard; password reveal is an
+  explicit temporary toggle.
+- Setup requests cross from Batocera's system-Python pygame process to the
+  venv backend as JSON over subprocess stdin. Passwords never appear in
+  argv, setup-state files, or graphical diagnostics and continue to use the
+  existing atomic mode-0600 credential files.
+- Failed fresh setup records only the failed step and a credential-free
+  error so the next launch offers repair. A retry revalidates the source and
+  reruns the idempotent apply pipeline. A failed attempt to repair an already
+  valid installation restores its previous config and credentials.
+- Fresh installs and `romcloud update` copy the complete `ports_gfx` payload,
+  including the wizard, through the existing shared reconciler. No manual
+  rerun of `install.sh` is required.
 
 ---
 
@@ -299,13 +328,11 @@ keyboard:
   `${ROMCLOUD_HOME}/ports-gfx-state/`, a location a reinstall/update never
   wipes (unlike `ports-gfx/`, which is recopied wholesale on every
   install/update).
-- **On-screen keyboard foundation** — a ROMCloud-owned OSK (letters,
+- **On-screen keyboard** — a ROMCloud-owned OSK (letters,
   numbers, symbols, space, backspace, shift/caps, confirm, cancel, and a
   masked-password show/hide toggle) usable by controller or touch, with
-  physical keyboard text entry still working at the same time. Not yet
-  wired into a live screen — it is reusable infrastructure for the
-  upcoming graphical setup wizard, not a user-facing feature on its own
-  yet.
+  physical keyboard text entry still working at the same time. The v0.9.0
+  graphical setup wizard uses it for SMB and cache fields.
 
 All input handling lives entirely inside `ports_gfx` — nothing was added
 to ROMCloud's backend (`romcloud uidata` contract, subprocess/JSON
@@ -466,7 +493,22 @@ Example:
 LocalFilesystemProvider
 ```
 
-#### Guided setup (default)
+#### Graphical first-run setup (default on Batocera)
+
+After installation, launch **Ports → ROMCloud**. A fresh or incomplete
+installation opens the graphical wizard automatically; a configured
+installation opens the maintenance dashboard. Normal SMB setup requires no
+SSH, mouse, or physical keyboard.
+
+The wizard discovers accessible shares, validates the selected share,
+reports recognized Batocera system folders, validates cache limits, mounts
+the source, refreshes the catalog/proxies, and generates the EmulationStation
+override. If a late step fails, the error identifies that step and can be
+retried without persisting the password in setup state. EmulationStation must
+still be restarted or rescanned after setup; ROMCloud does not terminate or
+restart it automatically.
+
+#### CLI guided setup
 
 `romcloud configure` no longer asks you to type a share name blindly. Instead
 it discovers what you can actually access, and only lets you pick from
@@ -521,8 +563,8 @@ Password entry shows `*` per character on terminals that support it, and
 falls back to fully hidden input (never plaintext) otherwise.
 
 The reusable discovery/setup logic lives in
-`romcloud.core.services.smb_discovery.SMBDiscoveryService` — it is not tied
-to the CLI, so a future graphical setup UI can use it unchanged.
+`romcloud.core.services.smb_discovery.SMBDiscoveryService`; both the CLI and
+graphical setup bridge use it rather than implementing SMB access in pygame.
 
 Example configuration:
 
@@ -714,7 +756,9 @@ Default mounted source:
 
 ## Configuration
 
-Run the interactive configuration wizard:
+On Batocera, launch **Ports → ROMCloud** for graphical SMB setup. The
+interactive CLI remains available for local/USB sources, advanced recovery,
+and terminal-based SMB setup:
 
 ```bash
 romcloud configure
@@ -943,7 +987,11 @@ Cached games continue to launch immediately with no ROMCloud screen at all.
 
 The current implementation requires CIFS mounting.
 
-A future native `SMBProvider` should remove the need for users to understand or configure mount points.
+The graphical wizard manages the standard mount point for normal SMB setup;
+there is still no native direct-SMB provider. Graphical discovery currently
+requires Batocera's `smbclient` tool. If it is unavailable, the wizard reports
+the failure without changing configuration; use `romcloud configure` for the
+CLI manual-share fallback.
 
 ### Multi-disc / multi-asset games — BIN/CUE
 

@@ -54,6 +54,47 @@ class TestHiddenFromHelp:
         assert "uidata" not in result.output
 
 
+class TestSetupBridge:
+    def test_fresh_setup_status_works_without_config(self, tmp_path):
+        cfg_path = tmp_path / "missing" / "romcloud.toml"
+        result = CliRunner().invoke(cli, ["--config", str(cfg_path), "uidata", "setup-status"])
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["ok"] is True
+        assert payload["state"] == "fresh"
+
+    def test_setup_request_is_read_from_stdin_not_argv(self, tmp_path, monkeypatch):
+        import romcloud.cli.commands.uidata as uidata_module
+
+        captured = {}
+
+        def discover(payload):
+            captured.update(payload)
+            return {"shares": [{"name": "ROMs", "comment": ""}]}
+
+        monkeypatch.setattr(uidata_module, "discover_shares", discover)
+        request = {"server": "nas", "username": "alice", "password": "private"}
+        result = CliRunner().invoke(
+            cli,
+            ["--config", str(tmp_path / "missing.toml"), "uidata", "setup-discover"],
+            input=json.dumps(request),
+        )
+        assert result.exit_code == 0
+        assert captured == request
+        assert "private" not in result.output
+
+    def test_malformed_setup_request_is_json_error(self, tmp_path):
+        result = CliRunner().invoke(
+            cli,
+            ["--config", str(tmp_path / "missing.toml"), "uidata", "setup-discover"],
+            input="not-json",
+        )
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["ok"] is False
+        assert "Traceback" not in result.output
+
+
 class TestStatus:
     def test_emits_single_json_object(self, tmp_path):
         result = _write_and_invoke(tmp_path, ["status"])

@@ -21,6 +21,8 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from ports_gfx.operation import OperationRunner
+
 RunFunc = Callable[..., "subprocess.CompletedProcess[str]"]
 
 DEFAULT_TIMEOUT = 20.0
@@ -87,3 +89,35 @@ def call_backend(
     if ok:
         return BackendResult(ok=True, data=payload)
     return BackendResult(ok=False, data=payload, error=str(payload.get("error", "unknown error")))
+
+
+def start_backend_operation(
+    romcloud_bin: str,
+    action: str,
+    payload: dict[str, Any],
+    *,
+    popen=None,  # noqa: ANN001
+) -> OperationRunner:
+    """Start a JSON uidata request without blocking the pygame event loop."""
+    kwargs = {"stdin_text": json.dumps(payload)}
+    if popen is not None:
+        kwargs["popen"] = popen
+    runner = OperationRunner([romcloud_bin, "uidata", action], **kwargs)
+    runner.start()
+    return runner
+
+
+def operation_result(runner: OperationRunner) -> BackendResult:
+    """Parse the final JSON response captured by a finished operation."""
+    stdout_lines = [line.text for line in runner.lines if line.stream == "stdout"]
+    if not stdout_lines:
+        return BackendResult(ok=False, error=runner.error or "no output from romcloud")
+    try:
+        payload = json.loads(stdout_lines[-1])
+    except ValueError:
+        return BackendResult(ok=False, error="malformed response from romcloud")
+    if not isinstance(payload, dict):
+        return BackendResult(ok=False, error="unexpected response shape from romcloud")
+    if payload.get("ok"):
+        return BackendResult(ok=True, data=payload)
+    return BackendResult(ok=False, data=payload, error=str(payload.get("error", runner.error or "unknown error")))

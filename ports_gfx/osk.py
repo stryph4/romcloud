@@ -1,7 +1,7 @@
 """ROMCloud-owned on-screen keyboard (OSK) foundation.
 
-Built for the upcoming graphical setup wizard (SMB server/share/username/
-password entry, etc.) but usable by any future text field — this module
+Used by the graphical setup wizard (SMB server/username/password and cache
+entry) but reusable by any future text field — this module
 only owns text-entry *state* and *key geometry*; it renders nothing and
 knows nothing about any particular screen. Navigation reuses
 ``layout.find_next_focus_index`` against the OSK's own computed key rects,
