@@ -237,6 +237,25 @@ All input handling lives entirely inside `ports_gfx` — nothing was added
 to ROMCloud's backend (`romcloud uidata` contract, subprocess/JSON
 boundary, and the venv/system-Python split are all unchanged).
 
+### Temporary hardware diagnostics
+
+For one-off controller troubleshooting on real Batocera hardware, the
+Ports UI can write a raw pygame event capture to
+`/userdata/system/romcloud/logs/controller-debug.log`.
+
+- Enable it by setting `ROMCLOUD_PORTS_GFX_INPUT_DEBUG=1` in the Batocera
+  Ports launcher environment before starting ROMCloud. The generated
+  launcher you would edit is `/userdata/system/romcloud/bin/romcloud-ports`
+  (or the Batocera Ports entry script it calls at
+  `/userdata/roms/ports/ROMCloud.sh`).
+- The log is **fresh per launch**: each run truncates the previous file so
+  one test session is easy to inspect.
+- It records only JOY*/CONTROLLER* input events plus startup controller
+  identity details (name, GUID, device index/instance id, button/axis/hat
+  fields where present). It does not log text input, backend data, or any
+  ROMCloud secrets.
+- Remove the environment variable to disable the capture again.
+
 ---
 
 ## Support ROMCloud

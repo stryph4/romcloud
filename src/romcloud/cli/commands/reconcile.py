@@ -78,3 +78,8 @@ def reconcile_install_cmd(
         click.echo("  Reconciled EmulationStation override.")
     elif report.es_override is False:
         click.echo("  Note: failed to reconcile EmulationStation override.")
+
+    if report.ports_gamelist is True:
+        click.echo("  Reconciled Ports gamelist entry for ROMCloud.")
+    elif report.ports_gamelist is False:
+        click.echo("  Note: failed to reconcile Ports gamelist entry.")

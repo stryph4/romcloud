@@ -3,9 +3,10 @@
 Both the bootstrap installer (``scripts/install.sh``) and the self-updater
 (:func:`romcloud.infrastructure.update.perform_update`) need to write the
 exact same set of managed runtime artifacts: the ``romcloud``/``romcloud-run``
-wrappers, the optional graphical Ports UI payload, and — only if previously
-enabled — the Batocera mount service script and the EmulationStation
-override. This module is the single, idempotent implementation of that
+wrappers, the optional graphical Ports UI payload (including its
+EmulationStation Ports ``gamelist.xml`` entry/icon), and — only if
+previously enabled — the Batocera mount service script and the
+EmulationStation override. This module is the single, idempotent implementation of that
 logic so neither caller duplicates it, and so a fresh install and a later
 self-update always produce byte-identical artifacts from the same source
 revision.
@@ -16,10 +17,11 @@ Failure semantics ("ROMCloud may fail; Batocera must not")
   is the one thing this module lets raise. Callers must treat any exception
   from :func:`write_core_wrappers` (and therefore from :func:`reconcile_install`)
   as a failed install/update.
-- Everything else — the graphical Ports UI, the mount service script, and
-  the EmulationStation override — is best-effort. A missing/incompatible
-  system Python, a never-configured mount service, or a never-installed ES
-  override are all normal states, not failures, and are reported back
+- Everything else — the graphical Ports UI (and its gamelist.xml entry),
+  the mount service script, and the EmulationStation override — is
+  best-effort. A missing/incompatible system Python, a never-configured
+  mount service, or a never-installed ES override are all normal states,
+  not failures, and are reported back
   through the returned result objects rather than raised.
 """
 
@@ -260,6 +262,32 @@ def reconcile_es_override(config_path: Path) -> Optional[bool]:
         return False
 
 
+def reconcile_ports_gamelist(ports_ui: PortsUiResult, ports_dir: Path) -> Optional[bool]:
+    """If the ROMCloud Ports entry (``ROMCloud.sh``) was installed this run,
+    ensure it has a matching `gamelist.xml` entry so EmulationStation shows
+    it with the bundled icon.
+
+    Returns ``None`` if not applicable (no Ports entry installed this run —
+    e.g. no system Python with pygame, or the ports directory doesn't
+    exist), ``True`` if the gamelist entry was reconciled successfully, or
+    ``False`` if it failed (best-effort; never raises).
+    """
+    if ports_ui.port_entry_path is None or ports_ui.ports_gfx_dir is None:
+        return None
+    try:
+        from romcloud.integrations.batocera import ports_gamelist_config
+
+        icon_path = ports_ui.ports_gfx_dir / "assets" / "icon.png"
+        ports_gamelist_config.reconcile(
+            image_path=icon_path,
+            gamelist_path=ports_dir / "gamelist.xml",
+        )
+        return True
+    except Exception:  # noqa: BLE001 — optional integration, never fatal
+        log.warning("Failed to reconcile Ports gamelist entry", exc_info=True)
+        return False
+
+
 # ── full reconciliation ───────────────────────────────────────────────────────
 
 
@@ -269,6 +297,7 @@ class ReconcileReport:
     ports_ui: PortsUiResult
     mount_service: Optional[bool]
     es_override: Optional[bool]
+    ports_gamelist: Optional[bool]
 
 
 def reconcile_install(
@@ -308,10 +337,12 @@ def reconcile_install(
 
     mount_service_status = reconcile_mount_service(bin_dir)
     es_override_status = reconcile_es_override(config_path)
+    ports_gamelist_status = reconcile_ports_gamelist(ports_ui, resolved_ports_dir)
 
     return ReconcileReport(
         core=core,
         ports_ui=ports_ui,
         mount_service=mount_service_status,
         es_override=es_override_status,
+        ports_gamelist=ports_gamelist_status,
     )

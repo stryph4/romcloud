@@ -33,6 +33,7 @@ from typing import Optional
 
 from ports_gfx.actions import ACTION_DIRECTIONS, Action
 from ports_gfx.client import BackendResult, call_backend
+from ports_gfx.input_debug import InputDebugLogger
 from ports_gfx.input_manager import InputEvent, InputManager
 from ports_gfx.layout import Layout, compute_layout, find_next_focus_index
 from ports_gfx.menu import CONTROLLER_TEST_ACTION, EXIT_ACTION, MenuItem, MenuState
@@ -171,6 +172,8 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
         except Exception:  # noqa: BLE001
             pass
 
+    input_debug: InputDebugLogger | None = None
+
     try:
         screen_w, screen_h = _detect_screen_size(pygame)
         screen = _open_display(pygame, screen_w, screen_h)
@@ -185,6 +188,16 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
         try:
             input_manager.controllers.open_existing_devices(pygame.joystick.get_count())
         except Exception:  # noqa: BLE001
+            pass
+
+        input_debug = InputDebugLogger(pygame)
+        try:
+            input_debug.log_startup(
+                joystick_count=pygame.joystick.get_count(),
+                controller_module_present=controller_module is not None,
+                snapshots=input_manager.controllers.snapshots(),
+            )
+        except Exception:  # noqa: BLE001 - diagnostics must never affect the UI
             pass
 
         controller_test = _ControllerTestScreenState()
@@ -207,6 +220,12 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
                     layout = compute_layout(screen_w, screen_h, len(state.items))
                     fonts = _build_fonts(pygame, layout)
                     continue
+
+                if input_debug is not None:
+                    try:
+                        input_debug.log_event(event)
+                    except Exception:  # noqa: BLE001 - logging is best-effort only
+                        pass
 
                 rects = layout.card_rects if current_screen == "menu" else ()
                 ievent = input_manager.handle_event(
@@ -250,6 +269,11 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
 
         return 0
     finally:
+        if input_debug is not None:
+            try:
+                input_debug.close()
+            except Exception:  # noqa: BLE001
+                pass
         pygame.quit()
 
 

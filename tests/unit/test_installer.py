@@ -342,6 +342,68 @@ class TestReconcileEsOverride:
         assert "snes" in content
 
 
+class TestReconcilePortsGamelist:
+    def test_not_applicable_when_no_port_entry_installed(self, tmp_path: Path) -> None:
+        ports_ui = inst.PortsUiResult(installed=False, skip_reason="no_pygame")
+
+        assert inst.reconcile_ports_gamelist(ports_ui, tmp_path / "ports") is None
+
+    def test_reconciled_when_port_entry_installed(self, tmp_path: Path) -> None:
+        ports_gfx_target = tmp_path / "ports-gfx" / "ports_gfx"
+        ports_gfx_target.mkdir(parents=True)
+        ports_dir = tmp_path / "ports"
+        ports_dir.mkdir()
+        port_entry_path = ports_dir / "ROMCloud.sh"
+        port_entry_path.write_text("#!/bin/bash\nexec true\n")
+
+        ports_ui = inst.PortsUiResult(
+            installed=True,
+            ports_gfx_dir=ports_gfx_target,
+            wrapper_path=tmp_path / "bin" / "romcloud-ports",
+            port_entry_path=port_entry_path,
+        )
+
+        result = inst.reconcile_ports_gamelist(ports_ui, ports_dir)
+
+        assert result is True
+        content = (ports_dir / "gamelist.xml").read_text()
+        assert "<path>./ROMCloud.sh</path>" in content
+        assert str(ports_gfx_target / "assets" / "icon.png") in content
+
+    def test_preserves_unrelated_entries_when_reconciled(self, tmp_path: Path) -> None:
+        ports_gfx_target = tmp_path / "ports-gfx" / "ports_gfx"
+        ports_gfx_target.mkdir(parents=True)
+        ports_dir = tmp_path / "ports"
+        ports_dir.mkdir()
+        (ports_dir / "gamelist.xml").write_text(
+            """<?xml version="1.0"?>
+<gameList>
+  <game>
+    <path>./SomeOtherPort.sh</path>
+    <name>Some Other Port</name>
+    <image>./images/some-other-port.png</image>
+  </game>
+</gameList>
+"""
+        )
+        port_entry_path = ports_dir / "ROMCloud.sh"
+        port_entry_path.write_text("#!/bin/bash\nexec true\n")
+
+        ports_ui = inst.PortsUiResult(
+            installed=True,
+            ports_gfx_dir=ports_gfx_target,
+            wrapper_path=tmp_path / "bin" / "romcloud-ports",
+            port_entry_path=port_entry_path,
+        )
+
+        result = inst.reconcile_ports_gamelist(ports_ui, ports_dir)
+
+        assert result is True
+        content = (ports_dir / "gamelist.xml").read_text()
+        assert "<path>./SomeOtherPort.sh</path>" in content
+        assert "<path>./ROMCloud.sh</path>" in content
+
+
 # ── full reconciliation ────────────────────────────────────────────────────────
 
 
@@ -373,6 +435,10 @@ class TestReconcileInstall:
         assert report.ports_ui.installed is True
         assert report.mount_service is None
         assert report.es_override is None
+        assert report.ports_gamelist is True
+        gamelist_content = (ports_dir / "gamelist.xml").read_text()
+        assert "<path>./ROMCloud.sh</path>" in gamelist_content
+        assert "assets/icon.png" in gamelist_content
 
     def test_repeated_reconciliation_is_harmless(self, tmp_path: Path, monkeypatch) -> None:
         from romcloud.integrations.batocera import mount_service, es_config
@@ -384,15 +450,21 @@ class TestReconcileInstall:
         project_root = tmp_path / "project"
         _make_ports_gfx_source(project_root)
         fake_python = _write_fake_system_python(tmp_path / "fake-python-pygame", has_pygame=True)
+        ports_dir = tmp_path / "ports"
+        ports_dir.mkdir()
 
         kwargs = dict(
             romcloud_home=romcloud_home,
             project_root=project_root,
-            ports_dir=tmp_path / "ports",
+            ports_dir=ports_dir,
             system_python=str(fake_python),
         )
         inst.reconcile_install(**kwargs)
+        gamelist_path = kwargs["ports_dir"] / "gamelist.xml"
+        content_after_first = gamelist_path.read_text()
         second = inst.reconcile_install(**kwargs)
 
         assert second.core.cli_wrapper.exists()
         assert second.ports_ui.installed is True
+        assert second.ports_gamelist is True
+        assert gamelist_path.read_text() == content_after_first
