@@ -37,22 +37,61 @@ from ports_gfx.input_debug import InputDebugLogger
 from ports_gfx.input_manager import InputEvent, InputManager
 from ports_gfx.layout import Layout, compute_layout, find_next_focus_index
 from ports_gfx.menu import CONTROLLER_TEST_ACTION, EXIT_ACTION, MenuItem, MenuState
+from ports_gfx.operation import OperationRunner, OperationState
+from ports_gfx.operation_screen import (
+    OPERATION_SCREEN,
+    OperationScreenState,
+    OperationSpec,
+    display_lines,
+    handle_operation_event,
+    visible_window,
+    wrap_lines,
+)
 
 MENU_ITEMS: tuple[MenuItem, ...] = (
     MenuItem("Catalog Status", "status"),
     MenuItem("Refresh Catalog", "refresh"),
     MenuItem("Health Check", "healthcheck"),
     MenuItem("Cache Status", "cache-status"),
+    MenuItem("Check for Updates", "update-check"),
     MenuItem("Controller Test", CONTROLLER_TEST_ACTION),
     MenuItem("Exit", EXIT_ACTION),
 )
+
+# Actions dispatched through the reusable long-running operation screen
+# (see operation_screen.py) instead of a quick blocking uidata JSON call.
+# Reusing this screen for a later action (update, repair, diagnostics,
+# mount/reconnect, sync) is just adding an entry here — never a change to
+# the screen itself. Each argv is an existing, already-safe CLI entry
+# point (never a new backend command).
+_OPERATIONS: dict[str, OperationSpec] = {
+    "refresh": OperationSpec(title="Refresh Catalog", args=("refresh",)),
+    "update-check": OperationSpec(title="Check for Updates", args=("update", "--check")),
+}
 
 _BG_COLOR = (18, 18, 24)
 _CARD_BG = (40, 40, 50)
 _FG_COLOR = (230, 230, 230)
 _SELECTED_BG = (60, 90, 160)
+_SUCCESS_COLOR = (90, 200, 120)
+_WARNING_COLOR = (230, 180, 60)
 _ERROR_COLOR = (220, 90, 90)
 _HINT_COLOR = (150, 150, 150)
+_MESSAGE_COLORS = {
+    "success": _SUCCESS_COLOR,
+    "warning": _WARNING_COLOR,
+    "error": _ERROR_COLOR,
+    "info": _FG_COLOR,
+}
+
+_STATE_LABELS = {
+    OperationState.STARTING: "Starting…",
+    OperationState.RUNNING: "Running…",
+    OperationState.SUCCEEDED: "Succeeded",
+    OperationState.FAILED: "Failed",
+}
+_OPERATION_HINT_RUNNING = "Please wait — operation is running"
+_OPERATION_HINT_FINISHED = "A/Enter/Esc/Tap return to menu   Up/Down scroll"
 
 # Fallback used only if the display driver reports a nonsensical size
 # (e.g. a headless/dummy driver) — never a "design resolution" the real
@@ -72,6 +111,45 @@ def format_result(action: str, result: BackendResult) -> str:
     if not result.ok:
         return f"Error: {result.error}"
     return f"{action}: {result.data}"
+
+
+def classify_message_kind(action: str, result: BackendResult) -> str:
+    """Classify a quick backend call's outcome for dashboard display —
+    distinguishes an outright failure from a merely-unreachable-but-not-broken
+    healthcheck result, so the UI never paints a soft warning the same red
+    as a real failure.
+
+    Pure function — no pygame — so it is fully unit-tested.
+    """
+    if not result.ok:
+        return "error"
+    if action == "healthcheck" and result.data.get("source_reachable") is False:
+        return "warning"
+    return "success"
+
+
+def start_operation(action: str, romcloud_bin: str, *, popen=None) -> OperationScreenState:  # noqa: ANN001
+    """Launch the backend subprocess for *action* and wrap it in a fresh
+    :class:`OperationScreenState`. *popen* is injectable for tests."""
+    spec = _OPERATIONS[action]
+    argv = [romcloud_bin, *spec.args]
+    runner = OperationRunner(argv) if popen is None else OperationRunner(argv, popen=popen)
+    runner.start()
+    return OperationScreenState(title=spec.title, runner=runner)
+
+
+def operation_summary_message(operation: OperationScreenState) -> tuple[str, str]:
+    """The dashboard message/kind to show after returning from a finished
+    operation screen — this is how the dashboard "refreshes" its status
+    line to reflect what just happened.
+
+    Pure function — no pygame — so it is fully unit-tested.
+    """
+    if operation.succeeded:
+        return f"{operation.title}: succeeded", "success"
+    detail = operation.runner.error
+    suffix = f" ({detail})" if detail else ""
+    return f"{operation.title}: failed{suffix}", "error"
 
 
 def run_app(romcloud_bin: str) -> int:
@@ -201,9 +279,10 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
             pass
 
         controller_test = _ControllerTestScreenState()
+        operation_screen: Optional[OperationScreenState] = None
         current_screen = "menu"
         message: Optional[str] = None
-        message_is_error = False
+        message_kind = "info"
 
         running = True
         while running:
@@ -227,7 +306,15 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
                     except Exception:  # noqa: BLE001 - logging is best-effort only
                         pass
 
-                rects = layout.card_rects if current_screen == "menu" else ()
+                if current_screen == "menu":
+                    rects = layout.card_rects
+                elif current_screen == OPERATION_SCREEN:
+                    # The whole safe area is one big "tap anywhere" target
+                    # — the operation screen's only touch interaction is
+                    # dismissing it once finished (see handle_operation_event).
+                    rects = (layout.safe_area,)
+                else:
+                    rects = ()
                 ievent = input_manager.handle_event(
                     event, screen_w=screen_w, screen_h=screen_h, rects=rects, now=now,
                 )
@@ -250,22 +337,38 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
                     continue
 
                 if current_screen == "menu":
-                    running, current_screen, message, message_is_error = _handle_menu_event(
-                        ievent, state, layout, romcloud_bin, running, message, message_is_error,
+                    running, current_screen, message, message_kind, new_operation = _handle_menu_event(
+                        ievent, state, layout, romcloud_bin, running, message, message_kind,
                     )
+                    if new_operation is not None:
+                        operation_screen = new_operation
                 elif current_screen == "controller_test":
                     current_screen = _handle_controller_test_event(
                         ievent, controller_test, input_manager,
                     )
+                elif current_screen == OPERATION_SCREEN and operation_screen is not None:
+                    current_screen = handle_operation_event(ievent, operation_screen)
+                    if current_screen == "menu":
+                        message, message_kind = operation_summary_message(operation_screen)
+                        operation_screen = None
+
+            # Drain output/state every frame regardless of whether an input
+            # event arrived this frame — the whole point of the operation
+            # screen is that the backend keeps working (and producing
+            # output) while the UI keeps rendering and waiting for input.
+            if current_screen == OPERATION_SCREEN and operation_screen is not None:
+                operation_screen.poll()
 
             if current_screen == "menu":
                 for action in input_manager.update(dt):
                     _apply_direction(state, layout, action)
 
             if current_screen == "menu":
-                _render_menu(pygame, screen, fonts, layout, state, message, message_is_error)
-            else:
+                _render_menu(pygame, screen, fonts, layout, state, message, message_kind)
+            elif current_screen == "controller_test":
                 _render_controller_test(pygame, screen, fonts, layout, input_manager, controller_test)
+            elif current_screen == OPERATION_SCREEN and operation_screen is not None:
+                _render_operation(pygame, screen, fonts, layout, operation_screen)
 
         return 0
     finally:
@@ -292,8 +395,8 @@ def _handle_menu_event(
     romcloud_bin: str,
     running: bool,
     message: Optional[str],
-    message_is_error: bool,
-) -> tuple[bool, str, Optional[str], bool]:
+    message_kind: str,
+) -> tuple[bool, str, Optional[str], str, Optional[OperationScreenState]]:
     action = ievent.action
     next_screen = "menu"
 
@@ -302,7 +405,7 @@ def _handle_menu_event(
 
     if action in ACTION_DIRECTIONS:
         _apply_direction(state, layout, action)
-        return running, next_screen, None, message_is_error
+        return running, next_screen, None, message_kind, None
 
     if action == Action.CONFIRM:
         item = state.selected_item
@@ -310,17 +413,21 @@ def _handle_menu_event(
             running = False
         elif item.action == CONTROLLER_TEST_ACTION:
             next_screen = "controller_test"
+        elif item.action in _OPERATIONS:
+            next_screen = OPERATION_SCREEN
+            operation = start_operation(item.action, romcloud_bin)
+            return running, next_screen, message, message_kind, operation
         else:
             result = call_backend(romcloud_bin, item.action)
             message = format_result(item.action, result)
-            message_is_error = not result.ok
-        return running, next_screen, message, message_is_error
+            message_kind = classify_message_kind(item.action, result)
+        return running, next_screen, message, message_kind, None
 
     if action == Action.BACK:
         running = False
-        return running, next_screen, message, message_is_error
+        return running, next_screen, message, message_kind, None
 
-    return running, next_screen, message, message_is_error
+    return running, next_screen, message, message_kind, None
 
 
 def _handle_controller_test_event(
@@ -360,7 +467,7 @@ def _render_menu(  # noqa: ANN001
     layout: Layout,
     state: MenuState,
     message: Optional[str],
-    message_is_error: bool,
+    message_kind: str,
 ) -> None:
     screen.fill(_BG_COLOR)
 
@@ -376,7 +483,7 @@ def _render_menu(  # noqa: ANN001
 
     if message:
         max_chars = max(1, layout.message_rect.w // 8)
-        color = _ERROR_COLOR if message_is_error else _FG_COLOR
+        color = _MESSAGE_COLORS.get(message_kind, _FG_COLOR)
         text = fonts["body"].render(message[:max_chars], True, color)
         screen.blit(text, (layout.message_rect.x, layout.message_rect.y))
 
@@ -434,6 +541,53 @@ def _render_controller_test(  # noqa: ANN001
         y += line_h + 4
 
     hint = fonts["hint"].render(_CONTROLLER_TEST_HINT, True, _HINT_COLOR)
+    screen.blit(hint, (layout.hint_rect.x, layout.hint_rect.y))
+
+    pygame.display.flip()
+
+
+def _render_operation(  # noqa: ANN001
+    pygame,
+    screen,
+    fonts: dict,
+    layout: Layout,
+    operation: OperationScreenState,
+) -> None:
+    """Renders the reusable long-running operation screen — a title, a
+    state label, and a bounded/scrolled/wrapped view of the subprocess's
+    captured output. Deliberately plain (no monospace terminal styling):
+    this is a 10-foot/Steam Deck status view, not a terminal emulator."""
+    screen.fill(_BG_COLOR)
+
+    title = fonts["title"].render(operation.title, True, _FG_COLOR)
+    screen.blit(title, (layout.safe_area.x, layout.safe_area.y))
+
+    state = operation.state
+    state_color = _SUCCESS_COLOR if state == OperationState.SUCCEEDED else (
+        _ERROR_COLOR if state == OperationState.FAILED else _FG_COLOR
+    )
+    state_y = layout.safe_area.y + layout.fonts.title + 8
+    state_label = fonts["body"].render(_STATE_LABELS[state], True, state_color)
+    screen.blit(state_label, (layout.safe_area.x, state_y))
+
+    output_top = state_y + layout.fonts.body + 12
+    output_bottom = layout.hint_rect.y - 8
+    line_h = layout.fonts.body + 4
+    viewport_rows = max(1, (output_bottom - output_top) // line_h)
+
+    max_chars = max(1, layout.safe_area.w // 10)
+    lines = wrap_lines(display_lines(operation.runner), max_chars)
+    start, end = visible_window(len(lines), viewport_rows, operation.scroll_offset)
+
+    y = output_top
+    for line in lines[start:end]:
+        color = _ERROR_COLOR if line.startswith("! ") else _FG_COLOR
+        text = fonts["body"].render(line, True, color)
+        screen.blit(text, (layout.safe_area.x, y))
+        y += line_h
+
+    hint_text = _OPERATION_HINT_FINISHED if operation.is_finished else _OPERATION_HINT_RUNNING
+    hint = fonts["hint"].render(hint_text, True, _HINT_COLOR)
     screen.blit(hint, (layout.hint_rect.x, layout.hint_rect.y))
 
     pygame.display.flip()

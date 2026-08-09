@@ -88,6 +88,35 @@ ROMCloud does not require every system to exist in the remote library. Only syst
 
 ---
 
+## Release note (v0.5.0)
+
+- New capability: the graphical Ports UI is now an actionable maintenance
+  app instead of a mostly-informational menu. `Refresh Catalog` and the
+  new `Check for Updates` action now open a reusable **operation screen**
+  that launches the backend subprocess without freezing the UI, streams
+  its live stdout/stderr output on screen (auto-scrolling, with a bounded
+  history so memory can't grow unbounded), and clearly shows
+  starting/running/succeeded/failed state before returning to the
+  dashboard — see "Interactive maintenance & the operation screen" below.
+- `Refresh Catalog` no longer relies on a fixed subprocess timeout (it had
+  recently been raised from 20s to 120s as a stopgap): the operation
+  screen owns the process lifecycle directly, so a legitimately long
+  refresh is never reported as failed just for taking a while, while a
+  truly failed refresh still reports failure via its real exit code.
+- `Health Check`'s dashboard result now distinguishes a soft warning (the
+  configured source isn't currently reachable) from an outright failure,
+  instead of coloring both the same way.
+- The operation screen is intentionally generic (title + subprocess argv)
+  so later maintenance actions (`romcloud update`, repair, diagnostics,
+  mount/reconnect, future sync operations) can reuse it directly.
+- No backend functionality was invented for this: every action the UI now
+  drives (`refresh`, `update --check`, `healthcheck`) is an existing CLI
+  command already safe to run directly. No change to catalog refresh
+  semantics, cache/download/launch behavior, or the subprocess/JSON
+  `uidata` boundary; `ports_gfx` still never imports `romcloud`.
+
+---
+
 ## Release note (v0.4.0)
 
 - New capability: the graphical Ports UI is now usable end-to-end with a
@@ -156,9 +185,9 @@ ROMCloud does not require every system to exist in the remote library. Only syst
 ## Graphical Ports UI (v0.3.0)
 
 ROMCloud now ships an optional graphical menu (Catalog Status, Refresh
-Catalog, Health Check, Cache Status) launched as a Batocera **Port**
-(`/userdata/roms/ports/ROMCloud.sh`), instead of only the controller-friendly
-curses menu.
+Catalog, Health Check, Cache Status, Check for Updates) launched as a
+Batocera **Port** (`/userdata/roms/ports/ROMCloud.sh`), instead of only the
+controller-friendly curses menu.
 
 **Why it runs outside ROMCloud's venv:** Batocera 42 ships pygame/SDL in its
 own system Python (confirmed on real hardware: pygame 2.5.2 / SDL 2.32.8),
@@ -255,6 +284,49 @@ Ports UI can write a raw pygame event capture to
   fields where present). It does not log text input, backend data, or any
   ROMCloud secrets.
 - Remove the environment variable to disable the capture again.
+
+---
+
+## Interactive maintenance & the operation screen (v0.5.0)
+
+The graphical Ports dashboard is now actionable, not just informational:
+
+- **Refresh Catalog** and **Check for Updates** open a reusable
+  **operation screen** instead of blocking the dashboard on a single
+  subprocess call. **Health Check** and **Cache Status** remain quick,
+  synchronous dashboard results (they already return promptly).
+- The operation screen (`ports_gfx/operation.py` +
+  `ports_gfx/operation_screen.py`) launches the backend as a real
+  subprocess via two background reader threads (stdout/stderr), and the
+  pygame event loop polls it once per frame — the UI keeps rendering and
+  accepting input the entire time the backend is working, however long
+  that legitimately takes. No timeout is ever applied to the subprocess
+  itself; only an actual non-zero exit (or a failed launch) is reported as
+  failure.
+- Output is shown live, auto-scrolls to the latest line, wraps to the
+  screen width, and is capped to a bounded number of retained lines so a
+  very chatty or very long operation can never grow memory unbounded.
+  Once an operation finishes, the user can scroll back through its output
+  before returning to the dashboard (`A`/`Enter`/`Esc`/tap, or `B`) — the
+  dashboard's status message then reflects the just-finished operation's
+  outcome.
+- `Refresh Catalog` is the first action migrated to this model, replacing
+  its previous fixed subprocess timeout entirely: a legitimately long
+  refresh over a large remote library is never reported as failed simply
+  because it runs past some arbitrary number of seconds, while a genuinely
+  failed refresh still reports failure (via its real process exit code).
+- The operation screen is deliberately generic (a title plus the backend
+  argv to run) rather than a large task/job framework — a later action
+  (`romcloud update`, repair, diagnostics, mount/reconnect, future sync
+  operations) reuses it by adding one entry, not by changing the screen.
+  This is also the presentation/state pattern the upcoming graphical
+  cache-miss download screen is expected to build on.
+- Fully controller/touch/keyboard accessible, at every supported
+  resolution (Steam Deck, 720p, 1080p, 4K, unusual aspect ratios) — same
+  responsive layout/input foundation as the rest of the Ports UI.
+- No backend/subprocess-JSON boundary changes: every action the operation
+  screen runs is an existing `romcloud` CLI command (`refresh`,
+  `update --check`); `ports_gfx` still never imports `romcloud`.
 
 ---
 

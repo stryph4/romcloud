@@ -16,13 +16,18 @@ from ports_gfx.app import (
     _apply_direction,
     _handle_controller_test_event,
     _handle_menu_event,
+    classify_message_kind,
     format_result,
+    operation_summary_message,
+    start_operation,
 )
 from ports_gfx.actions import Action
 from ports_gfx.client import BackendResult
 from ports_gfx.input_manager import InputEvent
 from ports_gfx.layout import compute_layout
 from ports_gfx.menu import CONTROLLER_TEST_ACTION, EXIT_ACTION, MenuState
+from ports_gfx.operation import OperationState
+from ports_gfx.operation_screen import OPERATION_SCREEN
 
 
 class TestMenuItems:
@@ -33,6 +38,7 @@ class TestMenuItems:
             "refresh",
             "healthcheck",
             "cache-status",
+            "update-check",
             CONTROLLER_TEST_ACTION,
             EXIT_ACTION,
         ]
@@ -52,6 +58,24 @@ class TestFormatResult:
         result = BackendResult(ok=False, error="connection refused")
         line = format_result("healthcheck", result)
         assert line == "Error: connection refused"
+
+
+class TestClassifyMessageKind:
+    def test_failed_call_is_error(self):
+        result = BackendResult(ok=False, error="boom")
+        assert classify_message_kind("status", result) == "error"
+
+    def test_successful_status_call_is_success(self):
+        result = BackendResult(ok=True, data={"ok": True, "games_total": 3})
+        assert classify_message_kind("status", result) == "success"
+
+    def test_healthcheck_unreachable_source_is_warning_not_error(self):
+        result = BackendResult(ok=True, data={"ok": True, "source_reachable": False})
+        assert classify_message_kind("healthcheck", result) == "warning"
+
+    def test_healthcheck_reachable_source_is_success(self):
+        result = BackendResult(ok=True, data={"ok": True, "source_reachable": True})
+        assert classify_message_kind("healthcheck", result) == "success"
 
 
 class TestRunAppHandlesMissingPygame:
@@ -104,11 +128,12 @@ class TestHandleMenuEvent:
         exit_index = next(i for i, item in enumerate(state.items) if item.action == EXIT_ACTION)
         state.select(exit_index)
 
-        running, screen, message, is_error = _handle_menu_event(
-            InputEvent(action=Action.CONFIRM), state, layout, "/opt/romcloud/bin/romcloud", True, None, False,
+        running, screen, message, kind, operation = _handle_menu_event(
+            InputEvent(action=Action.CONFIRM), state, layout, "/opt/romcloud/bin/romcloud", True, None, "info",
         )
         assert running is False
         assert screen == "menu"
+        assert operation is None
 
     def test_confirm_on_controller_test_item_switches_screen(self):
         state = self._state()
@@ -116,42 +141,83 @@ class TestHandleMenuEvent:
         idx = next(i for i, item in enumerate(state.items) if item.action == CONTROLLER_TEST_ACTION)
         state.select(idx)
 
-        running, screen, message, is_error = _handle_menu_event(
-            InputEvent(action=Action.CONFIRM), state, layout, "/opt/romcloud/bin/romcloud", True, None, False,
+        running, screen, message, kind, operation = _handle_menu_event(
+            InputEvent(action=Action.CONFIRM), state, layout, "/opt/romcloud/bin/romcloud", True, None, "info",
         )
         assert running is True
         assert screen == "controller_test"
+        assert operation is None
 
     def test_back_action_quits_the_app(self):
         state = self._state()
         layout = self._layout(state)
-        running, screen, message, is_error = _handle_menu_event(
-            InputEvent(action=Action.BACK), state, layout, "/opt/romcloud/bin/romcloud", True, None, False,
+        running, screen, message, kind, operation = _handle_menu_event(
+            InputEvent(action=Action.BACK), state, layout, "/opt/romcloud/bin/romcloud", True, None, "info",
         )
         assert running is False
+        assert operation is None
 
     def test_directional_action_moves_selection_via_layout(self):
         state = self._state()
         layout = self._layout(state)
-        running, screen, message, is_error = _handle_menu_event(
-            InputEvent(action=Action.RIGHT), state, layout, "/opt/romcloud/bin/romcloud", True, None, False,
+        running, screen, message, kind, operation = _handle_menu_event(
+            InputEvent(action=Action.RIGHT), state, layout, "/opt/romcloud/bin/romcloud", True, None, "info",
         )
         assert running is True
         assert screen == "menu"
         assert message is None
         assert state.selected_index == 1
+        assert operation is None
 
     def test_touch_index_focuses_before_dispatch(self):
         state = self._state()
         layout = self._layout(state)
         exit_index = next(i for i, item in enumerate(state.items) if item.action == EXIT_ACTION)
 
-        running, screen, message, is_error = _handle_menu_event(
+        running, screen, message, kind, operation = _handle_menu_event(
             InputEvent(action=Action.CONFIRM, touch_index=exit_index),
-            state, layout, "/opt/romcloud/bin/romcloud", True, None, False,
+            state, layout, "/opt/romcloud/bin/romcloud", True, None, "info",
         )
         assert state.selected_index == exit_index
         assert running is False
+        assert operation is None
+
+    def test_confirm_on_refresh_item_starts_an_operation_and_switches_screen(self, monkeypatch):
+        import sys
+
+        from ports_gfx import app as app_module
+
+        state = self._state()
+        layout = self._layout(state)
+        refresh_index = next(i for i, item in enumerate(state.items) if item.action == "refresh")
+        state.select(refresh_index)
+
+        def fake_popen(argv, **kwargs):
+            import subprocess
+
+            return subprocess.Popen(
+                [sys.executable, "-c", "pass"],
+                stdout=kwargs.get("stdout"),
+                stderr=kwargs.get("stderr"),
+                text=True,
+            )
+
+        def fake_start_operation(action, romcloud_bin):
+            spec = app_module._OPERATIONS[action]
+            runner = app_module.OperationRunner([romcloud_bin, *spec.args], popen=fake_popen)
+            runner.start()
+            return app_module.OperationScreenState(title=spec.title, runner=runner)
+
+        monkeypatch.setattr(app_module, "start_operation", fake_start_operation)
+
+        running, screen, message, kind, operation = app_module._handle_menu_event(
+            InputEvent(action=Action.CONFIRM), state, layout, "/opt/romcloud/bin/romcloud", True, None, "info",
+        )
+
+        assert running is True
+        assert screen == OPERATION_SCREEN
+        assert operation is not None
+        assert operation.title == "Refresh Catalog"
 
 
 class TestHandleControllerTestEvent:
@@ -185,3 +251,60 @@ class TestHandleControllerTestEvent:
         screen = _handle_controller_test_event(InputEvent(action=Action.CONFIRM), controller_test, manager)
         assert screen == "controller_test"
         assert controller_test.remap_instance_id is None
+
+
+class TestStartOperation:
+    def test_builds_argv_from_spec_and_starts_the_runner(self):
+        import subprocess
+        import sys
+
+        captured = {}
+
+        def fake_popen(argv, **kwargs):
+            captured["argv"] = argv
+            return subprocess.Popen(
+                [sys.executable, "-c", "pass"], stdout=kwargs.get("stdout"), stderr=kwargs.get("stderr"), text=True,
+            )
+
+        operation = start_operation("refresh", "/opt/romcloud/bin/romcloud", popen=fake_popen)
+
+        assert operation.title == "Refresh Catalog"
+        assert captured["argv"] == ["/opt/romcloud/bin/romcloud", "refresh"]
+        assert operation.runner.state in (OperationState.RUNNING, OperationState.SUCCEEDED)
+
+    def test_unknown_action_raises_key_error(self):
+        import pytest
+
+        with pytest.raises(KeyError):
+            start_operation("not-a-real-operation", "/opt/romcloud/bin/romcloud")
+
+
+class _FakeFinishedRunner:
+    def __init__(self, state: OperationState, error: str = "") -> None:
+        self.state = state
+        self.error = error
+
+
+class TestOperationSummaryMessage:
+    def _operation(self, *, state: OperationState, error: str = ""):
+        from ports_gfx.operation_screen import OperationScreenState
+
+        return OperationScreenState(title="Refresh Catalog", runner=_FakeFinishedRunner(state, error))
+
+    def test_succeeded_operation_reports_success(self):
+        operation = self._operation(state=OperationState.SUCCEEDED)
+        message, kind = operation_summary_message(operation)
+        assert message == "Refresh Catalog: succeeded"
+        assert kind == "success"
+
+    def test_failed_operation_reports_error_with_detail(self):
+        operation = self._operation(state=OperationState.FAILED, error="exited with code 1")
+        message, kind = operation_summary_message(operation)
+        assert message == "Refresh Catalog: failed (exited with code 1)"
+        assert kind == "error"
+
+    def test_failed_operation_without_detail_still_reports_error(self):
+        operation = self._operation(state=OperationState.FAILED, error="")
+        message, kind = operation_summary_message(operation)
+        assert message == "Refresh Catalog: failed"
+        assert kind == "error"
