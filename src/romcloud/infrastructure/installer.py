@@ -137,6 +137,7 @@ class PortsUiResult:
     skip_reason: Optional[str] = None
     ports_gfx_dir: Optional[Path] = None
     wrapper_path: Optional[Path] = None
+    launch_progress_wrapper_path: Optional[Path] = None
     port_entry_path: Optional[Path] = None
     port_entry_skip_reason: Optional[str] = None
     error: Optional[str] = None
@@ -185,6 +186,19 @@ def install_ports_ui(
         )
         wrapper_path = _write_executable(bin_dir / "romcloud-ports", wrapper_content)
 
+        # The cache-miss graphical progress screen (see
+        # romcloud.ui.graphical_progress) is driven directly over stdin/stdout
+        # by the venv-side launcher process, never via ROMCLOUD_BIN/uidata —
+        # it has nothing to ask the backend for, so no ROMCLOUD_BIN export.
+        launch_progress_wrapper_content = (
+            "#!/bin/bash\n"
+            f'export PYTHONPATH="{ports_gfx_dir}${{PYTHONPATH:+:$PYTHONPATH}}"\n'
+            f'exec "{resolved_python}" -m ports_gfx.launch_progress "$@"\n'
+        )
+        launch_progress_wrapper_path = _write_executable(
+            bin_dir / "romcloud-launch-progress", launch_progress_wrapper_content
+        )
+
         port_entry_path = None
         port_entry_skip_reason = None
         if ports_dir.is_dir():
@@ -198,6 +212,7 @@ def install_ports_ui(
             system_python=resolved_python,
             ports_gfx_dir=target,
             wrapper_path=wrapper_path,
+            launch_progress_wrapper_path=launch_progress_wrapper_path,
             port_entry_path=port_entry_path,
             port_entry_skip_reason=port_entry_skip_reason,
         )

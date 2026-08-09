@@ -198,6 +198,10 @@ def run_launcher_wrapper(argv: list[str]) -> None:
     # .romcloud proxy — resolve, cache, then hand off to emulatorlauncher.
     try:
         cached_path = _resolve_and_cache(rom_path)
+    except KeyboardInterrupt:
+        log.info("Launch cancelled by user for %r", rom_path)
+        print("romcloud-run: launch cancelled", file=sys.stderr)
+        sys.exit(1)
     except Exception as exc:  # noqa: BLE001
         log.error("Failed to prepare %r: %s", rom_path, exc)
         print(f"romcloud-run: error preparing game: {exc}", file=sys.stderr)
@@ -237,12 +241,36 @@ def _resolve_and_cache(proxy_path: str) -> str:
             f"Game is not cached and source is unreachable: {game.source_root}"
         )
 
-    if sys.stdout.isatty():
-        from romcloud.ui.progress import run_progress_transfer
-        path = run_progress_transfer(container.cache, game)
-    else:
-        path = container.cache.cache_game(game.id)
+    path = _transfer_with_progress(container, config, game)
 
     container.cache.mark_launched(game.id)
     return path
+
+
+def _transfer_with_progress(container, config, game) -> str:
+    """Choose the best available progress presentation for a cache-miss
+    transfer, in order: graphical (system-Python pygame subprocess, the
+    only option that can actually render during a real EmulationStation
+    launch — see ``romcloud.ui.graphical_progress``) > curses (only
+    reachable when stdout is a real tty, e.g. an interactive dev/SSH
+    session) > plain text. A missing/broken graphical install always
+    degrades silently to the next option rather than failing the launch.
+    """
+    from romcloud.ui.graphical_progress import (
+        GraphicalProgressUnavailable,
+        graphical_progress_binary,
+        run_graphical_progress_transfer,
+    )
+
+    launcher_bin = graphical_progress_binary(config)
+    if launcher_bin is not None:
+        try:
+            return run_graphical_progress_transfer(container.cache, game, launcher_bin=launcher_bin)
+        except GraphicalProgressUnavailable as exc:
+            log.warning("Graphical launch progress unavailable, falling back: %s", exc)
+
+    if sys.stdout.isatty():
+        from romcloud.ui.progress import run_progress_transfer
+        return run_progress_transfer(container.cache, game)
+    return container.cache.cache_game(game.id)
 

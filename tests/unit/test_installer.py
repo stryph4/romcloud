@@ -116,6 +116,10 @@ class TestInstallPortsUi:
         assert (ports_gfx_dir / "ports_gfx" / "client.py").exists()
         assert result.wrapper_path == bin_dir / "romcloud-ports"
         assert f'exec "{fake_python}" -m ports_gfx "$@"' in result.wrapper_path.read_text()
+        assert result.launch_progress_wrapper_path == bin_dir / "romcloud-launch-progress"
+        launch_progress_content = result.launch_progress_wrapper_path.read_text()
+        assert f'exec "{fake_python}" -m ports_gfx.launch_progress "$@"' in launch_progress_content
+        assert "ROMCLOUD_BIN" not in launch_progress_content
         assert result.port_entry_path == ports_dir / "ROMCloud.sh"
         assert f'exec "{result.wrapper_path}" "$@"' in result.port_entry_path.read_text()
 
@@ -136,6 +140,7 @@ class TestInstallPortsUi:
         assert result.installed is False
         assert result.skip_reason == "no_system_python"
         assert not (tmp_path / "ports-gfx").exists()
+        assert result.launch_progress_wrapper_path is None
 
     def test_pygame_missing_is_skipped_cleanly(self, tmp_path: Path) -> None:
         project_root = tmp_path / "project"
@@ -154,6 +159,7 @@ class TestInstallPortsUi:
         assert result.installed is False
         assert result.skip_reason == "no_pygame"
         assert not (tmp_path / "bin" / "romcloud-ports").exists()
+        assert not (tmp_path / "bin" / "romcloud-launch-progress").exists()
         assert not (tmp_path / "ports-gfx").exists()
 
     def test_missing_ports_dir_skips_port_entry_but_not_wrapper(self, tmp_path: Path) -> None:
@@ -440,6 +446,8 @@ class TestReconcileInstall:
         assert report.mount_service is None
         assert report.es_override is None
         assert report.ports_gamelist is True
+        assert report.ports_ui.launch_progress_wrapper_path == romcloud_home / "bin" / "romcloud-launch-progress"
+        assert report.ports_ui.launch_progress_wrapper_path.exists()
         gamelist_content = (ports_dir / "gamelist.xml").read_text()
         assert "<path>./ROMCloud.sh</path>" in gamelist_content
         assert "<image>./images/ROMCloud.png</image>" in gamelist_content

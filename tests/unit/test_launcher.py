@@ -16,6 +16,7 @@ Key invariants proved here:
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import call, patch
 
 import pytest
@@ -342,3 +343,128 @@ class TestEmulatorLauncherWithRom:
 
         assert "-newfeature" in captured["args"]
         assert "somevalue" in captured["args"]
+
+
+# ── _transfer_with_progress: graphical > curses > plain fallback order ───────
+
+
+class _FakeConfig:
+    def __init__(self, data_path="/userdata/system/romcloud/data"):
+        self.data_path = data_path
+
+
+class _FakeCache:
+    def __init__(self, path="/cache/game.iso"):
+        self.path = path
+        self.cache_game_calls = 0
+
+    def cache_game(self, game_id, on_progress=None):
+        self.cache_game_calls += 1
+        return self.path
+
+
+class _FakeContainer:
+    def __init__(self, cache):
+        self.cache = cache
+
+
+class TestTransferWithProgress:
+    def test_uses_graphical_progress_when_available(self, monkeypatch):
+        import romcloud.integrations.batocera.launcher as launcher_module
+        import romcloud.ui.graphical_progress as gp
+
+        monkeypatch.setattr(gp, "graphical_progress_binary", lambda config: Path("/bin/romcloud-launch-progress"))
+        called = {}
+
+        def fake_run(cache_service, game, *, launcher_bin):
+            called["launcher_bin"] = launcher_bin
+            return "/cache/graphical.iso"
+
+        monkeypatch.setattr(gp, "run_graphical_progress_transfer", fake_run)
+
+        cache = _FakeCache()
+        container = _FakeContainer(cache)
+        result = launcher_module._transfer_with_progress(container, _FakeConfig(), object())
+
+        assert result == "/cache/graphical.iso"
+        assert called["launcher_bin"] == Path("/bin/romcloud-launch-progress")
+        assert cache.cache_game_calls == 0
+
+    def test_falls_back_to_curses_when_graphical_unavailable_and_isatty(self, monkeypatch):
+        import romcloud.integrations.batocera.launcher as launcher_module
+        import romcloud.ui.graphical_progress as gp
+        import romcloud.ui.progress as progress_module
+
+        monkeypatch.setattr(gp, "graphical_progress_binary", lambda config: None)
+        monkeypatch.setattr(launcher_module.sys.stdout, "isatty", lambda: True)
+        called = {}
+
+        def fake_curses(cache_service, game):
+            called["curses"] = True
+            return "/cache/curses.iso"
+
+        monkeypatch.setattr(progress_module, "run_progress_transfer", fake_curses)
+
+        cache = _FakeCache()
+        container = _FakeContainer(cache)
+        result = launcher_module._transfer_with_progress(container, _FakeConfig(), object())
+
+        assert result == "/cache/curses.iso"
+        assert called.get("curses") is True
+        assert cache.cache_game_calls == 0
+
+    def test_falls_back_to_plain_when_no_ui_available(self, monkeypatch):
+        import romcloud.integrations.batocera.launcher as launcher_module
+        import romcloud.ui.graphical_progress as gp
+
+        monkeypatch.setattr(gp, "graphical_progress_binary", lambda config: None)
+        monkeypatch.setattr(launcher_module.sys.stdout, "isatty", lambda: False)
+
+        cache = _FakeCache(path="/cache/plain.iso")
+        container = _FakeContainer(cache)
+        game = type("_Game", (), {"id": "game-1"})()
+        result = launcher_module._transfer_with_progress(container, _FakeConfig(), game)
+
+        assert result == "/cache/plain.iso"
+        assert cache.cache_game_calls == 1
+
+    def test_graphical_unavailable_error_falls_back_instead_of_failing(self, monkeypatch):
+        import romcloud.integrations.batocera.launcher as launcher_module
+        import romcloud.ui.graphical_progress as gp
+
+        monkeypatch.setattr(gp, "graphical_progress_binary", lambda config: Path("/bin/romcloud-launch-progress"))
+
+        def fake_run(cache_service, game, *, launcher_bin):
+            raise gp.GraphicalProgressUnavailable("broken install")
+
+        monkeypatch.setattr(gp, "run_graphical_progress_transfer", fake_run)
+        monkeypatch.setattr(launcher_module.sys.stdout, "isatty", lambda: False)
+
+        cache = _FakeCache(path="/cache/fallback.iso")
+        container = _FakeContainer(cache)
+        game = type("_Game", (), {"id": "game-1"})()
+        result = launcher_module._transfer_with_progress(container, _FakeConfig(), game)
+
+        assert result == "/cache/fallback.iso"
+        assert cache.cache_game_calls == 1
+
+
+# ── run_launcher_wrapper: cancellation must not crash the wrapper ────────────
+
+
+class TestRunLauncherWrapperCancellation:
+    def test_cancelled_transfer_exits_cleanly_without_traceback(self, monkeypatch, capsys):
+        import romcloud.integrations.batocera.launcher as launcher_module
+
+        def fake_resolve_and_cache(proxy_path):
+            raise KeyboardInterrupt("Transfer cancelled by user")
+
+        monkeypatch.setattr(launcher_module, "_resolve_and_cache", fake_resolve_and_cache)
+
+        with pytest.raises(SystemExit) as exc_info:
+            launcher_module.run_launcher_wrapper(list(_ROMCLOUD_ARGV))
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "cancelled" in captured.err.lower()
+        assert "Traceback" not in captured.err

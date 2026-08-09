@@ -88,6 +88,32 @@ ROMCloud does not require every system to exist in the remote library. Only syst
 
 ---
 
+## Release note (v0.7.0)
+
+- New capability: a fullscreen graphical progress screen now appears
+  during real Batocera cache-miss game launches (previously only a
+  curses/terminal progress screen existed, which could never actually
+  render when EmulationStation launches a game — Batocera's launch path
+  has no controlling terminal for curses to attach to). The new screen
+  runs under Batocera's system Python via a small pygame-based subprocess,
+  `romcloud-launch-progress`, driven by the backend over a narrow
+  stdin/stdout event protocol.
+- Cache hits are unaffected: they continue to launch immediately with no
+  ROMCloud screen at all.
+- A missing/never-installed graphical component (e.g. no system Python
+  with `pygame`) falls back automatically to the existing terminal
+  progress bar (interactive sessions) or a silent transfer — a broken or
+  absent graphical piece never blocks a real game launch.
+- `romcloud update` and a fresh `scripts/install.sh` both install/refresh
+  this new artifact automatically (shared reconciliation logic) — no
+  manual re-run of `install.sh` is required after updating.
+- No change to cache/transfer semantics, `.partial` file handling,
+  resumability, LRU, catalog/proxy resolution, or the `emulatorlauncher`
+  argv contract (still only the `-rom` value is ever replaced).
+  `ports_gfx` still never imports `romcloud`.
+
+---
+
 ## Release note (v0.6.0)
 
 - Improvement: the graphical Ports UI and the related `romcloud uidata`
@@ -891,20 +917,27 @@ ROMCloud is still early software.
 
 Current limitations include:
 
-### No graphical launch progress yet
+### Graphical launch progress
 
-When launching an uncached game from EmulationStation, the transfer currently happens before the emulator starts, but Batocera does not yet display a dedicated ROMCloud progress screen.
+When launching an uncached game from EmulationStation, a fullscreen ROMCloud
+progress screen now appears while the game transfers, showing:
 
-A graphical cache-miss screen is planned with:
-
-- game title
+- game title and system
 - progress bar
 - transferred / total size
-- transfer speed
-- ETA
+- current phase (connecting / downloading / launching)
 - cancel support
 
-Cached games will continue to launch without showing this screen.
+It runs under Batocera's system Python via a small pygame-based subprocess
+(`romcloud-launch-progress`, installed alongside the graphical Ports UI),
+driven by the backend over a narrow stdin/stdout event protocol — the same
+subprocess boundary the Ports UI already uses, just in the other direction.
+If that subprocess isn't available (e.g. no system Python with `pygame`
+was found at install time), ROMCloud falls back to a terminal progress bar
+when run from an interactive session, or a silent transfer otherwise — a
+missing graphical component never blocks a game launch.
+
+Cached games continue to launch immediately with no ROMCloud screen at all.
 
 ### SMB is currently mount-based
 

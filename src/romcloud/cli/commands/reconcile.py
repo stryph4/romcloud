@@ -58,6 +58,7 @@ def reconcile_install_cmd(
             f"  Wrote graphical Ports wrapper: {ports.wrapper_path} "
             f"(system python: {ports.system_python})"
         )
+        click.echo(f"  Wrote graphical launch-progress wrapper: {ports.launch_progress_wrapper_path}")
         if ports.port_entry_path is not None:
             click.echo(f"  Installed Batocera Port entry: {ports.port_entry_path}")
         elif ports.port_entry_skip_reason == "ports_dir_missing":
