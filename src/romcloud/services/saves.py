@@ -9,11 +9,10 @@ Design (see the SaveSync v1 spec):
   preview a full diff, stage the new dataset without touching the
   existing one, verify the staged copy, then atomically swap it into
   place. State only advances after that verified commit.
-- The "remote" SaveSync dataset lives under the same already-mounted ROM
-  source the catalog uses (see :class:`~romcloud.infrastructure.config.SavesConfig`)
-  — ROMCloud has exactly one storage provider (a locally-mounted
-  filesystem), so reachability reuses the same check the ROM source
-  already relies on elsewhere.
+- The "remote" SaveSync dataset uses a dedicated read-write mount of the
+  same SMB share as the read-only ROM catalog mount. Local/USB deployments
+  keep using their ordinary filesystem root. Both remain plain filesystem
+  paths so staging and directory renames stay on one filesystem.
 - Both the CLI (``romcloud saves ...``) and the graphical UI (via
   ``romcloud uidata savesync-*``) call this same service — neither
   duplicates selection, diffing, or commit logic.
@@ -105,7 +104,7 @@ class SaveSyncService:
             _write_state(self._state_path, state)
         return state
 
-    # ── preview (read-only; never modifies anything) ─────────────────────
+    # ── preview (save-content read-only; may recover transaction debris) ─
 
     def preview_upload(self) -> SaveDiff:
         return self._preview("upload")
@@ -118,6 +117,11 @@ class SaveSyncService:
             raise SaveSyncConnectivityError(
                 f"Remote save location is not reachable: {self._connectivity_root}"
             )
+        # A killed process may have stopped between the two directory renames
+        # used when replacing an existing dataset. Restore the last complete
+        # dataset (or remove abandoned staging) before calculating a diff.
+        save_tree.recover_interrupted_commit(self._remote_root)
+        save_tree.recover_interrupted_commit(self._local_root)
         enabled_optional = self._enabled_optional_systems()
         local = save_tree.scan_tree(self._local_root, self._policy, enabled_optional_systems=enabled_optional)
         remote = save_tree.scan_tree(self._remote_root, self._policy, enabled_optional_systems=enabled_optional)
@@ -138,6 +142,7 @@ class SaveSyncService:
                 f"Remote save location is not reachable: {self._connectivity_root}"
             )
 
+        save_tree.recover_interrupted_commit(dest_root)
         staging = save_tree.new_staging_dir(dest_root)
         try:
             manifest = self._stage(diff, source_root=source_root, old_dest_root=dest_root, staging=staging)
@@ -290,4 +295,3 @@ def _write_state(path: Path, state: SaveSyncState) -> None:
         "last_download": record_dict(state.last_download),
     }
     atomic_write_text(path, json.dumps(payload, indent=2) + "\n")
-

@@ -584,6 +584,11 @@ server = "omnivault"
 share = "Roms"
 username = "your-user"
 port = 445
+
+[saves]
+# A second mount of the same share, intentionally writable for SaveSync only.
+remote_mount_path = "/userdata/romcloud-saves-source"
+remote_subdir = "romcloud-saves"
 ```
 
 The SMB password is stored separately from `romcloud.toml`, atomically, with
@@ -604,6 +609,10 @@ romcloud mount status
 - The service `start` routes to `romcloud mount boot-start`.
 - `boot-start` launches a detached background worker that performs SMB
   waiting and mounting; the service itself does not block Batocera's boot.
+- The worker mounts the ROM/catalog view read-only at `source.rom_root` and
+  mounts a separate SaveSync view read-write at `saves.remote_mount_path`.
+  Both views point to the same configured SMB share; ROM browsing and caching
+  never gain write access.
 - Principle: "ROMCloud may fail; Batocera must not." The installer and
   boot service avoid interfering with Batocera's critical startup path.
 
@@ -773,6 +782,9 @@ Local Batocera ROMs:
 
 Default mounted source:
   /userdata/romcloud-source
+
+Default SaveSync write mount (SMB only):
+  /userdata/romcloud-saves-source
 ```
 
 ---

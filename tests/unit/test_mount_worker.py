@@ -26,12 +26,18 @@ def _fake_config(
     rom_root: str = "/mnt/roms",
     smb=None,
     credentials_path: Path | None = None,
+    saves_mount: str | None = None,
 ):
     return SimpleNamespace(
         source=SimpleNamespace(rom_root=rom_root),
         smb=smb,
         credentials_path=credentials_path or Path("/tmp/does-not-matter/credentials.toml"),
         data_path=str(Path(rom_root).parent / "data"),
+        saves=(
+            SimpleNamespace(remote_mount_path=saves_mount)
+            if saves_mount is not None
+            else None
+        ),
     )
 
 
@@ -144,8 +150,33 @@ class TestOnlyOneWorkerRunsAtOnce:
 
 
 class TestRunWorker:
+    def test_mounts_catalog_read_only_and_savesync_separately_read_write(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw, "load_smb_password", lambda *a, **k: "hunter2")
+        monkeypatch.setattr(mw, "write_cifs_credentials_file", lambda *a, **k: None)
+        monkeypatch.setattr(mw.mount_endpoint_cache, "resolve_endpoint", lambda *a, **k: None)
+        attempts = []
+        monkeypatch.setattr(
+            mw.mountlib,
+            "mount_cifs_source",
+            lambda **kwargs: attempts.append(kwargs) or mw.mountlib.MountOutcome(
+                mounted=True, already_mounted=False, detail="mounted"
+            ),
+        )
+
+        config = _fake_config(smb=_fake_smb(), saves_mount="/mnt/saves-rw")
+        code = mw.run_worker(tmp_path, config)
+
+        assert code == 0
+        assert [item["mount_point"] for item in attempts] == ["/mnt/roms", "/mnt/saves-rw"]
+        assert attempts[0].get("read_only", True) is True
+        assert attempts[1]["read_only"] is False
+
     def test_already_mounted_records_success_and_skips_mount(self, tmp_path, monkeypatch):
         monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: True)
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted_read_only", lambda *a, **k: True)
 
         def _boom(*a, **k):
             raise AssertionError("must not attempt to mount when already mounted")
@@ -679,6 +710,7 @@ class TestGetDiagnostics:
 
     def test_mounted(self, tmp_path, monkeypatch):
         monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: True)
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted_read_only", lambda *a, **k: True)
         config = _fake_config(smb=_fake_smb())
         diag = mw.get_diagnostics(tmp_path, config)
         assert diag.mounted is True

@@ -51,6 +51,29 @@ class TestIsMounted:
         with pytest.raises(MountError):
             mount.is_target_mounted("/x", proc_mounts_path=str(tmp_path / "does-not-exist"))
 
+    def test_writable_check_distinguishes_ro_and_rw_mounts(self):
+        mounts = _SAMPLE_PROC_MOUNTS + (
+            "//192.168.1.50/ROMs /userdata/romcloud-saves-source cifs rw,relatime 0 0\n"
+        )
+
+        assert mount.is_mounted_writable("/userdata/romcloud-source", mounts) is False
+        assert mount.is_mounted_writable("/userdata/romcloud-saves-source", mounts) is True
+        assert mount.is_mounted_writable("/userdata/not-mounted", mounts) is False
+
+    def test_read_only_check_distinguishes_ro_and_rw_mounts(self, tmp_path):
+        mounts = tmp_path / "mounts"
+        mounts.write_text(
+            "//nas/ROMs /mnt/roms cifs ro 0 0\n"
+            "//nas/ROMs /mnt/saves cifs rw 0 0\n"
+        )
+
+        assert mount.is_target_mounted_read_only(
+            "/mnt/roms", proc_mounts_path=str(mounts)
+        ) is True
+        assert mount.is_target_mounted_read_only(
+            "/mnt/saves", proc_mounts_path=str(mounts)
+        ) is False
+
 
 class TestBuildArgv:
     def test_mount_argv_never_contains_password(self):
@@ -199,6 +222,20 @@ class TestMountCifsSource:
         )
         assert outcome.already_mounted is True
         assert called == []  # never even tried to run mount
+
+    def test_already_mounted_with_wrong_mode_fails_clearly(self, tmp_path):
+        proc_mounts = tmp_path / "mounts"
+        proc_mounts.write_text("//nas/ROMs /mnt/saves cifs ro 0 0\n")
+
+        with pytest.raises(MountError, match="wrong mode"):
+            mount.mount_cifs_source(
+                "nas",
+                "ROMs",
+                "/mnt/saves",
+                Path("/creds"),
+                read_only=False,
+                proc_mounts_path=str(proc_mounts),
+            )
 
     def test_unreachable_raises_before_mounting(self, tmp_path):
         proc_mounts = tmp_path / "mounts"

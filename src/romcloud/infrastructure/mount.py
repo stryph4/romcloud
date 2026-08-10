@@ -29,7 +29,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 
 from romcloud.core.exceptions import MountError, ProviderAuthError, ProviderNotReachableError
 from romcloud.infrastructure.logging import get_logger
@@ -71,6 +71,19 @@ def _parse_mounted_targets(mounts_text: str) -> set[str]:
     return targets
 
 
+def _mount_options(target: str, mounts_text: str) -> Optional[set[str]]:
+    """Return mount options for *target*, or ``None`` when it is not mounted."""
+    normalized = os.path.normpath(target)
+    for line in mounts_text.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        mount_target = parts[1].encode().decode("unicode_escape")
+        if os.path.normpath(mount_target) == normalized:
+            return set(parts[3].split(","))
+    return None
+
+
 def is_mounted(target: str, mounts_text: str) -> bool:
     """Pure check: is *target* listed as a mount point in *mounts_text*?
 
@@ -89,6 +102,37 @@ def is_target_mounted(target: str, *, proc_mounts_path: str = _DEFAULT_PROC_MOUN
     except OSError as exc:
         raise MountError(f"Cannot read {proc_mounts_path}: {exc}") from exc
     return is_mounted(target, mounts_text)
+
+
+def is_mounted_writable(target: str, mounts_text: str) -> bool:
+    """Return True only when *target* is mounted with the ``rw`` option."""
+    options = _mount_options(target, mounts_text)
+    return options is not None and "rw" in options
+
+
+def is_target_mounted_writable(
+    target: str, *, proc_mounts_path: str = _DEFAULT_PROC_MOUNTS
+) -> bool:
+    """Read the mount table and require a real read-write mount at *target*."""
+    try:
+        with open(proc_mounts_path, "r", encoding="utf-8") as fh:
+            mounts_text = fh.read()
+    except OSError as exc:
+        raise MountError(f"Cannot read {proc_mounts_path}: {exc}") from exc
+    return is_mounted_writable(target, mounts_text)
+
+
+def is_target_mounted_read_only(
+    target: str, *, proc_mounts_path: str = _DEFAULT_PROC_MOUNTS
+) -> bool:
+    """Read the mount table and require a real read-only mount at *target*."""
+    try:
+        with open(proc_mounts_path, "r", encoding="utf-8") as fh:
+            mounts_text = fh.read()
+    except OSError as exc:
+        raise MountError(f"Cannot read {proc_mounts_path}: {exc}") from exc
+    options = _mount_options(target, mounts_text)
+    return options is not None and "ro" in options
 
 
 # ── reachability ──────────────────────────────────────────────────────────────
@@ -170,8 +214,8 @@ def build_mount_argv(
     """Build the `mount -t cifs` argv. Never includes the password.
 
     Read-only by default, per ROMCloud's default safety posture for ROM
-    sources — pass ``read_only=False`` only for sources that must be
-    writable (e.g. save sync, out of scope here).
+    sources. SaveSync explicitly passes ``read_only=False`` for its separate,
+    narrowly purposed mount of the same share.
     """
     options = f"credentials={credentials_path},{'ro' if read_only else 'rw'}"
     return ["mount", "-t", "cifs", f"//{server}/{share}", str(mount_point), "-o", options]
@@ -226,6 +270,17 @@ def mount_cifs_source(
         Any other mount failure.
     """
     if is_target_mounted(mount_point, proc_mounts_path=proc_mounts_path):
+        mode_matches = (
+            is_target_mounted_read_only(mount_point, proc_mounts_path=proc_mounts_path)
+            if read_only
+            else is_target_mounted_writable(mount_point, proc_mounts_path=proc_mounts_path)
+        )
+        if not mode_matches:
+            expected = "read-only" if read_only else "read-write"
+            raise MountError(
+                f"{mount_point} is already mounted with the wrong mode; "
+                f"unmount it before mounting the required {expected} view"
+            )
         log.info("%s is already mounted — nothing to do", mount_point)
         return MountOutcome(mounted=True, already_mounted=True, detail="already mounted")
 

@@ -5,7 +5,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, Optional
 
-from romcloud.core.exceptions import ProviderError, ProviderNotReachableError, TransferError
+from romcloud.core.exceptions import (
+    MountError,
+    ProviderError,
+    ProviderNotReachableError,
+    TransferError,
+)
 from romcloud.core.storage import RemoteEntry, StorageProvider
 
 _CHUNK = 1024 * 1024
@@ -76,6 +81,24 @@ class LocalFilesystemProvider(StorageProvider):
             _copy_dir(src, dst, on_progress)
         else:
             _copy_file(src, dst, on_progress)
+
+
+class WritableMountedFilesystemProvider(LocalFilesystemProvider):
+    """Local-filesystem view that is reachable only as a real writable mount.
+
+    Used by SaveSync for SMB deployments. A bare mount-point directory left
+    behind after a disconnect must not be mistaken for the remote dataset.
+    """
+
+    def is_reachable(self, root: str) -> bool:
+        if not super().is_reachable(root):
+            return False
+        from romcloud.infrastructure import mount
+
+        try:
+            return mount.is_target_mounted_writable(root)
+        except MountError:
+            return False
 
 
 def _entry_size(path: Path) -> Optional[int]:

@@ -17,7 +17,10 @@ from typing import Optional
 
 from romcloud.core.models.cache import CachePolicy
 from romcloud.core.storage import StorageProvider
-from romcloud.infrastructure.providers.local import LocalFilesystemProvider
+from romcloud.infrastructure.providers.local import (
+    LocalFilesystemProvider,
+    WritableMountedFilesystemProvider,
+)
 from romcloud.integrations.batocera.catalog import CatalogService
 from romcloud.infrastructure.config import AppConfig
 from romcloud.infrastructure.database import Database
@@ -141,11 +144,21 @@ class Container:
         if self._saves is None:
             from pathlib import Path
 
+            remote_base = (
+                Path(self._config.saves.remote_mount_path)
+                if self._config.smb is not None
+                else Path(self._config.source.rom_root)
+            )
+            saves_provider = (
+                WritableMountedFilesystemProvider()
+                if self._config.smb is not None
+                else self.provider
+            )
             self._saves = SaveSyncService(
-                provider=self.provider,
-                connectivity_root=self._config.source.rom_root,
+                provider=saves_provider,
+                connectivity_root=str(remote_base),
                 local_root=self._config.saves.local_path,
-                remote_root=str(Path(self._config.source.rom_root) / self._config.saves.remote_subdir),
+                remote_root=str(remote_base / self._config.saves.remote_subdir),
                 state_path=Path(self._config.data_path) / "savesync-state.json",
                 xbox_enabled=self._config.saves.xbox_enabled,
             )

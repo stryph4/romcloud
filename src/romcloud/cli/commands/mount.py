@@ -75,7 +75,10 @@ def mount_status_cmd(ctx: click.Context) -> None:
         return
 
     click.echo(f"  Server:      //{config.smb.server}/{config.smb.share}")
-    click.echo(f"  Mount point: {config.source.rom_root}")
+    click.echo(f"  ROM mount:   {config.source.rom_root} (read-only)")
+    targets = mount_worker.configured_mounts(config)
+    if len(targets) > 1:
+        click.echo(f"  Save mount:  {targets[1].mount_point} (read-write)")
     click.echo(f"  State:       {diag.label}")
     if diag.worker_pid is not None:
         click.echo(f"  Worker:      running (pid {diag.worker_pid})")
@@ -110,19 +113,24 @@ def mount_start_cmd(ctx: click.Context) -> None:
     write_cifs_credentials_file(creds_path, config.smb.username, password)
 
     try:
-        outcome = mount.mount_cifs_source(
-            server=config.smb.server,
-            share=config.smb.share,
-            mount_point=config.source.rom_root,
-            credentials_path=creds_path,
-            port=config.smb.port,
-        )
+        outcomes = []
+        for target in mount_worker.configured_mounts(config):
+            outcomes.append(
+                mount.mount_cifs_source(
+                    server=config.smb.server,
+                    share=config.smb.share,
+                    mount_point=target.mount_point,
+                    credentials_path=creds_path,
+                    read_only=target.read_only,
+                    port=config.smb.port,
+                )
+            )
     except ROMCloudError as exc:
         click.echo(f"error: {exc}", err=True)
         ctx.exit(1)
         return
 
-    click.echo("Already mounted." if outcome.already_mounted else "Mounted.")
+    click.echo("Already mounted." if all(item.already_mounted for item in outcomes) else "Mounted.")
 
 
 @mount_group.command("boot-start")
@@ -145,7 +153,7 @@ def mount_boot_start_cmd(ctx: click.Context) -> None:
 
         romcloud_home = _romcloud_home(config)
 
-        if mount.is_target_mounted(config.source.rom_root):
+        if mount_worker.all_configured_mounts_are_mounted(config):
             click.echo("Already mounted.")
             return
 
@@ -185,13 +193,16 @@ def mount_stop_cmd(ctx: click.Context) -> None:
     mount_worker.stop_worker(romcloud_home)
 
     try:
-        did_unmount = mount.unmount_cifs_source(config.source.rom_root)
+        unmounted = [
+            mount.unmount_cifs_source(target.mount_point)
+            for target in reversed(mount_worker.configured_mounts(config))
+        ]
     except ROMCloudError as exc:
         click.echo(f"error: {exc}", err=True)
         ctx.exit(1)
         return
 
-    click.echo("Unmounted." if did_unmount else "Was not mounted.")
+    click.echo("Unmounted." if any(unmounted) else "Was not mounted.")
 
 
 @mount_group.command("install")

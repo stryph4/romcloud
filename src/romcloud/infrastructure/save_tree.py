@@ -1,11 +1,10 @@
 """Local filesystem scanning/materialization for SaveSync.
 
 Both the local save root and the "remote" SaveSync dataset are plain local
-filesystem paths — ROMCloud has exactly one storage provider, and a
-network SMB/CIFS share is always mounted locally first (see
-:mod:`romcloud.infrastructure.mount`) — so this module never needs its own
-provider abstraction; it only ever operates on real :class:`~pathlib.Path`
-objects already reachable on this machine.
+filesystem paths. For SMB, the remote path is on SaveSync's dedicated
+read-write mount of the same share used by the read-only catalog mount (see
+:mod:`romcloud.infrastructure.mount`). This module therefore operates on real
+:class:`~pathlib.Path` objects and can keep staging beside the live dataset.
 """
 
 from __future__ import annotations
@@ -17,6 +16,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+from romcloud.core.exceptions import SaveSyncError
 from romcloud.core.models.savesync import SaveArtifact
 from romcloud.core.save_selection import SaveSelectionPolicy
 
@@ -110,6 +110,40 @@ def new_staging_dir(sibling_of: Path) -> Path:
     return staging
 
 
+def recover_interrupted_commit(target_dir: Path) -> None:
+    """Recover or clean transaction artifacts left by an interrupted commit.
+
+    If the live target exists, it is authoritative: abandoned staging and
+    old backup directories are removed. If the target is absent and exactly
+    one backup exists, interruption happened after the old dataset was moved
+    aside, so that complete dataset is atomically restored before staging is
+    discarded. Multiple backups are ambiguous and are left untouched for
+    manual inspection rather than guessing which save dataset is correct.
+    """
+    parent = target_dir.parent
+    if not parent.is_dir():
+        return
+
+    staging_dirs = sorted(parent.glob(f".{target_dir.name}.staging-*"))
+    backup_dirs = sorted(parent.glob(f"{target_dir.name}.previous-*"))
+
+    if target_dir.exists():
+        for path in (*staging_dirs, *backup_dirs):
+            shutil.rmtree(path, ignore_errors=True)
+        return
+
+    if len(backup_dirs) > 1:
+        raise SaveSyncError(
+            f"Cannot recover interrupted SaveSync commit for {target_dir}: "
+            f"found {len(backup_dirs)} previous datasets"
+        )
+    if backup_dirs:
+        os.rename(backup_dirs[0], target_dir)
+
+    for path in staging_dirs:
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def atomic_replace_dir(new_dir: Path, target_dir: Path) -> None:
     """Atomically make *target_dir* become *new_dir*'s content.
 
@@ -130,7 +164,13 @@ def atomic_replace_dir(new_dir: Path, target_dir: Path) -> None:
     os.rename(target_dir, backup_dir)
     try:
         os.rename(new_dir, target_dir)
-    except OSError:
-        os.rename(backup_dir, target_dir)
+    except OSError as commit_error:
+        try:
+            os.rename(backup_dir, target_dir)
+        except OSError as restore_error:
+            raise SaveSyncError(
+                f"SaveSync commit failed and the previous dataset could not be restored; "
+                f"it remains at {backup_dir}: {restore_error}"
+            ) from commit_error
         raise
     shutil.rmtree(backup_dir, ignore_errors=True)

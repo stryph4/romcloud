@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+from romcloud.core.exceptions import ConfigurationError
 from romcloud.infrastructure.config import (
     AppConfig,
     CacheConfig,
@@ -32,6 +35,7 @@ class TestSavesConfigDefaults:
 
         assert loaded.saves.local_path == "/userdata/saves"
         assert loaded.saves.remote_subdir == "romcloud-saves"
+        assert loaded.saves.remote_mount_path == "/userdata/romcloud-saves-source"
         assert loaded.saves.xbox_enabled is False
 
     def test_missing_saves_section_in_legacy_config_uses_defaults(self, tmp_path: Path):
@@ -44,6 +48,7 @@ class TestSavesConfigDefaults:
         loaded = load_config(str(config_path))
 
         assert loaded.saves.local_path == "/userdata/saves"
+        assert loaded.saves.remote_mount_path == "/userdata/romcloud-saves-source"
         assert loaded.saves.xbox_enabled is False
 
 
@@ -51,7 +56,10 @@ class TestSavesConfigRoundTrip:
     def test_custom_values_round_trip(self, tmp_path: Path):
         config_path = tmp_path / "romcloud.toml"
         config = _base_config(
-            local_path="/mnt/saves", remote_subdir="my-saves", xbox_enabled=True
+            local_path="/mnt/saves",
+            remote_subdir="my-saves",
+            remote_mount_path="/mnt/saves-share",
+            xbox_enabled=True,
         )
         write_config(config, str(config_path))
 
@@ -59,6 +67,7 @@ class TestSavesConfigRoundTrip:
 
         assert loaded.saves.local_path == "/mnt/saves"
         assert loaded.saves.remote_subdir == "my-saves"
+        assert loaded.saves.remote_mount_path == "/mnt/saves-share"
         assert loaded.saves.xbox_enabled is True
 
     def test_rewriting_preserves_xbox_enabled(self, tmp_path: Path):
@@ -69,3 +78,35 @@ class TestSavesConfigRoundTrip:
         reloaded = load_config(str(config_path))
 
         assert reloaded.saves.xbox_enabled is True
+
+    def test_smb_save_mount_cannot_alias_read_only_rom_mount(self, tmp_path: Path):
+        config_path = tmp_path / "romcloud.toml"
+        config_path.write_text(
+            '[source]\nprovider = "local"\nrom_root = "/mnt/share"\n\n'
+            '[smb]\nserver = "nas"\nshare = "ROMs"\n\n'
+            '[saves]\nremote_mount_path = "/mnt/share"\n'
+        )
+
+        with pytest.raises(ConfigurationError, match="must be separate"):
+            load_config(str(config_path))
+
+    def test_smb_save_mount_cannot_be_nested_under_rom_mount(self, tmp_path: Path):
+        config_path = tmp_path / "romcloud.toml"
+        config_path.write_text(
+            '[source]\nprovider = "local"\nrom_root = "/mnt/share"\n\n'
+            '[smb]\nserver = "nas"\nshare = "ROMs"\n\n'
+            '[saves]\nremote_mount_path = "/mnt/share/saves-rw"\n'
+        )
+
+        with pytest.raises(ConfigurationError, match="must be separate"):
+            load_config(str(config_path))
+
+    def test_remote_subdir_rejects_parent_traversal(self, tmp_path: Path):
+        config_path = tmp_path / "romcloud.toml"
+        config_path.write_text(
+            '[source]\nprovider = "local"\nrom_root = "/mnt/share"\n\n'
+            '[saves]\nremote_subdir = "../outside"\n'
+        )
+
+        with pytest.raises(ConfigurationError, match="relative directory"):
+            load_config(str(config_path))

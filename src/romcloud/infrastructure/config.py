@@ -38,6 +38,7 @@ _DEFAULT_CACHE_ROOT = Path("/userdata/romcloud-cache")
 _DEFAULT_LOCAL_ROMS = Path("/userdata/roms")
 _DEFAULT_SAVES_LOCAL_PATH = Path("/userdata/saves")
 _DEFAULT_SAVES_REMOTE_SUBDIR = "romcloud-saves"
+_DEFAULT_SAVES_REMOTE_MOUNT_PATH = Path("/userdata/romcloud-saves-source")
 
 
 # ── sub-configs ───────────────────────────────────────────────────────────────
@@ -87,13 +88,16 @@ class LoggingConfig:
 class SavesConfig:
     """SaveSync v1 settings.
 
-    ``remote_subdir`` is a directory relative to ``source.rom_root`` — the
-    remote SaveSync dataset lives on the same already-mounted share the
-    ROM catalog uses, so no second network mount is needed.
+    ``remote_subdir`` is a directory relative to the remote storage root.
+    For SMB deployments, ``remote_mount_path`` is a dedicated read-write
+    mount of the same share; the ROM/catalog mount remains read-only. Plain
+    local/USB deployments continue to use ``source.rom_root`` directly and
+    ignore ``remote_mount_path``.
     """
 
     local_path: str = str(_DEFAULT_SAVES_LOCAL_PATH)
     remote_subdir: str = _DEFAULT_SAVES_REMOTE_SUBDIR
+    remote_mount_path: str = str(_DEFAULT_SAVES_REMOTE_MOUNT_PATH)
     xbox_enabled: bool = False
 
 
@@ -203,8 +207,38 @@ def _parse(data: dict, path: Path) -> AppConfig:  # noqa: C901
     saves = SavesConfig(
         local_path=saves_raw.get("local_path", str(_DEFAULT_SAVES_LOCAL_PATH)),
         remote_subdir=saves_raw.get("remote_subdir", _DEFAULT_SAVES_REMOTE_SUBDIR),
+        remote_mount_path=saves_raw.get(
+            "remote_mount_path", str(_DEFAULT_SAVES_REMOTE_MOUNT_PATH)
+        ),
         xbox_enabled=bool(saves_raw.get("xbox_enabled", False)),
     )
+
+    remote_subdir = Path(saves.remote_subdir)
+    if (
+        not saves.remote_subdir
+        or remote_subdir.is_absolute()
+        or ".." in remote_subdir.parts
+    ):
+        raise ConfigurationError(
+            f"{path}: saves.remote_subdir must be a relative directory without '..'."
+        )
+
+    if smb is not None:
+        rom_mount = Path(source.rom_root)
+        saves_mount = Path(saves.remote_mount_path)
+        if not saves_mount.is_absolute():
+            raise ConfigurationError(
+                f"{path}: saves.remote_mount_path must be an absolute path."
+            )
+        if (
+            saves_mount == rom_mount
+            or saves_mount in rom_mount.parents
+            or rom_mount in saves_mount.parents
+        ):
+            raise ConfigurationError(
+                f"{path}: saves.remote_mount_path must be separate from source.rom_root "
+                "so the catalog mount can remain read-only."
+            )
 
     return AppConfig(
         source=source,
@@ -280,6 +314,8 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
         "# SaveSync v1 — see `romcloud saves --help`.\n",
         f'local_path = "{config.saves.local_path}"\n',
         f'remote_subdir = "{config.saves.remote_subdir}"\n',
+        "# Dedicated read-write mount of the SMB share; ignored for local/USB sources.\n",
+        f'remote_mount_path = "{config.saves.remote_mount_path}"\n',
         f"xbox_enabled = {'true' if config.saves.xbox_enabled else 'false'}\n",
     ]
 

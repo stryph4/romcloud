@@ -27,6 +27,7 @@ from romcloud.infrastructure.credentials import (
     write_smb_password,
 )
 from romcloud.infrastructure.mount import mount_cifs_source
+from romcloud.infrastructure.mount_worker import configured_mounts
 from romcloud.infrastructure.smb_discovery_client import build_default_smb_discovery_service
 from romcloud.integrations.batocera import es_config, mount_service
 
@@ -244,13 +245,15 @@ def apply_setup(config_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
         _write_state(state_path, {"status": "applying", "step": step})
         cifs_path = cifs_credentials_path(config.credentials_path)
         write_cifs_credentials_file(cifs_path, request.username, request.password)
-        mount_cifs_source(
-            request.server,
-            request.share,
-            request.rom_root,
-            cifs_path,
-            port=request.port,
-        )
+        for target in configured_mounts(config):
+            mount_cifs_source(
+                request.server,
+                request.share,
+                target.mount_point,
+                cifs_path,
+                read_only=target.read_only,
+                port=request.port,
+            )
 
         step = "refresh catalog"
         _write_state(state_path, {"status": "applying", "step": step})

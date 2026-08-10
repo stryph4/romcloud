@@ -52,7 +52,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
-from romcloud.core.exceptions import ROMCloudError, ProviderNotReachableError
+from romcloud.core.exceptions import ConfigurationError, ROMCloudError, ProviderNotReachableError
 from romcloud.infrastructure import mount as mountlib
 from romcloud.infrastructure import mount_endpoint_cache
 from romcloud.infrastructure.credentials import (
@@ -73,6 +73,62 @@ DEFAULT_RETRY_MAX_DELAY = 30.0
 # actually retry within the overall budget above — never equal to it.
 DEFAULT_ATTEMPT_TIMEOUT = 8.0
 DEFAULT_ATTEMPT_INTERVAL = 2.0
+
+
+@dataclass(frozen=True)
+class ConfiguredMount:
+    """One local view of the configured SMB share."""
+
+    label: str
+    mount_point: str
+    read_only: bool
+
+
+def configured_mounts(config) -> tuple[ConfiguredMount, ...]:
+    """Return the intentional SMB mount views used by ROMCloud.
+
+    The catalog/cache view stays read-only. SaveSync gets a separate
+    read-write view so its same-filesystem staging and rename transaction
+    never require broad write access through the ROM browsing path.
+
+    Lightweight config objects without ``saves`` retain the historical
+    single-mount shape; real ``AppConfig`` objects always include the
+    SaveSync mount configuration.
+    """
+    catalog = ConfiguredMount("ROM catalog", config.source.rom_root, True)
+    saves = getattr(config, "saves", None)
+    if config.smb is None or saves is None:
+        return (catalog,)
+    rom_mount = Path(config.source.rom_root)
+    saves_mount = Path(saves.remote_mount_path)
+    if (
+        saves_mount == rom_mount
+        or saves_mount in rom_mount.parents
+        or rom_mount in saves_mount.parents
+    ):
+        raise ConfigurationError(
+            "saves.remote_mount_path must be separate from source.rom_root so the "
+            "ROM catalog mount can remain read-only"
+        )
+    return (
+        catalog,
+        ConfiguredMount("SaveSync", saves.remote_mount_path, False),
+    )
+
+
+def all_configured_mounts_are_mounted(config) -> bool:
+    return all(_configured_mount_is_ready(item) for item in configured_mounts(config))
+
+
+def _configured_mount_is_ready(item: ConfiguredMount) -> bool:
+    if not mountlib.is_target_mounted(item.mount_point):
+        return False
+    check = (
+        mountlib.is_target_mounted_read_only
+        if item.read_only
+        else mountlib.is_target_mounted_writable
+    )
+    return check(item.mount_point)
 
 
 # ── path helpers ──────────────────────────────────────────────────────────────
@@ -371,12 +427,11 @@ def _run_worker_locked(
     sleep: Callable[[float], None],
     clock: Callable[[], float],
 ) -> int:
-    mount_point = config.source.rom_root
-
     try:
-        if mountlib.is_target_mounted(mount_point):
+        targets = configured_mounts(config)
+        if all(_configured_mount_is_ready(item) for item in targets):
             _write_worker_status(romcloud_home, "success", "already mounted")
-            log.info("%s is already mounted — worker exiting.", mount_point)
+            log.info("All configured SMB mount views are already mounted — worker exiting.")
             return 0
 
         if config.smb is None:
@@ -397,23 +452,31 @@ def _run_worker_locked(
         creds_path = cifs_credentials_path(config.credentials_path)
         write_cifs_credentials_file(creds_path, config.smb.username, password)
 
-        outcome = _mount_with_cached_endpoint_fallback(
-            romcloud_home=romcloud_home,
-            server=config.smb.server,
-            share=config.smb.share,
-            mount_point=mount_point,
-            credentials_path=creds_path,
-            port=config.smb.port,
-            attempt_timeout=attempt_timeout,
-            attempt_interval=attempt_interval,
-            retry_timeout=retry_timeout,
-            retry_initial_delay=retry_initial_delay,
-            retry_max_delay=retry_max_delay,
-            sleep=sleep,
-            clock=clock,
-        )
-        _write_worker_status(romcloud_home, "success", outcome.detail)
-        log.info("Mount worker succeeded: %s", outcome.detail)
+        details: list[str] = []
+        for target in targets:
+            if _configured_mount_is_ready(target):
+                details.append(f"{target.label}: already mounted")
+                continue
+            outcome = _mount_with_cached_endpoint_fallback(
+                romcloud_home=romcloud_home,
+                server=config.smb.server,
+                share=config.smb.share,
+                mount_point=target.mount_point,
+                credentials_path=creds_path,
+                read_only=target.read_only,
+                port=config.smb.port,
+                attempt_timeout=attempt_timeout,
+                attempt_interval=attempt_interval,
+                retry_timeout=retry_timeout,
+                retry_initial_delay=retry_initial_delay,
+                retry_max_delay=retry_max_delay,
+                sleep=sleep,
+                clock=clock,
+            )
+            details.append(f"{target.label}: {outcome.detail}")
+        detail = "; ".join(details)
+        _write_worker_status(romcloud_home, "success", detail)
+        log.info("Mount worker succeeded: %s", detail)
         return 0
 
     except ROMCloudError as exc:
@@ -435,6 +498,7 @@ def _mount_with_cached_endpoint_fallback(
     share: str,
     mount_point: str,
     credentials_path: Path,
+    read_only: bool = True,
     port: int,
     attempt_timeout: float,
     attempt_interval: float,
@@ -461,6 +525,9 @@ def _mount_with_cached_endpoint_fallback(
             cached.endpoint, server,
         )
         try:
+            mount_kwargs = {}
+            if not read_only:
+                mount_kwargs["read_only"] = False
             outcome = mountlib.mount_cifs_source(
                 server=cached.endpoint,
                 share=share,
@@ -469,6 +536,7 @@ def _mount_with_cached_endpoint_fallback(
                 port=port,
                 wait_timeout=attempt_timeout,
                 wait_interval=attempt_interval,
+                **mount_kwargs,
             )
             log.info("Mount worker succeeded via cached endpoint %s", cached.endpoint)
             mount_endpoint_cache.write_endpoint_cache(romcloud_home, server, cached.endpoint)
@@ -484,6 +552,7 @@ def _mount_with_cached_endpoint_fallback(
         share=share,
         mount_point=mount_point,
         credentials_path=credentials_path,
+        read_only=read_only,
         port=port,
         attempt_timeout=attempt_timeout,
         attempt_interval=attempt_interval,
@@ -510,6 +579,7 @@ def _mount_with_retry(
     share: str,
     mount_point: str,
     credentials_path: Path,
+    read_only: bool = True,
     port: int,
     attempt_timeout: float,
     attempt_interval: float,
@@ -553,6 +623,9 @@ def _mount_with_retry(
             per_attempt_timeout,
         )
         try:
+            mount_kwargs = {}
+            if not read_only:
+                mount_kwargs["read_only"] = False
             outcome = mountlib.mount_cifs_source(
                 server=server,
                 share=share,
@@ -561,6 +634,7 @@ def _mount_with_retry(
                 port=port,
                 wait_timeout=per_attempt_timeout,
                 wait_interval=attempt_interval,
+                **mount_kwargs,
             )
             if attempt > 1:
                 log.info("Mount worker succeeded after %d attempts: %s", attempt, outcome.detail)
@@ -601,13 +675,19 @@ class MountDiagnostics:
     cached_endpoint: Optional[str] = None
     """The last resolved endpoint used for fast boot-time mounting, if any
     — diagnostic-only; never part of the user-facing source identity."""
+    saves_mounted: Optional[bool] = None
 
     @property
     def label(self) -> str:
         if not self.configured:
             return "not configured"
-        if self.mounted:
+        saves_mounted = self.mounted if self.saves_mounted is None else self.saves_mounted
+        if self.mounted and saves_mounted:
             return "mounted"
+        if self.mounted:
+            return "ROM source mounted — SaveSync write mount missing"
+        if saves_mounted:
+            return "SaveSync write mount mounted — ROM source missing"
         if self.worker_pid is not None:
             return "waiting for source (worker running)"
         if self.last_state == "failed":
@@ -626,7 +706,13 @@ def get_diagnostics(romcloud_home: Path, config) -> MountDiagnostics:
             last_state=None, last_detail="", last_timestamp="",
         )
 
-    mounted = mountlib.is_target_mounted(config.source.rom_root)
+    targets = configured_mounts(config)
+    mounted = _configured_mount_is_ready(targets[0])
+    saves_mounted = (
+        _configured_mount_is_ready(targets[1])
+        if len(targets) > 1
+        else mounted
+    )
     worker_pid = is_worker_running(romcloud_home)
     status = read_worker_status(romcloud_home)
     cached = mount_endpoint_cache.read_endpoint_cache(romcloud_home)
@@ -642,4 +728,5 @@ def get_diagnostics(romcloud_home: Path, config) -> MountDiagnostics:
         last_detail=status.detail if status else "",
         last_timestamp=status.timestamp if status else "",
         cached_endpoint=cached_endpoint,
+        saves_mounted=saves_mounted,
     )

@@ -84,7 +84,9 @@ def healthcheck_cmd(ctx: click.Context) -> None:
         try:
             romcloud_home = mount_worker.romcloud_home_from_config(config)
             diag = mount_worker.get_diagnostics(romcloud_home, config)
-            check("SMB source mounted", diag.mounted, "" if diag.mounted else diag.label)
+            saves_mounted = diag.mounted if diag.saves_mounted is None else diag.saves_mounted
+            mounts_ready = diag.mounted and saves_mounted
+            check("SMB source mounted", mounts_ready, "" if mounts_ready else diag.label)
         except Exception as exc:  # noqa: BLE001 — healthcheck must never crash
             check("SMB source mounted", False, f"error checking status: {exc}")
 

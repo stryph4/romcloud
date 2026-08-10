@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from romcloud.infrastructure import save_tree
+from romcloud.core.exceptions import SaveSyncError
 from romcloud.core.save_selection import (
     DEFAULT_SAVE_SELECTION_POLICY,
     SaveSelectionPolicy,
@@ -194,3 +195,71 @@ class TestAtomicReplaceDir:
             save_tree.atomic_replace_dir(new_dir, target)
 
         assert (target / "old.txt").read_text() == "old"
+
+    def test_reports_backup_location_if_commit_and_restore_both_fail(
+        self, tmp_path: Path, monkeypatch
+    ):
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "old.txt").write_text("old")
+        new_dir = tmp_path / "new"
+        new_dir.mkdir()
+
+        real_rename = save_tree.os.rename
+        calls = {"count": 0}
+
+        def fail_commit_and_restore(src, dst):
+            calls["count"] += 1
+            if calls["count"] >= 2:
+                raise OSError("simulated rename failure")
+            real_rename(src, dst)
+
+        monkeypatch.setattr(save_tree.os, "rename", fail_commit_and_restore)
+
+        with pytest.raises(SaveSyncError, match="remains at"):
+            save_tree.atomic_replace_dir(new_dir, target)
+
+        assert not target.exists()
+        assert len(list(tmp_path.glob("target.previous-*"))) == 1
+
+
+class TestRecoverInterruptedCommit:
+    def test_restores_previous_dataset_when_interrupted_between_renames(self, tmp_path: Path):
+        target = tmp_path / "remote-saves"
+        backup = tmp_path / "remote-saves.previous-deadbeef"
+        backup.mkdir()
+        (backup / "old.srm").write_bytes(b"complete-old-dataset")
+        staging = tmp_path / ".remote-saves.staging-cafebabe"
+        staging.mkdir()
+        (staging / "new.srm").write_bytes(b"incomplete-new-dataset")
+
+        save_tree.recover_interrupted_commit(target)
+
+        assert (target / "old.srm").read_bytes() == b"complete-old-dataset"
+        assert not backup.exists()
+        assert not staging.exists()
+
+    def test_live_dataset_wins_and_transaction_debris_is_cleaned(self, tmp_path: Path):
+        target = tmp_path / "remote-saves"
+        target.mkdir()
+        (target / "live.srm").write_bytes(b"live")
+        backup = tmp_path / "remote-saves.previous-deadbeef"
+        backup.mkdir()
+        staging = tmp_path / ".remote-saves.staging-cafebabe"
+        staging.mkdir()
+
+        save_tree.recover_interrupted_commit(target)
+
+        assert (target / "live.srm").read_bytes() == b"live"
+        assert not backup.exists()
+        assert not staging.exists()
+
+    def test_ambiguous_multiple_backups_are_preserved(self, tmp_path: Path):
+        target = tmp_path / "remote-saves"
+        for suffix in ("one", "two"):
+            (tmp_path / f"remote-saves.previous-{suffix}").mkdir()
+
+        with pytest.raises(SaveSyncError, match="found 2 previous datasets"):
+            save_tree.recover_interrupted_commit(target)
+
+        assert len(list(tmp_path.glob("remote-saves.previous-*"))) == 2

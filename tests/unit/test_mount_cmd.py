@@ -26,13 +26,20 @@ def _fake_smb(server="nas.local", share="ROMs", username="alice", port=445):
     return SimpleNamespace(server=server, share=share, username=username, port=port)
 
 
-def _fake_config(*, smb=None, rom_root="/mnt/roms", romcloud_home="/opt/romcloud"):
+def _fake_config(
+    *, smb=None, rom_root="/mnt/roms", romcloud_home="/opt/romcloud", saves_mount=None
+):
     home = Path(romcloud_home)
     return SimpleNamespace(
         source=SimpleNamespace(rom_root=rom_root),
         smb=smb,
         credentials_path=home / "config" / "credentials.toml",
         data_path=str(home / "data"),
+        saves=(
+            SimpleNamespace(remote_mount_path=saves_mount)
+            if saves_mount is not None
+            else None
+        ),
     )
 
 
@@ -41,8 +48,28 @@ def _invoke(args, config):
 
 
 class TestBootStart:
+    def test_catalog_mount_alone_does_not_hide_missing_savesync_mount(self, monkeypatch):
+        monkeypatch.setattr(
+            mount_cmd_module.mount,
+            "is_target_mounted",
+            lambda path: path == "/mnt/roms",
+        )
+        monkeypatch.setattr(mount_cmd_module.mount_worker, "is_worker_running", lambda *a: None)
+        monkeypatch.setattr(mount_cmd_module.mount_worker, "spawn_worker", lambda *a: 4242)
+
+        result = _invoke(
+            ["boot-start"],
+            _fake_config(smb=_fake_smb(), saves_mount="/mnt/saves-rw"),
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "4242" in result.output
+
     def test_already_mounted_skips_spawn(self, monkeypatch):
         monkeypatch.setattr(mount_cmd_module.mount, "is_target_mounted", lambda *a, **k: True)
+        monkeypatch.setattr(
+            mount_cmd_module.mount, "is_target_mounted_read_only", lambda *a, **k: True
+        )
         spawned = []
         monkeypatch.setattr(mount_cmd_module.mount_worker, "spawn_worker", lambda *a, **k: spawned.append(1))
 
@@ -122,6 +149,23 @@ class TestWorkerCommand:
 
 
 class TestStop:
+    def test_unmounts_savesync_before_catalog(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(mount_cmd_module.mount_worker, "stop_worker", lambda *a: None)
+        monkeypatch.setattr(
+            mount_cmd_module.mount,
+            "unmount_cifs_source",
+            lambda path: calls.append(path) or True,
+        )
+
+        result = _invoke(
+            ["stop"],
+            _fake_config(smb=_fake_smb(), saves_mount="/mnt/saves-rw"),
+        )
+
+        assert result.exit_code == 0, result.output
+        assert calls == ["/mnt/saves-rw", "/mnt/roms"]
+
     def test_stops_worker_then_unmounts(self, monkeypatch):
         calls = []
         monkeypatch.setattr(mount_cmd_module.mount_worker, "stop_worker", lambda *a, **k: calls.append("stop_worker"))
@@ -287,6 +331,28 @@ class TestStartupMigrationFromMountStatus:
 
 
 class TestExistingStartBehaviorIntact:
+    def test_start_mounts_catalog_ro_and_savesync_rw(self, monkeypatch):
+        monkeypatch.setattr(mount_cmd_module, "load_smb_password", lambda *a, **k: "hunter2")
+        monkeypatch.setattr(mount_cmd_module, "write_cifs_credentials_file", lambda *a, **k: None)
+        calls = []
+        monkeypatch.setattr(
+            mount_cmd_module.mount,
+            "mount_cifs_source",
+            lambda **kwargs: calls.append(kwargs) or SimpleNamespace(
+                mounted=True, already_mounted=False, detail="mounted"
+            ),
+        )
+
+        result = _invoke(
+            ["start"],
+            _fake_config(smb=_fake_smb(), saves_mount="/mnt/saves-rw"),
+        )
+
+        assert result.exit_code == 0, result.output
+        assert [item["mount_point"] for item in calls] == ["/mnt/roms", "/mnt/saves-rw"]
+        assert calls[0]["read_only"] is True
+        assert calls[1]["read_only"] is False
+
     def test_start_still_blocks_and_reports_mounted(self, monkeypatch):
         monkeypatch.setattr(mount_cmd_module, "load_smb_password", lambda *a, **k: "hunter2")
         monkeypatch.setattr(mount_cmd_module, "write_cifs_credentials_file", lambda *a, **k: None)

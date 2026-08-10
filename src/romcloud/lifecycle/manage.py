@@ -167,10 +167,11 @@ def uninstall(
     resolved_ports_dir = ports_dir or install.DEFAULT_PORTS_DIR
     mount_worker.stop_worker(romcloud_home)
     if config.smb is not None:
-        try:
-            mountlib.unmount_cifs_source(config.source.rom_root)
-        except Exception:
-            pass
+        for target in reversed(mount_worker.configured_mounts(config)):
+            try:
+                mountlib.unmount_cifs_source(target.mount_point)
+            except Exception:
+                pass
     mount_service.remove_service()
     es_config.remove()
     ports_gamelist_config.remove(ports_dir=resolved_ports_dir)
