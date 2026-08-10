@@ -40,7 +40,9 @@ def cli(ctx: click.Context, config_path: str | None, debug: bool) -> None:
     # Load config eagerly (except for commands which may run before one exists).
     # Individual uidata actions load it when required; setup-status must be
     # available to the graphical first-run UI on a completely fresh install.
-    if ctx.invoked_subcommand not in ("configure", "update", "_reconcile-install", "uidata"):
+    if ctx.invoked_subcommand not in (
+        "configure", "update", "repair", "uninstall", "purge", "_reconcile-install", "uidata"
+    ):
         try:
             config = load_config(config_path)
             ctx.obj["config"] = config
@@ -71,6 +73,7 @@ from romcloud.cli.commands.es import es_group
 from romcloud.cli.commands.mount import mount_group
 from romcloud.cli.commands.uidata import uidata_group
 from romcloud.cli.commands.reconcile import reconcile_install_cmd
+from romcloud.cli.commands.lifecycle import repair_cmd, uninstall_cmd, purge_cmd
 
 cli.add_command(configure_cmd, name="configure")
 cli.add_command(refresh_cmd, name="refresh")
@@ -84,6 +87,9 @@ cli.add_command(es_group, name="es")
 cli.add_command(mount_group, name="mount")
 cli.add_command(uidata_group, name="uidata")
 cli.add_command(reconcile_install_cmd, name="_reconcile-install")
+cli.add_command(repair_cmd, name="repair")
+cli.add_command(uninstall_cmd, name="uninstall")
+cli.add_command(purge_cmd, name="purge")
 
 
 if __name__ == "__main__":

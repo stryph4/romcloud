@@ -11,6 +11,7 @@ from __future__ import annotations
 from romcloud.integrations.batocera.ports_gamelist import (
     ROMCLOUD_GAME_NAME,
     ROMCLOUD_ROM_PATH,
+  remove_romcloud_entry,
     upsert_romcloud_entry,
 )
 
@@ -158,3 +159,19 @@ class TestMigratesOldAbsoluteImagePath:
         assert result.created is False
         assert "/userdata/system/romcloud" not in result.xml
         assert f"<image>{_ICON}</image>" in result.xml
+
+
+    class TestRemoveRomcloudEntry:
+      def test_removes_only_romcloud_entry(self):
+        existing = upsert_romcloud_entry(_EXISTING_WITH_UNRELATED, image=_ICON)
+        result = remove_romcloud_entry(existing.xml)
+
+        assert result.removed is True
+        assert "ROMCloud.sh" not in result.xml
+        assert "SomeOtherPort.sh" in result.xml
+
+      def test_invalid_xml_is_unchanged(self):
+        result = remove_romcloud_entry("not xml")
+
+        assert result.removed is False
+        assert result.xml == "not xml"

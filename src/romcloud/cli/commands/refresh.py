@@ -6,6 +6,7 @@ import click
 
 from romcloud.core.exceptions import ProviderNotReachableError, ROMCloudError
 from romcloud.cli.context import get_container
+from romcloud.integrations.batocera import es_config
 
 
 @click.command("refresh")
@@ -35,6 +36,26 @@ def refresh_cmd(ctx: click.Context, system: str | None, dry_run: bool) -> None:
 
         result = container.catalog.refresh()
         click.echo(str(result))
+
+        managed = container.game_repo.list_systems()
+        try:
+            es_result = es_config.refresh(managed)
+        except es_config.ESConfigError as exc:
+            click.echo(f"error: could not update EmulationStation integration — {exc}", err=True)
+            ctx.exit(1)
+            return
+
+        click.echo(
+            "Updated EmulationStation registration for "
+            f"{len(es_result.included_systems)} system(s)."
+        )
+        if es_result.missing_systems:
+            click.echo(
+                "warning: no Batocera system definition found for: "
+                + ", ".join(es_result.missing_systems),
+                err=True,
+            )
+        click.echo("Update game lists or restart EmulationStation to show catalog changes.")
 
         if result.errors:
             ctx.exit(1)

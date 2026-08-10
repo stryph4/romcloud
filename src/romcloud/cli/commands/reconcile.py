@@ -84,3 +84,6 @@ def reconcile_install_cmd(
         click.echo("  Reconciled Ports gamelist entry for ROMCloud.")
     elif report.ports_gamelist is False:
         click.echo("  Note: failed to reconcile Ports gamelist entry.")
+
+    if report.proxies_restored:
+        click.echo(f"  Restored generated proxies: {report.proxies_restored}")

@@ -262,7 +262,7 @@ class TestReconcileMountService:
 
         assert inst.reconcile_mount_service(tmp_path / "bin") is None
 
-    def test_reconciled_when_already_installed(self, tmp_path: Path, monkeypatch) -> None:
+    def test_restores_missing_override_from_existing_catalog(self, tmp_path: Path, monkeypatch) -> None:
         from romcloud.integrations.batocera import mount_service
 
         service_path = tmp_path / "services" / "romcloud_mount"
@@ -307,8 +307,6 @@ class TestReconcileEsOverride:
             "</systemList>\n"
         )
         override_path = tmp_path / "es_systems_romcloud.cfg"
-        override_path.parent.mkdir(parents=True, exist_ok=True)
-        override_path.write_text("stale override content")
 
         monkeypatch.setattr(es_config, "STOCK_ES_SYSTEMS_PATH", stock_path)
         monkeypatch.setattr(es_config, "ROMCLOUD_OVERRIDE_PATH", override_path)
@@ -348,8 +346,8 @@ class TestReconcileEsOverride:
 
         assert result is True
         content = override_path.read_text()
-        assert "stale override content" not in content
         assert "snes" in content
+        assert ".romcloud" in content
 
 
 class TestReconcilePortsGamelist:

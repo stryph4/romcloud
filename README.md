@@ -439,7 +439,13 @@ It does **not** modify Batocera's stock:
 /usr/share/emulationstation/es_systems.cfg
 ```
 
-ROMCloud reads Batocera's current system definitions, preserves the existing extension list and launcher arguments, appends `.romcloud`, and routes launches through `romcloud-run`.
+ROMCloud reads Batocera's current system definitions and writes a minimal,
+persistent named overlay for only the systems currently in its catalog. Each
+entry preserves the stock extension list and launcher arguments, appends
+`.romcloud`, and routes launches through `romcloud-run`; all other system
+metadata remains inherited from Batocera. A successful `romcloud refresh`
+also refreshes this registration. Update game lists or restart EmulationStation
+afterward to make newly registered proxies visible.
 
 ---
 
@@ -918,11 +924,22 @@ romcloud es
 romcloud healthcheck
 romcloud launch
 romcloud mount
+romcloud purge
 romcloud refresh
+romcloud repair
 romcloud saves
 romcloud status
+romcloud uninstall
 romcloud update
 ```
+
+`romcloud repair` non-destructively reconciles installed runtime artifacts,
+integrations, and missing generated proxies. `romcloud uninstall` removes the
+runtime and active Batocera integration while preserving configuration,
+credentials, catalog, cache, and logs for a later reinstall. `romcloud purge`
+also removes that retained ROMCloud state and requires confirmation unless
+`--yes` is supplied. Neither removal command deletes real ROMs or unrelated
+EmulationStation metadata/artwork.
 
 Run:
 

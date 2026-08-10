@@ -26,6 +26,7 @@ from romcloud.infrastructure.logging import get_logger
 from romcloud.integrations.batocera.ports_gamelist import (
     ROMCLOUD_GAME_NAME,
     ROMCLOUD_ROM_PATH,
+    remove_romcloud_entry,
     upsert_romcloud_entry,
 )
 
@@ -102,3 +103,33 @@ def reconcile(
         gamelist_path,
     )
     return True
+
+
+def remove(
+    *,
+    ports_dir: Path,
+    gamelist_path: Optional[Path] = None,
+) -> bool:
+    """Remove ROMCloud's exact Ports artifacts without touching shared data."""
+    changed = False
+    path = gamelist_path or ports_dir / "gamelist.xml"
+    if path.exists():
+        try:
+            existing_xml = path.read_text(encoding="utf-8")
+            result = remove_romcloud_entry(existing_xml)
+            if result.removed:
+                tmp_path = path.with_name(f".{path.name}.tmp")
+                tmp_path.write_text(result.xml, encoding="utf-8")
+                tmp_path.replace(path)
+                changed = True
+        except OSError as exc:
+            log.warning("Failed to remove ROMCloud entry from %s: %s", path, exc)
+
+    for owned_path in (
+        ports_dir / "ROMCloud.sh",
+        ports_dir / "images" / ROMCLOUD_IMAGE_FILENAME,
+    ):
+        if owned_path.exists():
+            owned_path.unlink()
+            changed = True
+    return changed

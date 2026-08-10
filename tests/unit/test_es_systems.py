@@ -130,12 +130,12 @@ class TestCommandArgvPreservation:
             "-extra %EXTRA%</command>" in result.xml
         )
 
-    def test_non_command_fields_preserved(self):
+    def test_non_overridden_fields_are_left_for_batocera_to_inherit(self):
         result = generate_override(_STOCK_XML, ["snes"], _WRAPPER)
-        assert "<fullname>Super Nintendo</fullname>" in result.xml
-        assert "<platform>snes</platform>" in result.xml
-        assert "<theme>snes</theme>" in result.xml
-        assert "<path>/userdata/roms/snes</path>" in result.xml
+        assert "<fullname>" not in result.xml
+        assert "<platform>" not in result.xml
+        assert "<theme>" not in result.xml
+        assert "<path>" not in result.xml
 
 
 class TestDeterminismAndIdempotency:

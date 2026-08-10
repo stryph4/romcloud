@@ -246,17 +246,16 @@ def reconcile_mount_service(bin_dir: Path) -> Optional[bool]:
 
 
 def reconcile_es_override(config_path: Path) -> Optional[bool]:
-    """If ROMCloud's EmulationStation override was already installed,
-    regenerate it from the current catalog.
+    """Restore or refresh ROMCloud's EmulationStation override from the catalog.
 
-    Returns ``None`` if not applicable (override never installed), ``True``
+    Returns ``None`` if not applicable (no usable configuration/catalog), ``True``
     if it was refreshed successfully, or ``False`` if refreshing it failed
     (best-effort; never raises).
     """
     from romcloud.integrations.batocera import es_config
 
     override_path = es_config.ROMCLOUD_OVERRIDE_PATH
-    if not override_path.exists():
+    if not config_path.exists():
         return None
     try:
         from romcloud.bootstrap.container import Container
@@ -265,6 +264,8 @@ def reconcile_es_override(config_path: Path) -> Optional[bool]:
         config = load_config(str(config_path))
         container = Container(config)
         managed = container.game_repo.list_systems()
+        if not managed and not override_path.exists():
+            return None
         es_config.refresh(
             managed,
             stock_path=es_config.STOCK_ES_SYSTEMS_PATH,
@@ -323,6 +324,7 @@ class ReconcileReport:
     mount_service: Optional[bool]
     es_override: Optional[bool]
     ports_gamelist: Optional[bool]
+    proxies_restored: int = 0
 
 
 def reconcile_install(
@@ -363,6 +365,15 @@ def reconcile_install(
     mount_service_status = reconcile_mount_service(bin_dir)
     es_override_status = reconcile_es_override(config_path)
     ports_gamelist_status = reconcile_ports_gamelist(ports_ui, resolved_ports_dir)
+    proxies_restored = 0
+    if config_path.exists():
+        try:
+            from romcloud.infrastructure.config import load_config
+            from romcloud.lifecycle.manage import restore_owned_proxies
+
+            proxies_restored = restore_owned_proxies(load_config(str(config_path)))
+        except Exception:  # noqa: BLE001 — optional recovery, never breaks runtime repair
+            log.warning("Failed to restore missing ROMCloud proxy files", exc_info=True)
 
     return ReconcileReport(
         core=core,
@@ -370,4 +381,5 @@ def reconcile_install(
         mount_service=mount_service_status,
         es_override=es_override_status,
         ports_gamelist=ports_gamelist_status,
+        proxies_restored=proxies_restored,
     )

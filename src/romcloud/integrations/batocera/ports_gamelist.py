@@ -64,6 +64,14 @@ class GeneratedGamelist:
     """True if a new `<game>` entry was appended; False if an existing one was updated in place."""
 
 
+@dataclass(frozen=True)
+class RemovedGamelistEntry:
+    """Result of removing ROMCloud's entry from a Ports `gamelist.xml`."""
+
+    xml: str
+    removed: bool
+
+
 def _parse_root(existing_xml: Optional[str]) -> ET.Element:
     if existing_xml:
         try:
@@ -121,3 +129,35 @@ def upsert_romcloud_entry(
     xml_body = ET.tostring(root, encoding="unicode")
     xml_text = '<?xml version="1.0"?>\n' + xml_body + "\n"
     return GeneratedGamelist(xml=xml_text, created=created)
+
+
+def remove_romcloud_entry(
+    existing_xml: str,
+    *,
+    rom_path: str = ROMCLOUD_ROM_PATH,
+) -> RemovedGamelistEntry:
+    """Remove only ROMCloud's `<game>` entry from an existing gamelist.
+
+    Invalid XML is returned unchanged. Every unrelated entry and the
+    shared `gamelist.xml` file itself remain owned by Batocera/the user.
+    """
+    try:
+        root = ET.fromstring(existing_xml)
+    except ET.ParseError:
+        return RemovedGamelistEntry(xml=existing_xml, removed=False)
+
+    removed = False
+    for candidate in list(root.findall("game")):
+        if _is_romcloud_entry(candidate, rom_path):
+            root.remove(candidate)
+            removed = True
+
+    if not removed:
+        return RemovedGamelistEntry(xml=existing_xml, removed=False)
+
+    ET.indent(root, space="  ")
+    xml_body = ET.tostring(root, encoding="unicode")
+    return RemovedGamelistEntry(
+        xml='<?xml version="1.0"?>\n' + xml_body + "\n",
+        removed=True,
+    )

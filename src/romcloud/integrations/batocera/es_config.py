@@ -23,11 +23,11 @@ using Batocera's persistent override mechanism:
 
 This file contains **only** the systems actually managed by the ROMCloud
 catalog (see the ``managed_systems`` argument below — callers typically pass
-``container.game_repo.list_systems()``), each cloned from the stock
-definition with its ``<command>`` executable swapped for the
-``romcloud-run`` wrapper and ``.romcloud`` appended to its ``<extension>``
-list if not already present. Every other Batocera system, and any other
-user override file, is left completely untouched. Removing ROMCloud's
+``container.game_repo.list_systems()``). Each entry contains only its name,
+the stock extension list with ``.romcloud`` appended, and the stock command
+with its executable swapped for ``romcloud-run``. Batocera inherits every
+other field from its stock definition. Every other Batocera system, and any
+other user override file, is left completely untouched. Removing ROMCloud's
 integration (:func:`remove`) only ever deletes this one file.
 
 Known limitation — folder-specific settings
@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Iterable
 
 from romcloud.core.exceptions import ProviderError
+from romcloud.infrastructure.atomic_file import atomic_write_text
 from romcloud.infrastructure.logging import get_logger
 from romcloud.integrations.batocera.es_systems import (
     GeneratedOverride,
@@ -121,7 +122,7 @@ def install(
     """
     result = _generate(managed_systems, stock_path=stock_path, wrapper_path=wrapper_path)
     override_path.parent.mkdir(parents=True, exist_ok=True)
-    override_path.write_text(result.xml, encoding="utf-8")
+    atomic_write_text(override_path, result.xml)
     log.info(
         "Wrote ES override for %d system(s) to %s (missing from stock: %s)",
         len(result.included_systems),
@@ -197,4 +198,3 @@ def remove(*, override_path: Path = ROMCLOUD_OVERRIDE_PATH) -> bool:
     override_path.unlink()
     log.info("Removed ES override: %s", override_path)
     return True
-

@@ -1,0 +1,232 @@
+"""Repair, uninstall, and purge orchestration for ROMCloud-owned artifacts."""
+
+from __future__ import annotations
+
+import json
+import shutil
+import sqlite3
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+from romcloud.bootstrap.container import Container
+from romcloud.infrastructure import mount as mountlib
+from romcloud.infrastructure import mount_worker
+from romcloud.infrastructure.config import AppConfig
+from romcloud.infrastructure.credentials import cifs_credentials_path
+from romcloud.integrations.batocera import es_config, mount_service, ports_gamelist_config
+from romcloud.lifecycle import install
+
+
+@dataclass(frozen=True)
+class LifecycleReport:
+    proxies_removed: int = 0
+    proxies_restored: int = 0
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _proxy_payload(path: Path) -> Optional[dict]:
+    if path.is_symlink() or path.suffix.lower() != ".romcloud":
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("romcloud_version") != "1":
+        return None
+    if not isinstance(payload.get("game_id"), str) or not payload["game_id"]:
+        return None
+    if not isinstance(payload.get("assets"), list):
+        return None
+    return payload
+
+
+def _manifest_records(config: AppConfig) -> list[tuple[str, Path]]:
+    db_path = Path(config.data_path) / "catalog.db"
+    if not db_path.is_file():
+        return []
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute("SELECT game_id, proxy_path FROM proxy_records").fetchall()
+    except sqlite3.Error:
+        return []
+    return [(str(game_id), Path(str(proxy_path))) for game_id, proxy_path in rows]
+
+
+def remove_owned_proxies(config: AppConfig) -> int:
+    """Remove only manifest-owned or strictly signed ROMCloud proxy files."""
+    local_root = Path(config.local_roms_path)
+    removed: set[Path] = set()
+
+    for game_id, path in _manifest_records(config):
+        payload = _proxy_payload(path)
+        if (
+            payload is not None
+            and payload["game_id"] == game_id
+            and _is_within(path, local_root)
+        ):
+            path.unlink(missing_ok=True)
+            removed.add(path)
+
+    if local_root.is_dir():
+        for path in local_root.rglob("*.romcloud"):
+            payload = _proxy_payload(path)
+            if payload is not None and _is_within(path, local_root):
+                path.unlink(missing_ok=True)
+                removed.add(path)
+
+    return len(removed)
+
+
+def restore_owned_proxies(config: AppConfig) -> int:
+    """Recreate missing manifest-owned proxies from retained catalog games."""
+    container = Container(config)
+    restored = 0
+    for record in container.proxy_repo.list_all():
+        path = Path(record.proxy_path)
+        if path.exists() or not _is_within(path, Path(config.local_roms_path)):
+            continue
+        game = container.game_repo.get(record.game_id)
+        if game is None:
+            continue
+        payload = {
+            "romcloud_version": "1",
+            "game_id": game.id,
+            "title": game.title,
+            "system": game.system,
+            "source_provider": game.source_provider,
+            "source_root": game.source_root,
+            "assets": [
+                {
+                    "filename": asset.filename,
+                    "relative_path": asset.relative_path,
+                    "is_primary": asset.is_primary,
+                }
+                for asset in game.assets
+            ],
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        restored += 1
+    return restored
+
+
+def repair(
+    *,
+    config: AppConfig,
+    romcloud_home: Path,
+    project_root: Path,
+    ports_dir: Optional[Path] = None,
+    system_python: Optional[str] = None,
+) -> tuple[install.ReconcileReport, LifecycleReport]:
+    venv_python = romcloud_home / "venv" / "bin" / "python"
+    if not venv_python.is_file():
+        raise RuntimeError(
+            f"The ROMCloud virtual environment is missing at {venv_python}; "
+            "rerun the bootstrap installer to recreate it."
+        )
+    installed_payload = romcloud_home / "ports-gfx" / "ports_gfx"
+    if not (project_root / "ports_gfx").is_dir() and installed_payload.is_dir():
+        with tempfile.TemporaryDirectory(prefix="romcloud-repair-") as tmp:
+            staged_root = Path(tmp)
+            shutil.copytree(installed_payload, staged_root / "ports_gfx")
+            reconcile_report = install.reconcile_install(
+                romcloud_home=romcloud_home,
+                project_root=staged_root,
+                ports_dir=ports_dir,
+                system_python=system_python,
+            )
+    else:
+        reconcile_report = install.reconcile_install(
+            romcloud_home=romcloud_home,
+            project_root=project_root,
+            ports_dir=ports_dir,
+            system_python=system_python,
+        )
+    return reconcile_report, LifecycleReport(
+        proxies_restored=reconcile_report.proxies_restored
+    )
+
+
+def uninstall(
+    *,
+    config: AppConfig,
+    romcloud_home: Path,
+    ports_dir: Optional[Path] = None,
+) -> LifecycleReport:
+    resolved_ports_dir = ports_dir or install.DEFAULT_PORTS_DIR
+    mount_worker.stop_worker(romcloud_home)
+    if config.smb is not None:
+        try:
+            mountlib.unmount_cifs_source(config.source.rom_root)
+        except Exception:
+            pass
+    mount_service.remove_service()
+    es_config.remove()
+    ports_gamelist_config.remove(ports_dir=resolved_ports_dir)
+    proxies_removed = remove_owned_proxies(config)
+    mount_worker.cleanup_runtime_state(romcloud_home)
+    cifs_credentials_path(config.credentials_path).unlink(missing_ok=True)
+    (config.credentials_path.parent / "setup-state.json").unlink(missing_ok=True)
+
+    for name in ("bin", "venv", "ports-gfx"):
+        shutil.rmtree(romcloud_home / name, ignore_errors=True)
+    (romcloud_home / "version.json").unlink(missing_ok=True)
+    run_dir = romcloud_home / "run"
+    try:
+        run_dir.rmdir()
+    except OSError:
+        pass
+    return LifecycleReport(proxies_removed=proxies_removed)
+
+
+def _validate_owned_tree(path: Path, *, protected: tuple[Path, ...]) -> None:
+    resolved = path.resolve()
+    forbidden = {Path("/"), Path("/userdata"), Path("/userdata/system")}
+    if not path.is_absolute() or resolved in forbidden:
+        raise RuntimeError(f"Refusing unsafe purge target: {path}")
+    if any(resolved == item.resolve() or _is_within(item, resolved) for item in protected):
+        raise RuntimeError(f"Refusing purge target that contains protected ROM data: {path}")
+
+
+def _remove_owned_tree(path: Path, *, protected: tuple[Path, ...]) -> None:
+    _validate_owned_tree(path, protected=protected)
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def purge(
+    *,
+    config: AppConfig,
+    romcloud_home: Path,
+    ports_dir: Optional[Path] = None,
+) -> LifecycleReport:
+    protected = (Path(config.local_roms_path), Path(config.source.rom_root))
+    external_roots = {Path(config.cache.path), Path(config.data_path)}
+    purge_roots = [
+        root for root in external_roots
+        if not _is_within(root, romcloud_home)
+    ]
+    for root in purge_roots:
+        _validate_owned_tree(root, protected=(*protected, romcloud_home))
+    _validate_owned_tree(romcloud_home, protected=protected)
+
+    report = uninstall(config=config, romcloud_home=romcloud_home, ports_dir=ports_dir)
+    for root in sorted(external_roots, key=lambda value: len(value.parts), reverse=True):
+        if not _is_within(root, romcloud_home):
+            _remove_owned_tree(root, protected=protected)
+    if config.logging.path and not _is_within(Path(config.logging.path), romcloud_home):
+        log_dir = Path(config.logging.path)
+        for name in ("romcloud.log", "romcloud.log.1", "romcloud.log.2", "romcloud.log.3"):
+            (log_dir / name).unlink(missing_ok=True)
+    _remove_owned_tree(romcloud_home, protected=protected)
+    return report

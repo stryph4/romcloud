@@ -27,10 +27,7 @@ Format (verified on Batocera 42)
 
 Transformation applied per managed system
 ------------------------------------------
-- Every child element of ``<system>`` (fullname, path, platform, theme, …)
-  is preserved byte-for-byte **except**:
-
-  - ``<extension>``: the existing space-separated token list is kept as-is;
+- ``<extension>``: the existing space-separated token list is kept as-is;
     ``.romcloud`` is appended only if no case-insensitive match for it is
     already present.
   - ``<command>``: only the *first whitespace-separated token* (the
@@ -39,14 +36,14 @@ Transformation applied per managed system
     ``%SYSTEM%``, and any future argument Batocera adds — is preserved
     exactly, in order. The argument count is never assumed or hardcoded.
 
-- Systems not present in *managed_systems* are omitted entirely from the
-  generated override — Batocera's stock definition continues to apply to
-  them unchanged, so non-ROMCloud ROMs keep working normally.
+- Each generated system contains only ``<name>``, ``<extension>``, and
+  ``<command>``. Batocera merges those fields over the matching stock system,
+  so all other metadata remains inherited from Batocera rather than copied.
+- Systems not present in *managed_systems* are omitted entirely.
 """
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass
 from typing import Iterable
 from xml.etree import ElementTree as ET
@@ -139,17 +136,19 @@ def generate_override(
             missing.append(name)
             continue
 
-        system_el = copy.deepcopy(stock_el)
-
-        ext_el = system_el.find("extension")
-        if ext_el is None:
-            ext_el = ET.SubElement(system_el, "extension")
-        ext_el.text = _ensure_romcloud_extension(ext_el.text or "")
-
-        cmd_el = system_el.find("command")
-        if cmd_el is None:
-            cmd_el = ET.SubElement(system_el, "command")
-        cmd_el.text = _rewrite_command(cmd_el.text or "", wrapper_path)
+        # Named Batocera overlays merge individual fields for a matching
+        # <name>. Keep this minimal so all unrelated stock metadata remains
+        # inherited and follows future Batocera updates.
+        system_el = ET.Element("system")
+        ET.SubElement(system_el, "name").text = name
+        stock_ext_el = stock_el.find("extension")
+        ET.SubElement(system_el, "extension").text = _ensure_romcloud_extension(
+            stock_ext_el.text if stock_ext_el is not None else ""
+        )
+        stock_cmd_el = stock_el.find("command")
+        ET.SubElement(system_el, "command").text = _rewrite_command(
+            stock_cmd_el.text if stock_cmd_el is not None else "", wrapper_path
+        )
 
         out_root.append(system_el)
         included.append(name)

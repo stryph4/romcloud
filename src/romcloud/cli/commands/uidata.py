@@ -139,6 +139,9 @@ def uidata_refresh(ctx: click.Context) -> None:
         _load_context_config(ctx)
         container = get_container(ctx)
         result = container.catalog.refresh()
+        from romcloud.integrations.batocera import es_config
+
+        es_result = es_config.refresh(container.game_repo.list_systems())
         return {
             "added": result.added,
             "updated": result.updated,
@@ -146,6 +149,9 @@ def uidata_refresh(ctx: click.Context) -> None:
             "removed": result.removed,
             "errors": [f"{system}: {message}" for system, message in result.errors],
             "warnings": result.warnings,
+            "es_systems": es_result.included_systems,
+            "es_missing_systems": es_result.missing_systems,
+            "es_restart_required": True,
         }
 
     _run_action(ctx, build)

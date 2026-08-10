@@ -132,7 +132,16 @@ class TestStatus:
 
 
 class TestRefresh:
-    def test_emits_added_skipped_removed_errors(self, tmp_path):
+    def test_emits_added_skipped_removed_errors(self, tmp_path, monkeypatch):
+        from romcloud.integrations.batocera import es_config
+
+        monkeypatch.setattr(
+            es_config,
+            "refresh",
+            lambda systems: type(
+                "Result", (), {"included_systems": [], "missing_systems": []}
+            )(),
+        )
         result = _write_and_invoke(tmp_path, ["refresh"])
 
         assert result.exit_code == 0, result.output
@@ -142,6 +151,8 @@ class TestRefresh:
         assert payload["skipped"] == 0
         assert payload["removed"] == 0
         assert payload["errors"] == []
+        assert payload["es_systems"] == []
+        assert payload["es_restart_required"] is True
 
 
 class TestHealthcheck:
