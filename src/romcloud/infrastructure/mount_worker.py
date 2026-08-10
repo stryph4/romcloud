@@ -50,7 +50,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
-from romcloud.core.exceptions import ROMCloudError
+from romcloud.core.exceptions import ROMCloudError, ProviderNotReachableError
 from romcloud.infrastructure import mount as mountlib
 from romcloud.infrastructure.credentials import (
     cifs_credentials_path,
@@ -63,6 +63,9 @@ log = get_logger("mount.worker")
 
 DEFAULT_WAIT_TIMEOUT = 300.0  # 5 minutes — finite; never waits forever.
 DEFAULT_WAIT_INTERVAL = 5.0
+DEFAULT_RETRY_TIMEOUT = 300.0
+DEFAULT_RETRY_INITIAL_DELAY = 2.0
+DEFAULT_RETRY_MAX_DELAY = 30.0
 
 
 # ── path helpers ──────────────────────────────────────────────────────────────
@@ -152,7 +155,21 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def is_worker_running(romcloud_home: Path) -> Optional[int]:
+def _worker_cmdline_matches(pid: int, *, proc_root: Path) -> bool:
+    """Return True when *pid* looks like ROMCloud's mount worker process."""
+    cmdline_path = proc_root / str(pid) / "cmdline"
+    try:
+        raw = cmdline_path.read_bytes()
+    except OSError:
+        return False
+
+    argv = [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part]
+    if len(argv) < 4:
+        return False
+    return argv[1:] == ["-m", "romcloud.cli.main", "mount", "worker"]
+
+
+def is_worker_running(romcloud_home: Path, *, proc_root: Path = Path("/proc")) -> Optional[int]:
     """Return the running worker's PID, or None.
 
     If the lock file references a PID that's no longer alive (a stale lock
@@ -172,10 +189,10 @@ def is_worker_running(romcloud_home: Path) -> Optional[int]:
         path.unlink(missing_ok=True)
         return None
 
-    if _pid_alive(pid):
+    if _pid_alive(pid) and _worker_cmdline_matches(pid, proc_root=proc_root):
         return pid
 
-    log.info("Removing stale mount-worker lock (pid %d is no longer running)", pid)
+    log.info("Removing stale mount-worker lock (pid %d is no longer our worker)", pid)
     path.unlink(missing_ok=True)
     return None
 
@@ -301,6 +318,11 @@ def run_worker(
     *,
     wait_timeout: float = DEFAULT_WAIT_TIMEOUT,
     wait_interval: float = DEFAULT_WAIT_INTERVAL,
+    retry_timeout: float = DEFAULT_RETRY_TIMEOUT,
+    retry_initial_delay: float = DEFAULT_RETRY_INITIAL_DELAY,
+    retry_max_delay: float = DEFAULT_RETRY_MAX_DELAY,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
 ) -> int:
     """Run the mount worker to completion — this call *blocks*, and is meant
     to execute only inside a detached background process (see
@@ -314,13 +336,32 @@ def run_worker(
     """
     try:
         with _WorkerLock(romcloud_home):
-            return _run_worker_locked(romcloud_home, config, wait_timeout, wait_interval)
+            return _run_worker_locked(
+                romcloud_home,
+                config,
+                wait_timeout,
+                wait_interval,
+                retry_timeout,
+                retry_initial_delay,
+                retry_max_delay,
+                sleep,
+                clock,
+            )
     except WorkerAlreadyRunning:
         log.info("A mount worker is already running — exiting without doing anything.")
         return 0
 
-
-def _run_worker_locked(romcloud_home: Path, config, wait_timeout: float, wait_interval: float) -> int:
+def _run_worker_locked(
+    romcloud_home: Path,
+    config,
+    wait_timeout: float,
+    wait_interval: float,
+    retry_timeout: float,
+    retry_initial_delay: float,
+    retry_max_delay: float,
+    sleep: Callable[[float], None],
+    clock: Callable[[], float],
+) -> int:
     mount_point = config.source.rom_root
 
     try:
@@ -347,7 +388,7 @@ def _run_worker_locked(romcloud_home: Path, config, wait_timeout: float, wait_in
         creds_path = cifs_credentials_path(config.credentials_path)
         write_cifs_credentials_file(creds_path, config.smb.username, password)
 
-        outcome = mountlib.mount_cifs_source(
+        outcome = _mount_with_retry(
             server=config.smb.server,
             share=config.smb.share,
             mount_point=mount_point,
@@ -355,6 +396,11 @@ def _run_worker_locked(romcloud_home: Path, config, wait_timeout: float, wait_in
             port=config.smb.port,
             wait_timeout=wait_timeout,
             wait_interval=wait_interval,
+            retry_timeout=retry_timeout,
+            retry_initial_delay=retry_initial_delay,
+            retry_max_delay=retry_max_delay,
+            sleep=sleep,
+            clock=clock,
         )
         _write_worker_status(romcloud_home, "success", outcome.detail)
         log.info("Mount worker succeeded: %s", outcome.detail)
@@ -370,6 +416,68 @@ def _run_worker_locked(romcloud_home: Path, config, wait_timeout: float, wait_in
         _write_worker_status(romcloud_home, "failed", f"unexpected error: {exc}")
         log.exception("Mount worker crashed unexpectedly")
         return 0
+
+
+def _mount_with_retry(
+    *,
+    server: str,
+    share: str,
+    mount_point: str,
+    credentials_path: Path,
+    port: int,
+    wait_timeout: float,
+    wait_interval: float,
+    retry_timeout: float,
+    retry_initial_delay: float,
+    retry_max_delay: float,
+    sleep: Callable[[float], None],
+    clock: Callable[[], float],
+) -> mountlib.MountOutcome:
+    deadline = clock() + retry_timeout
+    attempt = 1
+    delay = max(0.0, retry_initial_delay)
+
+    while True:
+        log.info(
+            "Mount worker attempt %d: mounting //%s/%s at %s",
+            attempt,
+            server,
+            share,
+            mount_point,
+        )
+        try:
+            outcome = mountlib.mount_cifs_source(
+                server=server,
+                share=share,
+                mount_point=mount_point,
+                credentials_path=credentials_path,
+                port=port,
+                wait_timeout=wait_timeout,
+                wait_interval=wait_interval,
+            )
+            if attempt > 1:
+                log.info("Mount worker succeeded after %d attempts: %s", attempt, outcome.detail)
+            return outcome
+        except ProviderNotReachableError as exc:
+            now = clock()
+            if now >= deadline:
+                message = (
+                    f"Timed out after {attempt} attempt(s) waiting for SMB source {server!r} "
+                    f"to become reachable: {exc}"
+                )
+                log.warning("Mount worker retry budget exhausted after %d attempt(s): %s", attempt, exc)
+                raise ProviderNotReachableError(message) from exc
+
+            sleep_for = min(delay, max(0.0, deadline - now))
+            log.info(
+                "Mount worker attempt %d failed because the source is not ready: %s; retrying in %.1fs",
+                attempt,
+                exc,
+                sleep_for,
+            )
+            sleep(sleep_for)
+            delay = min(max(delay * 2, retry_initial_delay if retry_initial_delay > 0 else delay), retry_max_delay)
+            attempt += 1
 
 
 # ── combined diagnostics (for `mount status` / `healthcheck`) ───────────────

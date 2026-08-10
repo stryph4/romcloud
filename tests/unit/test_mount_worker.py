@@ -39,6 +39,18 @@ def _fake_smb(server="nas.local", share="ROMs", username="alice", port=445):
     return SimpleNamespace(server=server, share=share, username=username, port=port)
 
 
+def _fake_clock(values: list[float]):
+    it = iter(values)
+
+    def clock():
+        try:
+            return next(it)
+        except StopIteration:
+            return values[-1]
+
+    return clock
+
+
 class TestRomcloudHomeFromConfig:
     def test_derives_parent_of_data_path(self):
         config = SimpleNamespace(data_path="/userdata/system/romcloud/data")
@@ -69,6 +81,7 @@ class TestIsWorkerRunning:
     def test_live_pid_is_detected(self, tmp_path):
         mw.lock_path(tmp_path).parent.mkdir(parents=True)
         mw.lock_path(tmp_path).write_text(str(os.getpid()))
+        mw._worker_cmdline_matches = lambda pid, *, proc_root: pid == os.getpid()
         assert mw.is_worker_running(tmp_path) == os.getpid()
 
     def test_stale_lock_is_recovered_and_removed(self, tmp_path):
@@ -91,13 +104,15 @@ class TestIsWorkerRunning:
 
 
 class TestWorkerLock:
-    def test_acquire_and_release(self, tmp_path):
+    def test_acquire_and_release(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mw, "_worker_cmdline_matches", lambda pid, *, proc_root: pid == os.getpid())
         with mw._WorkerLock(tmp_path):
             assert mw.lock_path(tmp_path).exists()
             assert mw.lock_path(tmp_path).read_text() == str(os.getpid())
         assert not mw.lock_path(tmp_path).exists()
 
-    def test_second_acquire_while_held_raises(self, tmp_path):
+    def test_second_acquire_while_held_raises(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mw, "_worker_cmdline_matches", lambda pid, *, proc_root: pid == os.getpid())
         with mw._WorkerLock(tmp_path):
             with pytest.raises(mw.WorkerAlreadyRunning):
                 with mw._WorkerLock(tmp_path):
@@ -114,6 +129,7 @@ class TestOnlyOneWorkerRunsAtOnce:
     def test_run_worker_skips_when_lock_already_held_by_live_process(self, tmp_path, monkeypatch):
         mw.lock_path(tmp_path).parent.mkdir(parents=True)
         mw.lock_path(tmp_path).write_text(str(os.getpid()))  # "our" pid — definitely alive
+        monkeypatch.setattr(mw, "_worker_cmdline_matches", lambda pid, *, proc_root: pid == os.getpid())
 
         called = []
         monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: called.append(1) or False)
@@ -171,19 +187,106 @@ class TestRunWorker:
         monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
         monkeypatch.setattr(mw, "load_smb_password", lambda *a, **k: "hunter2")
         monkeypatch.setattr(mw, "write_cifs_credentials_file", lambda *a, **k: None)
+        sleeps = []
+        attempts = []
+
         monkeypatch.setattr(
             mw.mountlib,
             "mount_cifs_source",
-            lambda **k: mw.mountlib.MountOutcome(mounted=True, already_mounted=False, detail="mounted"),
+            lambda **k: attempts.append(k) or mw.mountlib.MountOutcome(
+                mounted=True, already_mounted=False, detail="mounted"
+            ),
         )
 
         config = _fake_config(smb=_fake_smb())
-        code = mw.run_worker(tmp_path, config)
+        code = mw.run_worker(
+            tmp_path,
+            config,
+            sleep=lambda seconds: sleeps.append(seconds),
+            clock=_fake_clock([0.0, 0.5]),
+        )
 
         assert code == 0
+        assert attempts == [
+            {
+                "server": "nas.local",
+                "share": "ROMs",
+                "mount_point": "/mnt/roms",
+                "credentials_path": mw.cifs_credentials_path(config.credentials_path),
+                "port": 445,
+                "wait_timeout": mw.DEFAULT_WAIT_TIMEOUT,
+                "wait_interval": mw.DEFAULT_WAIT_INTERVAL,
+            }
+        ]
+        assert sleeps == []
         status = mw.read_worker_status(tmp_path)
         assert status.state == "success"
         assert not mw.lock_path(tmp_path).exists()
+
+    def test_retry_budget_exhaustion_records_failed_status(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw, "load_smb_password", lambda *a, **k: "hunter2")
+        monkeypatch.setattr(mw, "write_cifs_credentials_file", lambda *a, **k: None)
+
+        attempts = []
+
+        def fake_mount_cifs_source(**kwargs):
+            attempts.append(kwargs)
+            raise ProviderNotReachableError("SMB source unreachable")
+
+        monkeypatch.setattr(mw.mountlib, "mount_cifs_source", fake_mount_cifs_source)
+
+        sleeps = []
+        config = _fake_config(smb=_fake_smb())
+        code = mw.run_worker(
+            tmp_path,
+            config,
+            retry_timeout=1.0,
+            retry_initial_delay=0.5,
+            retry_max_delay=1.0,
+            sleep=lambda seconds: sleeps.append(seconds),
+            clock=_fake_clock([0.0, 0.5, 1.1]),
+        )
+
+        assert code == 0
+        assert len(attempts) == 2
+        assert sleeps == [0.5]
+        status = mw.read_worker_status(tmp_path)
+        assert status.state == "failed"
+        assert status.detail.startswith("Timed out after 2 attempt(s)")
+        assert "SMB source" in status.detail
+
+    def test_retries_provider_not_reachable_until_success(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw, "load_smb_password", lambda *a, **k: "hunter2")
+        monkeypatch.setattr(mw, "write_cifs_credentials_file", lambda *a, **k: None)
+
+        attempts = []
+
+        def fake_mount_cifs_source(**kwargs):
+            attempts.append(kwargs)
+            if len(attempts) < 3:
+                raise ProviderNotReachableError("SMB source unreachable")
+            return mw.mountlib.MountOutcome(mounted=True, already_mounted=False, detail="mounted")
+
+        monkeypatch.setattr(mw.mountlib, "mount_cifs_source", fake_mount_cifs_source)
+
+        sleeps = []
+        config = _fake_config(smb=_fake_smb())
+        code = mw.run_worker(
+            tmp_path,
+            config,
+            retry_timeout=30.0,
+            retry_initial_delay=1.0,
+            retry_max_delay=2.0,
+            sleep=lambda seconds: sleeps.append(seconds),
+            clock=_fake_clock([0.0, 1.0, 2.0, 3.0, 4.0]),
+        )
+
+        assert code == 0
+        assert len(attempts) == 3
+        assert sleeps == [1.0, 2.0]
+        assert mw.read_worker_status(tmp_path).state == "success"
 
     def test_auth_failure_never_raises_and_is_logged_without_password(self, tmp_path, monkeypatch):
         monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
@@ -252,11 +355,12 @@ class TestStopWorker:
         assert mw.stop_worker(tmp_path) is False
         assert not mw.lock_path(tmp_path).exists()
 
-    def test_terminates_live_worker_process(self, tmp_path):
+    def test_terminates_live_worker_process(self, tmp_path, monkeypatch):
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
         try:
             mw.lock_path(tmp_path).parent.mkdir(parents=True)
             mw.lock_path(tmp_path).write_text(str(child.pid))
+            monkeypatch.setattr(mw, "_worker_cmdline_matches", lambda pid, *, proc_root: pid == child.pid)
 
             stopped = mw.stop_worker(tmp_path, grace_period=5.0, poll_interval=0.05)
 
@@ -351,6 +455,7 @@ class TestGetDiagnostics:
         monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
         mw.lock_path(tmp_path).parent.mkdir(parents=True)
         mw.lock_path(tmp_path).write_text(str(os.getpid()))
+        monkeypatch.setattr(mw, "_worker_cmdline_matches", lambda pid, *, proc_root: pid == os.getpid())
 
         config = _fake_config(smb=_fake_smb())
         diag = mw.get_diagnostics(tmp_path, config)
