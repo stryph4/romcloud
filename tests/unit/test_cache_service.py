@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -159,6 +160,178 @@ class TestEviction:
         evicted = cache_service.evict()
         assert game.id not in evicted
         assert cache_service.is_cached(game.id)
+
+
+class TestAutomaticLaunchEviction:
+    """Regression coverage for space creation during ``cache_game``."""
+
+    @staticmethod
+    def _make_game(tmp_path, game_repo, name: str, size: int) -> Game:
+        source_root = tmp_path / "source"
+        source_path = source_root / "ps2" / f"{name}.iso"
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_bytes(name.encode()[:1] * size)
+        asset = GameAsset(
+            f"{name}.iso",
+            f"ps2/{name}.iso",
+            size_bytes=size,
+            is_primary=True,
+        )
+        game = Game.create("ps2", name, "local", str(source_root), [asset])
+        game_repo.save(game)
+        return game
+
+    @staticmethod
+    def _set_lru(cache_repo, games: list[Game]) -> None:
+        now = datetime.now(timezone.utc)
+        for index, game in enumerate(games):
+            cache_repo.update_last_accessed(
+                game.id, now - timedelta(days=len(games) - index)
+            )
+
+    def test_quota_full_evicts_one_entry_for_incoming_game(
+        self, cache_service, cache_repo, game_repo, tmp_path, monkeypatch
+    ):
+        old = self._make_game(tmp_path, game_repo, "Old", 400)
+        incoming = self._make_game(tmp_path, game_repo, "Incoming", 300)
+        old_path = cache_service.cache_game(old.id)
+        cache_service._policy = CachePolicy(max_size_bytes=500, min_free_bytes=0)
+        monkeypatch.setattr("romcloud.services.cache._free_bytes", lambda _path: 10_000)
+
+        incoming_path = cache_service.cache_game(incoming.id)
+
+        assert not Path(old_path).exists()
+        assert cache_repo.get(old.id) is None
+        assert Path(incoming_path).exists()
+
+    def test_evicts_multiple_entries_in_lru_order_until_game_fits(
+        self, cache_service, cache_repo, game_repo, tmp_path, monkeypatch
+    ):
+        oldest = self._make_game(tmp_path, game_repo, "Oldest", 200)
+        newer = self._make_game(tmp_path, game_repo, "Newer", 200)
+        incoming = self._make_game(tmp_path, game_repo, "Incoming", 300)
+        oldest_path = cache_service.cache_game(oldest.id)
+        newer_path = cache_service.cache_game(newer.id)
+        self._set_lru(cache_repo, [oldest, newer])
+        cache_service._policy = CachePolicy(max_size_bytes=400, min_free_bytes=0)
+        monkeypatch.setattr("romcloud.services.cache._free_bytes", lambda _path: 10_000)
+
+        cache_service.cache_game(incoming.id)
+
+        assert not Path(oldest_path).exists()
+        assert not Path(newer_path).exists()
+        assert cache_repo.get(oldest.id) is None
+        assert cache_repo.get(newer.id) is None
+
+    def test_pinned_oldest_is_skipped_and_next_lru_is_evicted(
+        self, cache_service, cache_repo, game_repo, tmp_path, monkeypatch
+    ):
+        pinned = self._make_game(tmp_path, game_repo, "Pinned", 200)
+        evictable = self._make_game(tmp_path, game_repo, "Evictable", 200)
+        incoming = self._make_game(tmp_path, game_repo, "Incoming", 200)
+        pinned_path = cache_service.cache_game(pinned.id)
+        evictable_path = cache_service.cache_game(evictable.id)
+        self._set_lru(cache_repo, [pinned, evictable])
+        cache_service.pin(pinned.id)
+        cache_service._policy = CachePolicy(max_size_bytes=400, min_free_bytes=0)
+        monkeypatch.setattr("romcloud.services.cache._free_bytes", lambda _path: 10_000)
+
+        cache_service.cache_game(incoming.id)
+
+        assert Path(pinned_path).exists()
+        assert cache_repo.get(pinned.id).is_pinned
+        assert not Path(evictable_path).exists()
+
+    def test_all_candidates_protected_fails_without_deleting_them(
+        self, cache_service, cache_repo, game_repo, tmp_path, monkeypatch
+    ):
+        pinned = self._make_game(tmp_path, game_repo, "Pinned", 200)
+        launching = self._make_game(tmp_path, game_repo, "Launching", 200)
+        incoming = self._make_game(tmp_path, game_repo, "Incoming", 300)
+        pinned_path = cache_service.cache_game(pinned.id)
+        launching_path = cache_service.cache_game(launching.id)
+        cache_service.pin(pinned.id)
+        cache_service.mark_launched(launching.id)
+        cache_service._policy = CachePolicy(max_size_bytes=400, min_free_bytes=0)
+        monkeypatch.setattr("romcloud.services.cache._free_bytes", lambda _path: 10_000)
+
+        with pytest.raises(InsufficientSpaceError, match="pinned, launching, or transferring"):
+            cache_service.cache_game(incoming.id)
+
+        assert Path(pinned_path).exists()
+        assert Path(launching_path).exists()
+        assert cache_repo.get(incoming.id) is None
+
+    def test_game_larger_than_total_capacity_fails_without_eviction(
+        self, cache_service, cache_repo, game_repo, tmp_path, monkeypatch
+    ):
+        cached = self._make_game(tmp_path, game_repo, "Cached", 100)
+        incoming = self._make_game(tmp_path, game_repo, "Too Large", 501)
+        cached_path = cache_service.cache_game(cached.id)
+        cache_service._policy = CachePolicy(max_size_bytes=500, min_free_bytes=0)
+        monkeypatch.setattr("romcloud.services.cache._free_bytes", lambda _path: 10_000)
+
+        with pytest.raises(InsufficientSpaceError, match="exceeds the configured cache capacity"):
+            cache_service.cache_game(incoming.id)
+
+        assert Path(cached_path).exists()
+        assert cache_repo.get(cached.id) is not None
+
+    def test_hardware_case_plenty_of_disk_but_only_2_7_gib_quota_remaining(
+        self, cache_service, cache_repo, game_repo, tmp_path, monkeypatch
+    ):
+        gib = 1024**3
+        cached = self._make_game(tmp_path, game_repo, "Cached", 1)
+        incoming = self._make_game(tmp_path, game_repo, "Incoming", 1)
+        cached_path = cache_service.cache_game(cached.id)
+        cache_repo.update_size(cached.id, int(7.3 * gib))
+        # Catalog metadata drives the pre-transfer reservation without creating
+        # a multi-gigabyte test file.
+        incoming.assets[0] = GameAsset(
+            "Incoming.iso",
+            "ps2/Incoming.iso",
+            size_bytes=int(3.3 * gib),
+            is_primary=True,
+        )
+        game_repo.save(incoming)
+        cache_service._policy = CachePolicy(max_size_bytes=10 * gib, min_free_bytes=0)
+        monkeypatch.setattr(
+            "romcloud.services.cache._free_bytes", lambda _path: int(673.1 * gib)
+        )
+        incoming_target = Path(cache_service._cache_root) / "ps2" / "Incoming.iso"
+
+        def transfer_after_reservation(_game, _on_progress=None):
+            incoming_target.parent.mkdir(parents=True, exist_ok=True)
+            incoming_target.write_bytes(b"i")
+            return str(incoming_target)
+
+        monkeypatch.setattr(cache_service._transfer, "transfer", transfer_after_reservation)
+
+        incoming_path = cache_service.cache_game(incoming.id)
+
+        assert not Path(cached_path).exists()
+        assert cache_repo.get(cached.id) is None
+        assert Path(incoming_path).exists()
+
+    def test_minimum_free_reserve_evicts_even_when_quota_has_room(
+        self, cache_service, cache_repo, game_repo, tmp_path, monkeypatch
+    ):
+        cached = self._make_game(tmp_path, game_repo, "Cached", 100)
+        incoming = self._make_game(tmp_path, game_repo, "Incoming", 200)
+        cached_path = Path(cache_service.cache_game(cached.id))
+        cache_service._policy = CachePolicy(max_size_bytes=1_000, min_free_bytes=100)
+
+        def disk_free(_path):
+            # Deleting the cache entry is the only event that changes the
+            # authoritative free-space reading.
+            return 350 if not cached_path.exists() else 250
+
+        monkeypatch.setattr("romcloud.services.cache._free_bytes", disk_free)
+
+        incoming_path = cache_service.cache_game(incoming.id)
+
+        assert not cached_path.exists()
+        assert Path(incoming_path).exists()
 
 
 class TestCacheCollisionSafety:

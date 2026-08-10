@@ -175,7 +175,7 @@ class CacheService:
             raise CacheError(f"Game {game_id!r} has no cacheable assets")
 
         needed = game.total_size_bytes or 0
-        self._ensure_space(needed)
+        self._ensure_space(needed, protected_game_id=game_id)
 
         # cache_path is fully determined by (system, primary asset's relative
         # path) — see romcloud.core.cache_paths — so it is already correct
@@ -261,7 +261,12 @@ class CacheService:
 
     # ── eviction ──────────────────────────────────────────────────────────────
 
-    def evict(self, bytes_needed: int = 0) -> list[str]:
+    def evict(
+        self,
+        bytes_needed: int = 0,
+        *,
+        protected_game_ids: Optional[set[str]] = None,
+    ) -> list[str]:
         """Free space by evicting LRU-eligible entries.
 
         Eviction never removes:
@@ -272,16 +277,29 @@ class CacheService:
         Returns a list of evicted game_ids.
         """
         evicted: list[str] = []
+        protected = set(protected_game_ids or ())
+        protected.update(self._active_launches)
         candidates = self._cache_repo.list_evictable_lru()
 
-        for entry in candidates:
+        for candidate in candidates:
+            # Disk free space and repository usage are authoritative. Re-read
+            # both after every removal rather than estimating reclaimed bytes.
             total = self._cache_repo.total_size()
             free = _free_bytes(str(self._cache_root))
 
-            if self._policy.is_within_limits(total, free) and total + bytes_needed <= self._policy.max_size_bytes:
+            if self._has_space_for(total, free, bytes_needed):
                 break
 
-            if entry.game_id in self._active_launches:
+            if (
+                candidate.game_id in protected
+                or candidate.game_id in self._active_launches
+            ):
+                continue
+
+            # The LRU list is a snapshot. Re-read before deletion so an entry
+            # pinned or moved into an active transfer meanwhile is protected.
+            entry = self._cache_repo.get(candidate.game_id)
+            if entry is None or not entry.is_evictable:
                 continue
 
             game = self._game_repo.get(entry.game_id)
@@ -294,24 +312,52 @@ class CacheService:
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
-    def _ensure_space(self, bytes_needed: int) -> None:
-        total = self._cache_repo.total_size()
-        free = _free_bytes(str(self._cache_root))
+    def _has_space_for(
+        self,
+        total_cache_bytes: int,
+        free_disk_bytes: int,
+        bytes_needed: int,
+    ) -> bool:
+        """Return whether adding *bytes_needed* satisfies both policy limits."""
+        return (
+            total_cache_bytes + bytes_needed <= self._policy.max_size_bytes
+            and free_disk_bytes - bytes_needed >= self._policy.min_free_bytes
+        )
 
-        if not self._policy.is_within_limits(total + bytes_needed, free - bytes_needed):
-            self.evict(bytes_needed)
-
-        # Re-check after eviction.
-        total = self._cache_repo.total_size()
-        free = _free_bytes(str(self._cache_root))
-        if (
-            total + bytes_needed > self._policy.max_size_bytes
-            or free - bytes_needed < self._policy.min_free_bytes
-        ):
+    def _ensure_space(
+        self,
+        bytes_needed: int,
+        *,
+        protected_game_id: Optional[str] = None,
+    ) -> None:
+        if bytes_needed > self._policy.max_size_bytes:
             raise InsufficientSpaceError(
-                f"Not enough space to cache game: need {bytes_needed / 1024**3:.1f} GB, "
+                f"Game requires {bytes_needed / 1024**3:.1f} GB, which exceeds "
+                f"the configured cache capacity of "
+                f"{self._policy.max_size_bytes / 1024**3:.1f} GB"
+            )
+
+        total = self._cache_repo.total_size()
+        free = _free_bytes(str(self._cache_root))
+
+        if not self._has_space_for(total, free, bytes_needed):
+            protected = {protected_game_id} if protected_game_id else set()
+            self.evict(bytes_needed, protected_game_ids=protected)
+
+        # Re-read authoritative values after eviction.
+        total = self._cache_repo.total_size()
+        free = _free_bytes(str(self._cache_root))
+        if not self._has_space_for(total, free, bytes_needed):
+            quota_remaining = max(0, self._policy.max_size_bytes - total)
+            reserve_available = max(0, free - self._policy.min_free_bytes)
+            raise InsufficientSpaceError(
+                f"Not enough space to cache game after evicting all eligible entries: "
+                f"need {bytes_needed / 1024**3:.1f} GB, "
                 f"have {free / 1024**3:.1f} GB free / "
-                f"{(self._policy.max_size_bytes - total) / 1024**3:.1f} GB of quota remaining"
+                f"{quota_remaining / 1024**3:.1f} GB of quota remaining / "
+                f"{reserve_available / 1024**3:.1f} GB available above the "
+                f"minimum free-space reserve; remaining cache entries are "
+                f"pinned, launching, or transferring"
             )
 
     def _touch_accessed(self, game_id: str) -> None:
