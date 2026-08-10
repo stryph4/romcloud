@@ -116,3 +116,19 @@ class UpdateArchiveError(UpdateError):
 
 class UpdateInstallError(UpdateError):
     """Installing the updated package into the virtual environment failed."""
+
+
+# ── Save Sync ─────────────────────────────────────────────────────────────────
+
+
+class SaveSyncError(ROMCloudError):
+    """A save-sync operation failed."""
+
+
+class SaveSyncConnectivityError(SaveSyncError):
+    """The remote save location is not reachable."""
+
+
+class SaveSyncVerificationError(SaveSyncError):
+    """Staged save data failed verification after copying — the source
+    changed since the preview, or the copy was corrupted."""

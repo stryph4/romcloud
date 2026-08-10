@@ -196,3 +196,116 @@ def uidata_cache_status(ctx: click.Context) -> None:
         }
 
     _run_action(ctx, build)
+
+
+# ── SaveSync v1 ────────────────────────────────────────────────────────────
+#
+# The graphical UI never re-implements selection/diffing/commit logic — it
+# only calls the same romcloud.services.saves.SaveSyncService the CLI
+# (`romcloud saves ...`) uses. `savesync-preview`/`savesync-commit` take
+# their request via stdin, since each `romcloud uidata` invocation is a
+# fresh, stateless process — the GUI round-trips the exact diff JSON it
+# received from a preview call back into the matching commit call.
+
+
+def _record_dict(record) -> dict | None:
+    if record is None:
+        return None
+    return {
+        "revision": record.revision,
+        "timestamp": record.timestamp,
+        "device_id": record.device_id,
+        "artifact_count": record.artifact_count,
+        "total_bytes": record.total_bytes,
+    }
+
+
+@uidata_group.command("savesync-status")
+@click.pass_context
+def uidata_savesync_status(ctx: click.Context) -> None:
+    """SaveSync connectivity/settings/last-sync summary as JSON."""
+
+    def build() -> dict:
+        _load_context_config(ctx)
+        saves = get_container(ctx).saves
+        state = saves.get_state()
+        return {
+            "remote_reachable": saves.is_remote_reachable(),
+            "xbox_enabled": saves.xbox_enabled,
+            "xbox_hdd_size_bytes": saves.xbox_hdd_size(),
+            "last_upload": _record_dict(state.last_upload),
+            "last_download": _record_dict(state.last_download),
+        }
+
+    _run_action(ctx, build)
+
+
+@uidata_group.command("savesync-preview")
+@click.pass_context
+def uidata_savesync_preview(ctx: click.Context) -> None:
+    """Build an upload/download diff; result (including the diff itself,
+    for a later `savesync-commit` call) as JSON."""
+
+    def build() -> dict:
+        request = _read_request()
+        direction = request.get("direction")
+        if direction not in ("upload", "download"):
+            raise ValueError("direction must be 'upload' or 'download'")
+        _load_context_config(ctx)
+        saves = get_container(ctx).saves
+        diff = saves.preview_upload() if direction == "upload" else saves.preview_download()
+        return {
+            "diff": diff.to_dict(),
+            "added": len(diff.added),
+            "changed": len(diff.changed),
+            "removed": len(diff.removed),
+            "unchanged": len(diff.unchanged),
+            "transfer_bytes": diff.transfer_bytes,
+        }
+
+    _run_action(ctx, build)
+
+
+@uidata_group.command("savesync-commit")
+@click.pass_context
+def uidata_savesync_commit(ctx: click.Context) -> None:
+    """Commit a previously previewed upload/download; result as JSON.
+
+    The request must carry the exact ``diff`` object a prior
+    ``savesync-preview`` call returned — this process never trusts a
+    diff it did not just compute itself for anything but its shape.
+    """
+
+    def build() -> dict:
+        from romcloud.core.models.savesync import SaveDiff
+
+        request = _read_request()
+        direction = request.get("direction")
+        if direction not in ("upload", "download"):
+            raise ValueError("direction must be 'upload' or 'download'")
+        diff = SaveDiff.from_dict(request["diff"])
+        _load_context_config(ctx)
+        saves = get_container(ctx).saves
+        record = saves.commit_upload(diff) if direction == "upload" else saves.commit_download(diff)
+        return {"record": _record_dict(record)}
+
+    _run_action(ctx, build)
+
+
+@uidata_group.command("savesync-settings")
+@click.pass_context
+def uidata_savesync_settings(ctx: click.Context) -> None:
+    """Update SaveSync settings (currently only Original Xbox opt-in)."""
+
+    def build() -> dict:
+        from dataclasses import replace
+
+        from romcloud.infrastructure.config import write_config
+
+        request = _read_request()
+        config = _load_context_config(ctx)
+        new_config = replace(config, saves=replace(config.saves, xbox_enabled=bool(request.get("xbox_enabled", config.saves.xbox_enabled))))
+        write_config(new_config, ctx.obj["config_path"])
+        return {"xbox_enabled": new_config.saves.xbox_enabled}
+
+    _run_action(ctx, build)

@@ -48,13 +48,31 @@ from ports_gfx.operation_screen import (
     wrap_lines,
 )
 from ports_gfx.osk import compute_osk_layout, compute_osk_text_rect
+from ports_gfx.savesync_screen import (
+    APPLYING_SETTINGS,
+    COMMITTING,
+    CONFIRMING,
+    DASHBOARD,
+    DASHBOARD_ITEMS,
+    PREVIEW,
+    PREVIEWING,
+    RESULT,
+    SETTINGS,
+    SaveSyncScreenState,
+)
 from ports_gfx.wizard import WizardState, WizardStep
+
+SAVESYNC_ACTION = "savesync"
+"""Sentinel the UI layer interprets as "switch to the SaveSync screen"
+rather than dispatching to the backend — SaveSync is a first-class
+top-level menu entry, not a Settings submenu."""
 
 MENU_ITEMS: tuple[MenuItem, ...] = (
     MenuItem("Catalog Status", "status"),
     MenuItem("Refresh Catalog", "refresh"),
     MenuItem("Health Check", "healthcheck"),
     MenuItem("Cache Status", "cache-status"),
+    MenuItem("SaveSync", SAVESYNC_ACTION),
     MenuItem("Check for Updates", "update-check"),
     MenuItem("Controller Test", CONTROLLER_TEST_ACTION),
     MenuItem("Exit", EXIT_ACTION),
@@ -312,6 +330,7 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
 
         controller_test = _ControllerTestScreenState()
         operation_screen: Optional[OperationScreenState] = None
+        savesync_screen: Optional[SaveSyncScreenState] = None
         current_screen = "wizard" if wizard is not None else "menu"
         message: Optional[str] = None
         message_kind = "info"
@@ -376,11 +395,21 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
                     continue
 
                 if current_screen == "menu":
-                    running, current_screen, message, message_kind, new_operation = _handle_menu_event(
-                        ievent, state, layout, romcloud_bin, running, message, message_kind,
-                    )
-                    if new_operation is not None:
-                        operation_screen = new_operation
+                    item = state.selected_item
+                    if ievent.action == Action.CONFIRM and item.action == SAVESYNC_ACTION:
+                        savesync_screen = SaveSyncScreenState(romcloud_bin=romcloud_bin)
+                        savesync_screen.refresh_status()
+                        current_screen = "savesync"
+                    else:
+                        running, current_screen, message, message_kind, new_operation = _handle_menu_event(
+                            ievent, state, layout, romcloud_bin, running, message, message_kind,
+                        )
+                        if new_operation is not None:
+                            operation_screen = new_operation
+                elif current_screen == "savesync" and savesync_screen is not None:
+                    current_screen = _handle_savesync_event(ievent, savesync_screen)
+                    if current_screen == "menu":
+                        savesync_screen = None
                 elif current_screen == "wizard" and wizard is not None:
                     if ievent.action == Action.BACK and wizard.step == WizardStep.WELCOME:
                         running = False
@@ -402,6 +431,9 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
             # output) while the UI keeps rendering and waiting for input.
             if current_screen == OPERATION_SCREEN and operation_screen is not None:
                 operation_screen.poll()
+            elif current_screen == "savesync" and savesync_screen is not None:
+                savesync_screen.poll()
+                savesync_screen.update_confirm(dt)
             elif current_screen == "wizard" and wizard is not None:
                 wizard.poll()
                 if wizard.finished:
@@ -424,6 +456,8 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
                 _render_controller_test(pygame, screen, fonts, layout, input_manager, controller_test)
             elif current_screen == OPERATION_SCREEN and operation_screen is not None:
                 _render_operation(pygame, screen, fonts, layout, operation_screen)
+            elif current_screen == "savesync" and savesync_screen is not None:
+                _render_savesync(pygame, screen, fonts, layout, savesync_screen)
             elif current_screen == "wizard" and wizard is not None:
                 _render_wizard(pygame, screen, fonts, layout, wizard)
 
@@ -515,6 +549,56 @@ def _handle_controller_test_event(
         return "menu"
 
     return "controller_test"
+
+
+def _handle_savesync_event(ievent: InputEvent, savesync_screen: SaveSyncScreenState) -> str:
+    """Translate one semantic input event into SaveSync screen-state
+    changes. Pure function — no pygame — so it is fully unit-tested.
+
+    Returns the screen name to switch to next ("savesync" to stay, "menu"
+    to leave). While a backend operation is in flight (PREVIEWING /
+    COMMITTING / APPLYING_SETTINGS) input is ignored — the same "a
+    legitimate operation is never interruptible mid-flight" rule the
+    reusable operation screen already follows.
+    """
+    step = savesync_screen.step
+
+    if step == DASHBOARD:
+        if ievent.action in ACTION_DIRECTIONS:
+            _, dy = ACTION_DIRECTIONS[ievent.action]
+            if dy:
+                savesync_screen.select(savesync_screen.selected_index + dy)
+            return "savesync"
+        if ievent.action == Action.CONFIRM:
+            return "menu" if savesync_screen.confirm_dashboard_selection() == "back" else "savesync"
+        if ievent.action == Action.BACK:
+            return "menu"
+        return "savesync"
+
+    if step == PREVIEW:
+        if ievent.action == Action.CONFIRM:
+            savesync_screen.begin_confirm()
+        elif ievent.action == Action.BACK:
+            savesync_screen.return_to_dashboard()
+        return "savesync"
+
+    if step == CONFIRMING:
+        savesync_screen.handle_confirm_event(ievent)
+        return "savesync"
+
+    if step == RESULT:
+        if ievent.action in (Action.CONFIRM, Action.BACK):
+            savesync_screen.return_to_dashboard()
+        return "savesync"
+
+    if step == SETTINGS:
+        if ievent.action == Action.CONFIRM:
+            savesync_screen.set_xbox_enabled(not savesync_screen.status.get("xbox_enabled", False))
+        elif ievent.action == Action.BACK:
+            savesync_screen.return_to_dashboard()
+        return "savesync"
+
+    return "savesync"  # PREVIEWING / COMMITTING / APPLYING_SETTINGS: wait
 
 
 def _render_menu(  # noqa: ANN001
@@ -645,6 +729,96 @@ def _render_operation(  # noqa: ANN001
 
     hint_text = _OPERATION_HINT_FINISHED if operation.is_finished else _OPERATION_HINT_RUNNING
     hint = fonts["hint"].render(hint_text, True, _HINT_COLOR)
+    screen.blit(hint, (layout.hint_rect.x, layout.hint_rect.y))
+
+    pygame.display.flip()
+
+
+def _savesync_body_lines(savesync_screen: SaveSyncScreenState) -> list[str]:
+    """Pure text content for the current SaveSync step — unit-tested
+    directly, independent of rendering."""
+    step = savesync_screen.step
+    status = savesync_screen.status
+
+    if step == DASHBOARD:
+        reachable = status.get("remote_reachable")
+        xbox_enabled = status.get("xbox_enabled", False)
+        last_upload = status.get("last_upload")
+        last_download = status.get("last_download")
+        return [
+            f"Remote: {'reachable' if reachable else 'unreachable'}",
+            f"Original Xbox: {'enabled' if xbox_enabled else 'disabled'}",
+            f"Last upload: {last_upload['timestamp'] if last_upload else 'never'}",
+            f"Last download: {last_download['timestamp'] if last_download else 'never'}",
+            "",
+            *DASHBOARD_ITEMS,
+        ]
+    if step == PREVIEWING:
+        return ["Comparing local and remote saves..."]
+    if step == PREVIEW:
+        summary = savesync_screen.preview_summary
+        return [
+            f"Added:     {summary.get('added', 0)}",
+            f"Changed:   {summary.get('changed', 0)}",
+            f"Removed:   {summary.get('removed', 0)}",
+            f"Unchanged: {summary.get('unchanged', 0)}",
+            "",
+            "Press Confirm and hold for 3 seconds to apply, Back to cancel.",
+        ]
+    if step == CONFIRMING:
+        percent = int(savesync_screen.confirm.progress * 100)
+        return [f"Hold Confirm... {percent}%", "Release to cancel."]
+    if step == COMMITTING:
+        return ["Applying changes..."]
+    if step == RESULT:
+        if savesync_screen.error:
+            return [f"Failed: {savesync_screen.error}", "Press Confirm to return."]
+        record = savesync_screen.result
+        return [
+            f"Done. {record.get('artifact_count', 0)} artifact(s).",
+            "Press Confirm to return.",
+        ]
+    if step == SETTINGS:
+        xbox_enabled = status.get("xbox_enabled", False)
+        return [
+            "xemu stores Original Xbox saves inside its virtual hard drive,",
+            "so ROMCloud must transfer the entire virtual drive to preserve",
+            "them safely.",
+            "",
+            f"Original Xbox save sync: {'enabled' if xbox_enabled else 'disabled'}",
+            "Press Confirm to toggle, Back to return.",
+        ]
+    if step == APPLYING_SETTINGS:
+        return ["Applying setting..."]
+    return []
+
+
+def _render_savesync(  # noqa: ANN001
+    pygame,
+    screen,
+    fonts: dict,
+    layout: Layout,
+    savesync_screen: SaveSyncScreenState,
+) -> None:
+    screen.fill(_BG_COLOR)
+
+    title = fonts["title"].render("SaveSync", True, _FG_COLOR)
+    screen.blit(title, (layout.safe_area.x, layout.safe_area.y))
+
+    y = layout.safe_area.y + layout.fonts.title + 16
+    line_h = layout.fonts.body + 6
+    for i, line in enumerate(_savesync_body_lines(savesync_screen)):
+        is_selected_item = (
+            savesync_screen.step == DASHBOARD
+            and line in DASHBOARD_ITEMS
+            and DASHBOARD_ITEMS.index(line) == savesync_screen.selected_index
+        )
+        color = _SELECTED_BG if is_selected_item else _FG_COLOR
+        text = fonts["body"].render(line, True, color)
+        screen.blit(text, (layout.safe_area.x, y))
+        y += line_h
+
+    hint = fonts["hint"].render(_HINT_TEXT, True, _HINT_COLOR)
     screen.blit(hint, (layout.hint_rect.x, layout.hint_rect.y))
 
     pygame.display.flip()

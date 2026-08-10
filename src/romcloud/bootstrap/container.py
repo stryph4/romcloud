@@ -139,7 +139,16 @@ class Container:
     @property
     def saves(self) -> SaveSyncService:
         if self._saves is None:
-            self._saves = SaveSyncService()
+            from pathlib import Path
+
+            self._saves = SaveSyncService(
+                provider=self.provider,
+                connectivity_root=self._config.source.rom_root,
+                local_root=self._config.saves.local_path,
+                remote_root=str(Path(self._config.source.rom_root) / self._config.saves.remote_subdir),
+                state_path=Path(self._config.data_path) / "savesync-state.json",
+                xbox_enabled=self._config.saves.xbox_enabled,
+            )
         return self._saves
 
     # ── helpers ───────────────────────────────────────────────────────────────

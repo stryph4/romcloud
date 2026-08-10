@@ -16,7 +16,7 @@ from typing import Optional, Sequence
 from ports_gfx.actions import Action
 from ports_gfx.controller import DEFAULT_DEADZONE, ControllerManager
 from ports_gfx.controller_config import make_loader, make_saver
-from ports_gfx.input_keyboard import action_for_key, text_for_input_event
+from ports_gfx.input_keyboard import action_for_key, action_for_key_up, text_for_input_event
 from ports_gfx.input_touch import (
     PointerDebouncer,
     Rect,
@@ -95,6 +95,10 @@ class InputManager:
             if action is not None:
                 self.last_input_mode = "keyboard"
             return InputEvent(action=action)
+
+        if event_type == getattr(pygame, "KEYUP", object()):
+            action = action_for_key_up(pygame, event.key)
+            return InputEvent(action=action) if action is not None else _NONE_EVENT
 
         if event_type == getattr(pygame, "TEXTINPUT", object()):
             text = text_for_input_event(event)

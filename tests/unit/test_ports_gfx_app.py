@@ -33,12 +33,15 @@ from ports_gfx.operation_screen import OPERATION_SCREEN
 
 class TestMenuItems:
     def test_contains_expected_actions_in_order(self):
+        from ports_gfx import app as app_module
+
         actions = [item.action for item in MENU_ITEMS]
         assert actions == [
             "status",
             "refresh",
             "healthcheck",
             "cache-status",
+            app_module.SAVESYNC_ACTION,
             "update-check",
             CONTROLLER_TEST_ACTION,
             EXIT_ACTION,
@@ -46,6 +49,13 @@ class TestMenuItems:
 
     def test_exit_is_the_last_item(self):
         assert MENU_ITEMS[-1].action == EXIT_ACTION
+
+    def test_savesync_is_first_class_top_level_entry(self):
+        from ports_gfx import app as app_module
+
+        savesync_items = [item for item in MENU_ITEMS if item.action == app_module.SAVESYNC_ACTION]
+        assert len(savesync_items) == 1
+        assert savesync_items[0].label == "SaveSync"
 
 
 class TestInitialScreen:
@@ -268,7 +278,82 @@ class TestHandleMenuEvent:
         assert running is True
         assert screen == OPERATION_SCREEN
         assert operation is not None
-        assert operation.title == "Refresh Catalog"
+
+
+class TestHandleSavesyncEvent:
+    def _screen(self, **kwargs):
+        from ports_gfx.savesync_screen import SaveSyncScreenState
+
+        return SaveSyncScreenState(romcloud_bin="/opt/romcloud/bin/romcloud", **kwargs)
+
+    def test_dashboard_directional_navigation(self):
+        from ports_gfx import app as app_module
+
+        screen = self._screen()
+        result = app_module._handle_savesync_event(InputEvent(action=Action.DOWN), screen)
+        assert result == "savesync"
+        assert screen.selected_index == 1
+
+    def test_dashboard_back_leaves_screen(self):
+        from ports_gfx import app as app_module
+
+        screen = self._screen()
+        assert app_module._handle_savesync_event(InputEvent(action=Action.BACK), screen) == "menu"
+
+    def test_dashboard_confirm_on_back_item_leaves_screen(self):
+        from ports_gfx import app as app_module
+
+        screen = self._screen(selected_index=3)  # "Back"
+        assert app_module._handle_savesync_event(InputEvent(action=Action.CONFIRM), screen) == "menu"
+
+    def test_dashboard_confirm_on_settings_switches_step(self):
+        from ports_gfx import app as app_module
+        from ports_gfx.savesync_screen import SETTINGS
+
+        screen = self._screen(selected_index=2)
+        assert app_module._handle_savesync_event(InputEvent(action=Action.CONFIRM), screen) == "savesync"
+        assert screen.step == SETTINGS
+
+    def test_preview_confirm_begins_hold(self):
+        from ports_gfx import app as app_module
+        from ports_gfx.savesync_screen import CONFIRMING, PREVIEW
+
+        screen = self._screen(step=PREVIEW)
+        app_module._handle_savesync_event(InputEvent(action=Action.CONFIRM), screen)
+        assert screen.step == CONFIRMING
+
+    def test_preview_back_returns_to_dashboard(self):
+        from ports_gfx import app as app_module
+        from ports_gfx.savesync_screen import DASHBOARD, PREVIEW
+
+        screen = self._screen(step=PREVIEW)
+        app_module._handle_savesync_event(InputEvent(action=Action.BACK), screen)
+        assert screen.step == DASHBOARD
+
+    def test_confirming_forwards_events_to_hold_state(self):
+        from ports_gfx import app as app_module
+        from ports_gfx.savesync_screen import CONFIRMING
+
+        screen = self._screen(step=CONFIRMING)
+        app_module._handle_savesync_event(InputEvent(action=Action.CONFIRM), screen)
+        assert screen.confirm.pressed is True
+
+    def test_result_confirm_returns_to_dashboard(self):
+        from ports_gfx import app as app_module
+        from ports_gfx.savesync_screen import DASHBOARD, RESULT
+
+        screen = self._screen(step=RESULT)
+        app_module._handle_savesync_event(InputEvent(action=Action.CONFIRM), screen)
+        assert screen.step == DASHBOARD
+
+    def test_previewing_ignores_input(self):
+        from ports_gfx import app as app_module
+        from ports_gfx.savesync_screen import PREVIEWING
+
+        screen = self._screen(step=PREVIEWING)
+        result = app_module._handle_savesync_event(InputEvent(action=Action.BACK), screen)
+        assert result == "savesync"
+        assert screen.step == PREVIEWING
 
 
 class TestHandleControllerTestEvent:

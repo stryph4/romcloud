@@ -445,6 +445,39 @@ class TestControllerProfiles:
         assert manager.handle_event(event) == Action.DOWN
 
 
+class TestConfirmButtonRelease:
+    """Needed by ports_gfx.hold_confirm — releasing the Confirm button must
+    be observable, not just its press edge."""
+
+    def test_raw_confirm_button_release_returns_confirm_released(self):
+        pygame = make_fake_pygame(joysticks={0: FakeJoystick(guid="g1")}, controller_indices=frozenset())
+        manager = ControllerManager(pygame)
+        manager.handle_event(_added_event(pygame, 0))
+
+        down = FakeEvent(type=pygame.JOYBUTTONDOWN, instance_id=1, button=0)
+        assert manager.handle_event(down) == Action.CONFIRM
+        up = FakeEvent(type=pygame.JOYBUTTONUP, instance_id=1, button=0)
+        assert manager.handle_event(up) == Action.CONFIRM_RELEASED
+
+    def test_logical_confirm_button_release_returns_confirm_released(self):
+        pygame = make_fake_pygame(joysticks={0: FakeJoystick(guid="g1")}, controller_indices=frozenset({0}))
+        manager = ControllerManager(pygame)
+        manager.handle_event(_added_event(pygame, 0, use_controller=True))
+
+        down = FakeEvent(type=pygame.CONTROLLERBUTTONDOWN, instance_id=1, button=pygame.CONTROLLER_BUTTON_A)
+        assert manager.handle_event(down) == Action.CONFIRM
+        up = FakeEvent(type=pygame.CONTROLLERBUTTONUP, instance_id=1, button=pygame.CONTROLLER_BUTTON_A)
+        assert manager.handle_event(up) == Action.CONFIRM_RELEASED
+
+    def test_non_confirm_button_release_returns_none(self):
+        pygame = make_fake_pygame(joysticks={0: FakeJoystick(guid="g1")}, controller_indices=frozenset())
+        manager = ControllerManager(pygame)
+        manager.handle_event(_added_event(pygame, 0))
+
+        up = FakeEvent(type=pygame.JOYBUTTONUP, instance_id=1, button=1)  # raw fallback BACK
+        assert manager.handle_event(up) is None
+
+
 class TestSteamDeckProfile:
     def test_builtin_profile_is_selected_by_guid_for_raw_buttons(self):
         pygame = make_fake_pygame(

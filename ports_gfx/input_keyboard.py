@@ -62,6 +62,17 @@ def action_for_key(pygame, key: int, *, text_mode: bool = False) -> Optional[Act
     return None
 
 
+def action_for_key_up(pygame, key: int) -> Optional[Action]:  # noqa: ANN001
+    """Translate a ``KEYUP`` key constant into a semantic release action.
+
+    Only the Confirm key's release is meaningful today (see
+    ``ports_gfx.hold_confirm``); every other key's release is untracked.
+    """
+    if key in _keys_by_name(pygame, _CONFIRM_KEY_NAMES):
+        return Action.CONFIRM_RELEASED
+    return None
+
+
 def text_for_input_event(event) -> Optional[str]:  # noqa: ANN001
     """Extract typed unicode text from a ``pygame.TEXTINPUT`` event.
 

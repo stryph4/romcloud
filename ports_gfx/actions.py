@@ -21,6 +21,11 @@ class Action(Enum):
     LEFT = "left"
     RIGHT = "right"
     CONFIRM = "confirm"
+    CONFIRM_RELEASED = "confirm_released"
+    """Emitted when the physical Confirm input (keyboard Enter, controller
+    A) is released — device-agnostic, for widgets that need to distinguish
+    a held press from a tap (see ``ports_gfx.hold_confirm``). Every other
+    screen simply never reacts to it."""
     BACK = "back"
     MENU = "menu"
 

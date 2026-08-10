@@ -442,11 +442,9 @@ class ControllerManager:
             return self._handle_button_down(instance_id, device, event.button, raw=False)
 
         if event_type == joy_button_up:
-            self._handle_button_up(device, event.button, raw=True)
-            return None
+            return self._handle_button_up(device, event.button, raw=True)
         if event_type == controller_button_up:
-            self._handle_button_up(device, event.button, raw=False)
-            return None
+            return self._handle_button_up(device, event.button, raw=False)
 
         if event_type == joy_axis:
             return self._handle_axis(device, self._resolve_raw_axis_name(device, event.axis), event.value)
@@ -496,10 +494,13 @@ class ControllerManager:
             device.repeater.press(ACTION_DIRECTIONS[action])
         return action
 
-    def _handle_button_up(self, device: _DeviceState, button: int, *, raw: bool) -> None:
+    def _handle_button_up(self, device: _DeviceState, button: int, *, raw: bool) -> Optional[Action]:
         action = self._resolve_button_action(device, button, raw=raw)
         if action in ACTION_DIRECTIONS and device.repeater.held_direction == ACTION_DIRECTIONS[action]:
             device.repeater.release()
+        if action == Action.CONFIRM:
+            return Action.CONFIRM_RELEASED
+        return None
 
     def _handle_axis(self, device: _DeviceState, axis_name: Optional[str], raw_value: float) -> Optional[Action]:
         if axis_name is None:

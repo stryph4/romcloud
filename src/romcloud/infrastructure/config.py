@@ -36,6 +36,8 @@ from romcloud.infrastructure.credentials import migrate_legacy_smb_credentials
 _DEFAULT_ROMCLOUD_HOME = Path("/userdata/system/romcloud")
 _DEFAULT_CACHE_ROOT = Path("/userdata/romcloud-cache")
 _DEFAULT_LOCAL_ROMS = Path("/userdata/roms")
+_DEFAULT_SAVES_LOCAL_PATH = Path("/userdata/saves")
+_DEFAULT_SAVES_REMOTE_SUBDIR = "romcloud-saves"
 
 
 # ── sub-configs ───────────────────────────────────────────────────────────────
@@ -82,6 +84,20 @@ class LoggingConfig:
 
 
 @dataclass(frozen=True)
+class SavesConfig:
+    """SaveSync v1 settings.
+
+    ``remote_subdir`` is a directory relative to ``source.rom_root`` — the
+    remote SaveSync dataset lives on the same already-mounted share the
+    ROM catalog uses, so no second network mount is needed.
+    """
+
+    local_path: str = str(_DEFAULT_SAVES_LOCAL_PATH)
+    remote_subdir: str = _DEFAULT_SAVES_REMOTE_SUBDIR
+    xbox_enabled: bool = False
+
+
+@dataclass(frozen=True)
 class AppConfig:
     source: SourceConfig
     cache: CacheConfig
@@ -89,6 +105,7 @@ class AppConfig:
     data_path: str
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     smb: Optional[SMBConfig] = None
+    saves: SavesConfig = field(default_factory=SavesConfig)
 
     @property
     def credentials_path(self) -> Path:
@@ -182,6 +199,13 @@ def _parse(data: dict, path: Path) -> AppConfig:  # noqa: C901
         path=log_raw.get("path"),
     )
 
+    saves_raw = data.get("saves", {})
+    saves = SavesConfig(
+        local_path=saves_raw.get("local_path", str(_DEFAULT_SAVES_LOCAL_PATH)),
+        remote_subdir=saves_raw.get("remote_subdir", _DEFAULT_SAVES_REMOTE_SUBDIR),
+        xbox_enabled=bool(saves_raw.get("xbox_enabled", False)),
+    )
+
     return AppConfig(
         source=source,
         cache=cache,
@@ -189,6 +213,7 @@ def _parse(data: dict, path: Path) -> AppConfig:  # noqa: C901
         data_path=data_path,
         logging=logging,
         smb=smb,
+        saves=saves,
     )
 
 
@@ -248,6 +273,15 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
             f'username = "{config.smb.username}"\n',
             f"port = {config.smb.port}\n",
         ]
+
+    lines += [
+        "\n",
+        "[saves]\n",
+        "# SaveSync v1 — see `romcloud saves --help`.\n",
+        f'local_path = "{config.saves.local_path}"\n',
+        f'remote_subdir = "{config.saves.remote_subdir}"\n',
+        f"xbox_enabled = {'true' if config.saves.xbox_enabled else 'false'}\n",
+    ]
 
     atomic_write_text(path, "".join(lines))
     return path

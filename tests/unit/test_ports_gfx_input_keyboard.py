@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ports_gfx.actions import Action
-from ports_gfx.input_keyboard import action_for_key, text_for_input_event
+from ports_gfx.input_keyboard import action_for_key, action_for_key_up, text_for_input_event
 from tests.unit._pygame_fakes import FakeEvent, make_fake_pygame
 
 
@@ -52,6 +52,19 @@ class TestActionForKey:
         pygame = make_fake_pygame()
         del pygame.K_TAB
         assert action_for_key(pygame, 4242) is None
+
+
+class TestActionForKeyUp:
+    def test_confirm_keys_release_to_confirm_released(self):
+        pygame = make_fake_pygame()
+        assert action_for_key_up(pygame, pygame.K_RETURN) == Action.CONFIRM_RELEASED
+        assert action_for_key_up(pygame, pygame.K_SPACE) == Action.CONFIRM_RELEASED
+        assert action_for_key_up(pygame, pygame.K_KP_ENTER) == Action.CONFIRM_RELEASED
+
+    def test_non_confirm_key_release_is_none(self):
+        pygame = make_fake_pygame()
+        assert action_for_key_up(pygame, pygame.K_ESCAPE) is None
+        assert action_for_key_up(pygame, pygame.K_UP) is None
 
 
 class TestTextForInputEvent:
