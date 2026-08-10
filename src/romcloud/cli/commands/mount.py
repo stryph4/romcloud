@@ -83,6 +83,8 @@ def mount_status_cmd(ctx: click.Context) -> None:
         click.echo(f"  Last error:  {diag.last_detail}")
     if diag.last_timestamp:
         click.echo(f"  Last check:  {diag.last_timestamp}")
+    if diag.cached_endpoint:
+        click.echo(f"  Cached IP:   {diag.cached_endpoint} (boot-time fast path)")
 
 
 @mount_group.command("start")

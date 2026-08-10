@@ -215,6 +215,35 @@ class TestStatus:
         assert result.exit_code == 0
         assert "nothing to mount" in result.output
 
+    def test_shows_cached_endpoint_when_present(self, monkeypatch):
+        diag = MountDiagnostics(
+            configured=True,
+            mounted=True,
+            worker_pid=None,
+            last_state="success",
+            last_detail="",
+            last_timestamp="",
+            cached_endpoint="192.0.2.10",
+        )
+        monkeypatch.setattr(mount_cmd_module.mount_worker, "get_diagnostics", lambda *a, **k: diag)
+
+        result = _invoke(["status"], _fake_config(smb=_fake_smb()))
+
+        assert result.exit_code == 0, result.output
+        assert "192.0.2.10" in result.output
+
+    def test_omits_cached_endpoint_line_when_absent(self, monkeypatch):
+        diag = MountDiagnostics(
+            configured=True, mounted=True, worker_pid=None,
+            last_state="success", last_detail="", last_timestamp="",
+        )
+        monkeypatch.setattr(mount_cmd_module.mount_worker, "get_diagnostics", lambda *a, **k: diag)
+
+        result = _invoke(["status"], _fake_config(smb=_fake_smb()))
+
+        assert result.exit_code == 0, result.output
+        assert "Cached IP" not in result.output
+
 
 class TestStartupMigrationFromMountStatus:
     def test_mount_status_triggers_legacy_credentials_migration(self, tmp_path, monkeypatch):

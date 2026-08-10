@@ -31,9 +31,11 @@ hang, never anything visible to Batocera's boot sequence.
 This module owns exactly these ROMCloud-specific files under
 ``{romcloud_home}``:
 
-- ``run/mount-worker.pid``           — single-instance lock (contains the PID)
-- ``run/mount-worker.status.json``   — last known state, for diagnostics
-- ``logs/mount-worker.log``          — the spawned worker's stdout/stderr
+- ``run/mount-worker.pid``            — single-instance lock (contains the PID)
+- ``run/mount-worker.status.json``    — last known state, for diagnostics
+- ``run/mount-endpoint-cache.json``   — last resolved endpoint, a boot-time
+  fast-path hint only (see :mod:`romcloud.infrastructure.mount_endpoint_cache`)
+- ``logs/mount-worker.log``           — the spawned worker's stdout/stderr
 """
 
 from __future__ import annotations
@@ -52,6 +54,7 @@ from typing import Callable, Optional
 
 from romcloud.core.exceptions import ROMCloudError, ProviderNotReachableError
 from romcloud.infrastructure import mount as mountlib
+from romcloud.infrastructure import mount_endpoint_cache
 from romcloud.infrastructure.credentials import (
     cifs_credentials_path,
     load_smb_password,
@@ -269,7 +272,8 @@ def stop_worker(
 
 
 def cleanup_runtime_state(romcloud_home: Path) -> None:
-    """Remove ROMCloud's own transient runtime files (lock + status).
+    """Remove ROMCloud's own transient runtime files (lock + status +
+    cached endpoint hint).
 
     Deliberately does not remove the worker log file — it's useful
     diagnostic history, not live state, and keeping it costs nothing.
@@ -277,6 +281,7 @@ def cleanup_runtime_state(romcloud_home: Path) -> None:
     """
     lock_path(romcloud_home).unlink(missing_ok=True)
     status_path(romcloud_home).unlink(missing_ok=True)
+    mount_endpoint_cache.endpoint_cache_path(romcloud_home).unlink(missing_ok=True)
 
 
 # ── spawning the detached background worker ──────────────────────────────────
@@ -392,7 +397,8 @@ def _run_worker_locked(
         creds_path = cifs_credentials_path(config.credentials_path)
         write_cifs_credentials_file(creds_path, config.smb.username, password)
 
-        outcome = _mount_with_retry(
+        outcome = _mount_with_cached_endpoint_fallback(
+            romcloud_home=romcloud_home,
             server=config.smb.server,
             share=config.smb.share,
             mount_point=mount_point,
@@ -420,6 +426,82 @@ def _run_worker_locked(
         _write_worker_status(romcloud_home, "failed", f"unexpected error: {exc}")
         log.exception("Mount worker crashed unexpectedly")
         return 0
+
+
+def _mount_with_cached_endpoint_fallback(
+    *,
+    romcloud_home: Path,
+    server: str,
+    share: str,
+    mount_point: str,
+    credentials_path: Path,
+    port: int,
+    attempt_timeout: float,
+    attempt_interval: float,
+    retry_timeout: float,
+    retry_initial_delay: float,
+    retry_max_delay: float,
+    sleep: Callable[[float], None],
+    clock: Callable[[], float],
+) -> mountlib.MountOutcome:
+    """Try a cached resolved endpoint first, then fall back to the existing
+    bounded hostname retry loop — the ultimate reliability safety net.
+
+    A cached endpoint is purely a boot-time UX optimization: it is only
+    tried once, for a single short ``attempt_timeout`` window, and is never
+    allowed to consume any of the hostname retry budget below. If it's
+    missing, for a different configured server, or simply doesn't work, it
+    is skipped/ignored silently and mounting proceeds exactly as before
+    this feature existed.
+    """
+    cached = mount_endpoint_cache.read_endpoint_cache(romcloud_home)
+    if cached is not None and cached.server == server and cached.endpoint != server:
+        log.info(
+            "Trying cached endpoint %s for %r before hostname resolution",
+            cached.endpoint, server,
+        )
+        try:
+            outcome = mountlib.mount_cifs_source(
+                server=cached.endpoint,
+                share=share,
+                mount_point=mount_point,
+                credentials_path=credentials_path,
+                port=port,
+                wait_timeout=attempt_timeout,
+                wait_interval=attempt_interval,
+            )
+            log.info("Mount worker succeeded via cached endpoint %s", cached.endpoint)
+            mount_endpoint_cache.write_endpoint_cache(romcloud_home, server, cached.endpoint)
+            return outcome
+        except ROMCloudError as exc:
+            log.info(
+                "Cached endpoint %s did not work (%s) — falling back to %r",
+                cached.endpoint, exc, server,
+            )
+
+    outcome = _mount_with_retry(
+        server=server,
+        share=share,
+        mount_point=mount_point,
+        credentials_path=credentials_path,
+        port=port,
+        attempt_timeout=attempt_timeout,
+        attempt_interval=attempt_interval,
+        retry_timeout=retry_timeout,
+        retry_initial_delay=retry_initial_delay,
+        retry_max_delay=retry_max_delay,
+        sleep=sleep,
+        clock=clock,
+    )
+    # A fresh resolution here is only a *candidate* (see
+    # mount_endpoint_cache.resolve_endpoint's docstring) — it is not
+    # provably the exact address the mount above used internally. Verify it
+    # is independently reachable right now before trusting it for next
+    # boot's fast path; an unreachable candidate is worse than no hint.
+    resolved = mount_endpoint_cache.resolve_endpoint(server, port)
+    if resolved and resolved != server and mountlib.check_reachable(resolved, port).ok:
+        mount_endpoint_cache.write_endpoint_cache(romcloud_home, server, resolved)
+    return outcome
 
 
 def _mount_with_retry(
@@ -516,6 +598,9 @@ class MountDiagnostics:
     last_state: Optional[str]
     last_detail: str
     last_timestamp: str
+    cached_endpoint: Optional[str] = None
+    """The last resolved endpoint used for fast boot-time mounting, if any
+    — diagnostic-only; never part of the user-facing source identity."""
 
     @property
     def label(self) -> str:
@@ -544,6 +629,10 @@ def get_diagnostics(romcloud_home: Path, config) -> MountDiagnostics:
     mounted = mountlib.is_target_mounted(config.source.rom_root)
     worker_pid = is_worker_running(romcloud_home)
     status = read_worker_status(romcloud_home)
+    cached = mount_endpoint_cache.read_endpoint_cache(romcloud_home)
+    cached_endpoint = (
+        cached.endpoint if cached is not None and cached.server == config.smb.server else None
+    )
 
     return MountDiagnostics(
         configured=True,
@@ -552,4 +641,5 @@ def get_diagnostics(romcloud_home: Path, config) -> MountDiagnostics:
         last_state=status.state if status else None,
         last_detail=status.detail if status else "",
         last_timestamp=status.timestamp if status else "",
+        cached_endpoint=cached_endpoint,
     )

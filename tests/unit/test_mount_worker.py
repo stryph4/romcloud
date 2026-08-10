@@ -399,6 +399,175 @@ class TestRunWorker:
         assert not mw.lock_path(tmp_path).exists()
 
 
+class TestCachedEndpointFallback:
+    """Boot-time UX: a cached resolved endpoint is tried first (fast path),
+    falling back to the existing bounded hostname retry loop untouched."""
+
+    def test_uses_cached_endpoint_first_and_succeeds_without_hostname_attempt(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw, "load_smb_password", lambda *a, **k: "hunter2")
+        monkeypatch.setattr(mw, "write_cifs_credentials_file", lambda *a, **k: None)
+        mw.mount_endpoint_cache.write_endpoint_cache(tmp_path, "omnivault", "192.0.2.10")
+
+        attempts = []
+
+        def fake_mount_cifs_source(**kwargs):
+            attempts.append(kwargs["server"])
+            if kwargs["server"] == "omnivault":
+                raise AssertionError("must not attempt the hostname when the cache succeeds")
+            return mw.mountlib.MountOutcome(mounted=True, already_mounted=False, detail="mounted")
+
+        monkeypatch.setattr(mw.mountlib, "mount_cifs_source", fake_mount_cifs_source)
+
+        config = _fake_config(smb=_fake_smb(server="omnivault"))
+        code = mw.run_worker(tmp_path, config)
+
+        assert code == 0
+        assert attempts == ["192.0.2.10"]
+        assert mw.read_worker_status(tmp_path).state == "success"
+
+    def test_falls_back_to_hostname_when_cached_endpoint_fails_without_losing_budget(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw, "load_smb_password", lambda *a, **k: "hunter2")
+        monkeypatch.setattr(mw, "write_cifs_credentials_file", lambda *a, **k: None)
+        mw.mount_endpoint_cache.write_endpoint_cache(tmp_path, "omnivault", "192.0.2.99")
+
+        attempts = []
+
+        def fake_mount_cifs_source(**kwargs):
+            attempts.append(kwargs["server"])
+            if kwargs["server"] == "192.0.2.99":
+                raise ProviderNotReachableError("stale endpoint unreachable")
+            return mw.mountlib.MountOutcome(mounted=True, already_mounted=False, detail="mounted")
+
+        monkeypatch.setattr(mw.mountlib, "mount_cifs_source", fake_mount_cifs_source)
+        monkeypatch.setattr(mw.mount_endpoint_cache, "resolve_endpoint", lambda *a, **k: "192.0.2.10")
+
+        config = _fake_config(smb=_fake_smb(server="omnivault"))
+        code = mw.run_worker(
+            tmp_path,
+            config,
+            retry_timeout=30.0,  # the hostname attempt must still get the FULL budget
+        )
+
+        assert code == 0
+        assert attempts == ["192.0.2.99", "omnivault"]
+        assert mw.read_worker_status(tmp_path).state == "success"
+
+    def test_ignores_cache_entry_for_a_different_configured_server(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw, "load_smb_password", lambda *a, **k: "hunter2")
+        monkeypatch.setattr(mw, "write_cifs_credentials_file", lambda *a, **k: None)
+        mw.mount_endpoint_cache.write_endpoint_cache(tmp_path, "old-nas", "192.0.2.50")
+
+        attempts = []
+
+        def fake_mount_cifs_source(**kwargs):
+            attempts.append(kwargs["server"])
+            return mw.mountlib.MountOutcome(mounted=True, already_mounted=False, detail="mounted")
+
+        monkeypatch.setattr(mw.mountlib, "mount_cifs_source", fake_mount_cifs_source)
+        monkeypatch.setattr(mw.mount_endpoint_cache, "resolve_endpoint", lambda *a, **k: None)
+
+        config = _fake_config(smb=_fake_smb(server="omnivault"))
+        code = mw.run_worker(tmp_path, config)
+
+        assert code == 0
+        assert attempts == ["omnivault"]  # the foreign cached IP was never tried
+
+    def test_successful_hostname_mount_refreshes_cache(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw, "load_smb_password", lambda *a, **k: "hunter2")
+        monkeypatch.setattr(mw, "write_cifs_credentials_file", lambda *a, **k: None)
+        monkeypatch.setattr(
+            mw.mountlib, "mount_cifs_source",
+            lambda **k: mw.mountlib.MountOutcome(mounted=True, already_mounted=False, detail="mounted"),
+        )
+        monkeypatch.setattr(mw.mount_endpoint_cache, "resolve_endpoint", lambda *a, **k: "192.0.2.10")
+        monkeypatch.setattr(
+            mw.mountlib, "check_reachable",
+            lambda *a, **k: mw.mountlib.ReachabilityResult(True, "ok", ""),
+        )
+
+        config = _fake_config(smb=_fake_smb(server="omnivault"))
+        code = mw.run_worker(tmp_path, config)
+
+        assert code == 0
+        entry = mw.mount_endpoint_cache.read_endpoint_cache(tmp_path)
+        assert entry is not None
+        assert entry.server == "omnivault"
+        assert entry.endpoint == "192.0.2.10"
+
+    def test_unreachable_resolved_candidate_is_never_cached(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw, "load_smb_password", lambda *a, **k: "hunter2")
+        monkeypatch.setattr(mw, "write_cifs_credentials_file", lambda *a, **k: None)
+        monkeypatch.setattr(
+            mw.mountlib, "mount_cifs_source",
+            lambda **k: mw.mountlib.MountOutcome(mounted=True, already_mounted=False, detail="mounted"),
+        )
+        # A fresh resolution can legitimately return a *different* address
+        # than the one the successful mount itself used (round-robin DNS,
+        # rotating resolvers) — an unverified candidate must never be cached.
+        monkeypatch.setattr(mw.mount_endpoint_cache, "resolve_endpoint", lambda *a, **k: "192.0.2.99")
+        monkeypatch.setattr(
+            mw.mountlib, "check_reachable",
+            lambda *a, **k: mw.mountlib.ReachabilityResult(False, "tcp", "unreachable"),
+        )
+
+        config = _fake_config(smb=_fake_smb(server="omnivault"))
+        code = mw.run_worker(tmp_path, config)
+
+        assert code == 0
+        assert mw.mount_endpoint_cache.read_endpoint_cache(tmp_path) is None
+
+    def test_direct_ip_config_never_triggers_a_redundant_cached_probe(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw, "load_smb_password", lambda *a, **k: "hunter2")
+        monkeypatch.setattr(mw, "write_cifs_credentials_file", lambda *a, **k: None)
+        # A previous run already cached the same IP the user configured directly.
+        mw.mount_endpoint_cache.write_endpoint_cache(tmp_path, "192.0.2.10", "192.0.2.10")
+
+        attempts = []
+
+        def fake_mount_cifs_source(**kwargs):
+            attempts.append(kwargs["server"])
+            return mw.mountlib.MountOutcome(mounted=True, already_mounted=False, detail="mounted")
+
+        monkeypatch.setattr(mw.mountlib, "mount_cifs_source", fake_mount_cifs_source)
+        monkeypatch.setattr(mw.mount_endpoint_cache, "resolve_endpoint", lambda *a, **k: "192.0.2.10")
+
+        config = _fake_config(smb=_fake_smb(server="192.0.2.10"))
+        code = mw.run_worker(tmp_path, config)
+
+        assert code == 0
+        assert attempts == ["192.0.2.10"]  # exactly one attempt, no wasted duplicate
+
+    def test_missing_cache_does_not_change_existing_hostname_behavior(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw, "load_smb_password", lambda *a, **k: "hunter2")
+        monkeypatch.setattr(mw, "write_cifs_credentials_file", lambda *a, **k: None)
+
+        attempts = []
+
+        def fake_mount_cifs_source(**kwargs):
+            attempts.append(kwargs["server"])
+            return mw.mountlib.MountOutcome(mounted=True, already_mounted=False, detail="mounted")
+
+        monkeypatch.setattr(mw.mountlib, "mount_cifs_source", fake_mount_cifs_source)
+        monkeypatch.setattr(mw.mount_endpoint_cache, "resolve_endpoint", lambda *a, **k: None)
+
+        config = _fake_config(smb=_fake_smb(server="omnivault"))
+        code = mw.run_worker(tmp_path, config)
+
+        assert code == 0
+        assert attempts == ["omnivault"]
+
+
 class TestStopWorker:
     def test_no_lock_returns_false(self, tmp_path):
         assert mw.stop_worker(tmp_path) is False
@@ -445,6 +614,13 @@ class TestCleanupRuntimeState:
         assert not mw.status_path(tmp_path).exists()
         assert mw.worker_log_path(tmp_path).exists()
         assert mw.worker_log_path(tmp_path).read_text() == "log contents"
+
+    def test_removes_cached_endpoint(self, tmp_path):
+        mw.mount_endpoint_cache.write_endpoint_cache(tmp_path, "omnivault", "192.0.2.10")
+
+        mw.cleanup_runtime_state(tmp_path)
+
+        assert mw.mount_endpoint_cache.read_endpoint_cache(tmp_path) is None
 
     def test_noop_when_nothing_exists(self, tmp_path):
         mw.cleanup_runtime_state(tmp_path)  # must not raise
@@ -536,3 +712,15 @@ class TestGetDiagnostics:
         config = _fake_config(smb=_fake_smb())
         diag = mw.get_diagnostics(tmp_path, config)
         assert diag.label == "not mounted"
+
+    def test_cached_endpoint_shown_only_when_it_matches_configured_server(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        mw.mount_endpoint_cache.write_endpoint_cache(tmp_path, "omnivault", "192.0.2.10")
+
+        config = _fake_config(smb=_fake_smb(server="omnivault"))
+        diag = mw.get_diagnostics(tmp_path, config)
+        assert diag.cached_endpoint == "192.0.2.10"
+
+        other_config = _fake_config(smb=_fake_smb(server="different-host"))
+        diag_other = mw.get_diagnostics(tmp_path, other_config)
+        assert diag_other.cached_endpoint is None
