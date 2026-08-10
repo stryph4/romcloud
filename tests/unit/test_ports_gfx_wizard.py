@@ -133,6 +133,49 @@ def test_skipping_remote_data_makes_choice_explicit():
     assert wizard.step == WizardStep.CACHE
 
 
+def test_remote_smb_can_reuse_source_credentials_without_second_password(monkeypatch):
+    wizard = WizardState()
+    wizard.server = "omnivault"
+    wizard.username = "stryph"
+    wizard.password = "source-secret"
+    wizard.step = WizardStep.REMOTE_DATA
+    wizard.selected_index = 0
+
+    wizard._confirm("romcloud")  # noqa: SLF001
+    assert wizard.step == WizardStep.REMOTE_AUTH
+
+    started = []
+    monkeypatch.setattr(
+        wizard,
+        "_start_operation",
+        lambda step, action, binary: started.append((step, action)),
+    )
+    wizard.selected_index = 0
+    wizard._confirm("romcloud")  # noqa: SLF001
+
+    assert started == [(WizardStep.REMOTE_DISCOVER, "setup-discover")]
+    assert wizard.remote_reuse_source_credentials is True
+    assert wizard.remote_server == "omnivault"
+    assert wizard.remote_username == "stryph"
+    assert wizard.remote_password == ""
+    payload = wizard.request_payload()
+    assert payload["password"] == "source-secret"
+    assert payload["remote_password"] == ""
+    assert payload["remote_reuse_source_credentials"] is True
+
+
+def test_remote_smb_supports_different_server_and_credentials():
+    wizard = WizardState()
+    wizard.step = WizardStep.REMOTE_AUTH
+    wizard.selected_index = 1
+
+    wizard._confirm("romcloud")  # noqa: SLF001
+
+    assert wizard.remote_reuse_source_credentials is False
+    assert wizard.step == WizardStep.REMOTE_SERVER
+    assert wizard.osk is not None
+
+
 def test_remote_smb_payload_is_independent_from_rom_source():
     wizard = WizardState()
     wizard.server = "rom-nas.local"

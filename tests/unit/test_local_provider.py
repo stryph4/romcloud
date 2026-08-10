@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import pytest
 from pathlib import Path
+from types import SimpleNamespace
 
 from romcloud.infrastructure.providers.local import (
     LocalFilesystemProvider,
+    StorageAccessResult,
     WritableLocalFilesystemProvider,
     WritableMountedFilesystemProvider,
+    probe_directory_access,
 )
 from romcloud.core.exceptions import ProviderError, ProviderNotReachableError, TransferError
 
@@ -162,6 +165,131 @@ class TestWritableRemoteDataProviders:
         assert list(tmp_path.glob(".romcloud-write-probe-*")) == []
         assert provider.is_reachable(str(tmp_path / "missing")) is False
 
+    def test_probe_verifies_read_write_readback_and_cleanup(self, tmp_path):
+        result = probe_directory_access(tmp_path, writable=True)
+
+        assert result.ok is True
+        assert result.as_dict() == {
+            "connected": True,
+            "read_verified": True,
+            "write_verified": True,
+            "cleanup_verified": True,
+        }
+        assert list(tmp_path.glob(".romcloud-write-probe-*")) == []
+
+    def test_listable_but_non_creatable_directory_fails_write_probe(
+        self, tmp_path, monkeypatch
+    ):
+        real_open = Path.open
+
+        def deny_probe_create(path, mode="r", *args, **kwargs):
+            if path.name.startswith(".romcloud-write-probe-") and mode == "x":
+                raise PermissionError("read-only share")
+            return real_open(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", deny_probe_create)
+        result = probe_directory_access(tmp_path, writable=True)
+
+        assert result.connected and result.read_verified
+        assert result.write_verified is False
+        assert "write access failed" in result.detail
+
+    def test_readback_failure_still_attempts_cleanup(self, tmp_path, monkeypatch):
+        real_read_text = Path.read_text
+        real_unlink = Path.unlink
+        cleanup_calls = []
+
+        def wrong_probe_content(path, *args, **kwargs):
+            if path.name.startswith(".romcloud-write-probe-"):
+                return "unexpected content"
+            return real_read_text(path, *args, **kwargs)
+
+        def track_unlink(path, *args, **kwargs):
+            if path.name.startswith(".romcloud-write-probe-"):
+                cleanup_calls.append(path)
+            return real_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", wrong_probe_content)
+        monkeypatch.setattr(Path, "unlink", track_unlink)
+
+        result = probe_directory_access(tmp_path, writable=True)
+
+        assert result.write_verified is False
+        assert result.cleanup_verified is True
+        assert len(cleanup_calls) == 1
+        assert "content did not match" in result.detail
+
+    def test_write_failure_after_create_still_attempts_cleanup(self, tmp_path, monkeypatch):
+        real_open = Path.open
+        real_unlink = Path.unlink
+        cleanup_calls = []
+
+        class FailingWrite:
+            def __init__(self, handle):
+                self.handle = handle
+
+            def __enter__(self):
+                self.handle.__enter__()
+                return self
+
+            def write(self, content):
+                self.handle.write("partial")
+                raise OSError("write interrupted")
+
+            def __exit__(self, *args):
+                return self.handle.__exit__(*args)
+
+        def fail_probe_write(path, mode="r", *args, **kwargs):
+            handle = real_open(path, mode, *args, **kwargs)
+            if path.name.startswith(".romcloud-write-probe-") and mode == "x":
+                return FailingWrite(handle)
+            return handle
+
+        def track_unlink(path, *args, **kwargs):
+            if path.name.startswith(".romcloud-write-probe-"):
+                cleanup_calls.append(path)
+            return real_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", fail_probe_write)
+        monkeypatch.setattr(Path, "unlink", track_unlink)
+
+        result = probe_directory_access(tmp_path, writable=True)
+
+        assert result.write_verified is False
+        assert result.cleanup_verified is True
+        assert len(cleanup_calls) == 1
+        assert list(tmp_path.glob(".romcloud-write-probe-*")) == []
+
+    def test_cleanup_failure_is_surfaced(self, tmp_path, monkeypatch):
+        real_unlink = Path.unlink
+
+        def fail_probe_cleanup(path, *args, **kwargs):
+            if path.name.startswith(".romcloud-write-probe-"):
+                raise PermissionError("delete denied")
+            return real_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", fail_probe_cleanup)
+        result = probe_directory_access(tmp_path, writable=True)
+
+        assert result.write_verified is True
+        assert result.cleanup_verified is False
+        assert "cleanup failed" in result.detail
+        probe = next(tmp_path.glob(".romcloud-write-probe-*"))
+        real_unlink(probe)
+
+    def test_exclusive_probe_never_overwrites_existing_file(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "romcloud.infrastructure.providers.local.uuid.uuid4",
+            lambda: SimpleNamespace(hex="fixed"),
+        )
+        existing = tmp_path / ".romcloud-write-probe-fixed"
+        existing.write_text("user data")
+
+        result = probe_directory_access(tmp_path, writable=True)
+
+        assert result.ok is False
+        assert existing.read_text() == "user data"
+
     def test_mounted_root_rejects_bare_mountpoint(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
             "romcloud.infrastructure.mount.is_target_mounted_cifs",
@@ -182,8 +310,10 @@ class TestWritableRemoteDataProviders:
             lambda path, **kwargs: True,
         )
         monkeypatch.setattr(
-            "romcloud.infrastructure.providers.local._directory_is_writable",
-            lambda path: False,
+            "romcloud.infrastructure.providers.local.probe_directory_access",
+            lambda path, **kwargs: StorageAccessResult(
+                True, True, False, False, "not writable"
+            ),
         )
 
         provider = WritableMountedFilesystemProvider(

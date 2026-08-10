@@ -13,6 +13,7 @@ from romcloud.services.smb_discovery import (
     ListSharesResult,
     SMBErrorKind,
     ShareInfo,
+    ShareValidationResult,
 )
 from romcloud.infrastructure.config import (
     AppConfig,
@@ -29,6 +30,7 @@ from romcloud.infrastructure.credentials import (
     load_smb_password,
     write_smb_password,
 )
+from romcloud.infrastructure.providers.local import StorageAccessResult
 
 
 def _payload(**overrides):
@@ -59,10 +61,20 @@ def _config(config_path: Path) -> AppConfig:
 
 
 class _Discovery:
-    def __init__(self, *, reachable=True, auth=True, shares=(ShareInfo("ROMs"),)):
+    def __init__(
+        self,
+        *,
+        reachable=True,
+        auth=True,
+        shares=(ShareInfo("ROMs"),),
+        validation=None,
+    ):
         self.reachable = reachable
         self.auth = auth
         self.shares = shares
+        self.validation = validation or ShareValidationResult(
+            True, "ROMs", top_level_entries=("psx",)
+        )
 
     def validate_server(self, target):
         return SimpleNamespace(ok=self.reachable, detail="host unreachable")
@@ -79,17 +91,54 @@ class _Discovery:
             return ListSharesResult(False, error_kind=SMBErrorKind.NO_SHARES_FOUND, detail="no shares")
         return ListSharesResult(True, shares=tuple(self.shares))
 
+    def validate_share(self, target, credentials, share):
+        return self.validation
+
+    def detect_systems(self, validation):
+        return SimpleNamespace(detected_systems=("psx",), count=1)
+
 
 class _Container:
-    def __init__(self, config, *, errors=(), remote_reachable=True):
+    def __init__(
+        self,
+        config,
+        *,
+        errors=(),
+        source_reachable=True,
+        remote_reachable=True,
+        remote_probe=None,
+    ):
         self.config = config
+        self.provider = SimpleNamespace(
+            validate_access=lambda root: StorageAccessResult(
+                source_reachable,
+                source_reachable,
+                detail="" if source_reachable else "read access denied",
+            )
+        )
         self.catalog = SimpleNamespace(refresh=lambda: SimpleNamespace(errors=errors))
         self.game_repo = SimpleNamespace(list_systems=lambda: ["psx", "snes"])
-        self.saves = SimpleNamespace(is_remote_reachable=lambda: remote_reachable)
+        self.saves = SimpleNamespace(
+            is_remote_reachable=lambda: remote_reachable,
+            validate_remote_storage=lambda: remote_probe
+            or StorageAccessResult(
+                    True,
+                    True,
+                    write_verified=remote_reachable,
+                    cleanup_verified=remote_reachable,
+                    detail="" if remote_reachable else "not writable",
+                ),
+        )
 
 
 def _patch_apply_dependencies(
-    monkeypatch, *, refresh_errors=(), mount_error=None, remote_reachable=True
+    monkeypatch,
+    *,
+    refresh_errors=(),
+    mount_error=None,
+    source_reachable=True,
+    remote_reachable=True,
+    remote_probe=None,
 ):
     monkeypatch.setattr(
         graphical_setup,
@@ -109,7 +158,9 @@ def _patch_apply_dependencies(
         lambda config: _Container(
             config,
             errors=refresh_errors,
+            source_reachable=source_reachable,
             remote_reachable=remote_reachable,
+            remote_probe=remote_probe,
         ),
     )
     monkeypatch.setattr(graphical_setup.es_config, "install", lambda systems: None)
@@ -172,6 +223,42 @@ class TestDiscovery:
         with pytest.raises(ValueError, match=message):
             graphical_setup.discover_shares(_payload(share=""))
 
+    def test_source_share_validation_reports_connected_and_read_verified(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            graphical_setup,
+            "build_default_smb_discovery_service",
+            lambda: _Discovery(),
+        )
+
+        result = graphical_setup.validate_share(_payload())
+
+        assert result["validation"] == {
+            "connected": True,
+            "read_verified": True,
+        }
+
+    def test_bad_credentials_fail_cleanly_without_password(self, monkeypatch):
+        password = "top-secret-password"
+        validation = ShareValidationResult(
+            False,
+            "ROMs",
+            error_kind=SMBErrorKind.AUTH_FAILED,
+            detail=f"credential {password} rejected",
+        )
+        monkeypatch.setattr(
+            graphical_setup,
+            "build_default_smb_discovery_service",
+            lambda: _Discovery(validation=validation),
+        )
+
+        with pytest.raises(ValueError) as exc:
+            graphical_setup.validate_share(_payload(password=password))
+
+        assert password not in str(exc.value)
+        assert "***" in str(exc.value)
+
 
 class TestCacheValidation:
     def test_defaults_are_valid(self):
@@ -226,6 +313,35 @@ class TestCacheValidation:
                 )
             )
 
+    def test_reusing_source_credentials_resolves_independent_remote_target(self):
+        request = SetupRequest.from_payload(
+            _payload(
+                remote_data_type="smb",
+                remote_share="ROMCloud",
+                remote_reuse_source_credentials=True,
+            )
+        )
+
+        assert request.remote_server == request.server == "nas.local"
+        assert request.remote_username == request.username == "player"
+        assert request.remote_password == request.password == "secret-value"
+        assert request.remote_share == "ROMCloud"
+
+    def test_explicit_remote_credentials_remain_independent(self):
+        request = SetupRequest.from_payload(
+            _payload(
+                remote_data_type="smb",
+                remote_server="data-nas",
+                remote_share="ROMCloud",
+                remote_username="writer",
+                remote_password="write-secret",
+            )
+        )
+
+        assert request.remote_server == "data-nas"
+        assert request.remote_username == "writer"
+        assert request.remote_password == "write-secret"
+
 
 class TestApply:
     def test_reconfigure_preserves_savesync_selection_settings(self, tmp_path):
@@ -251,8 +367,20 @@ class TestApply:
         _patch_apply_dependencies(monkeypatch)
         result = graphical_setup.apply_setup(config_path, _payload())
         assert result["system_count"] == 2
+        assert result["source_validation"]["read_verified"] is True
         assert graphical_setup.setup_state(config_path)["state"] == "configured"
         assert not (config_path.parent / graphical_setup.SETUP_STATE_FILENAME).exists()
+
+    def test_source_read_validation_failure_is_clean_and_redacted(
+        self, tmp_path, monkeypatch
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        _patch_apply_dependencies(monkeypatch, source_reachable=False)
+
+        with pytest.raises(RuntimeError, match="ROM library access validation failed") as exc:
+            graphical_setup.apply_setup(config_path, _payload())
+
+        assert "secret-value" not in str(exc.value)
 
     def test_mount_failure_is_partial_and_password_is_not_persisted_in_state(self, tmp_path, monkeypatch):
         config_path = tmp_path / "config" / "romcloud.toml"
@@ -328,6 +456,26 @@ class TestApply:
         assert load_smb_password(config.credentials_path) == "secret-value"
         assert load_remote_data_smb_password(config.credentials_path) == "sync-secret"
 
+    def test_reused_remote_credentials_are_persisted_independently(
+        self, tmp_path, monkeypatch
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        _patch_apply_dependencies(monkeypatch)
+        payload = _payload(
+            remote_data_type="smb",
+            remote_share="ROMCloud",
+            remote_reuse_source_credentials=True,
+        )
+
+        graphical_setup.apply_setup(config_path, payload)
+        config = graphical_setup.load_config(str(config_path))
+
+        assert config.smb.share == "ROMs"
+        assert config.remote_data.smb.share == "ROMCloud"
+        assert config.remote_data.smb is not config.smb
+        assert load_smb_password(config.credentials_path) == "secret-value"
+        assert load_remote_data_smb_password(config.credentials_path) == "secret-value"
+
     def test_local_remote_data_root_is_persisted_only_after_writable_validation(
         self, tmp_path, monkeypatch
     ):
@@ -376,6 +524,31 @@ class TestApply:
             "/userdata/romcloud/remote",
             "/userdata/romcloud/source",
         ]
+
+    def test_remote_probe_cleanup_failure_is_surfaced(self, tmp_path, monkeypatch):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        _patch_apply_dependencies(
+            monkeypatch,
+            remote_probe=StorageAccessResult(
+                True,
+                True,
+                write_verified=True,
+                cleanup_verified=False,
+                detail="cleanup failed for ROMCloud probe: delete denied",
+            ),
+        )
+        payload = _payload(
+            remote_data_type="smb",
+            remote_server="backup-nas.local",
+            remote_share="ROMCloud",
+            remote_username="sync-user",
+            remote_password="remote-secret-value",
+        )
+
+        with pytest.raises(RuntimeError, match="cleanup failed") as exc:
+            graphical_setup.apply_setup(config_path, payload)
+
+        assert "remote-secret-value" not in str(exc.value)
 
     def test_failed_setup_reports_incomplete_mount_cleanup(
         self, tmp_path, monkeypatch

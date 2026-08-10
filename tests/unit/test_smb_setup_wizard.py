@@ -22,7 +22,7 @@ from romcloud.services.smb_discovery import (
     SystemDetectionResult,
 )
 from romcloud.infrastructure.mount import ReachabilityResult
-from romcloud.cli.smb_setup_wizard import run_smb_setup_wizard
+from romcloud.cli.smb_setup_wizard import SMBConnectionDetails, run_smb_setup_wizard
 
 
 @dataclass
@@ -92,6 +92,37 @@ class TestHappyPath:
         assert "RESULT:omnivault:Roms:stryph:hunter2:" in result.output
         assert "psx" in result.output and "dreamcast" in result.output
 
+    def test_reused_connection_skips_server_username_and_password_prompts(self):
+        discovery = FakeDiscovery(
+            shares=ListSharesResult(ok=True, shares=(ShareInfo("ROMCloud"),)),
+            validations={
+                "ROMCloud": ShareValidationResult(
+                    ok=True, share="ROMCloud", top_level_entries=()
+                )
+            },
+        )
+
+        @click.command()
+        def command():
+            result = run_smb_setup_wizard(
+                discovery,
+                purpose="ROMCloud data location",
+                detect_systems=False,
+                connection=SMBConnectionDetails(
+                    "omnivault", "stryph", "hunter2"
+                ),
+            )
+            click.echo(f"RESULT:{result.share}" if result else "CANCELLED")
+
+        result = CliRunner().invoke(command, input="1\ny\n")
+
+        assert result.exit_code == 0, result.output
+        assert "Server:" not in result.output
+        assert "Username:" not in result.output
+        assert "Password:" not in result.output
+        assert "RESULT:ROMCloud" in result.output
+        assert "hunter2" not in result.output
+
 
 class TestServerUnreachable:
     def test_dns_failure_cancels_immediately(self):
@@ -116,6 +147,24 @@ class TestAuthenticationFailure:
 
         assert result.exit_code == 0, result.output
         assert "CANCELLED" in result.output
+
+    def test_password_is_redacted_from_authentication_error(self):
+        from romcloud.services.smb_discovery import SMBErrorKind
+
+        discovery = FakeDiscovery(
+            auth=AuthResult(
+                ok=False,
+                error_kind=SMBErrorKind.AUTH_FAILED,
+                detail="password hunter2 rejected",
+            )
+        )
+        result = CliRunner().invoke(
+            _make_command(discovery),
+            input="omnivault\nstryph\nhunter2\n",
+        )
+
+        assert "hunter2" not in result.output
+        assert "***" in result.output
 
 
 class TestManualShareFallback:

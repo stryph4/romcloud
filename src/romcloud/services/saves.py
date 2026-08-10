@@ -47,6 +47,7 @@ from romcloud.core.storage import StorageProvider
 from romcloud.infrastructure import save_tree
 from romcloud.infrastructure.atomic_file import atomic_write_text
 from romcloud.infrastructure.logging import get_logger
+from romcloud.infrastructure.providers.local import StorageAccessResult
 
 log = get_logger("saves")
 
@@ -81,6 +82,24 @@ class SaveSyncService:
             and self._connectivity_root is not None
             and self._provider.is_reachable(self._connectivity_root)
         )
+
+    def validate_remote_storage(self) -> StorageAccessResult:
+        """Return the detailed read/write/cleanup probe used during setup."""
+        if self._provider is None or self._connectivity_root is None:
+            return StorageAccessResult(
+                False, False, detail="ROMCloud data storage is not configured"
+            )
+        validate = getattr(self._provider, "validate_access", None)
+        if validate is None:
+            reachable = self._provider.is_reachable(self._connectivity_root)
+            return StorageAccessResult(
+                reachable,
+                reachable,
+                write_verified=reachable,
+                cleanup_verified=reachable,
+                detail="" if reachable else "storage location is not writable",
+            )
+        return validate(self._connectivity_root)
 
     @property
     def is_remote_configured(self) -> bool:

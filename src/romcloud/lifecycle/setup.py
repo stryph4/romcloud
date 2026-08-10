@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -48,7 +48,7 @@ class SetupRequest:
     server: str
     share: str
     username: str
-    password: str
+    password: str = field(repr=False)
     rom_root: str = DEFAULT_ROM_ROOT
     cache_root: str = DEFAULT_CACHE_ROOT
     max_size_gb: float = DEFAULT_MAX_SIZE_GB
@@ -59,8 +59,9 @@ class SetupRequest:
     remote_server: str = ""
     remote_share: str = ""
     remote_username: str = ""
-    remote_password: str = ""
+    remote_password: str = field(default="", repr=False)
     remote_port: int = 445
+    remote_reuse_source_credentials: bool = False
 
     @classmethod
     def from_payload(
@@ -70,23 +71,35 @@ class SetupRequest:
         require_share: bool = True,
         validate_cache: bool = True,
     ) -> "SetupRequest":
+        server = str(payload.get("server", "")).strip()
+        username = str(payload.get("username", "")).strip()
+        password = str(payload.get("password", ""))
+        port = int(payload.get("port", 445))
+        reuse_remote = bool(payload.get("remote_reuse_source_credentials", False))
         request = cls(
-            server=str(payload.get("server", "")).strip(),
+            server=server,
             share=str(payload.get("share", "")).strip(),
-            username=str(payload.get("username", "")).strip(),
-            password=str(payload.get("password", "")),
+            username=username,
+            password=password,
             rom_root=str(payload.get("rom_root", DEFAULT_ROM_ROOT)).strip(),
             cache_root=str(payload.get("cache_root", DEFAULT_CACHE_ROOT)).strip(),
             max_size_gb=_number(payload.get("max_size_gb", DEFAULT_MAX_SIZE_GB), "Maximum cache size"),
             min_free_gb=_number(payload.get("min_free_gb", DEFAULT_MIN_FREE_GB), "Minimum free space"),
-            port=int(payload.get("port", 445)),
+            port=port,
             remote_data_type=str(payload.get("remote_data_type", "none")).strip().lower(),
             remote_data_root=str(payload.get("remote_data_root", "")).strip(),
-            remote_server=str(payload.get("remote_server", "")).strip(),
+            remote_server=(
+                server if reuse_remote else str(payload.get("remote_server", "")).strip()
+            ),
             remote_share=str(payload.get("remote_share", "")).strip(),
-            remote_username=str(payload.get("remote_username", "")).strip(),
-            remote_password=str(payload.get("remote_password", "")),
-            remote_port=int(payload.get("remote_port", 445)),
+            remote_username=(
+                username if reuse_remote else str(payload.get("remote_username", "")).strip()
+            ),
+            remote_password=(
+                password if reuse_remote else str(payload.get("remote_password", ""))
+            ),
+            remote_port=(port if reuse_remote else int(payload.get("remote_port", 445))),
+            remote_reuse_source_credentials=reuse_remote,
         )
         request.validate(require_share=require_share, validate_cache=validate_cache)
         return request
@@ -222,12 +235,14 @@ def setup_state(config_path: Path) -> dict[str, Any]:
             "server": config.smb.server,
             "share": config.smb.share,
             "username": config.smb.username,
+            "port": config.smb.port,
         })
     if config.remote_data is not None and config.remote_data.smb is not None:
         payload.update({
             "remote_server": config.remote_data.smb.server,
             "remote_share": config.remote_data.smb.share,
             "remote_username": config.remote_data.smb.username,
+            "remote_port": config.remote_data.smb.port,
         })
     return payload
 
@@ -263,13 +278,19 @@ def discover_shares(payload: dict[str, Any]) -> dict[str, Any]:
 
     reachability = discovery.validate_server(target)
     if not reachability.ok:
-        raise ValueError(reachability.detail or "SMB server is unreachable.")
+        raise ValueError(_redact(reachability.detail, password) or "SMB server is unreachable.")
     authentication = discovery.authenticate(target, credentials)
     if not authentication.ok:
-        raise ValueError(authentication.detail or str(authentication.error_kind or "Authentication failed."))
+        raise ValueError(
+            _redact(authentication.detail, password)
+            or str(authentication.error_kind or "Authentication failed.")
+        )
     result = discovery.list_shares(target, credentials)
     if not result.ok:
-        raise ValueError(result.detail or str(result.error_kind or "No shares found."))
+        raise ValueError(
+            _redact(result.detail, password)
+            or str(result.error_kind or "No shares found.")
+        )
     return {
         "shares": [
             {"name": share.name, "comment": share.comment}
@@ -290,13 +311,21 @@ def validate_share(payload: dict[str, Any]) -> dict[str, Any]:
     credentials = SMBCredentials(username, password)
     validation = discovery.validate_share(target, credentials, share)
     if not validation.ok:
-        raise ValueError(validation.detail or str(validation.error_kind or "Share validation failed."))
+        raise ValueError(
+            _redact(validation.detail, password)
+            or str(validation.error_kind or "Share validation failed.")
+        )
     if purpose == "remote_data":
-        return {"systems": [], "count": 0}
+        return {
+            "systems": [],
+            "count": 0,
+            "validation": {"connected": True, "read_verified": True},
+        }
     detection = discovery.detect_systems(validation)
     return {
         "systems": list(detection.detected_systems),
         "count": detection.count,
+        "validation": {"connected": True, "read_verified": True},
     }
 
 
@@ -350,15 +379,26 @@ def apply_setup(config_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
             if outcome is not None and not outcome.already_mounted:
                 mounted_during_setup.append(target.mount_point)
 
+        container = Container(config)
+        source_probe = container.provider.validate_access(config.source.rom_root)
+        if not source_probe.ok:
+            raise RuntimeError(
+                f"ROM library access validation failed: {source_probe.detail}"
+            )
+
+        remote_probe = None
         if config.remote_data is not None:
             if config.remote_data.provider == "local":
                 Path(config.remote_data.root).mkdir(parents=True, exist_ok=True)
-            if not Container(config).saves.is_remote_reachable():
-                raise RuntimeError("Configured ROMCloud data location is not writable.")
+            remote_probe = container.saves.validate_remote_storage()
+            if not remote_probe.ok:
+                raise RuntimeError(
+                    "Configured ROMCloud data location failed validation: "
+                    f"{remote_probe.detail}"
+                )
 
         step = "refresh catalog"
         _write_state(state_path, {"status": "applying", "step": step})
-        container = Container(config)
         refresh_result = container.catalog.refresh()
         if refresh_result.errors:
             details = "; ".join(f"{system}: {message}" for system, message in refresh_result.errors)
@@ -415,6 +455,10 @@ def apply_setup(config_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
         "system_count": validation_result["count"],
         "max_size_gb": request.max_size_gb,
         "remote_data_type": request.remote_data_type,
+        "source_validation": source_probe.as_dict(),
+        "remote_data_validation": (
+            remote_probe.as_dict() if remote_probe is not None else None
+        ),
     }
 
 
@@ -464,6 +508,14 @@ def _build_config(config_path: Path, request: SetupRequest, existing: AppConfig 
 
 def _connection_values(payload: dict[str, Any]) -> tuple[str, int, str, str]:
     purpose = str(payload.get("purpose", "source"))
+    if purpose == "remote_data" and payload.get("remote_reuse_source_credentials"):
+        server = str(payload.get("server", "")).strip()
+        username = str(payload.get("username", "")).strip()
+        password = str(payload.get("password", ""))
+        port = int(payload.get("port", 445))
+        if not server or not username or not password:
+            raise ValueError("Source SMB credentials are required for reuse.")
+        return server, port, username, password
     prefix = "remote_" if purpose == "remote_data" else ""
     server = str(payload.get(f"{prefix}server", "")).strip()
     username = str(payload.get(f"{prefix}username", "")).strip()
@@ -472,6 +524,13 @@ def _connection_values(payload: dict[str, Any]) -> tuple[str, int, str, str]:
     if not server or not username or not password:
         raise ValueError("SMB server, username, and password are required.")
     return server, port, username, password
+
+
+def _redact(detail: str, *secrets: str) -> str:
+    for secret in secrets:
+        if secret:
+            detail = detail.replace(secret, "***")
+    return detail
 
 
 def _read_state(path: Path) -> dict[str, Any]:

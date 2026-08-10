@@ -25,6 +25,7 @@ class WizardStep(Enum):
     SYSTEMS = "systems"
     REMOTE_DATA = "remote_data"
     REMOTE_LOCAL = "remote_local"
+    REMOTE_AUTH = "remote_auth"
     REMOTE_SERVER = "remote_server"
     REMOTE_USERNAME = "remote_username"
     REMOTE_PASSWORD = "remote_password"
@@ -61,6 +62,7 @@ class WizardState:
         self.server = str(data.get("server", ""))
         self.username = str(data.get("username", ""))
         self.password = ""
+        self.port = int(data.get("port", 445))
         self.share = str(data.get("share", ""))
         self.rom_root = str(data.get("rom_root", "/userdata/romcloud/source"))
         self.shares: list[dict[str, str]] = []
@@ -70,6 +72,8 @@ class WizardState:
         self.remote_server = str(data.get("remote_server", ""))
         self.remote_username = str(data.get("remote_username", ""))
         self.remote_password = ""
+        self.remote_port = int(data.get("remote_port", 445))
+        self.remote_reuse_source_credentials = False
         self.remote_share = str(data.get("remote_share", ""))
         self.remote_shares: list[dict[str, str]] = []
         self.cache_root = str(data.get("cache_root", "/userdata/romcloud/cache"))
@@ -82,6 +86,8 @@ class WizardState:
         self.runner: OperationRunner | None = None
         self.finished = False
         self.applied_summary: dict[str, Any] = {}
+        self.source_validation: dict[str, Any] = {}
+        self.remote_validation: dict[str, Any] = {}
 
     @property
     def step_number(self) -> int:
@@ -101,6 +107,7 @@ class WizardState:
             WizardStep.SYSTEMS: "Detected Systems",
             WizardStep.REMOTE_DATA: "ROMCloud Data Storage",
             WizardStep.REMOTE_LOCAL: "Local Data Directory",
+            WizardStep.REMOTE_AUTH: "Data SMB Credentials",
             WizardStep.REMOTE_SERVER: "Data SMB Server",
             WizardStep.REMOTE_USERNAME: "Data SMB Username",
             WizardStep.REMOTE_PASSWORD: "Data SMB Password",
@@ -127,6 +134,11 @@ class WizardState:
                 "SMB network location",
                 "Local / external directory",
                 "Skip (SaveSync unavailable)",
+            ]
+        if self.step == WizardStep.REMOTE_AUTH:
+            return [
+                "Use same server and credentials",
+                "Use different server or credentials",
             ]
         if self.step == WizardStep.REMOTE_SHARE:
             return [share["name"] for share in self.remote_shares]
@@ -285,6 +297,7 @@ class WizardState:
             self.enter_text_step(WizardStep.REMOTE_PASSWORD)
         elif current == WizardStep.REMOTE_PASSWORD:
             self.remote_password = value
+            self.remote_reuse_source_credentials = False
             self.osk = None
             self._start_operation(
                 WizardStep.REMOTE_DISCOVER, "setup-discover", romcloud_bin
@@ -300,7 +313,7 @@ class WizardState:
             WizardStep.USERNAME: WizardStep.SERVER,
             WizardStep.PASSWORD: WizardStep.USERNAME,
             WizardStep.REMOTE_LOCAL: WizardStep.REMOTE_DATA,
-            WizardStep.REMOTE_SERVER: WizardStep.REMOTE_DATA,
+            WizardStep.REMOTE_SERVER: WizardStep.REMOTE_AUTH,
             WizardStep.REMOTE_USERNAME: WizardStep.REMOTE_SERVER,
             WizardStep.REMOTE_PASSWORD: WizardStep.REMOTE_USERNAME,
         }[self.step]
@@ -333,15 +346,30 @@ class WizardState:
         elif self.step == WizardStep.REMOTE_DATA:
             if self.selected_index == 0:
                 self.remote_data_type = "smb"
-                self.remote_server = self.remote_server or self.server
-                self.remote_username = self.remote_username or self.username
-                self.enter_text_step(WizardStep.REMOTE_SERVER)
+                self.step = WizardStep.REMOTE_AUTH
+                self.selected_index = 0
             elif self.selected_index == 1:
                 self.enter_text_step(WizardStep.REMOTE_LOCAL)
             else:
                 self.remote_data_type = "none"
                 self.step = WizardStep.CACHE
                 self.selected_index = 0
+        elif self.step == WizardStep.REMOTE_AUTH:
+            if self.selected_index == 0:
+                self.remote_reuse_source_credentials = True
+                self.remote_server = self.server
+                self.remote_username = self.username
+                self.remote_password = ""
+                self.remote_port = self.port
+                self._start_operation(
+                    WizardStep.REMOTE_DISCOVER, "setup-discover", romcloud_bin
+                )
+            else:
+                self.remote_reuse_source_credentials = False
+                self.remote_server = ""
+                self.remote_username = ""
+                self.remote_password = ""
+                self.enter_text_step(WizardStep.REMOTE_SERVER)
         elif self.step == WizardStep.REMOTE_DISCOVER:
             self._start_operation(
                 WizardStep.REMOTE_DISCOVER, "setup-discover", romcloud_bin
@@ -384,8 +412,17 @@ class WizardState:
             WizardStep.DETECT: WizardStep.SHARE,
             WizardStep.SYSTEMS: WizardStep.SHARE,
             WizardStep.REMOTE_DATA: WizardStep.SYSTEMS,
-            WizardStep.REMOTE_DISCOVER: WizardStep.REMOTE_PASSWORD,
-            WizardStep.REMOTE_SHARE: WizardStep.REMOTE_PASSWORD,
+            WizardStep.REMOTE_AUTH: WizardStep.REMOTE_DATA,
+            WizardStep.REMOTE_DISCOVER: (
+                WizardStep.REMOTE_AUTH
+                if self.remote_reuse_source_credentials
+                else WizardStep.REMOTE_PASSWORD
+            ),
+            WizardStep.REMOTE_SHARE: (
+                WizardStep.REMOTE_AUTH
+                if self.remote_reuse_source_credentials
+                else WizardStep.REMOTE_PASSWORD
+            ),
             WizardStep.REMOTE_VALIDATE: WizardStep.REMOTE_SHARE,
             WizardStep.CACHE: WizardStep.REMOTE_DATA,
             WizardStep.REVIEW: WizardStep.CACHE,
@@ -433,6 +470,7 @@ class WizardState:
             self.selected_index = 0
         elif self.step == WizardStep.DETECT:
             self.systems = [str(system) for system in result.data.get("systems", [])]
+            self.source_validation = dict(result.data.get("validation", {}))
             self.step = WizardStep.SYSTEMS
             self.selected_index = 0
         elif self.step == WizardStep.REMOTE_DISCOVER:
@@ -443,6 +481,7 @@ class WizardState:
             self.step = WizardStep.REMOTE_SHARE
             self.selected_index = 0
         elif self.step == WizardStep.REMOTE_VALIDATE:
+            self.remote_validation = dict(result.data.get("validation", {}))
             self.step = WizardStep.CACHE
             self.selected_index = 0
         elif self.step == WizardStep.APPLY:
@@ -458,6 +497,7 @@ class WizardState:
             "share": self.share,
             "username": self.username,
             "password": self.password,
+            "port": self.port,
             "rom_root": self.rom_root,
             "cache_root": self.cache_root,
             "max_size_gb": self.max_size_gb,
@@ -468,6 +508,8 @@ class WizardState:
             "remote_share": self.remote_share,
             "remote_username": self.remote_username,
             "remote_password": self.remote_password,
+            "remote_port": self.remote_port,
+            "remote_reuse_source_credentials": self.remote_reuse_source_credentials,
             "purpose": (
                 "remote_data"
                 if self.step in (

@@ -224,7 +224,7 @@ class TestConfigureDelegatesToReusableSmbService:
             configure_cmd,
             ["--source-type", "smb"],
             obj={"config_path": str(cfg_path)},
-            input="\ny\n\n\n50\n5\n",
+            input="\ny\n\nn\n\n50\n5\n",
         )
 
         assert result.exit_code == 0, result.output
@@ -235,10 +235,56 @@ class TestConfigureDelegatesToReusableSmbService:
         assert calls[1] == {
             "purpose": "ROMCloud data location",
             "detect_systems": False,
+            "connection": None,
         }
         creds_path = cfg_path.parent / "credentials.toml"
         assert load_smb_password(creds_path) == "rom-secret"
         assert load_remote_data_smb_password(creds_path) == "data-secret"
+
+    def test_remote_smb_reuses_source_authentication_prompts_but_persists_independently(
+        self, tmp_path, monkeypatch
+    ):
+        cfg_path = tmp_path / "romcloud.toml"
+        calls = []
+
+        def fake_wizard(discovery, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return _fake_setup_result()
+            connection = kwargs["connection"]
+            return _fake_setup_result(
+                server=connection.server,
+                share="ROMCloud",
+                username=connection.username,
+                password=connection.password,
+                detected_systems=(),
+            )
+
+        monkeypatch.setattr(
+            configure_cmd_module,
+            "build_default_smb_discovery_service",
+            lambda: "fake-discovery",
+        )
+        monkeypatch.setattr(configure_cmd_module, "run_smb_setup_wizard", fake_wizard)
+
+        result = CliRunner().invoke(
+            configure_cmd,
+            ["--source-type", "smb"],
+            obj={"config_path": str(cfg_path)},
+            input="\ny\n\n\n\n50\n5\n",
+        )
+
+        assert result.exit_code == 0, result.output
+        reused = calls[1]["connection"]
+        assert reused.server == "omnivault"
+        assert reused.username == "stryph"
+        assert reused.password == "hunter2"
+        config = load_config(str(cfg_path))
+        assert config.smb.share == "Roms"
+        assert config.remote_data.smb.share == "ROMCloud"
+        creds_path = cfg_path.parent / "credentials.toml"
+        assert load_smb_password(creds_path) == "hunter2"
+        assert load_remote_data_smb_password(creds_path) == "hunter2"
 
     def test_wizard_receives_service_from_factory(self, tmp_path, monkeypatch):
         """The CLI must not construct discovery logic itself — it must use

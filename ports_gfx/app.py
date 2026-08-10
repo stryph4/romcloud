@@ -876,13 +876,26 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
     if wizard.step == WizardStep.DETECT:
         return [f"Checking //{wizard.server}/{wizard.share}..."] if wizard.runner else []
     if wizard.step == WizardStep.SYSTEMS:
-        if not wizard.systems:
-            return ["No recognized Batocera system folders were found."]
-        return [f"{len(wizard.systems)} systems: {', '.join(wizard.systems)}"]
+        validation = []
+        if wizard.source_validation.get("connected"):
+            validation.append("\u2713 Connected")
+        if wizard.source_validation.get("read_verified"):
+            validation.append("\u2713 Read access verified")
+        systems = (
+            ["No recognized Batocera system folders were found."]
+            if not wizard.systems
+            else [f"{len(wizard.systems)} systems: {', '.join(wizard.systems)}"]
+        )
+        return [*validation, *systems]
     if wizard.step == WizardStep.REMOTE_DATA:
         return [
             "Choose separate writable storage for synchronized ROMCloud data.",
             "SaveSync is unavailable if this step is skipped.",
+        ]
+    if wizard.step == WizardStep.REMOTE_AUTH:
+        return [
+            "Reuse only affects setup prompts.",
+            "ROM and writable-data credentials remain independently stored.",
         ]
     if wizard.step == WizardStep.REMOTE_DISCOVER:
         return ["Connecting and finding writable-data shares..."] if wizard.runner else []
@@ -891,11 +904,12 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
             f"Checking //{wizard.remote_server}/{wizard.remote_share}..."
         ] if wizard.runner else []
     if wizard.step == WizardStep.REVIEW:
-        return [
-            f"SMB: //{wizard.server}/{wizard.share}",
+        lines = [
+            f"ROM library: //{wizard.server}/{wizard.share} [Read only]",
+            "\u2713 Connected  \u2713 Read access verified",
             f"Systems: {len(wizard.systems)}",
             (
-                f"ROMCloud data: //{wizard.remote_server}/{wizard.remote_share}"
+                f"ROMCloud data: //{wizard.remote_server}/{wizard.remote_share} [Read/write]"
                 if wizard.remote_data_type == "smb"
                 else f"ROMCloud data: {wizard.remote_data_root}"
                 if wizard.remote_data_type == "local"
@@ -903,19 +917,47 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
             ),
             f"Cache: {wizard.cache_root} ({wizard.max_size_gb:g} GB max)",
         ]
+        if wizard.remote_data_type == "smb" and wizard.remote_validation:
+            lines.insert(-1, "\u2713 Connected  \u2713 Read access verified")
+            lines.insert(-1, "Write and cleanup will be verified before setup completes.")
+        return lines
     if wizard.step == WizardStep.APPLY:
         return [
             "Mounting source/data storage, validating writes, refreshing the catalog, "
             "and updating EmulationStation..."
         ] if wizard.runner else []
     if wizard.step == WizardStep.DONE:
-        return [
-            f"SMB source: //{wizard.applied_summary.get('server', wizard.server)}/{wizard.applied_summary.get('share', wizard.share)}",
+        lines = [
+            f"ROM library: //{wizard.applied_summary.get('server', wizard.server)}/{wizard.applied_summary.get('share', wizard.share)} [Read only]",
             f"Detected systems: {wizard.applied_summary.get('system_count', len(wizard.systems))}",
-            f"ROMCloud data: {wizard.applied_summary.get('remote_data_type', wizard.remote_data_type)}",
-            f"Cache size: {wizard.applied_summary.get('max_size_gb', wizard.max_size_gb):g} GB",
-            "ROMCloud is ready. Return to EmulationStation and restart or rescan it to show new games.",
         ]
+        if wizard.applied_summary.get("source_validation", {}).get("connected"):
+            lines.extend(["\u2713 Connected", "\u2713 Read access verified"])
+        if wizard.remote_data_type == "smb":
+            lines.append(
+                f"ROMCloud data: //{wizard.remote_server}/{wizard.remote_share} [Read/write]"
+            )
+        else:
+            lines.append(
+                f"ROMCloud data: {wizard.applied_summary.get('remote_data_type', wizard.remote_data_type)}"
+            )
+        remote_validation = wizard.applied_summary.get("remote_data_validation") or {}
+        if remote_validation:
+            lines.extend(
+                [
+                    "\u2713 Connected",
+                    "\u2713 Read access verified",
+                    "\u2713 Write access verified",
+                    "\u2713 Cleanup verified",
+                ]
+            )
+        lines.extend(
+            [
+                f"Cache size: {wizard.applied_summary.get('max_size_gb', wizard.max_size_gb):g} GB",
+                "ROMCloud is ready. Return to EmulationStation and restart or rescan it to show new games.",
+            ]
+        )
+        return lines
     return []
 
 

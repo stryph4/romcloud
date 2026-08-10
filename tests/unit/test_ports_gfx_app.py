@@ -16,6 +16,7 @@ from ports_gfx.app import (
     _apply_direction,
     _handle_controller_test_event,
     _handle_menu_event,
+    _wizard_body_lines,
     classify_message_kind,
     format_result,
     initial_screen_for_status,
@@ -29,6 +30,7 @@ from ports_gfx.layout import compute_layout
 from ports_gfx.menu import CONTROLLER_TEST_ACTION, EXIT_ACTION, MenuState
 from ports_gfx.operation import OperationState
 from ports_gfx.operation_screen import OPERATION_SCREEN
+from ports_gfx.wizard import WizardState, WizardStep
 
 
 class TestMenuItems:
@@ -72,6 +74,45 @@ class TestInitialScreen:
         failed = BackendResult(ok=False, error="malformed response")
         assert initial_screen_for_status(partial) == "wizard"
         assert initial_screen_for_status(failed) == "wizard"
+
+
+class TestWizardValidationPresentation:
+    def test_review_labels_source_read_only_and_remote_read_write(self):
+        wizard = WizardState()
+        wizard.step = WizardStep.REVIEW
+        wizard.server = "omnivault"
+        wizard.share = "Roms"
+        wizard.remote_data_type = "smb"
+        wizard.remote_server = "omnivault"
+        wizard.remote_share = "ROMCloud"
+        wizard.remote_validation = {"connected": True, "read_verified": True}
+
+        lines = _wizard_body_lines(wizard)
+
+        assert "ROM library: //omnivault/Roms [Read only]" in lines
+        assert "ROMCloud data: //omnivault/ROMCloud [Read/write]" in lines
+        assert any("Write and cleanup will be verified" in line for line in lines)
+
+    def test_done_shows_all_successful_probe_stages(self):
+        wizard = WizardState()
+        wizard.step = WizardStep.DONE
+        wizard.remote_data_type = "smb"
+        wizard.remote_server = "omnivault"
+        wizard.remote_share = "ROMCloud"
+        wizard.applied_summary = {
+            "source_validation": {"connected": True, "read_verified": True},
+            "remote_data_validation": {
+                "connected": True,
+                "read_verified": True,
+                "write_verified": True,
+                "cleanup_verified": True,
+            },
+        }
+
+        lines = _wizard_body_lines(wizard)
+
+        assert "\u2713 Write access verified" in lines
+        assert "\u2713 Cleanup verified" in lines
 
 
 class TestFormatResult:

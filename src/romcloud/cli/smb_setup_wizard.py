@@ -16,7 +16,7 @@ portion).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import click
@@ -54,6 +54,13 @@ def _error_message(error_kind: Optional[SMBErrorKind], detail: str) -> str:
     return f"{base} ({detail})" if detail else base
 
 
+def _redact(detail: str, *secrets: str) -> str:
+    for secret in secrets:
+        if secret:
+            detail = detail.replace(secret, "***")
+    return detail
+
+
 @dataclass(frozen=True)
 class SMBSetupResult:
     """A fully validated SMB location, staged in memory — nothing has been
@@ -63,8 +70,18 @@ class SMBSetupResult:
     port: int
     share: str
     username: str
-    password: str
+    password: str = field(repr=False)
     detected_systems: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SMBConnectionDetails:
+    """Secret-bearing setup input used to reuse authentication prompts only."""
+
+    server: str
+    username: str
+    password: str = field(repr=False)
+    port: int = DEFAULT_SMB_PORT
 
 
 def run_smb_setup_wizard(
@@ -72,6 +89,7 @@ def run_smb_setup_wizard(
     *,
     purpose: str = "ROM library",
     detect_systems: bool = True,
+    connection: SMBConnectionDetails | None = None,
 ) -> Optional[SMBSetupResult]:
     """Run the interactive SMB discovery/setup flow.
 
@@ -79,8 +97,17 @@ def run_smb_setup_wizard(
     cancels at any point — callers must leave any existing configuration
     and credentials completely unchanged in that case.
     """
-    server = click.prompt("Server")
-    port = DEFAULT_SMB_PORT
+    if connection is None:
+        server = click.prompt("Server")
+        port = DEFAULT_SMB_PORT
+        username = ""
+        password = ""
+    else:
+        server = connection.server
+        port = connection.port
+        username = connection.username
+        password = connection.password
+        click.echo(f"Using the ROM library server and credentials for {server}.")
 
     click.echo("\nChecking server reachability...")
     reach = discovery.validate_server(SMBServerTarget(host=server, port=port))
@@ -88,8 +115,9 @@ def run_smb_setup_wizard(
         click.echo(f"Could not reach {server}: {reach.detail}")
         return None
 
-    username = click.prompt("Username")
-    password = prompt_password("Password")
+    if connection is None:
+        username = click.prompt("Username")
+        password = prompt_password("Password")
 
     target = SMBServerTarget(host=server, port=port)
     credentials = SMBCredentials(username=username, password=password)
@@ -97,15 +125,18 @@ def run_smb_setup_wizard(
     click.echo("\nConnecting...")
     auth = discovery.authenticate(target, credentials)
     if not auth.ok:
-        click.echo(_error_message(auth.error_kind, auth.detail))
+        click.echo(_error_message(auth.error_kind, _redact(auth.detail, password)))
         return None
-    click.echo("Connected.")
+    click.echo("\u2713 Connected")
 
     shares_result = discovery.list_shares(target, credentials)
     manual_only = False
     shares: tuple[ShareInfo, ...] = ()
     if not shares_result.ok:
-        click.echo(f"\nShare enumeration unavailable: {_error_message(shares_result.error_kind, shares_result.detail)}")
+        click.echo(
+            "\nShare enumeration unavailable: "
+            f"{_error_message(shares_result.error_kind, _redact(shares_result.detail, password))}"
+        )
         click.echo("Falling back to manual share entry.")
         manual_only = True
     else:
@@ -130,10 +161,15 @@ def run_smb_setup_wizard(
         click.echo(f"\nValidating //{server}/{share}...")
         validation = discovery.validate_share(target, credentials, share)
         if not validation.ok:
-            click.echo(f"Could not access share: {_error_message(validation.error_kind, validation.detail)}")
+            click.echo(
+                "Could not access share: "
+                f"{_error_message(validation.error_kind, _redact(validation.detail, password))}"
+            )
             if not click.confirm("Try a different share?", default=True):
                 return None
             continue
+
+        click.echo("\u2713 Read access verified")
 
         detection = (
             discovery.detect_systems(validation)

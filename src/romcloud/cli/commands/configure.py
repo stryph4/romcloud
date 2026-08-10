@@ -6,7 +6,10 @@ from pathlib import Path
 
 import click
 
-from romcloud.cli.smb_setup_wizard import run_smb_setup_wizard
+from romcloud.cli.smb_setup_wizard import (
+    SMBConnectionDetails,
+    run_smb_setup_wizard,
+)
 from romcloud.infrastructure.config import (
     AppConfig,
     CacheConfig,
@@ -130,6 +133,7 @@ def configure_cmd(
     # confirmation succeeds.
     smb_cfg = None
     smb_password: str | None = None
+    source_setup_result = None
     if source_type == "smb":
         if not non_interactive:
             click.echo()
@@ -146,6 +150,7 @@ def configure_cmd(
                 port=setup_result.port,
             )
             smb_password = setup_result.password
+            source_setup_result = setup_result
         else:
             smb_cfg = SMBConfig(server="localhost", share="ROMs", username="guest")
 
@@ -215,10 +220,22 @@ def configure_cmd(
         else:
             click.echo("\nChoose an independent writable SMB location for ROMCloud data.")
             discovery = build_default_smb_discovery_service()
+            reused_connection = None
+            if source_setup_result is not None and click.confirm(
+                "Use the same server and credentials as the ROM library?",
+                default=True,
+            ):
+                reused_connection = SMBConnectionDetails(
+                    server=source_setup_result.server,
+                    port=source_setup_result.port,
+                    username=source_setup_result.username,
+                    password=source_setup_result.password,
+                )
             remote_result = run_smb_setup_wizard(
                 discovery,
                 purpose="ROMCloud data location",
                 detect_systems=False,
+                connection=reused_connection,
             )
             if remote_result is None:
                 click.echo("\nSetup cancelled — existing configuration left unchanged.")
@@ -257,10 +274,15 @@ def configure_cmd(
                 f"ROMCloud data directory must not overlap the cache: {cache_root}"
             )
         root_path.mkdir(parents=True, exist_ok=True)
-        if not WritableLocalFilesystemProvider().is_reachable(str(root_path)):
+        validation = WritableLocalFilesystemProvider().validate_access(str(root_path))
+        if not validation.ok:
             raise click.ClickException(
-                f"ROMCloud data directory is not writable: {root_path}"
+                f"ROMCloud data directory failed validation: {validation.detail}"
             )
+        click.echo("\u2713 Connected")
+        click.echo("\u2713 Read access verified")
+        click.echo("\u2713 Write access verified")
+        click.echo("\u2713 Cleanup verified")
 
     # ── build and write ───────────────────────────────────────────────────────
     # Advanced settings (local_roms_path, data_path, logging) are preserved
