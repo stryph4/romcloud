@@ -16,7 +16,7 @@ set -euo pipefail
 
 # ── defaults ──────────────────────────────────────────────────────────────────
 ROMCLOUD_HOME="${ROMCLOUD_HOME:-/userdata/system/romcloud}"
-CACHE_ROOT="${CACHE_ROOT:-/userdata/romcloud-cache}"
+CACHE_ROOT="${CACHE_ROOT:-/userdata/romcloud/cache}"
 LOCAL_ROMS="${LOCAL_ROMS:-/userdata/roms}"
 # Where Batocera's EmulationStation looks for Ports scripts. Overridable so
 # tests can point it at a throwaway directory instead of the real
@@ -63,7 +63,6 @@ fi
 
 # ── create directory structure ────────────────────────────────────────────────
 mkdir -p "${BIN_DIR}" "${CONFIG_DIR}" "${DATA_DIR}" "${LOGS_DIR}"
-mkdir -p "${CACHE_ROOT}/.partial"
 
 echo "  Created directory structure."
 
@@ -218,6 +217,10 @@ if ! "${VENV_DIR}/bin/python" -m romcloud.cli.main _reconcile-install \
     exit 1
 fi
 
+# Create the current cache layout only after reconciliation has had a chance
+# to move an exact, ROMCloud-owned legacy cache into this location.
+mkdir -p "${CACHE_ROOT}/.partial"
+
 # ── write default config (only if none exists) ────────────────────────────────
 CONFIG_FILE="${CONFIG_DIR}/romcloud.toml"
 if [[ ! -f "${CONFIG_FILE}" ]]; then
@@ -227,7 +230,7 @@ if [[ ! -f "${CONFIG_FILE}" ]]; then
 
 [source]
 provider = "local"
-rom_root = "/mnt/rom-source/ROMs"
+rom_root = "/userdata/romcloud/source"
 
 [cache]
 path = "${CACHE_ROOT}"

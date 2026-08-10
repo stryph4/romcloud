@@ -33,8 +33,12 @@ def _fake_config(
         smb=smb,
         credentials_path=credentials_path or Path("/tmp/does-not-matter/credentials.toml"),
         data_path=str(Path(rom_root).parent / "data"),
-        saves=(
-            SimpleNamespace(remote_mount_path=saves_mount)
+        remote_data=(
+            SimpleNamespace(
+                provider="smb",
+                root=saves_mount,
+                smb=_fake_smb(server="data-nas.local", share="ROMCloud"),
+            )
             if saves_mount is not None
             else None
         ),
@@ -138,7 +142,7 @@ class TestOnlyOneWorkerRunsAtOnce:
         monkeypatch.setattr(mw, "_worker_cmdline_matches", lambda pid, *, proc_root: pid == os.getpid())
 
         called = []
-        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: called.append(1) or False)
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: called.append(1) or False)
 
         config = _fake_config(smb=_fake_smb())
         code = mw.run_worker(tmp_path, config)
@@ -153,8 +157,9 @@ class TestRunWorker:
     def test_mounts_catalog_read_only_and_savesync_separately_read_write(
         self, tmp_path, monkeypatch
     ):
-        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: False)
         monkeypatch.setattr(mw, "load_smb_password", lambda *a, **k: "hunter2")
+        monkeypatch.setattr(mw, "load_remote_data_smb_password", lambda *a, **k: "sync-secret")
         monkeypatch.setattr(mw, "write_cifs_credentials_file", lambda *a, **k: None)
         monkeypatch.setattr(mw.mount_endpoint_cache, "resolve_endpoint", lambda *a, **k: None)
         attempts = []
@@ -171,11 +176,41 @@ class TestRunWorker:
 
         assert code == 0
         assert [item["mount_point"] for item in attempts] == ["/mnt/roms", "/mnt/saves-rw"]
+        assert [item["server"] for item in attempts] == ["nas.local", "data-nas.local"]
+        assert [item["share"] for item in attempts] == ["ROMs", "ROMCloud"]
         assert attempts[0].get("read_only", True) is True
         assert attempts[1]["read_only"] is False
 
+    def test_local_rom_source_with_smb_remote_data_mounts_only_remote_target(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: False)
+        monkeypatch.setattr(
+            mw, "load_remote_data_smb_password", lambda *a, **k: "sync-secret"
+        )
+        monkeypatch.setattr(mw, "write_cifs_credentials_file", lambda *a, **k: None)
+        attempts = []
+        monkeypatch.setattr(
+            mw.mountlib,
+            "mount_cifs_source",
+            lambda **kwargs: attempts.append(kwargs)
+            or mw.mountlib.MountOutcome(True, False, "mounted"),
+        )
+
+        code = mw.run_worker(
+            tmp_path,
+            _fake_config(smb=None, saves_mount="/mnt/remote-rw"),
+        )
+
+        assert code == 0
+        assert len(attempts) == 1
+        assert attempts[0]["server"] == "data-nas.local"
+        assert attempts[0]["share"] == "ROMCloud"
+        assert attempts[0]["mount_point"] == "/mnt/remote-rw"
+        assert attempts[0]["read_only"] is False
+
     def test_already_mounted_records_success_and_skips_mount(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: True)
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: True)
         monkeypatch.setattr(mw.mountlib, "is_target_mounted_read_only", lambda *a, **k: True)
 
         def _boom(*a, **k):
@@ -192,7 +227,7 @@ class TestRunWorker:
         assert not mw.lock_path(tmp_path).exists()
 
     def test_no_smb_section_records_failure_cleanly(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: False)
 
         config = _fake_config(smb=None)
         code = mw.run_worker(tmp_path, config)
@@ -203,7 +238,7 @@ class TestRunWorker:
         assert "smb" in status.detail.lower()
 
     def test_no_password_records_failure_cleanly(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: False)
         monkeypatch.setattr(mw, "load_smb_password", lambda *a, **k: None)
 
         config = _fake_config(smb=_fake_smb())
@@ -215,7 +250,7 @@ class TestRunWorker:
         assert "password" in status.detail.lower()
 
     def test_successful_mount_records_success(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: False)
         monkeypatch.setattr(mw, "load_smb_password", lambda *a, **k: "hunter2")
         monkeypatch.setattr(mw, "write_cifs_credentials_file", lambda *a, **k: None)
         sleeps = []
@@ -264,7 +299,7 @@ class TestRunWorker:
         assert mw.DEFAULT_ATTEMPT_TIMEOUT < mw.DEFAULT_RETRY_TIMEOUT
 
     def test_retry_budget_exhaustion_records_failed_status(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: False)
         monkeypatch.setattr(mw, "load_smb_password", lambda *a, **k: "hunter2")
         monkeypatch.setattr(mw, "write_cifs_credentials_file", lambda *a, **k: None)
 
@@ -297,7 +332,7 @@ class TestRunWorker:
         assert "SMB source" in status.detail
 
     def test_retries_provider_not_reachable_until_success(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: False)
         monkeypatch.setattr(mw, "load_smb_password", lambda *a, **k: "hunter2")
         monkeypatch.setattr(mw, "write_cifs_credentials_file", lambda *a, **k: None)
 
@@ -329,7 +364,7 @@ class TestRunWorker:
         assert mw.read_worker_status(tmp_path).state == "success"
 
     def test_auth_failure_never_raises_and_is_logged_without_password(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: False)
         monkeypatch.setattr(mw, "load_smb_password", lambda *a, **k: "hunter2")
         monkeypatch.setattr(mw, "write_cifs_credentials_file", lambda *a, **k: None)
 
@@ -348,7 +383,7 @@ class TestRunWorker:
         assert not mw.lock_path(tmp_path).exists()
 
     def test_network_failure_never_raises(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: False)
         monkeypatch.setattr(mw, "load_smb_password", lambda *a, **k: "hunter2")
         monkeypatch.setattr(mw, "write_cifs_credentials_file", lambda *a, **k: None)
 
@@ -379,7 +414,7 @@ class TestRunWorker:
         """With real wall-clock timing (no fake clock), the retry loop must
         actually retry more than once within a bounded overall window, and no
         single attempt may be handed the full overall retry budget."""
-        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: False)
         monkeypatch.setattr(mw, "load_smb_password", lambda *a, **k: "hunter2")
         monkeypatch.setattr(mw, "write_cifs_credentials_file", lambda *a, **k: None)
 
@@ -412,7 +447,7 @@ class TestRunWorker:
         assert mw.read_worker_status(tmp_path).state == "failed"
 
     def test_unexpected_exception_never_crashes_worker(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: False)
         monkeypatch.setattr(mw, "load_smb_password", lambda *a, **k: "hunter2")
         monkeypatch.setattr(mw, "write_cifs_credentials_file", lambda *a, **k: None)
 
@@ -437,7 +472,7 @@ class TestCachedEndpointFallback:
     def test_uses_cached_endpoint_first_and_succeeds_without_hostname_attempt(
         self, tmp_path, monkeypatch
     ):
-        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: False)
         monkeypatch.setattr(mw, "load_smb_password", lambda *a, **k: "hunter2")
         monkeypatch.setattr(mw, "write_cifs_credentials_file", lambda *a, **k: None)
         mw.mount_endpoint_cache.write_endpoint_cache(tmp_path, "omnivault", "192.0.2.10")
@@ -462,7 +497,7 @@ class TestCachedEndpointFallback:
     def test_falls_back_to_hostname_when_cached_endpoint_fails_without_losing_budget(
         self, tmp_path, monkeypatch
     ):
-        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: False)
         monkeypatch.setattr(mw, "load_smb_password", lambda *a, **k: "hunter2")
         monkeypatch.setattr(mw, "write_cifs_credentials_file", lambda *a, **k: None)
         mw.mount_endpoint_cache.write_endpoint_cache(tmp_path, "omnivault", "192.0.2.99")
@@ -490,7 +525,7 @@ class TestCachedEndpointFallback:
         assert mw.read_worker_status(tmp_path).state == "success"
 
     def test_ignores_cache_entry_for_a_different_configured_server(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: False)
         monkeypatch.setattr(mw, "load_smb_password", lambda *a, **k: "hunter2")
         monkeypatch.setattr(mw, "write_cifs_credentials_file", lambda *a, **k: None)
         mw.mount_endpoint_cache.write_endpoint_cache(tmp_path, "old-nas", "192.0.2.50")
@@ -511,7 +546,7 @@ class TestCachedEndpointFallback:
         assert attempts == ["omnivault"]  # the foreign cached IP was never tried
 
     def test_successful_hostname_mount_refreshes_cache(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: False)
         monkeypatch.setattr(mw, "load_smb_password", lambda *a, **k: "hunter2")
         monkeypatch.setattr(mw, "write_cifs_credentials_file", lambda *a, **k: None)
         monkeypatch.setattr(
@@ -534,7 +569,7 @@ class TestCachedEndpointFallback:
         assert entry.endpoint == "192.0.2.10"
 
     def test_unreachable_resolved_candidate_is_never_cached(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: False)
         monkeypatch.setattr(mw, "load_smb_password", lambda *a, **k: "hunter2")
         monkeypatch.setattr(mw, "write_cifs_credentials_file", lambda *a, **k: None)
         monkeypatch.setattr(
@@ -557,7 +592,7 @@ class TestCachedEndpointFallback:
         assert mw.mount_endpoint_cache.read_endpoint_cache(tmp_path) is None
 
     def test_direct_ip_config_never_triggers_a_redundant_cached_probe(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: False)
         monkeypatch.setattr(mw, "load_smb_password", lambda *a, **k: "hunter2")
         monkeypatch.setattr(mw, "write_cifs_credentials_file", lambda *a, **k: None)
         # A previous run already cached the same IP the user configured directly.
@@ -579,7 +614,7 @@ class TestCachedEndpointFallback:
         assert attempts == ["192.0.2.10"]  # exactly one attempt, no wasted duplicate
 
     def test_missing_cache_does_not_change_existing_hostname_behavior(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: False)
         monkeypatch.setattr(mw, "load_smb_password", lambda *a, **k: "hunter2")
         monkeypatch.setattr(mw, "write_cifs_credentials_file", lambda *a, **k: None)
 
@@ -709,7 +744,7 @@ class TestGetDiagnostics:
         assert diag.label == "not configured"
 
     def test_mounted(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: True)
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: True)
         monkeypatch.setattr(mw.mountlib, "is_target_mounted_read_only", lambda *a, **k: True)
         config = _fake_config(smb=_fake_smb())
         diag = mw.get_diagnostics(tmp_path, config)
@@ -717,7 +752,7 @@ class TestGetDiagnostics:
         assert diag.label == "mounted"
 
     def test_worker_running_shows_waiting(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: False)
         mw.lock_path(tmp_path).parent.mkdir(parents=True)
         mw.lock_path(tmp_path).write_text(str(os.getpid()))
         monkeypatch.setattr(mw, "_worker_cmdline_matches", lambda pid, *, proc_root: pid == os.getpid())
@@ -729,7 +764,7 @@ class TestGetDiagnostics:
         assert "waiting" in diag.label
 
     def test_last_failure_shown_when_no_worker_and_not_mounted(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: False)
         mw._write_worker_status(tmp_path, "failed", "SMB authentication failed")
 
         config = _fake_config(smb=_fake_smb())
@@ -740,13 +775,13 @@ class TestGetDiagnostics:
         assert diag.last_detail == "SMB authentication failed"
 
     def test_default_not_mounted_label(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: False)
         config = _fake_config(smb=_fake_smb())
         diag = mw.get_diagnostics(tmp_path, config)
         assert diag.label == "not mounted"
 
     def test_cached_endpoint_shown_only_when_it_matches_configured_server(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: False)
         mw.mount_endpoint_cache.write_endpoint_cache(tmp_path, "omnivault", "192.0.2.10")
 
         config = _fake_config(smb=_fake_smb(server="omnivault"))

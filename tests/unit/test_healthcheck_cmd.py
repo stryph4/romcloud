@@ -10,12 +10,18 @@ from click.testing import CliRunner
 
 from romcloud.cli.main import cli
 from romcloud.cli.commands.healthcheck import healthcheck_cmd
-from romcloud.infrastructure.config import AppConfig, CacheConfig, SMBConfig, SourceConfig
+from romcloud.infrastructure.config import (
+    AppConfig,
+    CacheConfig,
+    RemoteDataConfig,
+    SMBConfig,
+    SourceConfig,
+)
 from romcloud.infrastructure.config import write_config
 from romcloud.infrastructure.mount_worker import MountDiagnostics
 
 
-def _build_config(tmp_path, smb=None):
+def _build_config(tmp_path, smb=None, remote_data=None):
     source_root = tmp_path / "roms"
     source_root.mkdir()
     data_root = tmp_path / "data"
@@ -26,6 +32,7 @@ def _build_config(tmp_path, smb=None):
         local_roms_path=str(tmp_path / "local_roms"),
         data_path=str(data_root),
         smb=smb,
+        remote_data=remote_data,
     )
 
 
@@ -36,7 +43,7 @@ def _invoke(config):
 class TestMountDiagnosticLine:
     def test_absent_when_no_smb_configured(self, tmp_path):
         result = _invoke(_build_config(tmp_path, smb=None))
-        assert "SMB source mounted" not in result.output
+        assert "SMB locations mounted" not in result.output
         assert "Source reachable (Local filesystem)" in result.output
 
     def test_shown_and_passing_when_mounted(self, tmp_path, monkeypatch):
@@ -50,8 +57,8 @@ class TestMountDiagnosticLine:
         result = _invoke(config)
 
         assert "Source reachable (SMB)" in result.output
-        assert "SMB source mounted" in result.output
-        assert "✓  SMB source mounted" in result.output
+        assert "SMB locations mounted" in result.output
+        assert "✓  SMB locations mounted" in result.output
 
     def test_shown_and_failing_with_detail_when_not_mounted(self, tmp_path, monkeypatch):
         diag = MountDiagnostics(
@@ -64,7 +71,7 @@ class TestMountDiagnosticLine:
         result = _invoke(config)
 
         assert "Source reachable (SMB)" in result.output
-        assert "✗  SMB source mounted" in result.output
+        assert "✗  SMB locations mounted" in result.output
         assert "last attempt failed" in result.output
         assert result.exit_code != 0
 
@@ -81,8 +88,34 @@ class TestMountDiagnosticLine:
         # what must never happen is the RuntimeError itself propagating out.
         assert not isinstance(result.exception, RuntimeError)
         assert "Source reachable (SMB)" in result.output
-        assert "SMB source mounted" in result.output
+        assert "SMB locations mounted" in result.output
         assert "error checking status" in result.output
+
+
+class TestRemoteDataHealth:
+    def test_local_remote_data_reports_real_writability(self, tmp_path):
+        remote_root = tmp_path / "remote-data"
+        remote_root.mkdir()
+        config = _build_config(
+            tmp_path,
+            remote_data=RemoteDataConfig("local", str(remote_root)),
+        )
+
+        result = _invoke(config)
+
+        assert "✓  ROMCloud data location writable" in result.output
+
+    def test_missing_local_remote_data_root_fails_healthcheck(self, tmp_path):
+        remote_root = tmp_path / "missing-remote-data"
+        config = _build_config(
+            tmp_path,
+            remote_data=RemoteDataConfig("local", str(remote_root)),
+        )
+
+        result = _invoke(config)
+
+        assert "✗  ROMCloud data location writable" in result.output
+        assert result.exit_code != 0
 
 
 class TestStartupMigrationFromHealthcheck:

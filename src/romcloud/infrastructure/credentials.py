@@ -5,7 +5,8 @@ Credentials (e.g. SMB password) are stored in a separate TOML file at mode
 
 Legacy Batocera installs may still have ``smb.credentials`` alongside the
 canonical ``credentials.toml``. This module owns the migration path for that
-legacy file and keeps the derived ``smb-cifs-credentials`` helper separate.
+legacy file and keeps separate derived mount helpers for the ROM source and
+remote-data SMB targets.
 """
 
 from __future__ import annotations
@@ -38,7 +39,12 @@ def load_smb_password(credentials_path: Path) -> Optional[str]:
     Returns None if no credentials file exists or no password is set.
     Never raises; logs warnings via the standard library.
     """
-    return _read_toml_smb_password(credentials_path)
+    return _read_toml_password(credentials_path, "smb")
+
+
+def load_remote_data_smb_password(credentials_path: Path) -> Optional[str]:
+    """Read the independent remote-data SMB password, if configured."""
+    return _read_toml_password(credentials_path, "remote_data_smb")
 
 
 def migrate_legacy_smb_credentials(credentials_path: Path) -> bool:
@@ -52,7 +58,7 @@ def migrate_legacy_smb_credentials(credentials_path: Path) -> bool:
     if legacy_password is None:
         return False
 
-    if credentials_path.exists():
+    if load_smb_password(credentials_path) is not None:
         legacy_path.unlink(missing_ok=True)
         return True
 
@@ -67,12 +73,12 @@ def migrate_legacy_smb_credentials(credentials_path: Path) -> bool:
 
 def write_smb_password(credentials_path: Path, password: str) -> None:
     """Atomically write the SMB password to the credentials file, mode 0600."""
-    content = "[smb]\n"
-    # Simple escaping: TOML basic strings need backslash and quote escaping.
-    escaped = password.replace("\\", "\\\\").replace('"', '\\"')
-    content += f'password = "{escaped}"\n'
+    _write_password_section(credentials_path, "smb", password)
 
-    atomic_write_text(credentials_path, content, mode=stat.S_IRUSR | stat.S_IWUSR)
+
+def write_remote_data_smb_password(credentials_path: Path, password: str) -> None:
+    """Store the remote-data SMB password without replacing source credentials."""
+    _write_password_section(credentials_path, "remote_data_smb", password)
 
 
 def cifs_credentials_path(main_credentials_path: Path) -> Path:
@@ -80,6 +86,11 @@ def cifs_credentials_path(main_credentials_path: Path) -> Path:
     derived from the main (TOML) credentials file's own path — kept
     alongside it so both are covered by the same directory permissions."""
     return main_credentials_path.parent / "smb-cifs-credentials"
+
+
+def remote_data_cifs_credentials_path(main_credentials_path: Path) -> Path:
+    """Separate mount.cifs credential file for the remote-data target."""
+    return main_credentials_path.parent / "remote-data-smb-cifs-credentials"
 
 
 def write_cifs_credentials_file(
@@ -109,14 +120,14 @@ def _legacy_credentials_path(credentials_path: Path) -> Path:
     return credentials_path.with_name(_LEGACY_CREDENTIALS_FILENAME)
 
 
-def _read_toml_smb_password(credentials_path: Path) -> Optional[str]:
+def _read_toml_password(credentials_path: Path, section: str) -> Optional[str]:
     if tomllib is None:
         return None
 
     try:
         with credentials_path.open("rb") as fh:
             data = tomllib.load(fh)
-        return _password_from_mapping(data)
+        return _password_from_mapping(data, section)
     except Exception:  # noqa: BLE001
         return None
 
@@ -125,7 +136,7 @@ def _read_legacy_password(legacy_path: Path) -> Optional[str]:
     if not legacy_path.exists():
         return None
 
-    password = _read_toml_smb_password(legacy_path)
+    password = _read_toml_password(legacy_path, "smb")
     if password is not None:
         return password
 
@@ -163,18 +174,43 @@ def _read_legacy_cifs_password(legacy_path: Path) -> Optional[str]:
     return password
 
 
-def _password_from_mapping(data) -> Optional[str]:
+def _password_from_mapping(data, section: str = "smb") -> Optional[str]:
     if not isinstance(data, dict):
         return None
 
-    smb_data = data.get("smb")
+    smb_data = data.get(section)
     if isinstance(smb_data, dict):
         password = smb_data.get("password")
         if isinstance(password, str) and password:
             return password
 
-    password = data.get("password")
-    if isinstance(password, str) and password:
-        return password
+    if section == "smb":
+        password = data.get("password")
+        if isinstance(password, str) and password:
+            return password
 
     return None
+
+
+def _write_password_section(credentials_path: Path, section: str, password: str) -> None:
+    passwords = {
+        "smb": load_smb_password(credentials_path),
+        "remote_data_smb": load_remote_data_smb_password(credentials_path),
+    }
+    passwords[section] = password
+
+    lines: list[str] = []
+    for name in ("smb", "remote_data_smb"):
+        value = passwords[name]
+        if value is None:
+            continue
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        if lines:
+            lines.append("\n")
+        lines.extend([f"[{name}]\n", f'password = "{escaped}"\n'])
+
+    atomic_write_text(
+        credentials_path,
+        "".join(lines),
+        mode=stat.S_IRUSR | stat.S_IWUSR,
+    )

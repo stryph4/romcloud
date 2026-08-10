@@ -37,6 +37,16 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
 
 
+def test_default_runtime_paths_use_single_userdata_namespace() -> None:
+    content = INSTALL_SH.read_text()
+
+    assert 'CACHE_ROOT="${CACHE_ROOT:-/userdata/romcloud/cache}"' in content
+    assert "/userdata/romcloud-cache" not in content
+    assert "/userdata/romcloud-source" not in content
+    assert "/userdata/romcloud-saves-source" not in content
+    assert 'rom_root = "/userdata/romcloud/source"' in content
+
+
 def _run_install(
     env_overrides: dict[str, str], *, path: str | None = None
 ) -> subprocess.CompletedProcess[str]:

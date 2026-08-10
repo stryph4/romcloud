@@ -67,9 +67,15 @@ class SaveSyncScreenState:
     def confirm_dashboard_selection(self) -> Optional[str]:
         """Returns ``"back"`` if the caller should leave this screen entirely."""
         if self.selected_index == _UPLOAD_INDEX:
-            self.start_preview("upload")
+            if self.status.get("remote_configured", False):
+                self.start_preview("upload")
+            else:
+                self.error = "Configure writable ROMCloud data storage before using SaveSync."
         elif self.selected_index == _DOWNLOAD_INDEX:
-            self.start_preview("download")
+            if self.status.get("remote_configured", False):
+                self.start_preview("download")
+            else:
+                self.error = "Configure writable ROMCloud data storage before using SaveSync."
         elif self.selected_index == _SETTINGS_INDEX:
             self.step = SETTINGS
         elif self.selected_index == _BACK_INDEX:

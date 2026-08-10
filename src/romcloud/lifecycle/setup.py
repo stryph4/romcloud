@@ -9,30 +9,35 @@ from pathlib import Path
 from typing import Any
 
 from romcloud.bootstrap.container import Container
-from romcloud.services.smb_discovery import SMBCredentials, SMBServerTarget
 from romcloud.infrastructure.atomic_file import atomic_write_text
 from romcloud.infrastructure.config import (
     AppConfig,
     CacheConfig,
     LoggingConfig,
+    RemoteDataConfig,
+    SavesConfig,
     SMBConfig,
     SourceConfig,
+    paths_overlap,
     load_config,
     write_config,
 )
 from romcloud.infrastructure.credentials import (
-    cifs_credentials_path,
+    load_remote_data_smb_password,
     load_smb_password,
     write_cifs_credentials_file,
+    write_remote_data_smb_password,
     write_smb_password,
 )
 from romcloud.infrastructure.mount import mount_cifs_source
-from romcloud.infrastructure.mount_worker import configured_mounts
+from romcloud.infrastructure import mount_worker
 from romcloud.infrastructure.smb_discovery_client import build_default_smb_discovery_service
 from romcloud.integrations.batocera import es_config, mount_service
+from romcloud.services.smb_discovery import SMBCredentials, SMBServerTarget
 
-DEFAULT_ROM_ROOT = "/userdata/romcloud-source"
-DEFAULT_CACHE_ROOT = "/userdata/romcloud-cache"
+DEFAULT_ROM_ROOT = "/userdata/romcloud/source"
+DEFAULT_REMOTE_DATA_ROOT = "/userdata/romcloud/remote"
+DEFAULT_CACHE_ROOT = "/userdata/romcloud/cache"
 DEFAULT_MAX_SIZE_GB = 50.0
 DEFAULT_MIN_FREE_GB = 5.0
 SETUP_STATE_FILENAME = "setup-state.json"
@@ -49,6 +54,13 @@ class SetupRequest:
     max_size_gb: float = DEFAULT_MAX_SIZE_GB
     min_free_gb: float = DEFAULT_MIN_FREE_GB
     port: int = 445
+    remote_data_type: str = "none"
+    remote_data_root: str = ""
+    remote_server: str = ""
+    remote_share: str = ""
+    remote_username: str = ""
+    remote_password: str = ""
+    remote_port: int = 445
 
     @classmethod
     def from_payload(
@@ -68,6 +80,13 @@ class SetupRequest:
             max_size_gb=_number(payload.get("max_size_gb", DEFAULT_MAX_SIZE_GB), "Maximum cache size"),
             min_free_gb=_number(payload.get("min_free_gb", DEFAULT_MIN_FREE_GB), "Minimum free space"),
             port=int(payload.get("port", 445)),
+            remote_data_type=str(payload.get("remote_data_type", "none")).strip().lower(),
+            remote_data_root=str(payload.get("remote_data_root", "")).strip(),
+            remote_server=str(payload.get("remote_server", "")).strip(),
+            remote_share=str(payload.get("remote_share", "")).strip(),
+            remote_username=str(payload.get("remote_username", "")).strip(),
+            remote_password=str(payload.get("remote_password", "")),
+            remote_port=int(payload.get("remote_port", 445)),
         )
         request.validate(require_share=require_share, validate_cache=validate_cache)
         return request
@@ -81,11 +100,39 @@ class SetupRequest:
             raise ValueError("SMB username is required.")
         if not self.password:
             raise ValueError("SMB password is required.")
-        serialized_values = (self.server, self.share, self.username, self.rom_root, self.cache_root)
+        serialized_values = (
+            self.server,
+            self.share,
+            self.username,
+            self.rom_root,
+            self.cache_root,
+            self.remote_data_root,
+            self.remote_server,
+            self.remote_share,
+            self.remote_username,
+        )
         if any('"' in value or "\n" in value or "\r" in value for value in serialized_values):
             raise ValueError("Setup values cannot contain quotes or line breaks.")
         if not 1 <= self.port <= 65535:
             raise ValueError("SMB port must be between 1 and 65535.")
+        if self.remote_data_type not in {"none", "local", "smb"}:
+            raise ValueError("ROMCloud data storage type must be none, local, or smb.")
+        if self.remote_data_type == "local":
+            if not self.remote_data_root or not Path(self.remote_data_root).is_absolute():
+                raise ValueError("Local ROMCloud data location must be an absolute path.")
+        if self.remote_data_type == "smb":
+            if not all((self.remote_server, self.remote_share, self.remote_username, self.remote_password)):
+                raise ValueError("Remote-data SMB server, share, username, and password are required.")
+            if not 1 <= self.remote_port <= 65535:
+                raise ValueError("Remote-data SMB port must be between 1 and 65535.")
+            if (
+                self.server.casefold() == self.remote_server.casefold()
+                and self.share.strip("/").casefold()
+                == self.remote_share.strip("/").casefold()
+            ):
+                raise ValueError(
+                    "ROMCloud data must use a separate writable share from the ROM library."
+                )
         if validate_cache and self.max_size_gb <= 0:
             raise ValueError("Maximum cache size must be greater than zero.")
         if validate_cache and self.min_free_gb < 0:
@@ -97,6 +144,17 @@ class SetupRequest:
             raise ValueError("ROM and cache paths must be absolute.")
         if validate_cache and (cache_root == rom_root or rom_root in cache_root.parents):
             raise ValueError("Cache location cannot be inside the mounted ROM source.")
+        if self.remote_data_type != "none":
+            remote_root = (
+                Path(self.remote_data_root)
+                if self.remote_data_type == "local"
+                else Path(DEFAULT_REMOTE_DATA_ROOT)
+            )
+            for label, other in (("ROM source", rom_root), ("cache", cache_root)):
+                if paths_overlap(remote_root, other):
+                    raise ValueError(
+                        f"ROMCloud data location cannot overlap the {label}."
+                    )
 
         if not validate_cache:
             return
@@ -151,6 +209,12 @@ def setup_state(config_path: Path) -> dict[str, Any]:
         "cache_root": config.cache.path,
         "max_size_gb": config.cache.max_size_gb,
         "min_free_gb": config.cache.min_free_gb,
+        "remote_data_type": config.remote_data.provider if config.remote_data else "none",
+        "remote_data_root": (
+            config.remote_data.root
+            if config.remote_data and config.remote_data.provider == "local"
+            else ""
+        ),
         "failed_step": saved_state.get("failed_step"),
     }
     if config.smb is not None:
@@ -158,6 +222,12 @@ def setup_state(config_path: Path) -> dict[str, Any]:
             "server": config.smb.server,
             "share": config.smb.share,
             "username": config.smb.username,
+        })
+    if config.remote_data is not None and config.remote_data.smb is not None:
+        payload.update({
+            "remote_server": config.remote_data.smb.server,
+            "remote_share": config.remote_data.smb.share,
+            "remote_username": config.remote_data.smb.username,
         })
     return payload
 
@@ -174,14 +244,22 @@ def _structural_issues(config: AppConfig) -> list[str]:
         issues.append("Minimum free space cannot be negative.")
     if config.smb is not None and load_smb_password(config.credentials_path) is None:
         issues.append("SMB credentials are missing.")
+    if config.remote_data is not None:
+        if not Path(config.remote_data.root).is_absolute():
+            issues.append("ROMCloud data root must be absolute.")
+        if (
+            config.remote_data.provider == "smb"
+            and load_remote_data_smb_password(config.credentials_path) is None
+        ):
+            issues.append("Remote-data SMB credentials are missing.")
     return issues
 
 
 def discover_shares(payload: dict[str, Any]) -> dict[str, Any]:
-    request = SetupRequest.from_payload(payload, require_share=False, validate_cache=False)
+    server, port, username, password = _connection_values(payload)
     discovery = build_default_smb_discovery_service()
-    target = SMBServerTarget(request.server, request.port)
-    credentials = SMBCredentials(request.username, request.password)
+    target = SMBServerTarget(server, port)
+    credentials = SMBCredentials(username, password)
 
     reachability = discovery.validate_server(target)
     if not reachability.ok:
@@ -201,13 +279,20 @@ def discover_shares(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def validate_share(payload: dict[str, Any]) -> dict[str, Any]:
-    request = SetupRequest.from_payload(payload, validate_cache=False)
+    purpose = str(payload.get("purpose", "source"))
+    server, port, username, password = _connection_values(payload)
+    share_key = "remote_share" if purpose == "remote_data" else "share"
+    share = str(payload.get(share_key, "")).strip()
+    if not share:
+        raise ValueError("SMB share is required.")
     discovery = build_default_smb_discovery_service()
-    target = SMBServerTarget(request.server, request.port)
-    credentials = SMBCredentials(request.username, request.password)
-    validation = discovery.validate_share(target, credentials, request.share)
+    target = SMBServerTarget(server, port)
+    credentials = SMBCredentials(username, password)
+    validation = discovery.validate_share(target, credentials, share)
     if not validation.ok:
         raise ValueError(validation.detail or str(validation.error_kind or "Share validation failed."))
+    if purpose == "remote_data":
+        return {"systems": [], "count": 0}
     detection = discovery.detect_systems(validation)
     return {
         "systems": list(detection.detected_systems),
@@ -218,6 +303,8 @@ def validate_share(payload: dict[str, Any]) -> dict[str, Any]:
 def apply_setup(config_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
     request = SetupRequest.from_payload(payload)
     validation_result = validate_share(payload)
+    if request.remote_data_type == "smb":
+        validate_share({**payload, "purpose": "remote_data"})
     state_path = config_path.parent / SETUP_STATE_FILENAME
     existing = _existing_config(config_path)
     existing_was_valid = existing is not None and not _structural_issues(existing)
@@ -229,31 +316,45 @@ def apply_setup(config_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
         else None
     )
     config = _build_config(config_path, request, existing)
+    mounted_during_setup: list[str] = []
 
     step = "write configuration"
     _write_state(state_path, {"status": "applying", "step": step})
     try:
         write_config(config, str(config_path))
         write_smb_password(config.credentials_path, request.password)
+        if request.remote_data_type == "smb":
+            write_remote_data_smb_password(
+                config.credentials_path, request.remote_password
+            )
 
         step = "install mount service"
         _write_state(state_path, {"status": "applying", "step": step})
         romcloud_bin = config_path.parent.parent / "bin" / "romcloud"
         mount_service.install_service(str(romcloud_bin))
 
-        step = "mount and test source"
+        step = "mount and test storage"
         _write_state(state_path, {"status": "applying", "step": step})
-        cifs_path = cifs_credentials_path(config.credentials_path)
-        write_cifs_credentials_file(cifs_path, request.username, request.password)
-        for target in configured_mounts(config):
-            mount_cifs_source(
-                request.server,
-                request.share,
+        for target in mount_worker.configured_mounts(config):
+            password, cifs_path = mount_worker.credentials_for_mount(config, target)
+            assert password is not None
+            write_cifs_credentials_file(cifs_path, target.smb.username, password)
+            outcome = mount_cifs_source(
+                target.smb.server,
+                target.smb.share,
                 target.mount_point,
                 cifs_path,
                 read_only=target.read_only,
-                port=request.port,
+                port=target.smb.port,
             )
+            if outcome is not None and not outcome.already_mounted:
+                mounted_during_setup.append(target.mount_point)
+
+        if config.remote_data is not None:
+            if config.remote_data.provider == "local":
+                Path(config.remote_data.root).mkdir(parents=True, exist_ok=True)
+            if not Container(config).saves.is_remote_reachable():
+                raise RuntimeError("Configured ROMCloud data location is not writable.")
 
         step = "refresh catalog"
         _write_state(state_path, {"status": "applying", "step": step})
@@ -268,7 +369,24 @@ def apply_setup(config_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
         managed_systems = container.game_repo.list_systems()
         es_config.install(managed_systems)
     except Exception as exc:
+        from romcloud.infrastructure.mount import unmount_cifs_source
+
+        cleanup_errors: list[str] = []
+        for mount_point in reversed(mounted_during_setup):
+            try:
+                unmount_cifs_source(mount_point)
+            except Exception as cleanup_exc:  # noqa: BLE001 - try every new mount
+                cleanup_errors.append(f"{mount_point}: {cleanup_exc}")
         safe_error = str(exc).replace(request.password, "***")
+        if request.remote_password:
+            safe_error = safe_error.replace(request.remote_password, "***")
+        if cleanup_errors:
+            cleanup_detail = "; ".join(cleanup_errors).replace(
+                request.password, "***"
+            )
+            if request.remote_password:
+                cleanup_detail = cleanup_detail.replace(request.remote_password, "***")
+            safe_error += f"; mount cleanup failed: {cleanup_detail}"
         if previous_config is not None:
             config_path.write_bytes(previous_config)
             if previous_credentials_path is not None:
@@ -277,7 +395,13 @@ def apply_setup(config_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
                 else:
                     previous_credentials_path.write_bytes(previous_credentials)
                     previous_credentials_path.chmod(0o600)
-            state_path.unlink(missing_ok=True)
+            if cleanup_errors:
+                _write_state(
+                    state_path,
+                    {"status": "failed", "failed_step": step, "error": safe_error},
+                )
+            else:
+                state_path.unlink(missing_ok=True)
         else:
             _write_state(state_path, {"status": "failed", "failed_step": step, "error": safe_error})
         raise RuntimeError(f"{step}: {safe_error}") from exc
@@ -290,6 +414,7 @@ def apply_setup(config_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
         "systems": validation_result["systems"],
         "system_count": validation_result["count"],
         "max_size_gb": request.max_size_gb,
+        "remote_data_type": request.remote_data_type,
     }
 
 
@@ -302,6 +427,20 @@ def _existing_config(config_path: Path) -> AppConfig | None:
 
 def _build_config(config_path: Path, request: SetupRequest, existing: AppConfig | None) -> AppConfig:
     home = config_path.parent.parent
+    remote_data = None
+    if request.remote_data_type == "local":
+        remote_data = RemoteDataConfig(provider="local", root=request.remote_data_root)
+    elif request.remote_data_type == "smb":
+        remote_data = RemoteDataConfig(
+            provider="smb",
+            root=DEFAULT_REMOTE_DATA_ROOT,
+            smb=SMBConfig(
+                server=request.remote_server,
+                share=request.remote_share,
+                username=request.remote_username,
+                port=request.remote_port,
+            ),
+        )
     return AppConfig(
         source=SourceConfig(provider="local", rom_root=request.rom_root),
         cache=CacheConfig(
@@ -318,7 +457,21 @@ def _build_config(config_path: Path, request: SetupRequest, existing: AppConfig 
             username=request.username,
             port=request.port,
         ),
+        remote_data=remote_data,
+        saves=existing.saves if existing else SavesConfig(),
     )
+
+
+def _connection_values(payload: dict[str, Any]) -> tuple[str, int, str, str]:
+    purpose = str(payload.get("purpose", "source"))
+    prefix = "remote_" if purpose == "remote_data" else ""
+    server = str(payload.get(f"{prefix}server", "")).strip()
+    username = str(payload.get(f"{prefix}username", "")).strip()
+    password = str(payload.get(f"{prefix}password", ""))
+    port = int(payload.get(f"{prefix}port", 445))
+    if not server or not username or not password:
+        raise ValueError("SMB server, username, and password are required.")
+    return server, port, username, password
 
 
 def _read_state(path: Path) -> dict[str, Any]:

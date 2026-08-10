@@ -11,8 +11,10 @@ import stat
 from pathlib import Path
 
 from romcloud.infrastructure.credentials import (
+    load_remote_data_smb_password,
     migrate_legacy_smb_credentials,
     load_smb_password,
+    write_remote_data_smb_password,
     write_cifs_credentials_file,
     write_smb_password,
 )
@@ -37,6 +39,26 @@ class TestSmbPasswordToml:
         path = tmp_path / "credentials.toml"
         write_smb_password(path, 'pa"ss\\word')
         assert load_smb_password(path) == 'pa"ss\\word'
+
+    def test_source_and_remote_data_passwords_are_independent(self, tmp_path: Path):
+        path = tmp_path / "credentials.toml"
+        write_smb_password(path, "source-secret")
+        write_remote_data_smb_password(path, "remote-secret")
+
+        assert load_smb_password(path) == "source-secret"
+        assert load_remote_data_smb_password(path) == "remote-secret"
+
+        write_smb_password(path, "new-source-secret")
+        assert load_smb_password(path) == "new-source-secret"
+        assert load_remote_data_smb_password(path) == "remote-secret"
+
+    def test_remote_password_can_exist_without_source_password(self, tmp_path: Path):
+        path = tmp_path / "credentials.toml"
+        write_remote_data_smb_password(path, "remote-only")
+
+        assert load_smb_password(path) is None
+        assert load_remote_data_smb_password(path) == "remote-only"
+        assert path.stat().st_mode & 0o777 == 0o600
 
 
 class TestLegacySmbCredentialsMigration:

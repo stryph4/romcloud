@@ -108,10 +108,57 @@ def test_multiple_or_no_detected_systems_are_reviewable(monkeypatch):
         assert wizard.options == ["Continue"]
 
 
+def test_detected_systems_lead_to_explicit_remote_data_choice():
+    wizard = WizardState()
+    wizard.step = WizardStep.SYSTEMS
+
+    wizard._confirm("romcloud")  # noqa: SLF001 - pure navigation test
+
+    assert wizard.step == WizardStep.REMOTE_DATA
+    assert wizard.options == [
+        "SMB network location",
+        "Local / external directory",
+        "Skip (SaveSync unavailable)",
+    ]
+
+
+def test_skipping_remote_data_makes_choice_explicit():
+    wizard = WizardState()
+    wizard.step = WizardStep.REMOTE_DATA
+    wizard.selected_index = 2
+
+    wizard._confirm("romcloud")  # noqa: SLF001 - pure navigation test
+
+    assert wizard.remote_data_type == "none"
+    assert wizard.step == WizardStep.CACHE
+
+
+def test_remote_smb_payload_is_independent_from_rom_source():
+    wizard = WizardState()
+    wizard.server = "rom-nas.local"
+    wizard.share = "ROMs"
+    wizard.username = "reader"
+    wizard.password = "rom-secret"
+    wizard.remote_data_type = "smb"
+    wizard.remote_server = "data-nas.local"
+    wizard.remote_share = "ROMCloud"
+    wizard.remote_username = "writer"
+    wizard.remote_password = "data-secret"
+    wizard.step = WizardStep.REMOTE_VALIDATE
+
+    payload = wizard.request_payload()
+
+    assert payload["server"] == "rom-nas.local"
+    assert payload["remote_server"] == "data-nas.local"
+    assert payload["remote_share"] == "ROMCloud"
+    assert payload["purpose"] == "remote_data"
+
+
 def test_apply_failure_retries_and_success_clears_password(monkeypatch):
     wizard = WizardState()
     wizard.step = WizardStep.APPLY
     wizard.password = "secret"
+    wizard.remote_password = "remote-secret"
     wizard.runner = _Runner()
     monkeypatch.setattr(
         "ports_gfx.wizard.operation_result",
@@ -129,6 +176,7 @@ def test_apply_failure_retries_and_success_clears_password(monkeypatch):
     wizard.poll()
     assert wizard.step == WizardStep.DONE
     assert wizard.password == ""
+    assert wizard.remote_password == ""
 
 
 def test_back_cancels_running_operation():

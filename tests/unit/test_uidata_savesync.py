@@ -7,7 +7,13 @@ import json
 from click.testing import CliRunner
 
 from romcloud.cli.main import cli
-from romcloud.infrastructure.config import AppConfig, CacheConfig, SourceConfig, write_config
+from romcloud.infrastructure.config import (
+    AppConfig,
+    CacheConfig,
+    RemoteDataConfig,
+    SourceConfig,
+    write_config,
+)
 
 
 def _build_config(tmp_path):
@@ -21,6 +27,8 @@ def _build_config(tmp_path):
     cache_root.mkdir()
     saves_root = tmp_path / "saves"
     saves_root.mkdir()
+    remote_data_root = tmp_path / "remote-data"
+    remote_data_root.mkdir()
 
     from romcloud.infrastructure.config import SavesConfig
 
@@ -29,6 +37,7 @@ def _build_config(tmp_path):
         cache=CacheConfig(path=str(cache_root)),
         local_roms_path=str(local_roms),
         data_path=str(data_root),
+        remote_data=RemoteDataConfig(provider="local", root=str(remote_data_root)),
         saves=SavesConfig(local_path=str(saves_root)),
     )
 
@@ -53,11 +62,32 @@ class TestSavesyncStatus:
         assert result.exit_code == 0, result.output
         payload = json.loads(result.output.strip())
         assert payload["ok"] is True
+        assert payload["remote_configured"] is True
         assert payload["remote_reachable"] is True
         assert payload["xbox_enabled"] is False
         assert payload["xbox_hdd_size_bytes"] is None
         assert payload["last_upload"] is None
         assert payload["last_download"] is None
+
+    def test_reports_savesync_unavailable_without_remote_data(self, tmp_path):
+        config = _build_config(tmp_path)
+        config = AppConfig(
+            source=config.source,
+            cache=config.cache,
+            local_roms_path=config.local_roms_path,
+            data_path=config.data_path,
+            saves=config.saves,
+        )
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        cfg_path = config_dir / "romcloud.toml"
+        write_config(config, str(cfg_path))
+
+        result = _invoke(cfg_path, ["savesync-status"])
+        payload = json.loads(result.output.strip())
+
+        assert payload["remote_configured"] is False
+        assert payload["remote_reachable"] is False
 
 
 class TestSavesyncPreview:

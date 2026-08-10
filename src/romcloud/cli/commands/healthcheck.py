@@ -77,18 +77,26 @@ def healthcheck_cmd(ctx: click.Context) -> None:
     data_path = Path(config.data_path)
     check("Data directory writable", _can_write(data_path), str(data_path))
 
-    # Mounted SMB source (only relevant for the mounted-SMB deployment model).
-    if config.smb is not None:
-        from romcloud.infrastructure import mount_worker
+    # SaveSync's optional destination has a stricter reachability contract:
+    # local roots must pass a real write probe, while SMB roots must be an
+    # actual read-write mount and also pass that probe.
+    if config.remote_data is not None:
+        remote_ok = container.saves.is_remote_reachable()
+        check(
+            "ROMCloud data location writable",
+            remote_ok,
+            "" if remote_ok else str(config.remote_data.root),
+        )
 
+    # Independently configured SMB-backed source/remote-data mounts.
+    from romcloud.infrastructure import mount_worker
+    if mount_worker.configured_mounts(config):
         try:
             romcloud_home = mount_worker.romcloud_home_from_config(config)
             diag = mount_worker.get_diagnostics(romcloud_home, config)
-            saves_mounted = diag.mounted if diag.saves_mounted is None else diag.saves_mounted
-            mounts_ready = diag.mounted and saves_mounted
-            check("SMB source mounted", mounts_ready, "" if mounts_ready else diag.label)
+            check("SMB locations mounted", diag.mounted, "" if diag.mounted else diag.label)
         except Exception as exc:  # noqa: BLE001 — healthcheck must never crash
-            check("SMB source mounted", False, f"error checking status: {exc}")
+            check("SMB locations mounted", False, f"error checking status: {exc}")
 
     click.echo("─" * 50)
     if ok:

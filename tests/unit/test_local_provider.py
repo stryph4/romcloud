@@ -5,7 +5,11 @@ from __future__ import annotations
 import pytest
 from pathlib import Path
 
-from romcloud.infrastructure.providers.local import LocalFilesystemProvider
+from romcloud.infrastructure.providers.local import (
+    LocalFilesystemProvider,
+    WritableLocalFilesystemProvider,
+    WritableMountedFilesystemProvider,
+)
 from romcloud.core.exceptions import ProviderError, ProviderNotReachableError, TransferError
 
 
@@ -148,3 +152,41 @@ class TestLocalFilesystemProvider:
     def test_provider_id(self):
         p = LocalFilesystemProvider()
         assert p.provider_id == "local"
+
+
+class TestWritableRemoteDataProviders:
+    def test_explicit_local_root_requires_a_real_write_probe(self, tmp_path):
+        provider = WritableLocalFilesystemProvider()
+
+        assert provider.is_reachable(str(tmp_path)) is True
+        assert list(tmp_path.glob(".romcloud-write-probe-*")) == []
+        assert provider.is_reachable(str(tmp_path / "missing")) is False
+
+    def test_mounted_root_rejects_bare_mountpoint(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "romcloud.infrastructure.mount.is_target_mounted_cifs",
+            lambda path, **kwargs: False,
+        )
+
+        provider = WritableMountedFilesystemProvider(
+            expected_server="nas.local", expected_share="ROMCloud"
+        )
+        assert provider.is_reachable(str(tmp_path)) is False
+        assert list(tmp_path.iterdir()) == []
+
+    def test_mounted_root_requires_both_rw_mode_and_write_permission(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "romcloud.infrastructure.mount.is_target_mounted_cifs",
+            lambda path, **kwargs: True,
+        )
+        monkeypatch.setattr(
+            "romcloud.infrastructure.providers.local._directory_is_writable",
+            lambda path: False,
+        )
+
+        provider = WritableMountedFilesystemProvider(
+            expected_server="nas.local", expected_share="ROMCloud"
+        )
+        assert provider.is_reachable(str(tmp_path)) is False

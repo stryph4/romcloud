@@ -40,14 +40,14 @@ class TestSourceTypeNonInteractive:
                 "--source-type",
                 "smb",
                 "--rom-root",
-                "/userdata/romcloud-source",
+                "/userdata/romcloud/source",
             ],
         )
         assert result.exit_code == 0, result.output
 
         config = load_config(str(cfg_path))
         assert config.source.provider == "local"
-        assert config.source.rom_root == "/userdata/romcloud-source"
+        assert config.source.rom_root == "/userdata/romcloud/source"
         assert config.smb is not None
 
     def test_local_source_type_has_no_smb_section(self, tmp_path):
@@ -61,6 +61,55 @@ class TestSourceTypeNonInteractive:
         config = load_config(str(cfg_path))
         assert config.source.provider == "local"
         assert config.smb is None
+        assert config.remote_data is None
+
+    def test_noninteractive_local_remote_data_is_explicit_and_writable(self, tmp_path):
+        cfg_path = tmp_path / "romcloud.toml"
+        remote_root = tmp_path / "remote-data"
+        result = _run(
+            cfg_path,
+            [
+                "--non-interactive",
+                "--source-type",
+                "local",
+                "--rom-root",
+                str(tmp_path / "roms"),
+                "--cache-root",
+                str(tmp_path / "cache"),
+                "--remote-data-type",
+                "local",
+                "--remote-data-root",
+                str(remote_root),
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        config = load_config(str(cfg_path))
+        assert config.remote_data.provider == "local"
+        assert config.remote_data.root == str(remote_root)
+        assert remote_root.is_dir()
+
+    def test_remote_data_cannot_be_placed_under_rom_source(self, tmp_path):
+        cfg_path = tmp_path / "romcloud.toml"
+        rom_root = tmp_path / "roms"
+        result = _run(
+            cfg_path,
+            [
+                "--non-interactive",
+                "--source-type",
+                "local",
+                "--rom-root",
+                str(rom_root),
+                "--remote-data-type",
+                "local",
+                "--remote-data-root",
+                str(rom_root / "ROMCloud"),
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "must not overlap" in result.output
+        assert not cfg_path.exists()
 
     def test_smb_source_type_defaults_rom_root_to_mount_point(self, tmp_path):
         """Without --rom-root, an SMB source type must default to a sensible
@@ -70,7 +119,7 @@ class TestSourceTypeNonInteractive:
         assert result.exit_code == 0, result.output
 
         config = load_config(str(cfg_path))
-        assert config.source.rom_root == "/userdata/romcloud-source"
+        assert config.source.rom_root == "/userdata/romcloud/source"
 
     def test_default_source_type_is_local(self, tmp_path):
         cfg_path = tmp_path / "romcloud.toml"
@@ -93,7 +142,10 @@ class TestSourceTypeNonInteractive:
 from types import SimpleNamespace  # noqa: E402
 
 import romcloud.cli.commands.configure as configure_cmd_module  # noqa: E402
-from romcloud.infrastructure.credentials import load_smb_password  # noqa: E402
+from romcloud.infrastructure.credentials import (  # noqa: E402
+    load_remote_data_smb_password,
+    load_smb_password,
+)
 
 
 def _fake_setup_result(**overrides):
@@ -121,9 +173,9 @@ class TestConfigureDelegatesToReusableSmbService:
         runner = CliRunner()
         result = runner.invoke(
             configure_cmd,
-            ["--source-type", "smb", "--rom-root", "/userdata/romcloud-source"],
+            ["--source-type", "smb", "--rom-root", "/userdata/romcloud/source"],
             obj={"config_path": str(cfg_path)},
-            input="/userdata/romcloud-cache\n50\n5\n",
+            input="n\n/userdata/romcloud/cache\n50\n5\n",
         )
 
         assert result.exit_code == 0, result.output
@@ -134,6 +186,59 @@ class TestConfigureDelegatesToReusableSmbService:
 
         creds_path = cfg_path.parent / "credentials.toml"
         assert load_smb_password(creds_path) == "hunter2"
+
+    def test_source_and_remote_smb_wizards_persist_independent_targets(
+        self, tmp_path, monkeypatch
+    ):
+        cfg_path = tmp_path / "romcloud.toml"
+        results = iter(
+            [
+                _fake_setup_result(
+                    server="rom-nas", share="ROMs", password="rom-secret"
+                ),
+                _fake_setup_result(
+                    server="data-nas",
+                    share="ROMCloud",
+                    username="writer",
+                    password="data-secret",
+                    detected_systems=(),
+                ),
+            ]
+        )
+        calls = []
+        monkeypatch.setattr(
+            configure_cmd_module,
+            "build_default_smb_discovery_service",
+            lambda: "fake-discovery",
+        )
+
+        def fake_wizard(discovery, **kwargs):
+            calls.append(kwargs)
+            return next(results)
+
+        monkeypatch.setattr(
+            configure_cmd_module, "run_smb_setup_wizard", fake_wizard
+        )
+
+        result = CliRunner().invoke(
+            configure_cmd,
+            ["--source-type", "smb"],
+            obj={"config_path": str(cfg_path)},
+            input="\ny\n\n\n50\n5\n",
+        )
+
+        assert result.exit_code == 0, result.output
+        config = load_config(str(cfg_path))
+        assert config.smb.server == "rom-nas"
+        assert config.remote_data.smb.server == "data-nas"
+        assert config.remote_data.smb.share == "ROMCloud"
+        assert calls[1] == {
+            "purpose": "ROMCloud data location",
+            "detect_systems": False,
+        }
+        creds_path = cfg_path.parent / "credentials.toml"
+        assert load_smb_password(creds_path) == "rom-secret"
+        assert load_remote_data_smb_password(creds_path) == "data-secret"
 
     def test_wizard_receives_service_from_factory(self, tmp_path, monkeypatch):
         """The CLI must not construct discovery logic itself — it must use
@@ -152,9 +257,9 @@ class TestConfigureDelegatesToReusableSmbService:
 
         CliRunner().invoke(
             configure_cmd,
-            ["--source-type", "smb", "--rom-root", "/userdata/romcloud-source"],
+            ["--source-type", "smb", "--rom-root", "/userdata/romcloud/source"],
             obj={"config_path": str(cfg_path)},
-            input="/userdata/romcloud-cache\n50\n5\n",
+            input="n\n/userdata/romcloud/cache\n50\n5\n",
         )
 
         assert received["discovery"] is sentinel
@@ -173,7 +278,7 @@ class TestConfigurePreservesExistingStateOnCancellation:
         runner = CliRunner()
         result = runner.invoke(
             configure_cmd,
-            ["--source-type", "smb", "--rom-root", "/userdata/romcloud-source"],
+            ["--source-type", "smb", "--rom-root", "/userdata/romcloud/source"],
             obj={"config_path": str(cfg_path)},
             input="y\n",  # "Update it?" confirm, since an existing config was found
         )
@@ -189,7 +294,7 @@ class TestConfigurePreservesExistingStateOnCancellation:
 
         CliRunner().invoke(
             configure_cmd,
-            ["--source-type", "smb", "--rom-root", "/userdata/romcloud-source"],
+            ["--source-type", "smb", "--rom-root", "/userdata/romcloud/source"],
             obj={"config_path": str(cfg_path)},
         )
 
@@ -220,9 +325,9 @@ class TestConfigureTransactionalPersistence:
         runner = CliRunner()
         result = runner.invoke(
             configure_cmd,
-            ["--source-type", "smb", "--rom-root", "/userdata/romcloud-source"],
+            ["--source-type", "smb", "--rom-root", "/userdata/romcloud/source"],
             obj={"config_path": str(cfg_path)},
-            input="/userdata/romcloud-cache\n50\n5\n",
+            input="n\n/userdata/romcloud/cache\n50\n5\n",
         )
 
         assert result.exit_code != 0
@@ -250,10 +355,9 @@ class TestConfigureTransactionalPersistence:
 
         CliRunner().invoke(
             configure_cmd,
-            ["--source-type", "smb", "--rom-root", "/userdata/romcloud-source"],
+            ["--source-type", "smb", "--rom-root", "/userdata/romcloud/source"],
             obj={"config_path": str(cfg_path)},
-            input="/userdata/romcloud-cache\n50\n5\n",
+            input="n\n/userdata/romcloud/cache\n50\n5\n",
         )
 
         assert order == ["config", "credentials"]
-

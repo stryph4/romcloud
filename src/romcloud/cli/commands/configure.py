@@ -11,13 +11,20 @@ from romcloud.infrastructure.config import (
     AppConfig,
     CacheConfig,
     LoggingConfig,
+    RemoteDataConfig,
+    SavesConfig,
     SMBConfig,
     SourceConfig,
+    paths_overlap,
     default_config_path,
     load_config,
     write_config,
 )
-from romcloud.infrastructure.credentials import write_smb_password
+from romcloud.infrastructure.credentials import (
+    write_remote_data_smb_password,
+    write_smb_password,
+)
+from romcloud.infrastructure.providers.local import WritableLocalFilesystemProvider
 from romcloud.infrastructure.smb_discovery_client import build_default_smb_discovery_service
 
 
@@ -31,6 +38,17 @@ from romcloud.infrastructure.smb_discovery_client import build_default_smb_disco
     "--cache-root",
     default=None,
     help="Where to store cached ROMs locally.",
+)
+@click.option(
+    "--remote-data-type",
+    default=None,
+    type=click.Choice(["none", "local", "smb"], case_sensitive=False),
+    help="Writable ROMCloud data storage for SaveSync: none, local, or SMB.",
+)
+@click.option(
+    "--remote-data-root",
+    default=None,
+    help="Explicit writable local/USB ROMCloud data directory.",
 )
 @click.option(
     "--source-type",
@@ -51,6 +69,8 @@ def configure_cmd(
     ctx: click.Context,
     rom_root: str | None,
     cache_root: str | None,
+    remote_data_type: str | None,
+    remote_data_root: str | None,
     source_type: str | None,
     non_interactive: bool,
 ) -> None:
@@ -91,12 +111,12 @@ def configure_cmd(
         if source_type == "smb":
             rom_root = click.prompt(
                 "Local mount point for the SMB share",
-                default="/userdata/romcloud-source",
+                default="/userdata/romcloud/source",
             )
         else:
             rom_root = click.prompt("ROM root path", default="/mnt/rom-source/ROMs")
     if rom_root is None:
-        rom_root = "/userdata/romcloud-source" if source_type == "smb" else "/userdata/roms"
+        rom_root = "/userdata/romcloud/source" if source_type == "smb" else "/userdata/roms"
 
     # ── SMB settings ──────────────────────────────────────────────────────────
     # Persisted regardless of how the source is actually read at runtime — the
@@ -129,19 +149,118 @@ def configure_cmd(
         else:
             smb_cfg = SMBConfig(server="localhost", share="ROMs", username="guest")
 
+    # ── general writable ROMCloud data storage ───────────────────────────────
+    remote_data = existing.remote_data if existing is not None else None
+    remote_password: str | None = None
+    if remote_data_type is None and not non_interactive:
+        use_remote = click.confirm(
+            "Configure writable ROMCloud data storage for SaveSync?",
+            default=remote_data is not None,
+        )
+        if use_remote:
+            remote_data_type = click.prompt(
+                "ROMCloud data storage type",
+                type=click.Choice(["local", "smb"], case_sensitive=False),
+                default=remote_data.provider if remote_data is not None else "smb",
+            )
+        else:
+            remote_data_type = "none"
+    elif remote_data_type is None:
+        remote_data_type = remote_data.provider if remote_data is not None else "none"
+
+    remote_data_type = remote_data_type.lower()
+    if remote_data_type == "none":
+        remote_data = None
+    elif remote_data_type == "local":
+        if remote_data_root is None and not non_interactive:
+            existing_root = (
+                remote_data.root
+                if remote_data is not None and remote_data.provider == "local"
+                else "/userdata/romcloud/remote"
+            )
+            remote_data_root = click.prompt(
+                "Writable ROMCloud data directory",
+                default=existing_root,
+            )
+        remote_data_root = remote_data_root or "/userdata/romcloud/remote"
+        root_path = Path(remote_data_root)
+        if not root_path.is_absolute():
+            raise click.ClickException(
+                "ROMCloud data directory must be an explicit absolute path."
+            )
+        effective_data_path = (
+            Path(existing.data_path)
+            if existing is not None
+            else config_path.parent.parent / "data"
+        )
+        effective_saves_path = Path(
+            existing.saves.local_path if existing is not None else SavesConfig().local_path
+        )
+        for label, other in (
+            ("ROM source", Path(rom_root)),
+            ("ROMCloud system data", effective_data_path),
+            ("local save source", effective_saves_path),
+        ):
+            if paths_overlap(root_path, other):
+                raise click.ClickException(
+                    f"ROMCloud data directory must not overlap the {label}: {other}"
+                )
+        remote_data = RemoteDataConfig(provider="local", root=str(root_path))
+    else:
+        if non_interactive:
+            if remote_data is None or remote_data.provider != "smb":
+                raise click.ClickException(
+                    "Non-interactive SMB remote data requires an existing configured target."
+                )
+        else:
+            click.echo("\nChoose an independent writable SMB location for ROMCloud data.")
+            discovery = build_default_smb_discovery_service()
+            remote_result = run_smb_setup_wizard(
+                discovery,
+                purpose="ROMCloud data location",
+                detect_systems=False,
+            )
+            if remote_result is None:
+                click.echo("\nSetup cancelled — existing configuration left unchanged.")
+                ctx.exit(1)
+                return
+            remote_data = RemoteDataConfig(
+                provider="smb",
+                root="/userdata/romcloud/remote",
+                smb=SMBConfig(
+                    server=remote_result.server,
+                    share=remote_result.share,
+                    username=remote_result.username,
+                    port=remote_result.port,
+                ),
+            )
+            remote_password = remote_result.password
+
     # ── cache ─────────────────────────────────────────────────────────────────
     if cache_root is None and not non_interactive:
         cache_root = click.prompt(
             "Cache directory",
-            default="/userdata/romcloud-cache",
+            default="/userdata/romcloud/cache",
         )
-    cache_root = cache_root or "/userdata/romcloud-cache"
+    cache_root = cache_root or "/userdata/romcloud/cache"
 
     max_gb: float = 50.0
     min_free_gb: float = 5.0
     if not non_interactive:
         max_gb = click.prompt("Max cache size (GB)", default=50.0, type=float)
         min_free_gb = click.prompt("Min free disk space (GB)", default=5.0, type=float)
+
+    if remote_data is not None and remote_data.provider == "local":
+        root_path = Path(remote_data.root)
+        if paths_overlap(root_path, Path(cache_root)):
+            raise click.ClickException(
+                f"ROMCloud data directory must not overlap the cache: {cache_root}"
+            )
+        root_path.mkdir(parents=True, exist_ok=True)
+        if not WritableLocalFilesystemProvider().is_reachable(str(root_path)):
+            raise click.ClickException(
+                f"ROMCloud data directory is not writable: {root_path}"
+            )
 
     # ── build and write ───────────────────────────────────────────────────────
     # Advanced settings (local_roms_path, data_path, logging) are preserved
@@ -170,6 +289,8 @@ def configure_cmd(
             path=str(_default_home / "logs"),
         ),
         smb=smb_cfg,
+        remote_data=remote_data,
+        saves=existing.saves if existing else SavesConfig(),
     )
 
     written = write_config(config, str(config_path))
@@ -179,12 +300,17 @@ def configure_cmd(
         creds_path = config_path.parent / "credentials.toml"
         write_smb_password(creds_path, smb_password)
         click.echo(f"Credentials written to {creds_path} (mode 0600)")
+    if remote_password:
+        creds_path = config_path.parent / "credentials.toml"
+        write_remote_data_smb_password(creds_path, remote_password)
+        click.echo("Remote-data credentials stored separately (mode 0600)")
 
-    if smb_cfg is not None:
+    if smb_cfg is not None or (
+        remote_data is not None and remote_data.provider == "smb"
+    ):
         click.echo(
-            "Run `romcloud mount start` to mount the SMB share, then "
+            "Run `romcloud mount start` to mount the configured SMB location(s), then "
             "`romcloud healthcheck` to verify the setup."
         )
     else:
         click.echo("Run `romcloud healthcheck` to verify the setup.")
-

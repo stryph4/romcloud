@@ -170,6 +170,8 @@ def uidata_healthcheck(ctx: click.Context) -> None:
         payload = {
             "source_provider": config.source.provider,
             "source_reachable": reachable,
+            "remote_data_configured": container.saves.is_remote_configured,
+            "remote_data_reachable": container.saves.is_remote_reachable(),
         }
         payload.update(source_display_summary(config))
         return payload
@@ -230,6 +232,7 @@ def uidata_savesync_status(ctx: click.Context) -> None:
         saves = get_container(ctx).saves
         state = saves.get_state()
         return {
+            "remote_configured": saves.is_remote_configured,
             "remote_reachable": saves.is_remote_reachable(),
             "xbox_enabled": saves.xbox_enabled,
             "xbox_hdd_size_bytes": saves.xbox_hdd_size(),

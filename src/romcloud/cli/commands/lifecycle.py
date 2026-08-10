@@ -78,7 +78,10 @@ def uninstall_cmd(ctx: click.Context, yes: bool) -> None:
         click.echo("Uninstall cancelled.")
         return
     romcloud_home, config = _paths(ctx, allow_missing=True)
-    report = manage.uninstall(config=config, romcloud_home=romcloud_home)
+    try:
+        report = manage.uninstall(config=config, romcloud_home=romcloud_home)
+    except Exception as exc:  # noqa: BLE001
+        raise click.ClickException(str(exc)) from exc
     click.echo(f"ROMCloud uninstalled. Removed proxies: {report.proxies_removed}")
 
 
@@ -96,5 +99,8 @@ def purge_cmd(ctx: click.Context, yes: bool) -> None:
         click.echo("Purge cancelled.")
         return
     romcloud_home, config = _paths(ctx, allow_missing=True)
-    report = manage.purge(config=config, romcloud_home=romcloud_home)
+    try:
+        report = manage.purge(config=config, romcloud_home=romcloud_home)
+    except Exception as exc:  # noqa: BLE001
+        raise click.ClickException(str(exc)) from exc
     click.echo(f"ROMCloud purged. Removed proxies: {report.proxies_removed}")

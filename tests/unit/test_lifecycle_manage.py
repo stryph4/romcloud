@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,19 @@ from click.testing import CliRunner
 from romcloud.cli.main import cli
 from romcloud.core.models.game import Game, GameAsset
 from romcloud.core.models.proxy import ProxyRecord
-from romcloud.infrastructure.config import AppConfig, CacheConfig, LoggingConfig, SourceConfig, write_config
+from romcloud.infrastructure.config import (
+    AppConfig,
+    CacheConfig,
+    LoggingConfig,
+    RemoteDataConfig,
+    SMBConfig,
+    SourceConfig,
+    write_config,
+)
+from romcloud.infrastructure.credentials import (
+    cifs_credentials_path,
+    remote_data_cifs_credentials_path,
+)
 from romcloud.infrastructure.database import Database
 from romcloud.infrastructure.repositories.game import GameRepository
 from romcloud.infrastructure.repositories.proxy import ProxyRepository
@@ -183,6 +196,90 @@ def test_purge_removes_owned_state_and_signed_orphan_only(
     assert not cache.exists()
     assert not proxy.exists() and not signed_orphan.exists()
     assert foreign_proxy.exists() and real_rom.exists() and unrelated.exists()
+
+
+def test_purge_preserves_user_controlled_remote_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, home, _local_roms, _cache = _config(tmp_path)
+    remote_root = tmp_path / "remote-data"
+    remote_save = remote_root / "saves" / "psx" / "Game.srm"
+    remote_save.parent.mkdir(parents=True)
+    remote_save.write_bytes(b"user-save")
+    config = replace(
+        config,
+        remote_data=RemoteDataConfig(provider="local", root=str(remote_root)),
+    )
+    write_config(config, str(home / "config" / "romcloud.toml"))
+    _isolate_integrations(monkeypatch)
+
+    manage.purge(config=config, romcloud_home=home, ports_dir=tmp_path / "ports")
+
+    assert remote_save.read_bytes() == b"user-save"
+
+
+def test_uninstall_unmounts_remote_before_source_and_removes_both_helpers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, home, _local_roms, _cache = _config(tmp_path)
+    remote_root = tmp_path / "remote-mount"
+    remote_root.mkdir()
+    config = replace(
+        config,
+        smb=SMBConfig("rom-nas", "ROMs", "reader"),
+        remote_data=RemoteDataConfig(
+            provider="smb",
+            root=str(remote_root),
+            smb=SMBConfig("data-nas", "ROMCloud", "writer"),
+        ),
+    )
+    for helper in (
+        cifs_credentials_path(config.credentials_path),
+        remote_data_cifs_credentials_path(config.credentials_path),
+    ):
+        helper.parent.mkdir(parents=True, exist_ok=True)
+        helper.write_text("temporary helper")
+    calls = []
+    _isolate_integrations(monkeypatch)
+    monkeypatch.setattr(
+        manage.mountlib,
+        "unmount_cifs_source",
+        lambda path: calls.append(path) or True,
+    )
+
+    manage.uninstall(config=config, romcloud_home=home, ports_dir=tmp_path / "ports")
+
+    assert calls == [str(remote_root), config.source.rom_root]
+    assert not cifs_credentials_path(config.credentials_path).exists()
+    assert not remote_data_cifs_credentials_path(config.credentials_path).exists()
+
+
+def test_uninstall_stops_before_runtime_removal_if_a_mount_cannot_unmount(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, home, _local_roms, _cache = _config(tmp_path)
+    (home / "bin").mkdir(parents=True)
+    runtime_file = home / "bin" / "romcloud"
+    runtime_file.write_text("keep until mount is safe")
+    config = replace(config, smb=SMBConfig("rom-nas", "ROMs", "reader"))
+    calls = []
+    _isolate_integrations(monkeypatch)
+    monkeypatch.setattr(
+        manage.mountlib,
+        "unmount_cifs_source",
+        lambda path: (_ for _ in ()).throw(RuntimeError("target busy")),
+    )
+    monkeypatch.setattr(
+        manage.mount_service,
+        "remove_service",
+        lambda: calls.append("service"),
+    )
+
+    with pytest.raises(RuntimeError, match="uninstall stopped"):
+        manage.uninstall(config=config, romcloud_home=home)
+
+    assert runtime_file.exists()
+    assert calls == []
 
 
 def test_purge_refuses_cache_root_containing_real_roms(

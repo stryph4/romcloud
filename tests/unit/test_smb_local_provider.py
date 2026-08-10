@@ -46,7 +46,7 @@ class TestConfigureNeverSelectsSmbProvider:
 
     def test_smb_source_writes_provider_local_and_smb_section(self, tmp_path):
         config = _base_config(
-            source=SourceConfig(provider="local", rom_root="/userdata/romcloud-source"),
+            source=SourceConfig(provider="local", rom_root="/userdata/romcloud/source"),
             smb=SMBConfig(server="nas.local", share="ROMs", username="alice"),
         )
         cfg_path = tmp_path / "romcloud.toml"
@@ -68,7 +68,7 @@ class TestContainerResolvesLocalProvider:
 
     def test_smb_configured_source_resolves_to_local_provider(self):
         config = _base_config(
-            source=SourceConfig(provider="local", rom_root="/userdata/romcloud-source"),
+            source=SourceConfig(provider="local", rom_root="/userdata/romcloud/source"),
             smb=SMBConfig(server="nas.local", share="ROMs"),
         )
         container = Container(config)
@@ -84,7 +84,7 @@ class TestLegacySmbProviderMigration:
         cfg_path.write_text(
             "[source]\n"
             'provider = "smb"\n'
-            'rom_root = "/userdata/romcloud-source"\n'
+            'rom_root = "/userdata/romcloud/source"\n'
             "\n"
             "[smb]\n"
             'server = "nas.local"\n'
@@ -103,7 +103,7 @@ class TestLegacySmbProviderMigration:
         cfg_path.write_text(
             "[source]\n"
             'provider = "smb"\n'
-            'rom_root = "/userdata/romcloud-source"\n',
+            'rom_root = "/userdata/romcloud/source"\n',
             encoding="utf-8",
         )
         with pytest.raises(ConfigurationError, match="smb"):
@@ -115,7 +115,7 @@ class TestLegacySmbProviderMigration:
         cfg_path.write_text(
             "[source]\n"
             'provider = "smb"\n'
-            'rom_root = "/userdata/romcloud-source"\n'
+            'rom_root = "/userdata/romcloud/source"\n'
             "\n"
             "[smb]\n"
             'server = "nas.local"\n'
@@ -155,7 +155,7 @@ class TestMountCommandsStillSeeSmbConfig:
 
     def test_smb_section_survives_round_trip_with_local_provider(self, tmp_path):
         config = _base_config(
-            source=SourceConfig(provider="local", rom_root="/userdata/romcloud-source"),
+            source=SourceConfig(provider="local", rom_root="/userdata/romcloud/source"),
             smb=SMBConfig(server="nas.local", share="ROMs", username="alice", port=445),
         )
         cfg_path = tmp_path / "romcloud.toml"
@@ -167,14 +167,14 @@ class TestMountCommandsStillSeeSmbConfig:
         assert reloaded.smb.server == "nas.local"
         assert reloaded.smb.share == "ROMs"
         assert reloaded.smb.username == "alice"
-        assert reloaded.source.rom_root == "/userdata/romcloud-source"
+        assert reloaded.source.rom_root == "/userdata/romcloud/source"
 
     def test_legacy_migrated_config_also_retains_smb_for_mount(self, tmp_path):
         cfg_path = tmp_path / "romcloud.toml"
         cfg_path.write_text(
             "[source]\n"
             'provider = "smb"\n'
-            'rom_root = "/userdata/romcloud-source"\n'
+            'rom_root = "/userdata/romcloud/source"\n'
             "\n"
             "[smb]\n"
             'server = "nas.local"\n'

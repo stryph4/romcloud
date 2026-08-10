@@ -351,6 +351,13 @@ def reconcile_install(
     config_path = romcloud_home / "config" / "romcloud.toml"
     resolved_ports_dir = Path(ports_dir) if ports_dir else DEFAULT_PORTS_DIR
 
+    try:
+        from romcloud.lifecycle.runtime_layout import reconcile_legacy_runtime_layout
+
+        reconcile_legacy_runtime_layout(config_path)
+    except Exception:  # noqa: BLE001 - optional conservative migration
+        log.warning("Failed to reconcile legacy runtime paths", exc_info=True)
+
     core = write_core_wrappers(bin_dir, venv_python)
 
     ports_ui = install_ports_ui(

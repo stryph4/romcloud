@@ -38,7 +38,7 @@ def test_local_vertical_slice(tmp_path: Path) -> None:
     The scenario mirrors a real user setup:
     - ROM source: a mounted filesystem with Batocera folder structure
     - Local ROM dir: /userdata/roms (proxy files placed here)
-    - Cache: /userdata/romcloud-cache (ROM copies placed here)
+    - Cache: /userdata/romcloud/cache (ROM copies placed here)
     - SQLite catalog: /userdata/system/romcloud/data/catalog.db
     """
 
@@ -482,5 +482,4 @@ def test_cue_bin_full_cache_hit_bypasses_transfer(tmp_path: Path) -> None:
     )
     cache_svc.cache_game(game.id)  # must short-circuit before touching transfer
     assert calls == []
-
 

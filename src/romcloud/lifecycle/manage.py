@@ -14,7 +14,10 @@ from romcloud.bootstrap.container import Container
 from romcloud.infrastructure import mount as mountlib
 from romcloud.infrastructure import mount_worker
 from romcloud.infrastructure.config import AppConfig
-from romcloud.infrastructure.credentials import cifs_credentials_path
+from romcloud.infrastructure.credentials import (
+    cifs_credentials_path,
+    remote_data_cifs_credentials_path,
+)
 from romcloud.integrations.batocera import es_config, mount_service, ports_gamelist_config
 from romcloud.lifecycle import install
 
@@ -166,18 +169,25 @@ def uninstall(
 ) -> LifecycleReport:
     resolved_ports_dir = ports_dir or install.DEFAULT_PORTS_DIR
     mount_worker.stop_worker(romcloud_home)
-    if config.smb is not None:
+    unmount_errors: list[str] = []
+    if mount_worker.configured_mounts(config):
         for target in reversed(mount_worker.configured_mounts(config)):
             try:
                 mountlib.unmount_cifs_source(target.mount_point)
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001 - attempt every configured target
+                unmount_errors.append(f"{target.label}: {exc}")
+    if unmount_errors:
+        raise RuntimeError(
+            "Could not unmount all ROMCloud SMB locations; uninstall stopped "
+            f"before removing runtime state: {'; '.join(unmount_errors)}"
+        )
     mount_service.remove_service()
     es_config.remove()
     ports_gamelist_config.remove(ports_dir=resolved_ports_dir)
     proxies_removed = remove_owned_proxies(config)
     mount_worker.cleanup_runtime_state(romcloud_home)
     cifs_credentials_path(config.credentials_path).unlink(missing_ok=True)
+    remote_data_cifs_credentials_path(config.credentials_path).unlink(missing_ok=True)
     (config.credentials_path.parent / "setup-state.json").unlink(missing_ok=True)
 
     for name in ("bin", "venv", "ports-gfx"):
@@ -212,6 +222,8 @@ def purge(
     ports_dir: Optional[Path] = None,
 ) -> LifecycleReport:
     protected = (Path(config.local_roms_path), Path(config.source.rom_root))
+    if config.remote_data is not None:
+        protected = (*protected, Path(config.remote_data.root))
     external_roots = {Path(config.cache.path), Path(config.data_path)}
     purge_roots = [
         root for root in external_roots

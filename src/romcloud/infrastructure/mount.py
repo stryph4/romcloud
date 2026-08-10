@@ -84,6 +84,20 @@ def _mount_options(target: str, mounts_text: str) -> Optional[set[str]]:
     return None
 
 
+def _mount_record(target: str, mounts_text: str) -> Optional[tuple[str, str, set[str]]]:
+    """Return ``(source, filesystem_type, options)`` for a mounted target."""
+    normalized = os.path.normpath(target)
+    for line in mounts_text.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        mount_target = parts[1].encode().decode("unicode_escape")
+        if os.path.normpath(mount_target) == normalized:
+            source = parts[0].encode().decode("unicode_escape")
+            return source, parts[2].lower(), set(parts[3].split(","))
+    return None
+
+
 def is_mounted(target: str, mounts_text: str) -> bool:
     """Pure check: is *target* listed as a mount point in *mounts_text*?
 
@@ -133,6 +147,68 @@ def is_target_mounted_read_only(
         raise MountError(f"Cannot read {proc_mounts_path}: {exc}") from exc
     options = _mount_options(target, mounts_text)
     return options is not None and "ro" in options
+
+
+def is_mounted_cifs_target(
+    target: str,
+    mounts_text: str,
+    *,
+    server: Optional[str] = None,
+    share: Optional[str] = None,
+    read_only: Optional[bool] = None,
+) -> bool:
+    """Require a CIFS mount at *target* with the expected identity and mode.
+
+    ``server=None`` accepts any server spelling while still requiring the
+    expected share. The read-only ROM source uses that form because its boot
+    fast path may mount through a cached IP address. Writable remote data
+    always supplies both server and share.
+    """
+    record = _mount_record(target, mounts_text)
+    if record is None:
+        return False
+    source, filesystem_type, options = record
+    if filesystem_type != "cifs" or not source.startswith("//"):
+        return False
+    try:
+        mounted_server, mounted_share = source[2:].split("/", 1)
+    except ValueError:
+        return False
+    if server is not None and mounted_server.casefold() != server.casefold():
+        return False
+    if (
+        share is not None
+        and mounted_share.rstrip("/").casefold() != share.rstrip("/").casefold()
+    ):
+        return False
+    if read_only is True and "ro" not in options:
+        return False
+    if read_only is False and "rw" not in options:
+        return False
+    return True
+
+
+def is_target_mounted_cifs(
+    target: str,
+    *,
+    server: Optional[str] = None,
+    share: Optional[str] = None,
+    read_only: Optional[bool] = None,
+    proc_mounts_path: str = _DEFAULT_PROC_MOUNTS,
+) -> bool:
+    """Read the mount table and apply :func:`is_mounted_cifs_target`."""
+    try:
+        with open(proc_mounts_path, "r", encoding="utf-8") as fh:
+            mounts_text = fh.read()
+    except OSError as exc:
+        raise MountError(f"Cannot read {proc_mounts_path}: {exc}") from exc
+    return is_mounted_cifs_target(
+        target,
+        mounts_text,
+        server=server,
+        share=share,
+        read_only=read_only,
+    )
 
 
 # ── reachability ──────────────────────────────────────────────────────────────
@@ -214,8 +290,8 @@ def build_mount_argv(
     """Build the `mount -t cifs` argv. Never includes the password.
 
     Read-only by default, per ROMCloud's default safety posture for ROM
-    sources. SaveSync explicitly passes ``read_only=False`` for its separate,
-    narrowly purposed mount of the same share.
+    sources. General ROMCloud remote data explicitly passes
+    ``read_only=False`` for its independently configured writable mount.
     """
     options = f"credentials={credentials_path},{'ro' if read_only else 'rw'}"
     return ["mount", "-t", "cifs", f"//{server}/{share}", str(mount_point), "-o", options]
@@ -230,7 +306,7 @@ def _classify_mount_failure(stderr: str) -> Exception:
     if any(marker in lowered for marker in _AUTH_FAILURE_MARKERS):
         return ProviderAuthError(f"SMB authentication failed: {stderr.strip()}")
     if any(marker in lowered for marker in _NETWORK_FAILURE_MARKERS):
-        return ProviderNotReachableError(f"SMB source unreachable: {stderr.strip()}")
+        return ProviderNotReachableError(f"SMB target unreachable: {stderr.strip()}")
     return MountError(f"mount failed: {stderr.strip()}")
 
 
@@ -270,16 +346,19 @@ def mount_cifs_source(
         Any other mount failure.
     """
     if is_target_mounted(mount_point, proc_mounts_path=proc_mounts_path):
-        mode_matches = (
-            is_target_mounted_read_only(mount_point, proc_mounts_path=proc_mounts_path)
-            if read_only
-            else is_target_mounted_writable(mount_point, proc_mounts_path=proc_mounts_path)
+        identity_matches = is_target_mounted_cifs(
+            mount_point,
+            server=None if read_only else server,
+            share=share,
+            read_only=read_only,
+            proc_mounts_path=proc_mounts_path,
         )
-        if not mode_matches:
+        if not identity_matches:
             expected = "read-only" if read_only else "read-write"
             raise MountError(
-                f"{mount_point} is already mounted with the wrong mode; "
-                f"unmount it before mounting the required {expected} view"
+                f"{mount_point} is already mounted with the wrong mode or SMB source; "
+                f"unmount it before mounting the required {expected} "
+                f"//{server}/{share} view"
             )
         log.info("%s is already mounted — nothing to do", mount_point)
         return MountOutcome(mounted=True, already_mounted=True, detail="already mounted")
@@ -289,7 +368,7 @@ def mount_cifs_source(
     )
     if not reach.ok:
         raise ProviderNotReachableError(
-            f"Timed out waiting for SMB source {server!r} to become reachable "
+            f"Timed out waiting for SMB target {server!r} to become reachable "
             f"({reach.stage}): {reach.detail}"
         )
 

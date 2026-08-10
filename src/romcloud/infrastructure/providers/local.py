@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -90,15 +91,47 @@ class WritableMountedFilesystemProvider(LocalFilesystemProvider):
     behind after a disconnect must not be mistaken for the remote dataset.
     """
 
+    def __init__(self, *, expected_server: str, expected_share: str) -> None:
+        self._expected_server = expected_server
+        self._expected_share = expected_share
+
     def is_reachable(self, root: str) -> bool:
         if not super().is_reachable(root):
             return False
         from romcloud.infrastructure import mount
 
         try:
-            return mount.is_target_mounted_writable(root)
+            return mount.is_target_mounted_cifs(
+                root,
+                server=self._expected_server,
+                share=self._expected_share,
+                read_only=False,
+            ) and _directory_is_writable(Path(root))
         except MountError:
             return False
+
+
+class WritableLocalFilesystemProvider(LocalFilesystemProvider):
+    """Explicit local/USB remote-data root with a real write probe."""
+
+    def is_reachable(self, root: str) -> bool:
+        path = Path(root)
+        return path.is_dir() and _directory_is_writable(path)
+
+
+def _directory_is_writable(path: Path) -> bool:
+    probe = path / f".romcloud-write-probe-{uuid.uuid4().hex}"
+    try:
+        with probe.open("x", encoding="utf-8") as fh:
+            fh.write("write probe\n")
+        probe.unlink()
+        return True
+    except OSError:
+        try:
+            probe.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
 
 
 def _entry_size(path: Path) -> Optional[int]:

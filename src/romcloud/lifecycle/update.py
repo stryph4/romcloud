@@ -36,9 +36,12 @@ Design
    reported as installed.
 7. The temp directory is always removed (success or failure).
 
-This module never touches ``romcloud.toml``, ``credentials.toml``, the
-cache root, the local ROMs directory, the catalog database, or logs — those
-are exclusively user/runtime state. It *does* rewrite the ``romcloud``/
+This module normally leaves ``romcloud.toml``, ``credentials.toml``, the
+cache root, the local ROMs directory, the catalog database, and logs alone.
+The shared reconciler has one narrow exception: it atomically rewrites exact
+pre-beta ROMCloud default mount/cache paths into the consolidated runtime
+layout, while physical cleanup remains conservative and best-effort; it never
+migrates or deletes remote synchronized data. It *does* rewrite the ``romcloud``/
 ``romcloud-run`` wrappers, ``version.json``, and — only where already
 present/configured — the graphical Ports UI payload, the Batocera mount
 service script, and ROMCloud's own EmulationStation override file.

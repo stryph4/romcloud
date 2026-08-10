@@ -6,8 +6,8 @@ dependency), upgrades the existing persistent venv in place via
 reconciles ROMCloud's own runtime artifacts (CLI/launch wrappers, the
 graphical Ports UI, and — only if previously enabled — the Batocera mount
 service script and EmulationStation override) against that same source
-revision. Never touches ``romcloud.toml``, credentials, the catalog
-database, the cache, or logs — see
+revision. It also reconciles exact historical default paths in
+``romcloud.toml``; credentials, the catalog database, and logs are left alone — see
 :mod:`romcloud.lifecycle.update` for the full design.
 """
 
@@ -88,4 +88,3 @@ def update_cmd(ctx: click.Context, check_only: bool, repo: str | None, branch: s
     click.echo(f"Updated ROMCloud to {result.new.version} ({result.new.commit_short}).")
     if result.reconcile_log:
         click.echo(result.reconcile_log)
-

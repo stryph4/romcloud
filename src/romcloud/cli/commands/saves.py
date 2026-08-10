@@ -53,7 +53,13 @@ def saves_group() -> None:
 def saves_status(ctx: click.Context) -> None:
     """Show connectivity, settings, and last successful upload/download."""
     saves = get_container(ctx).saves
-    click.echo(f"Remote save location: {'reachable' if saves.is_remote_reachable() else 'unreachable'}")
+    if not saves.is_remote_configured:
+        click.echo("ROMCloud data storage: not configured (SaveSync unavailable)")
+    else:
+        click.echo(
+            f"ROMCloud data storage: "
+            f"{'reachable and writable' if saves.is_remote_reachable() else 'unreachable or read-only'}"
+        )
     click.echo(f"Original Xbox (heavyweight, opt-in): {'enabled' if saves.xbox_enabled else 'disabled'}")
     xbox_size = saves.xbox_hdd_size()
     if xbox_size is not None:
@@ -180,4 +186,3 @@ def saves_xbox_disable(ctx: click.Context) -> None:
     """Disable Original Xbox save sync (the default)."""
     _set_xbox_enabled(ctx, False)
     click.echo("Original Xbox save sync disabled.")
-

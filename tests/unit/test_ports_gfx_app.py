@@ -120,6 +120,22 @@ class TestFormatResult:
         assert "/userdata/roms" in line
         assert "reachable" in line
 
+    def test_healthcheck_includes_remote_data_writability(self):
+        result = BackendResult(
+            ok=True,
+            data={
+                "source_type": "SMB",
+                "source_description": "rom-nas:ROMs",
+                "source_reachable": True,
+                "remote_data_configured": True,
+                "remote_data_reachable": False,
+            },
+        )
+
+        line = format_result("healthcheck", result)
+
+        assert "ROMCloud data: unreachable/read-only" in line
+
 
 class TestClassifyMessageKind:
     def test_failed_call_is_error(self):
@@ -137,6 +153,17 @@ class TestClassifyMessageKind:
     def test_healthcheck_reachable_source_is_success(self):
         result = BackendResult(ok=True, data={"ok": True, "source_reachable": True})
         assert classify_message_kind("healthcheck", result) == "success"
+
+    def test_healthcheck_unwritable_remote_data_is_warning(self):
+        result = BackendResult(
+            ok=True,
+            data={
+                "source_reachable": True,
+                "remote_data_configured": True,
+                "remote_data_reachable": False,
+            },
+        )
+        assert classify_message_kind("healthcheck", result) == "warning"
 
 
 class TestRunAppHandlesMissingPygame:

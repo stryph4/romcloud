@@ -18,11 +18,17 @@ from romcloud.infrastructure.config import (
     AppConfig,
     CacheConfig,
     LoggingConfig,
+    RemoteDataConfig,
+    SavesConfig,
     SMBConfig,
     SourceConfig,
     write_config,
 )
-from romcloud.infrastructure.credentials import write_smb_password
+from romcloud.infrastructure.credentials import (
+    load_remote_data_smb_password,
+    load_smb_password,
+    write_smb_password,
+)
 
 
 def _payload(**overrides):
@@ -31,8 +37,8 @@ def _payload(**overrides):
         "share": "ROMs",
         "username": "player",
         "password": "secret-value",
-        "rom_root": "/userdata/romcloud-source",
-        "cache_root": "/userdata/romcloud-cache",
+        "rom_root": "/userdata/romcloud/source",
+        "cache_root": "/userdata/romcloud/cache",
         "max_size_gb": 50,
         "min_free_gb": 5,
     }
@@ -43,8 +49,8 @@ def _payload(**overrides):
 def _config(config_path: Path) -> AppConfig:
     home = config_path.parent.parent
     return AppConfig(
-        source=SourceConfig("local", "/userdata/romcloud-source"),
-        cache=CacheConfig("/userdata/romcloud-cache", 50, 5),
+        source=SourceConfig("local", "/userdata/romcloud/source"),
+        cache=CacheConfig("/userdata/romcloud/cache", 50, 5),
         local_roms_path="/userdata/roms",
         data_path=str(home / "data"),
         logging=LoggingConfig(),
@@ -75,13 +81,16 @@ class _Discovery:
 
 
 class _Container:
-    def __init__(self, config, *, errors=()):
+    def __init__(self, config, *, errors=(), remote_reachable=True):
         self.config = config
         self.catalog = SimpleNamespace(refresh=lambda: SimpleNamespace(errors=errors))
         self.game_repo = SimpleNamespace(list_systems=lambda: ["psx", "snes"])
+        self.saves = SimpleNamespace(is_remote_reachable=lambda: remote_reachable)
 
 
-def _patch_apply_dependencies(monkeypatch, *, refresh_errors=(), mount_error=None):
+def _patch_apply_dependencies(
+    monkeypatch, *, refresh_errors=(), mount_error=None, remote_reachable=True
+):
     monkeypatch.setattr(
         graphical_setup,
         "validate_share",
@@ -97,7 +106,11 @@ def _patch_apply_dependencies(monkeypatch, *, refresh_errors=(), mount_error=Non
     monkeypatch.setattr(
         graphical_setup,
         "Container",
-        lambda config: _Container(config, errors=refresh_errors),
+        lambda config: _Container(
+            config,
+            errors=refresh_errors,
+            remote_reachable=remote_reachable,
+        ),
     )
     monkeypatch.setattr(graphical_setup.es_config, "install", lambda systems: None)
 
@@ -171,15 +184,68 @@ class TestCacheValidation:
             {"max_size_gb": 0},
             {"min_free_gb": -1},
             {"cache_root": "relative/cache"},
-            {"cache_root": "/userdata/romcloud-source/cache"},
+            {"cache_root": "/userdata/romcloud/source/cache"},
         ],
     )
     def test_invalid_or_unsafe_values_are_rejected(self, changes):
         with pytest.raises(ValueError):
             SetupRequest.from_payload(_payload(**changes))
 
+    def test_defaults_use_consolidated_runtime_layout(self):
+        request = SetupRequest.from_payload(
+            {
+                "server": "nas.local",
+                "share": "ROMs",
+                "username": "player",
+                "password": "secret",
+            }
+        )
+
+        assert request.rom_root == "/userdata/romcloud/source"
+        assert request.cache_root == "/userdata/romcloud/cache"
+        assert request.remote_data_type == "none"
+
+    def test_remote_data_must_not_overlap_source_or_cache(self):
+        with pytest.raises(ValueError, match="cannot overlap"):
+            SetupRequest.from_payload(
+                _payload(
+                    remote_data_type="local",
+                    remote_data_root="/userdata/romcloud/source/data",
+                )
+            )
+
+    def test_remote_data_smb_must_not_reuse_rom_share(self):
+        with pytest.raises(ValueError, match="separate writable share"):
+            SetupRequest.from_payload(
+                _payload(
+                    remote_data_type="smb",
+                    remote_server="NAS.local",
+                    remote_share="roms",
+                    remote_username="writer",
+                    remote_password="write-secret",
+                )
+            )
+
 
 class TestApply:
+    def test_reconfigure_preserves_savesync_selection_settings(self, tmp_path):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        existing = _config(config_path)
+        existing = AppConfig(
+            **{
+                **existing.__dict__,
+                "saves": SavesConfig(local_path="/custom/saves", xbox_enabled=True),
+            }
+        )
+
+        updated = graphical_setup._build_config(
+            config_path,
+            SetupRequest.from_payload(_payload()),
+            existing,
+        )
+
+        assert updated.saves == existing.saves
+
     def test_success_marks_setup_configured(self, tmp_path, monkeypatch):
         config_path = tmp_path / "config" / "romcloud.toml"
         _patch_apply_dependencies(monkeypatch)
@@ -196,7 +262,7 @@ class TestApply:
         state_path = config_path.parent / graphical_setup.SETUP_STATE_FILENAME
         state_text = state_path.read_text()
         assert "secret-value" not in state_text
-        assert json.loads(state_text)["failed_step"] == "mount and test source"
+        assert json.loads(state_text)["failed_step"] == "mount and test storage"
         assert graphical_setup.setup_state(config_path)["state"] == "partial"
 
     def test_refresh_failure_can_be_retried(self, tmp_path, monkeypatch):
@@ -225,3 +291,122 @@ class TestApply:
         assert config_path.read_bytes() == old_config
         assert config.credentials_path.read_bytes() == old_credentials
         assert graphical_setup.setup_state(config_path)["state"] == "configured"
+
+    def test_independent_remote_smb_target_is_mounted_read_write(
+        self, tmp_path, monkeypatch
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        _patch_apply_dependencies(monkeypatch)
+        calls = []
+        monkeypatch.setattr(
+            graphical_setup,
+            "mount_cifs_source",
+            lambda *args, **kwargs: calls.append((args, kwargs)),
+        )
+        payload = _payload(
+            remote_data_type="smb",
+            remote_server="backup-nas.local",
+            remote_share="ROMCloud",
+            remote_username="sync-user",
+            remote_password="sync-secret",
+        )
+
+        graphical_setup.apply_setup(config_path, payload)
+        config = graphical_setup.load_config(str(config_path))
+
+        assert [(call[0][0], call[0][1]) for call in calls] == [
+            ("nas.local", "ROMs"),
+            ("backup-nas.local", "ROMCloud"),
+        ]
+        assert calls[0][1]["read_only"] is True
+        assert calls[1][1]["read_only"] is False
+        assert config.remote_data == RemoteDataConfig(
+            provider="smb",
+            root="/userdata/romcloud/remote",
+            smb=SMBConfig("backup-nas.local", "ROMCloud", "sync-user"),
+        )
+        assert load_smb_password(config.credentials_path) == "secret-value"
+        assert load_remote_data_smb_password(config.credentials_path) == "sync-secret"
+
+    def test_local_remote_data_root_is_persisted_only_after_writable_validation(
+        self, tmp_path, monkeypatch
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        remote_root = tmp_path / "remote-data"
+        _patch_apply_dependencies(monkeypatch)
+
+        graphical_setup.apply_setup(
+            config_path,
+            _payload(remote_data_type="local", remote_data_root=str(remote_root)),
+        )
+
+        config = graphical_setup.load_config(str(config_path))
+        assert config.remote_data == RemoteDataConfig("local", str(remote_root))
+        assert remote_root.is_dir()
+
+    def test_unwritable_remote_data_fails_without_exposing_password(
+        self, tmp_path, monkeypatch
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        _patch_apply_dependencies(monkeypatch, remote_reachable=False)
+        monkeypatch.setattr(
+            graphical_setup,
+            "mount_cifs_source",
+            lambda *args, **kwargs: SimpleNamespace(already_mounted=False),
+        )
+        unmounted = []
+        monkeypatch.setattr(
+            "romcloud.infrastructure.mount.unmount_cifs_source",
+            lambda path: unmounted.append(path) or True,
+        )
+        payload = _payload(
+            remote_data_type="smb",
+            remote_server="backup-nas.local",
+            remote_share="ROMCloud",
+            remote_username="sync-user",
+            remote_password="remote-secret-value",
+        )
+
+        with pytest.raises(RuntimeError, match="not writable"):
+            graphical_setup.apply_setup(config_path, payload)
+
+        state_text = (config_path.parent / graphical_setup.SETUP_STATE_FILENAME).read_text()
+        assert "remote-secret-value" not in state_text
+        assert unmounted == [
+            "/userdata/romcloud/remote",
+            "/userdata/romcloud/source",
+        ]
+
+    def test_failed_setup_reports_incomplete_mount_cleanup(
+        self, tmp_path, monkeypatch
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        _patch_apply_dependencies(monkeypatch, remote_reachable=False)
+        monkeypatch.setattr(
+            graphical_setup,
+            "mount_cifs_source",
+            lambda *args, **kwargs: SimpleNamespace(already_mounted=False),
+        )
+
+        def cleanup(path):
+            if path == "/userdata/romcloud/remote":
+                raise RuntimeError("target busy")
+            return True
+
+        monkeypatch.setattr(
+            "romcloud.infrastructure.mount.unmount_cifs_source", cleanup
+        )
+        payload = _payload(
+            remote_data_type="smb",
+            remote_server="backup-nas.local",
+            remote_share="ROMCloud",
+            remote_username="sync-user",
+            remote_password="remote-secret-value",
+        )
+
+        with pytest.raises(RuntimeError, match="mount cleanup failed"):
+            graphical_setup.apply_setup(config_path, payload)
+
+        state_text = (config_path.parent / graphical_setup.SETUP_STATE_FILENAME).read_text()
+        assert "target busy" in state_text
+        assert "remote-secret-value" not in state_text

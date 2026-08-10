@@ -46,7 +46,7 @@ Known compatibility limitation — folder-specific settings
 ----------------------------------------------------------
 ``snes.folder["/userdata/roms/snes"].*`` overrides are keyed on the ROM's
 **containing directory**.  Cached ROMs live under
-``/userdata/romcloud-cache/<system>/<uuid>/``, which differs from the
+``/userdata/romcloud/cache/<system>/<uuid>/``, which differs from the
 original ``/userdata/roms/<system>/`` directory used as the folder key.
 
 **Folder-level settings will not apply to cached ROMs.**
@@ -325,4 +325,3 @@ def _transfer_with_progress(container, config, game) -> str:
         from romcloud.ui.progress import run_progress_transfer
         return run_progress_transfer(container.cache, game)
     return container.cache.cache_game(game.id)
-

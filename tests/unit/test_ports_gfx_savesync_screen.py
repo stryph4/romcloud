@@ -93,11 +93,28 @@ class TestDashboardSelection:
         assert state.step == SETTINGS
 
     def test_upload_starts_preview(self):
-        state = SaveSyncScreenState(romcloud_bin="romcloud", selected_index=0)
+        state = SaveSyncScreenState(
+            romcloud_bin="romcloud",
+            selected_index=0,
+            status={"remote_configured": True},
+        )
         state.popen = _fake_popen_returning({"ok": True, "diff": {"direction": "upload", "entries": []}})
         state.confirm_dashboard_selection()
         assert state.step == PREVIEWING
         assert state.direction == "upload"
+
+    def test_upload_is_unavailable_without_configured_remote_data(self):
+        state = SaveSyncScreenState(
+            romcloud_bin="romcloud",
+            selected_index=0,
+            status={"remote_configured": False},
+        )
+
+        state.confirm_dashboard_selection()
+
+        assert state.step == DASHBOARD
+        assert "Configure writable" in state.error
+        assert state._runner is None  # noqa: SLF001
 
 
 class TestPreviewFlow:

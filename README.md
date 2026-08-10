@@ -40,7 +40,7 @@ romcloud-run
         └── cache miss
                 │
                 ▼
-        /userdata/romcloud-cache
+        /userdata/romcloud/cache
                 │
                 ▼
         Batocera emulatorlauncher
@@ -96,7 +96,8 @@ ROMCloud does not require every system to exist in the remote library. Only syst
   the unchanged maintenance dashboard.
 - The supported graphical source flow is SMB: welcome, source selection,
   server, username, masked password, share discovery and selection, system
-  detection, cache settings, review, mount/test, catalog and EmulationStation
+  detection, selection of an optional independent writable ROMCloud data
+  location, cache settings, review, mount/test, catalog and EmulationStation
   integration, then completion. Local/USB setup remains available through
   `romcloud configure` and is shown as unavailable in the graphical wizard.
 - Controller, touchscreen, and physical keyboard input all use the same
@@ -454,14 +455,14 @@ afterward to make newly registered proxies visible.
 Downloaded ROMs are stored outside EmulationStation's scanned ROM directories:
 
 ```text
-/userdata/romcloud-cache
+/userdata/romcloud/cache
 ```
 
 The cache mirrors the Batocera system namespace:
 
 ```text
-/userdata/romcloud-cache/psx/Alundra (USA).chd
-/userdata/romcloud-cache/ps2/Some Game.iso
+/userdata/romcloud/cache/psx/Alundra (USA).chd
+/userdata/romcloud/cache/ps2/Some Game.iso
 ```
 
 ROMCloud preserves the original filename so Batocera's per-game configuration continues to work correctly.
@@ -494,7 +495,7 @@ Example:
 ```text
 //omnivault/Roms
         ↓
-/userdata/romcloud-source
+/userdata/romcloud/source
         ↓
 LocalFilesystemProvider
 ```
@@ -506,13 +507,17 @@ installation opens the graphical wizard automatically; a configured
 installation opens the maintenance dashboard. Normal SMB setup requires no
 SSH, mouse, or physical keyboard.
 
-The wizard discovers accessible shares, validates the selected share,
-reports recognized Batocera system folders, validates cache limits, mounts
-the source, refreshes the catalog/proxies, and generates the EmulationStation
-override. If a late step fails, the error identifies that step and can be
-retried without persisting the password in setup state. EmulationStation must
-still be restarted or rescanned after setup; ROMCloud does not terminate or
-restart it automatically.
+The wizard discovers accessible shares, validates the selected ROM share,
+reports recognized Batocera system folders, and then asks for an optional
+writable ROMCloud data location. That location can be an independent SMB
+server/share with its own credentials or a local/external directory. If it is
+skipped, SaveSync remains unavailable. Setup validates cache limits, mounts
+the ROM source read-only and remote-data SMB target read-write, performs a
+real write probe, refreshes the catalog/proxies, and generates the
+EmulationStation override. If a late step fails, the error identifies that
+step and can be retried without persisting the password in setup state.
+EmulationStation must still be restarted or rescanned after setup; ROMCloud
+does not terminate or restart it automatically.
 
 #### CLI guided setup
 
@@ -577,7 +582,7 @@ Example configuration:
 ```toml
 [source]
 provider = "local"
-rom_root = "/userdata/romcloud-source"
+rom_root = "/userdata/romcloud/source"
 
 [smb]
 server = "omnivault"
@@ -585,14 +590,26 @@ share = "Roms"
 username = "your-user"
 port = 445
 
+[remote_data]
+# Optional general writable storage for synchronized ROMCloud data.
+provider = "smb"
+root = "/userdata/romcloud/remote"
+
+[remote_data.smb]
+# Independent from the ROM source: this may be another share or server.
+server = "backup-nas"
+share = "ROMCloud"
+username = "your-write-user"
+port = 445
+
 [saves]
-# A second mount of the same share, intentionally writable for SaveSync only.
-remote_mount_path = "/userdata/romcloud-saves-source"
-remote_subdir = "romcloud-saves"
+local_path = "/userdata/saves"
+xbox_enabled = false
 ```
 
-The SMB password is stored separately from `romcloud.toml`, atomically, with
-mode 0600.
+The ROM-source and remote-data SMB passwords are stored as independent entries
+outside `romcloud.toml`, atomically, with mode 0600. ROMCloud never assumes
+the two locations share credentials.
 
 ROMCloud can install and manage a Batocera mount service:
 
@@ -609,10 +626,15 @@ romcloud mount status
 - The service `start` routes to `romcloud mount boot-start`.
 - `boot-start` launches a detached background worker that performs SMB
   waiting and mounting; the service itself does not block Batocera's boot.
-- The worker mounts the ROM/catalog view read-only at `source.rom_root` and
-  mounts a separate SaveSync view read-write at `saves.remote_mount_path`.
-  Both views point to the same configured SMB share; ROM browsing and caching
-  never gain write access.
+- The worker mounts the ROM/catalog view read-only at `source.rom_root` and,
+  when configured, mounts the independent ROMCloud data target read-write at
+  `remote_data.root`. The targets may use different shares, servers, users,
+  and passwords. ROM browsing and caching never gain write access.
+- The SMB data target must not be the same server/share as the ROM library;
+  use a dedicated writable share (on the same server or a different one).
+- A bare directory left behind at `/userdata/romcloud/remote` after a network
+  disconnect is not accepted as remote storage. SaveSync requires a real
+  read-write mount plus a successful write probe.
 - Principle: "ROMCloud may fail; Batocera must not." The installer and
   boot service avoid interfering with Batocera's critical startup path.
 
@@ -775,17 +797,21 @@ Logs:
   /userdata/system/romcloud/logs
 
 Cache:
-  /userdata/romcloud-cache
+  /userdata/romcloud/cache
 
 Local Batocera ROMs:
   /userdata/roms
 
 Default mounted source:
-  /userdata/romcloud-source
+  /userdata/romcloud/source
 
-Default SaveSync write mount (SMB only):
-  /userdata/romcloud-saves-source
+Default remote-data mount (SMB only):
+  /userdata/romcloud/remote
 ```
+
+Mounts and cache are operational storage under `/userdata/romcloud/`.
+Configuration, credentials, catalog/state, logs, wrappers, and the private
+venv remain under `/userdata/system/romcloud/`.
 
 ---
 
@@ -803,6 +829,12 @@ Current source types:
 
 - Local / USB
 - SMB network share
+
+Optional writable ROMCloud data types:
+
+- Local / USB directory selected explicitly by the user
+- Independent SMB network location
+- None, which leaves SaveSync unavailable
 
 For SMB, the current implementation mounts the share locally and then uses the local filesystem provider internally.
 
@@ -920,6 +952,7 @@ The health check verifies things such as:
 - cache writability
 - minimum free disk space
 - ROMCloud data directory writability
+- remote-data mount presence, read-write mode, and actual writability when configured
 
 The long-term goal is for failures to be reported in user-friendly language rather than exposing raw Linux errors.
 
@@ -950,8 +983,8 @@ integrations, and missing generated proxies. `romcloud uninstall` removes the
 runtime and active Batocera integration while preserving configuration,
 credentials, catalog, cache, and logs for a later reinstall. `romcloud purge`
 also removes that retained ROMCloud state and requires confirmation unless
-`--yes` is supplied. Neither removal command deletes real ROMs or unrelated
-EmulationStation metadata/artwork.
+`--yes` is supplied. Neither removal command deletes real ROMs, user-controlled
+remote synchronized data, or unrelated EmulationStation metadata/artwork.
 
 Run:
 
@@ -1085,9 +1118,25 @@ parsing for those has not been written yet.
 
 ### Save sync
 
-Save synchronization is planned but not complete.
+SaveSync v1 is manual and directional. `romcloud saves upload` and
+`romcloud saves download` always preview a whole-dataset diff and require
+confirmation (unless `--yes` is supplied). The graphical SaveSync screen calls
+the same `SaveSyncService` through the backend bridge.
 
-The intended design keeps save synchronization separate from ROM caching and avoids silently overwriting conflicting saves.
+SaveSync is available only after an explicit writable `[remote_data]` target
+is configured. Its live dataset is fixed at:
+
+```text
+<remote_data.root>/saves/
+```
+
+ROMCloud owns the `saves/` directory and its sibling transaction artifacts;
+the user selects only the general data root/share. Upload/download stages a
+complete replacement beside the live dataset, verifies sizes and hashes,
+then swaps directories transactionally. Failed stages are removed, interrupted
+swaps are recovered conservatively, and sync state advances only after the
+commit succeeds. Original Xbox virtual-disk synchronization remains explicit
+opt-in because it transfers the entire `xbox_hdd.qcow2` artifact.
 
 ---
 
@@ -1161,6 +1210,7 @@ The ideal end-user flow is eventually:
 Install ROMCloud
 → choose ROM source
 → enter network credentials if needed
+→ choose optional writable ROMCloud data storage for SaveSync
 → choose cache size
 → enable integration
 → refresh library

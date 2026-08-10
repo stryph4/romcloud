@@ -56,7 +56,7 @@ _ROMCLOUD_ARGV: list[str] = [
     "-systemname", _SYSTEMNAME,
 ]
 
-_CACHED_ROM = "/userdata/romcloud-cache/snes/abc123/Chrono Trigger.sfc"
+_CACHED_ROM = "/userdata/romcloud/cache/snes/abc123/Chrono Trigger.sfc"
 
 # Expected argv[0] that reaches emulatorlauncher
 _EL = "emulatorlauncher"
@@ -256,7 +256,7 @@ class TestEmulatorLauncherWithRom:
             _WRAPPER, "-system", "xbox", "-rom",
             "/userdata/roms/xbox/Aeon Flux.romcloud",
         ]
-        cached_iso = "/userdata/romcloud-cache/xbox/Aeon Flux.iso"
+        cached_iso = "/userdata/romcloud/cache/xbox/Aeon Flux.iso"
         captured = {}
         monkeypatch.setattr("os.execvp", lambda f, a: captured.update(args=list(a)))
 

@@ -56,7 +56,7 @@ def _error_message(error_kind: Optional[SMBErrorKind], detail: str) -> str:
 
 @dataclass(frozen=True)
 class SMBSetupResult:
-    """A fully validated SMB source, staged in memory — nothing has been
+    """A fully validated SMB location, staged in memory — nothing has been
     persisted yet."""
 
     server: str
@@ -67,7 +67,12 @@ class SMBSetupResult:
     detected_systems: tuple[str, ...]
 
 
-def run_smb_setup_wizard(discovery: SMBDiscoveryService) -> Optional[SMBSetupResult]:
+def run_smb_setup_wizard(
+    discovery: SMBDiscoveryService,
+    *,
+    purpose: str = "ROM library",
+    detect_systems: bool = True,
+) -> Optional[SMBSetupResult]:
     """Run the interactive SMB discovery/setup flow.
 
     Returns a validated :class:`SMBSetupResult`, or ``None`` if the user
@@ -130,14 +135,19 @@ def run_smb_setup_wizard(discovery: SMBDiscoveryService) -> Optional[SMBSetupRes
                 return None
             continue
 
-        detection: SystemDetectionResult = discovery.detect_systems(validation)
+        detection = (
+            discovery.detect_systems(validation)
+            if detect_systems
+            else SystemDetectionResult(detected_systems=(), unrecognized_entries=())
+        )
         click.echo(f"\nConnected to //{server}/{share}")
-        click.echo("\nDetected systems:\n")
-        for system in detection.detected_systems:
-            click.echo(f"  \u2713 {system}")
-        click.echo(f"\n{detection.count} systems detected.")
+        if detect_systems:
+            click.echo("\nDetected systems:\n")
+            for system in detection.detected_systems:
+                click.echo(f"  \u2713 {system}")
+            click.echo(f"\n{detection.count} systems detected.")
 
-        if click.confirm("\nUse this library?", default=True):
+        if click.confirm(f"\nUse this {purpose}?", default=True):
             return SMBSetupResult(
                 server=server,
                 port=port,

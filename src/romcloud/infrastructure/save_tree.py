@@ -1,8 +1,8 @@
 """Local filesystem scanning/materialization for SaveSync.
 
-Both the local save root and the "remote" SaveSync dataset are plain local
-filesystem paths. For SMB, the remote path is on SaveSync's dedicated
-read-write mount of the same share used by the read-only catalog mount (see
+Both the local save root and the configured remote SaveSync dataset are plain
+local filesystem paths. For SMB, the remote path is on the independently
+configured read-write ROMCloud-data mount (see
 :mod:`romcloud.infrastructure.mount`). This module therefore operates on real
 :class:`~pathlib.Path` objects and can keep staging beside the live dataset.
 """

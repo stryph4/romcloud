@@ -19,14 +19,14 @@ from romcloud.infrastructure import mount
 _SAMPLE_PROC_MOUNTS = (
     "sysfs /sys sysfs rw 0 0\n"
     "proc /proc proc rw 0 0\n"
-    "//192.168.1.50/ROMs /userdata/romcloud-source cifs ro,relatime 0 0\n"
+    "//192.168.1.50/ROMs /userdata/romcloud/source cifs ro,relatime 0 0\n"
     "tmpfs /tmp\\040with\\040space tmpfs rw 0 0\n"
 )
 
 
 class TestIsMounted:
     def test_detects_mounted_target(self):
-        assert mount.is_mounted("/userdata/romcloud-source", _SAMPLE_PROC_MOUNTS) is True
+        assert mount.is_mounted("/userdata/romcloud/source", _SAMPLE_PROC_MOUNTS) is True
 
     def test_unmounted_target_returns_false(self):
         assert mount.is_mounted("/userdata/somewhere-else", _SAMPLE_PROC_MOUNTS) is False
@@ -35,13 +35,13 @@ class TestIsMounted:
         assert mount.is_mounted("/tmp with space", _SAMPLE_PROC_MOUNTS) is True
 
     def test_trailing_slash_normalised(self):
-        assert mount.is_mounted("/userdata/romcloud-source/", _SAMPLE_PROC_MOUNTS) is True
+        assert mount.is_mounted("/userdata/romcloud/source/", _SAMPLE_PROC_MOUNTS) is True
 
     def test_is_target_mounted_reads_real_file(self, tmp_path):
         fake_proc_mounts = tmp_path / "mounts"
         fake_proc_mounts.write_text(_SAMPLE_PROC_MOUNTS)
         assert mount.is_target_mounted(
-            "/userdata/romcloud-source", proc_mounts_path=str(fake_proc_mounts)
+            "/userdata/romcloud/source", proc_mounts_path=str(fake_proc_mounts)
         ) is True
         assert mount.is_target_mounted(
             "/nope", proc_mounts_path=str(fake_proc_mounts)
@@ -53,11 +53,11 @@ class TestIsMounted:
 
     def test_writable_check_distinguishes_ro_and_rw_mounts(self):
         mounts = _SAMPLE_PROC_MOUNTS + (
-            "//192.168.1.50/ROMs /userdata/romcloud-saves-source cifs rw,relatime 0 0\n"
+            "//192.168.1.50/ROMCloud /userdata/romcloud/remote cifs rw,relatime 0 0\n"
         )
 
-        assert mount.is_mounted_writable("/userdata/romcloud-source", mounts) is False
-        assert mount.is_mounted_writable("/userdata/romcloud-saves-source", mounts) is True
+        assert mount.is_mounted_writable("/userdata/romcloud/source", mounts) is False
+        assert mount.is_mounted_writable("/userdata/romcloud/remote", mounts) is True
         assert mount.is_mounted_writable("/userdata/not-mounted", mounts) is False
 
     def test_read_only_check_distinguishes_ro_and_rw_mounts(self, tmp_path):
@@ -72,6 +72,42 @@ class TestIsMounted:
         ) is True
         assert mount.is_target_mounted_read_only(
             "/mnt/saves", proc_mounts_path=str(mounts)
+        ) is False
+
+    @pytest.mark.parametrize(
+        ("server", "share", "read_only", "expected"),
+        [
+            ("192.168.1.50", "ROMCloud", False, True),
+            ("other-nas", "ROMCloud", False, False),
+            ("192.168.1.50", "Other", False, False),
+            ("192.168.1.50", "ROMCloud", True, False),
+            (None, "ROMCloud", False, True),
+        ],
+    )
+    def test_cifs_identity_requires_expected_source_and_mode(
+        self, server, share, read_only, expected
+    ):
+        mounts = _SAMPLE_PROC_MOUNTS + (
+            "//192.168.1.50/ROMCloud /userdata/romcloud/remote cifs rw,relatime 0 0\n"
+        )
+
+        assert mount.is_mounted_cifs_target(
+            "/userdata/romcloud/remote",
+            mounts,
+            server=server,
+            share=share,
+            read_only=read_only,
+        ) is expected
+
+    def test_cifs_identity_rejects_non_cifs_mount(self):
+        mounts = "/dev/sda1 /userdata/romcloud/remote ext4 rw 0 0\n"
+
+        assert mount.is_mounted_cifs_target(
+            "/userdata/romcloud/remote",
+            mounts,
+            server="nas",
+            share="ROMCloud",
+            read_only=False,
         ) is False
 
 
@@ -232,6 +268,20 @@ class TestMountCifsSource:
                 "nas",
                 "ROMs",
                 "/mnt/saves",
+                Path("/creds"),
+                read_only=False,
+                proc_mounts_path=str(proc_mounts),
+            )
+
+    def test_already_mounted_rw_wrong_share_fails_clearly(self, tmp_path):
+        proc_mounts = tmp_path / "mounts"
+        proc_mounts.write_text("//nas/Other /mnt/remote cifs rw 0 0\n")
+
+        with pytest.raises(MountError, match="wrong mode or SMB source"):
+            mount.mount_cifs_source(
+                "nas",
+                "ROMCloud",
+                "/mnt/remote",
                 Path("/creds"),
                 read_only=False,
                 proc_mounts_path=str(proc_mounts),

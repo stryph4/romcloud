@@ -1,4 +1,4 @@
-"""romcloud mount — manage the mounted SMB ROM source.
+"""romcloud mount — manage configured SMB-backed ROMCloud locations.
 
 Only relevant for the "mount a CIFS share locally, then use the `local`
 storage provider against the mount point" deployment model. If ROMCloud is
@@ -32,23 +32,23 @@ from pathlib import Path
 import click
 
 from romcloud.cli.context import get_container
-from romcloud.core.exceptions import ROMCloudError
+from romcloud.core.exceptions import ConfigurationError, ROMCloudError
 from romcloud.infrastructure import mount, mount_worker
-from romcloud.infrastructure.credentials import cifs_credentials_path, load_smb_password, write_cifs_credentials_file
+from romcloud.infrastructure.credentials import write_cifs_credentials_file
 from romcloud.integrations.batocera import mount_service
 
 
 @click.group("mount")
 def mount_group() -> None:
-    """Manage the mounted SMB ROM source."""
+    """Manage SMB-backed ROM source and remote-data mounts."""
 
 
-def _require_smb(ctx: click.Context):
+def _require_mounts(ctx: click.Context):
     container = get_container(ctx)
     config = container.config
-    if config.smb is None:
+    if not mount_worker.configured_mounts(config):
         click.echo(
-            "No [smb] section configured — source is a plain local/USB path, "
+            "No SMB-backed ROM source or remote-data location is configured — "
             "nothing to mount.",
         )
         ctx.exit(0)
@@ -64,7 +64,7 @@ def _romcloud_home(config) -> Path:
 def mount_status_cmd(ctx: click.Context) -> None:
     """Show detailed mount/worker status: mounted, waiting, worker running,
     last failure, or not configured."""
-    config = _require_smb(ctx)
+    config = _require_mounts(ctx)
     romcloud_home = _romcloud_home(config)
 
     try:
@@ -74,11 +74,13 @@ def mount_status_cmd(ctx: click.Context) -> None:
         ctx.exit(1)
         return
 
-    click.echo(f"  Server:      //{config.smb.server}/{config.smb.share}")
-    click.echo(f"  ROM mount:   {config.source.rom_root} (read-only)")
     targets = mount_worker.configured_mounts(config)
-    if len(targets) > 1:
-        click.echo(f"  Save mount:  {targets[1].mount_point} (read-write)")
+    for target in targets:
+        mode = "read-only" if target.read_only else "read-write"
+        click.echo(
+            f"  {target.label}: //{target.smb.server}/{target.smb.share} "
+            f"→ {target.mount_point} ({mode})"
+        )
     click.echo(f"  State:       {diag.label}")
     if diag.worker_pid is not None:
         click.echo(f"  Worker:      running (pid {diag.worker_pid})")
@@ -93,39 +95,40 @@ def mount_status_cmd(ctx: click.Context) -> None:
 @mount_group.command("start")
 @click.pass_context
 def mount_start_cmd(ctx: click.Context) -> None:
-    """Mount the configured SMB source (blocking; waits for reachability).
+    """Mount configured SMB locations (blocking; waits for reachability).
 
     For interactive/manual use only — the Batocera boot service uses
     ``romcloud mount boot-start`` instead, which never blocks.
     """
-    config = _require_smb(ctx)
+    config = _require_mounts(ctx)
 
-    password = load_smb_password(config.credentials_path)
-    if not password:
-        click.echo(
-            "error: no SMB password stored. Run `romcloud configure` first.",
-            err=True,
-        )
-        ctx.exit(1)
-        return
-
-    creds_path = cifs_credentials_path(config.credentials_path)
-    write_cifs_credentials_file(creds_path, config.smb.username, password)
-
+    mounted_during_start: list[str] = []
     try:
         outcomes = []
         for target in mount_worker.configured_mounts(config):
-            outcomes.append(
-                mount.mount_cifs_source(
-                    server=config.smb.server,
-                    share=config.smb.share,
-                    mount_point=target.mount_point,
-                    credentials_path=creds_path,
-                    read_only=target.read_only,
-                    port=config.smb.port,
+            password, creds_path = mount_worker.credentials_for_mount(config, target)
+            if not password:
+                raise ConfigurationError(
+                    f"No SMB password stored for {target.label}; run `romcloud configure`"
                 )
+            write_cifs_credentials_file(creds_path, target.smb.username, password)
+            outcome = mount.mount_cifs_source(
+                server=target.smb.server,
+                share=target.smb.share,
+                mount_point=target.mount_point,
+                credentials_path=creds_path,
+                read_only=target.read_only,
+                port=target.smb.port,
             )
-    except ROMCloudError as exc:
+            outcomes.append(outcome)
+            if not outcome.already_mounted:
+                mounted_during_start.append(target.mount_point)
+    except (ROMCloudError, OSError) as exc:
+        for mount_point in reversed(mounted_during_start):
+            try:
+                mount.unmount_cifs_source(mount_point)
+            except Exception:  # noqa: BLE001 - preserve the original mount error
+                pass
         click.echo(f"error: {exc}", err=True)
         ctx.exit(1)
         return
@@ -147,8 +150,8 @@ def mount_boot_start_cmd(ctx: click.Context) -> None:
         container = get_container(ctx)
         config = container.config
 
-        if config.smb is None:
-            click.echo("No [smb] section configured — nothing to do.")
+        if not mount_worker.configured_mounts(config):
+            click.echo("No SMB-backed locations configured — nothing to do.")
             return
 
         romcloud_home = _romcloud_home(config)
@@ -186,19 +189,21 @@ def mount_worker_cmd(ctx: click.Context) -> None:
 @mount_group.command("stop")
 @click.pass_context
 def mount_stop_cmd(ctx: click.Context) -> None:
-    """Stop any running mount worker, then unmount the configured SMB source."""
-    config = _require_smb(ctx)
+    """Stop the mount worker, then unmount every configured SMB location."""
+    config = _require_mounts(ctx)
     romcloud_home = _romcloud_home(config)
 
     mount_worker.stop_worker(romcloud_home)
 
-    try:
-        unmounted = [
-            mount.unmount_cifs_source(target.mount_point)
-            for target in reversed(mount_worker.configured_mounts(config))
-        ]
-    except ROMCloudError as exc:
-        click.echo(f"error: {exc}", err=True)
+    unmounted: list[bool] = []
+    errors: list[str] = []
+    for target in reversed(mount_worker.configured_mounts(config)):
+        try:
+            unmounted.append(mount.unmount_cifs_source(target.mount_point))
+        except ROMCloudError as exc:
+            errors.append(f"{target.label}: {exc}")
+    if errors:
+        click.echo(f"error: {'; '.join(errors)}", err=True)
         ctx.exit(1)
         return
 
@@ -208,8 +213,8 @@ def mount_stop_cmd(ctx: click.Context) -> None:
 @mount_group.command("install")
 @click.pass_context
 def mount_install_cmd(ctx: click.Context) -> None:
-    """Install the Batocera boot-time service that mounts the source at startup."""
-    config = _require_smb(ctx)
+    """Install the Batocera boot-time service for configured SMB locations."""
+    config = _require_mounts(ctx)
 
     romcloud_bin = _romcloud_home(config) / "bin" / "romcloud"
     path = mount_service.install_service(str(romcloud_bin))
@@ -224,9 +229,16 @@ def mount_remove_cmd(ctx: click.Context) -> None:
     runtime state (only ROMCloud-owned files; never touches other services)."""
     container = get_container(ctx)
     config = container.config
-    if config.smb is not None:
+    targets = mount_worker.configured_mounts(config)
+    errors: list[str] = []
+    if targets:
         romcloud_home = _romcloud_home(config)
         mount_worker.stop_worker(romcloud_home)
+        for target in reversed(targets):
+            try:
+                mount.unmount_cifs_source(target.mount_point)
+            except ROMCloudError as exc:
+                errors.append(f"{target.label}: {exc}")
         mount_worker.cleanup_runtime_state(romcloud_home)
 
     removed = mount_service.remove_service()
@@ -234,3 +246,6 @@ def mount_remove_cmd(ctx: click.Context) -> None:
         click.echo(f"Removed boot service: {mount_service.SERVICE_SCRIPT_PATH}")
     else:
         click.echo("No ROMCloud mount service present — nothing to do.")
+    if errors:
+        click.echo(f"error: {'; '.join(errors)}", err=True)
+        ctx.exit(1)

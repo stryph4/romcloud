@@ -25,7 +25,7 @@ class CacheEntry:
     """Represents a game's presence in the local cache.
 
     ``cache_path`` is the *container directory* for the game inside the
-    cache root, e.g. ``/userdata/romcloud-cache/ps2/<game_id>/``.
+    cache root, e.g. ``/userdata/romcloud/cache/ps2/<game_id>/``.
     Individual asset files live inside that directory.
     """
 

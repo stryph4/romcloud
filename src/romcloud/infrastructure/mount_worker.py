@@ -53,11 +53,14 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from romcloud.core.exceptions import ConfigurationError, ROMCloudError, ProviderNotReachableError
+from romcloud.infrastructure.config import SMBConfig, paths_overlap
 from romcloud.infrastructure import mount as mountlib
 from romcloud.infrastructure import mount_endpoint_cache
 from romcloud.infrastructure.credentials import (
     cifs_credentials_path,
+    load_remote_data_smb_password,
     load_smb_password,
+    remote_data_cifs_credentials_path,
     write_cifs_credentials_file,
 )
 from romcloud.infrastructure.logging import get_logger
@@ -82,53 +85,76 @@ class ConfiguredMount:
     label: str
     mount_point: str
     read_only: bool
+    smb: SMBConfig
+    credential_kind: str
 
 
 def configured_mounts(config) -> tuple[ConfiguredMount, ...]:
     """Return the intentional SMB mount views used by ROMCloud.
 
-    The catalog/cache view stays read-only. SaveSync gets a separate
-    read-write view so its same-filesystem staging and rename transaction
-    never require broad write access through the ROM browsing path.
-
-    Lightweight config objects without ``saves`` retain the historical
-    single-mount shape; real ``AppConfig`` objects always include the
-    SaveSync mount configuration.
+    The catalog/cache view stays read-only. General remote data gets its own
+    independently configured read-write target and credentials.
     """
-    catalog = ConfiguredMount("ROM catalog", config.source.rom_root, True)
-    saves = getattr(config, "saves", None)
-    if config.smb is None or saves is None:
-        return (catalog,)
-    rom_mount = Path(config.source.rom_root)
-    saves_mount = Path(saves.remote_mount_path)
-    if (
-        saves_mount == rom_mount
-        or saves_mount in rom_mount.parents
-        or rom_mount in saves_mount.parents
-    ):
-        raise ConfigurationError(
-            "saves.remote_mount_path must be separate from source.rom_root so the "
-            "ROM catalog mount can remain read-only"
+    targets: list[ConfiguredMount] = []
+    if config.smb is not None:
+        targets.append(
+            ConfiguredMount(
+                "ROM catalog", config.source.rom_root, True, config.smb, "source"
+            )
         )
-    return (
-        catalog,
-        ConfiguredMount("SaveSync", saves.remote_mount_path, False),
-    )
+
+    remote_data = getattr(config, "remote_data", None)
+    if remote_data is not None and remote_data.provider == "smb":
+        if remote_data.smb is None:
+            raise ConfigurationError("SMB remote data requires its own SMB target")
+        remote_mount = Path(remote_data.root)
+        if config.smb is not None:
+            rom_mount = Path(config.source.rom_root)
+            if paths_overlap(remote_mount, rom_mount):
+                raise ConfigurationError(
+                    "remote_data.root must be separate from source.rom_root so the "
+                    "ROM catalog mount can remain read-only"
+                )
+        targets.append(
+            ConfiguredMount(
+                "ROMCloud remote data",
+                remote_data.root,
+                False,
+                remote_data.smb,
+                "remote_data",
+            )
+        )
+    return tuple(targets)
 
 
 def all_configured_mounts_are_mounted(config) -> bool:
-    return all(_configured_mount_is_ready(item) for item in configured_mounts(config))
+    targets = configured_mounts(config)
+    return bool(targets) and all(_configured_mount_is_ready(item) for item in targets)
 
 
 def _configured_mount_is_ready(item: ConfiguredMount) -> bool:
-    if not mountlib.is_target_mounted(item.mount_point):
-        return False
-    check = (
-        mountlib.is_target_mounted_read_only
-        if item.read_only
-        else mountlib.is_target_mounted_writable
+    return mountlib.is_target_mounted_cifs(
+        item.mount_point,
+        # The source worker may deliberately use its cached IP alias. The
+        # share still identifies the configured source. Writable remote data
+        # has no alias fast path, so require its exact configured server too.
+        server=None if item.read_only else item.smb.server,
+        share=item.smb.share,
+        read_only=item.read_only,
     )
-    return check(item.mount_point)
+
+
+def credentials_for_mount(config, target: ConfiguredMount) -> tuple[Optional[str], Path]:
+    """Resolve the independently stored password/helper path for a mount."""
+    if target.credential_kind == "source":
+        return (
+            load_smb_password(config.credentials_path),
+            cifs_credentials_path(config.credentials_path),
+        )
+    return (
+        load_remote_data_smb_password(config.credentials_path),
+        remote_data_cifs_credentials_path(config.credentials_path),
+    )
 
 
 # ── path helpers ──────────────────────────────────────────────────────────────
@@ -429,42 +455,40 @@ def _run_worker_locked(
 ) -> int:
     try:
         targets = configured_mounts(config)
+        if not targets:
+            _write_worker_status(romcloud_home, "failed", "no SMB mounts configured")
+            log.warning("Mount worker started but no SMB mounts are configured — exiting.")
+            return 0
         if all(_configured_mount_is_ready(item) for item in targets):
             _write_worker_status(romcloud_home, "success", "already mounted")
             log.info("All configured SMB mount views are already mounted — worker exiting.")
             return 0
-
-        if config.smb is None:
-            _write_worker_status(romcloud_home, "failed", "no [smb] section configured")
-            log.warning("Mount worker started but no [smb] section is configured — exiting.")
-            return 0
-
-        password = load_smb_password(config.credentials_path)
-        if not password:
-            _write_worker_status(romcloud_home, "failed", "no SMB password stored")
-            log.warning("Mount worker: no SMB password stored (run `romcloud configure`) — exiting.")
-            return 0
-
-        _write_worker_status(
-            romcloud_home, "waiting", f"waiting for {config.smb.server}:{config.smb.port}"
-        )
-
-        creds_path = cifs_credentials_path(config.credentials_path)
-        write_cifs_credentials_file(creds_path, config.smb.username, password)
 
         details: list[str] = []
         for target in targets:
             if _configured_mount_is_ready(target):
                 details.append(f"{target.label}: already mounted")
                 continue
+            password, creds_path = credentials_for_mount(config, target)
+            if not password:
+                raise ConfigurationError(
+                    f"No SMB password stored for {target.label}; run `romcloud configure`"
+                )
+            _write_worker_status(
+                romcloud_home,
+                "waiting",
+                f"waiting for {target.label} at {target.smb.server}:{target.smb.port}",
+            )
+            write_cifs_credentials_file(creds_path, target.smb.username, password)
             outcome = _mount_with_cached_endpoint_fallback(
                 romcloud_home=romcloud_home,
-                server=config.smb.server,
-                share=config.smb.share,
+                server=target.smb.server,
+                share=target.smb.share,
                 mount_point=target.mount_point,
                 credentials_path=creds_path,
                 read_only=target.read_only,
-                port=config.smb.port,
+                port=target.smb.port,
+                use_endpoint_cache=target.credential_kind == "source",
                 attempt_timeout=attempt_timeout,
                 attempt_interval=attempt_interval,
                 retry_timeout=retry_timeout,
@@ -499,6 +523,7 @@ def _mount_with_cached_endpoint_fallback(
     mount_point: str,
     credentials_path: Path,
     read_only: bool = True,
+    use_endpoint_cache: bool = True,
     port: int,
     attempt_timeout: float,
     attempt_interval: float,
@@ -518,7 +543,11 @@ def _mount_with_cached_endpoint_fallback(
     is skipped/ignored silently and mounting proceeds exactly as before
     this feature existed.
     """
-    cached = mount_endpoint_cache.read_endpoint_cache(romcloud_home)
+    cached = (
+        mount_endpoint_cache.read_endpoint_cache(romcloud_home)
+        if use_endpoint_cache
+        else None
+    )
     if cached is not None and cached.server == server and cached.endpoint != server:
         log.info(
             "Trying cached endpoint %s for %r before hostname resolution",
@@ -539,7 +568,10 @@ def _mount_with_cached_endpoint_fallback(
                 **mount_kwargs,
             )
             log.info("Mount worker succeeded via cached endpoint %s", cached.endpoint)
-            mount_endpoint_cache.write_endpoint_cache(romcloud_home, server, cached.endpoint)
+            if use_endpoint_cache:
+                mount_endpoint_cache.write_endpoint_cache(
+                    romcloud_home, server, cached.endpoint
+                )
             return outcome
         except ROMCloudError as exc:
             log.info(
@@ -567,7 +599,7 @@ def _mount_with_cached_endpoint_fallback(
     # provably the exact address the mount above used internally. Verify it
     # is independently reachable right now before trusting it for next
     # boot's fast path; an unreachable candidate is worse than no hint.
-    resolved = mount_endpoint_cache.resolve_endpoint(server, port)
+    resolved = mount_endpoint_cache.resolve_endpoint(server, port) if use_endpoint_cache else None
     if resolved and resolved != server and mountlib.check_reachable(resolved, port).ok:
         mount_endpoint_cache.write_endpoint_cache(romcloud_home, server, resolved)
     return outcome
@@ -605,7 +637,7 @@ def _mount_with_retry(
         remaining = deadline - clock()
         if remaining <= 0:
             message = (
-                f"Timed out after {attempt - 1} attempt(s) waiting for SMB source {server!r} "
+                f"Timed out after {attempt - 1} attempt(s) waiting for SMB target {server!r} "
                 f"to become reachable: retry budget exhausted"
             )
             log.warning(
@@ -643,7 +675,7 @@ def _mount_with_retry(
             now = clock()
             if now >= deadline:
                 message = (
-                    f"Timed out after {attempt} attempt(s) waiting for SMB source {server!r} "
+                    f"Timed out after {attempt} attempt(s) waiting for SMB target {server!r} "
                     f"to become reachable: {exc}"
                 )
                 log.warning("Mount worker retry budget exhausted after %d attempt(s): %s", attempt, exc)
@@ -675,19 +707,20 @@ class MountDiagnostics:
     cached_endpoint: Optional[str] = None
     """The last resolved endpoint used for fast boot-time mounting, if any
     — diagnostic-only; never part of the user-facing source identity."""
-    saves_mounted: Optional[bool] = None
+    remote_data_mounted: Optional[bool] = None
+    source_mounted: Optional[bool] = None
 
     @property
     def label(self) -> str:
         if not self.configured:
             return "not configured"
-        saves_mounted = self.mounted if self.saves_mounted is None else self.saves_mounted
-        if self.mounted and saves_mounted:
-            return "mounted"
         if self.mounted:
-            return "ROM source mounted — SaveSync write mount missing"
-        if saves_mounted:
-            return "SaveSync write mount mounted — ROM source missing"
+            return "mounted"
+        source_mounted = self.mounted if self.source_mounted is None else self.source_mounted
+        if source_mounted and self.remote_data_mounted is False:
+            return "ROM source mounted — remote-data write mount missing"
+        if self.remote_data_mounted and source_mounted is False:
+            return "Remote-data write mount mounted — ROM source missing"
         if self.worker_pid is not None:
             return "waiting for source (worker running)"
         if self.last_state == "failed":
@@ -700,24 +733,27 @@ class MountDiagnostics:
 def get_diagnostics(romcloud_home: Path, config) -> MountDiagnostics:
     """Combine live mount state, worker liveness, and last recorded status
     into a single, clear diagnostic snapshot."""
-    if config.smb is None:
+    targets = configured_mounts(config)
+    if not targets:
         return MountDiagnostics(
             configured=False, mounted=False, worker_pid=None,
             last_state=None, last_detail="", last_timestamp="",
         )
 
-    targets = configured_mounts(config)
-    mounted = _configured_mount_is_ready(targets[0])
-    saves_mounted = (
-        _configured_mount_is_ready(targets[1])
-        if len(targets) > 1
-        else mounted
+    source_target = next((item for item in targets if item.credential_kind == "source"), None)
+    remote_target = next((item for item in targets if item.credential_kind == "remote_data"), None)
+    source_mounted = _configured_mount_is_ready(source_target) if source_target is not None else None
+    remote_data_mounted = (
+        _configured_mount_is_ready(remote_target) if remote_target is not None else None
     )
+    mounted = (source_mounted is not False) and (remote_data_mounted is not False)
     worker_pid = is_worker_running(romcloud_home)
     status = read_worker_status(romcloud_home)
     cached = mount_endpoint_cache.read_endpoint_cache(romcloud_home)
     cached_endpoint = (
-        cached.endpoint if cached is not None and cached.server == config.smb.server else None
+        cached.endpoint
+        if cached is not None and config.smb is not None and cached.server == config.smb.server
+        else None
     )
 
     return MountDiagnostics(
@@ -728,5 +764,6 @@ def get_diagnostics(romcloud_home: Path, config) -> MountDiagnostics:
         last_detail=status.detail if status else "",
         last_timestamp=status.timestamp if status else "",
         cached_endpoint=cached_endpoint,
-        saves_mounted=saves_mounted,
+        remote_data_mounted=remote_data_mounted,
+        source_mounted=source_mounted,
     )

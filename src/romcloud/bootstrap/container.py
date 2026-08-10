@@ -16,18 +16,19 @@ from __future__ import annotations
 from typing import Optional
 
 from romcloud.core.models.cache import CachePolicy
+from romcloud.core.exceptions import ConfigurationError
 from romcloud.core.storage import StorageProvider
+from romcloud.infrastructure.config import AppConfig, validate_remote_data_boundary
+from romcloud.infrastructure.database import Database
 from romcloud.infrastructure.providers.local import (
     LocalFilesystemProvider,
+    WritableLocalFilesystemProvider,
     WritableMountedFilesystemProvider,
 )
 from romcloud.integrations.batocera.catalog import CatalogService
-from romcloud.infrastructure.config import AppConfig
-from romcloud.infrastructure.database import Database
 from romcloud.infrastructure.repositories.cache import CacheRepository
 from romcloud.infrastructure.repositories.game import GameRepository
 from romcloud.infrastructure.repositories.proxy import ProxyRepository
-from romcloud.core.exceptions import ConfigurationError
 from romcloud.services.cache import CacheService
 from romcloud.services.saves import SaveSyncService
 from romcloud.services.transfer import TransferService
@@ -144,21 +145,33 @@ class Container:
         if self._saves is None:
             from pathlib import Path
 
-            remote_base = (
-                Path(self._config.saves.remote_mount_path)
-                if self._config.smb is not None
-                else Path(self._config.source.rom_root)
+            remote_data = self._config.remote_data
+            validate_remote_data_boundary(
+                source=self._config.source,
+                source_smb=self._config.smb,
+                cache=self._config.cache,
+                data_path=self._config.data_path,
+                local_saves_path=self._config.saves.local_path,
+                remote_data=remote_data,
+                context="ROMCloud configuration",
             )
-            saves_provider = (
-                WritableMountedFilesystemProvider()
-                if self._config.smb is not None
-                else self.provider
-            )
+            remote_base = Path(remote_data.root) if remote_data is not None else None
+            if remote_data is None:
+                saves_provider = None
+            elif remote_data.provider == "smb":
+                if remote_data.smb is None:  # validated above; keeps type narrowing explicit
+                    raise ConfigurationError("SMB remote data requires an SMB target")
+                saves_provider = WritableMountedFilesystemProvider(
+                    expected_server=remote_data.smb.server,
+                    expected_share=remote_data.smb.share,
+                )
+            else:
+                saves_provider = WritableLocalFilesystemProvider()
             self._saves = SaveSyncService(
                 provider=saves_provider,
-                connectivity_root=str(remote_base),
+                connectivity_root=str(remote_base) if remote_base is not None else None,
                 local_root=self._config.saves.local_path,
-                remote_root=str(remote_base / self._config.saves.remote_subdir),
+                remote_root=str(remote_base / "saves") if remote_base is not None else None,
                 state_path=Path(self._config.data_path) / "savesync-state.json",
                 xbox_enabled=self._config.saves.xbox_enabled,
             )

@@ -15,6 +15,7 @@ from romcloud.infrastructure import mount, save_tree
 from romcloud.infrastructure.config import (
     AppConfig,
     CacheConfig,
+    RemoteDataConfig,
     SavesConfig,
     SMBConfig,
     SourceConfig,
@@ -121,10 +122,12 @@ class TestWritableRemoteBoundary:
             local_roms_path=str(tmp_path / "roms"),
             data_path=str(tmp_path / "data"),
             smb=SMBConfig(server="nas.local", share="ROMs"),
-            saves=SavesConfig(
-                local_path=str(local_saves),
-                remote_mount_path=str(save_mount),
+            remote_data=RemoteDataConfig(
+                provider="smb",
+                root=str(save_mount),
+                smb=SMBConfig(server="data-nas.local", share="ROMCloud"),
             ),
+            saves=SavesConfig(local_path=str(local_saves)),
         )
         _write(local_saves / "psx" / "Game.srm", b"hardware-regression")
         rom_mount.chmod(0o555)
@@ -132,25 +135,23 @@ class TestWritableRemoteBoundary:
         real_new_staging_dir = save_tree.new_staging_dir
 
         def reject_catalog_staging(sibling_of: Path) -> Path:
-            if sibling_of == rom_mount / config.saves.remote_subdir:
+            if sibling_of == rom_mount / "saves":
                 raise OSError(errno.EROFS, "Read-only file system", str(sibling_of))
             return real_new_staging_dir(sibling_of)
 
         monkeypatch.setattr(save_tree, "new_staging_dir", reject_catalog_staging)
         monkeypatch.setattr(
             mount,
-            "is_target_mounted_writable",
-            lambda path: Path(path) == save_mount,
+            "is_target_mounted_cifs",
+            lambda path, **kwargs: Path(path) == save_mount,
         )
 
         service = Container(config).saves
         record = service.commit_upload(service.preview_upload())
 
         assert record.artifact_count == 1
-        assert not (rom_mount / config.saves.remote_subdir).exists()
-        assert (
-            save_mount / config.saves.remote_subdir / "psx" / "Game.srm"
-        ).read_bytes() == b"hardware-regression"
+        assert not (rom_mount / "saves").exists()
+        assert (save_mount / "saves" / "psx" / "Game.srm").read_bytes() == b"hardware-regression"
 
     def test_disconnected_smb_mount_point_directory_is_not_reachable(
         self, tmp_path: Path, monkeypatch
@@ -166,19 +167,98 @@ class TestWritableRemoteBoundary:
             local_roms_path=str(tmp_path / "roms"),
             data_path=str(tmp_path / "data"),
             smb=SMBConfig(server="nas.local", share="ROMs"),
-            saves=SavesConfig(
-                local_path=str(local_saves),
-                remote_mount_path=str(save_mount),
+            remote_data=RemoteDataConfig(
+                provider="smb",
+                root=str(save_mount),
+                smb=SMBConfig(server="data-nas.local", share="ROMCloud"),
             ),
+            saves=SavesConfig(local_path=str(local_saves)),
         )
         _write(local_saves / "psx" / "Game.srm", b"must-not-land-locally")
-        monkeypatch.setattr(mount, "is_target_mounted_writable", lambda path: False)
+        monkeypatch.setattr(mount, "is_target_mounted_cifs", lambda path, **kwargs: False)
 
         service = Container(config).saves
         with pytest.raises(SaveSyncConnectivityError):
             service.preview_upload()
 
         assert list(save_mount.iterdir()) == []
+
+    def test_read_only_remote_data_mount_is_rejected_before_staging(
+        self, tmp_path: Path, monkeypatch
+    ):
+        rom_mount = tmp_path / "rom-source-ro"
+        remote_mount = tmp_path / "remote-mounted-ro"
+        local_saves = tmp_path / "local-saves"
+        for path in (rom_mount, remote_mount, local_saves):
+            path.mkdir()
+        config = AppConfig(
+            source=SourceConfig("local", str(rom_mount)),
+            cache=CacheConfig(str(tmp_path / "cache")),
+            local_roms_path=str(tmp_path / "roms"),
+            data_path=str(tmp_path / "data"),
+            smb=SMBConfig("rom-nas", "ROMs"),
+            remote_data=RemoteDataConfig(
+                "smb",
+                str(remote_mount),
+                SMBConfig("data-nas", "ROMCloud"),
+            ),
+            saves=SavesConfig(local_path=str(local_saves)),
+        )
+        _write(local_saves / "psx" / "Game.srm", b"do-not-stage")
+        monkeypatch.setattr(mount, "is_target_mounted_cifs", lambda path, **kwargs: False)
+
+        with pytest.raises(SaveSyncConnectivityError):
+            Container(config).saves.preview_upload()
+
+        assert list(remote_mount.iterdir()) == []
+
+    def test_wrong_rw_smb_share_is_rejected_before_staging(
+        self, tmp_path: Path, monkeypatch
+    ):
+        remote_mount = tmp_path / "remote-mounted-wrong-share"
+        local_saves = tmp_path / "local-saves"
+        remote_mount.mkdir()
+        local_saves.mkdir()
+        config = AppConfig(
+            source=SourceConfig("local", str(tmp_path / "roms")),
+            cache=CacheConfig(str(tmp_path / "cache")),
+            local_roms_path=str(tmp_path / "roms"),
+            data_path=str(tmp_path / "data"),
+            remote_data=RemoteDataConfig(
+                "smb", str(remote_mount), SMBConfig("data-nas", "ROMCloud")
+            ),
+            saves=SavesConfig(local_path=str(local_saves)),
+        )
+        _write(local_saves / "psx" / "Game.srm", b"do-not-stage")
+        observed = []
+
+        def reject_wrong_share(path, **expected):
+            observed.append(expected)
+            return False
+
+        monkeypatch.setattr(mount, "is_target_mounted_cifs", reject_wrong_share)
+
+        with pytest.raises(SaveSyncConnectivityError):
+            Container(config).saves.preview_upload()
+
+        assert observed == [
+            {"server": "data-nas", "share": "ROMCloud", "read_only": False}
+        ]
+        assert list(remote_mount.iterdir()) == []
+
+    def test_missing_remote_data_configuration_disables_savesync(self, tmp_path: Path):
+        config = AppConfig(
+            source=SourceConfig(provider="local", rom_root=str(tmp_path / "roms")),
+            cache=CacheConfig(path=str(tmp_path / "cache")),
+            local_roms_path=str(tmp_path / "roms"),
+            data_path=str(tmp_path / "data"),
+            saves=SavesConfig(local_path=str(tmp_path / "local-saves")),
+        )
+        service = Container(config).saves
+
+        assert service.is_remote_configured is False
+        with pytest.raises(SaveSyncConnectivityError, match="not configured"):
+            service.preview_upload()
 
 
 class TestPreviewAccuracy:
@@ -333,7 +413,7 @@ class TestStagingCommitFailureSafety:
         assert (tmp_path / "remote-saves" / "psx" / "Good.srm").read_bytes() == previous_bytes
         assert not (tmp_path / "remote-saves" / "psx" / "Corrupt.srm").exists()
         # No leftover staging directories.
-        assert list(tmp_path.glob("remote-saves.staging-*")) == []
+        assert list(tmp_path.glob(".remote-saves.staging-*")) == []
         assert service.get_state().last_upload is not None
         assert service.get_state().last_upload.manifest[0].relative_path == "psx/Good.srm"
 

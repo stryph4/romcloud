@@ -7,7 +7,14 @@ import json
 from click.testing import CliRunner
 
 from romcloud.cli.main import cli
-from romcloud.infrastructure.config import AppConfig, CacheConfig, SavesConfig, SourceConfig, write_config
+from romcloud.infrastructure.config import (
+    AppConfig,
+    CacheConfig,
+    RemoteDataConfig,
+    SavesConfig,
+    SourceConfig,
+    write_config,
+)
 
 
 def _config_path(tmp_path, *, xbox_enabled: bool = False):
@@ -21,12 +28,15 @@ def _config_path(tmp_path, *, xbox_enabled: bool = False):
     cache_root.mkdir()
     saves_root = tmp_path / "saves"
     saves_root.mkdir()
+    remote_data_root = tmp_path / "remote-data"
+    remote_data_root.mkdir()
 
     config = AppConfig(
         source=SourceConfig(provider="local", rom_root=str(source_root)),
         cache=CacheConfig(path=str(cache_root)),
         local_roms_path=str(local_roms),
         data_path=str(data_root),
+        remote_data=RemoteDataConfig(provider="local", root=str(remote_data_root)),
         saves=SavesConfig(local_path=str(saves_root), xbox_enabled=xbox_enabled),
     )
     config_dir = tmp_path / "config"

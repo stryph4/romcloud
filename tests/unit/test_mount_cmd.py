@@ -17,6 +17,7 @@ from click.testing import CliRunner
 
 from romcloud.cli.main import cli
 import romcloud.cli.commands.mount as mount_cmd_module
+from romcloud.core.exceptions import MountError
 from romcloud.cli.commands.mount import mount_group
 from romcloud.infrastructure.config import AppConfig, CacheConfig, SMBConfig, SourceConfig, write_config
 from romcloud.infrastructure.mount_worker import MountDiagnostics
@@ -35,8 +36,12 @@ def _fake_config(
         smb=smb,
         credentials_path=home / "config" / "credentials.toml",
         data_path=str(home / "data"),
-        saves=(
-            SimpleNamespace(remote_mount_path=saves_mount)
+        remote_data=(
+            SimpleNamespace(
+                provider="smb",
+                root=saves_mount,
+                smb=_fake_smb(server="data-nas.local", share="ROMCloud"),
+            )
             if saves_mount is not None
             else None
         ),
@@ -51,8 +56,8 @@ class TestBootStart:
     def test_catalog_mount_alone_does_not_hide_missing_savesync_mount(self, monkeypatch):
         monkeypatch.setattr(
             mount_cmd_module.mount,
-            "is_target_mounted",
-            lambda path: path == "/mnt/roms",
+            "is_target_mounted_cifs",
+            lambda path, **kwargs: path == "/mnt/roms",
         )
         monkeypatch.setattr(mount_cmd_module.mount_worker, "is_worker_running", lambda *a: None)
         monkeypatch.setattr(mount_cmd_module.mount_worker, "spawn_worker", lambda *a: 4242)
@@ -66,7 +71,7 @@ class TestBootStart:
         assert "4242" in result.output
 
     def test_already_mounted_skips_spawn(self, monkeypatch):
-        monkeypatch.setattr(mount_cmd_module.mount, "is_target_mounted", lambda *a, **k: True)
+        monkeypatch.setattr(mount_cmd_module.mount, "is_target_mounted_cifs", lambda *a, **k: True)
         monkeypatch.setattr(
             mount_cmd_module.mount, "is_target_mounted_read_only", lambda *a, **k: True
         )
@@ -80,7 +85,7 @@ class TestBootStart:
         assert spawned == []
 
     def test_worker_already_running_skips_spawn(self, monkeypatch):
-        monkeypatch.setattr(mount_cmd_module.mount, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mount_cmd_module.mount, "is_target_mounted_cifs", lambda *a, **k: False)
         monkeypatch.setattr(mount_cmd_module.mount_worker, "is_worker_running", lambda *a, **k: 4242)
         spawned = []
         monkeypatch.setattr(mount_cmd_module.mount_worker, "spawn_worker", lambda *a, **k: spawned.append(1))
@@ -92,7 +97,7 @@ class TestBootStart:
         assert spawned == []
 
     def test_spawns_worker_and_returns_immediately(self, monkeypatch):
-        monkeypatch.setattr(mount_cmd_module.mount, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mount_cmd_module.mount, "is_target_mounted_cifs", lambda *a, **k: False)
         monkeypatch.setattr(mount_cmd_module.mount_worker, "is_worker_running", lambda *a, **k: None)
         monkeypatch.setattr(mount_cmd_module.mount_worker, "spawn_worker", lambda *a, **k: 9999)
 
@@ -104,7 +109,7 @@ class TestBootStart:
 
     def test_no_smb_configured_is_a_clean_noop(self, monkeypatch):
         called = []
-        monkeypatch.setattr(mount_cmd_module.mount, "is_target_mounted", lambda *a, **k: called.append(1))
+        monkeypatch.setattr(mount_cmd_module.mount, "is_target_mounted_cifs", lambda *a, **k: called.append(1))
 
         result = _invoke(["boot-start"], _fake_config(smb=None))
 
@@ -118,7 +123,7 @@ class TestBootStart:
         def _boom(*a, **k):
             raise RuntimeError("disk on fire")
 
-        monkeypatch.setattr(mount_cmd_module.mount, "is_target_mounted", _boom)
+        monkeypatch.setattr(mount_cmd_module.mount, "is_target_mounted_cifs", _boom)
 
         result = _invoke(["boot-start"], _fake_config(smb=_fake_smb()))
 
@@ -193,6 +198,28 @@ class TestStop:
         assert result.exit_code == 0
         assert "nothing to mount" in result.output
 
+    def test_unmount_failure_does_not_skip_the_other_configured_mount(
+        self, monkeypatch
+    ):
+        calls = []
+        monkeypatch.setattr(mount_cmd_module.mount_worker, "stop_worker", lambda *a: None)
+
+        def unmount(path):
+            calls.append(path)
+            if path == "/mnt/saves-rw":
+                raise MountError("remote busy")
+            return True
+
+        monkeypatch.setattr(mount_cmd_module.mount, "unmount_cifs_source", unmount)
+
+        result = _invoke(
+            ["stop"],
+            _fake_config(smb=_fake_smb(), saves_mount="/mnt/saves-rw"),
+        )
+
+        assert result.exit_code != 0
+        assert calls == ["/mnt/saves-rw", "/mnt/roms"]
+
 
 class TestRemove:
     def test_stops_worker_and_cleans_state_when_smb_configured(self, monkeypatch):
@@ -219,6 +246,43 @@ class TestRemove:
         assert result.exit_code == 0, result.output
         assert calls == []
         assert "nothing to do" in result.output.lower()
+
+    def test_unmounts_all_targets_before_removing_service(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            mount_cmd_module.mount_worker,
+            "stop_worker",
+            lambda *a: calls.append("stop"),
+        )
+        monkeypatch.setattr(
+            mount_cmd_module.mount_worker,
+            "cleanup_runtime_state",
+            lambda *a: calls.append("cleanup"),
+        )
+        monkeypatch.setattr(
+            mount_cmd_module.mount,
+            "unmount_cifs_source",
+            lambda path: calls.append(path) or True,
+        )
+        monkeypatch.setattr(
+            mount_cmd_module.mount_service,
+            "remove_service",
+            lambda: calls.append("service") or True,
+        )
+
+        result = _invoke(
+            ["remove"],
+            _fake_config(smb=_fake_smb(), saves_mount="/mnt/saves-rw"),
+        )
+
+        assert result.exit_code == 0, result.output
+        assert calls == [
+            "stop",
+            "/mnt/saves-rw",
+            "/mnt/roms",
+            "cleanup",
+            "service",
+        ]
 
 
 class TestInstall:
@@ -332,7 +396,11 @@ class TestStartupMigrationFromMountStatus:
 
 class TestExistingStartBehaviorIntact:
     def test_start_mounts_catalog_ro_and_savesync_rw(self, monkeypatch):
-        monkeypatch.setattr(mount_cmd_module, "load_smb_password", lambda *a, **k: "hunter2")
+        monkeypatch.setattr(
+            mount_cmd_module.mount_worker,
+            "credentials_for_mount",
+            lambda config, target: ("hunter2", Path(f"/{target.credential_kind}-creds")),
+        )
         monkeypatch.setattr(mount_cmd_module, "write_cifs_credentials_file", lambda *a, **k: None)
         calls = []
         monkeypatch.setattr(
@@ -350,11 +418,17 @@ class TestExistingStartBehaviorIntact:
 
         assert result.exit_code == 0, result.output
         assert [item["mount_point"] for item in calls] == ["/mnt/roms", "/mnt/saves-rw"]
+        assert [item["server"] for item in calls] == ["nas.local", "data-nas.local"]
+        assert [item["share"] for item in calls] == ["ROMs", "ROMCloud"]
         assert calls[0]["read_only"] is True
         assert calls[1]["read_only"] is False
 
     def test_start_still_blocks_and_reports_mounted(self, monkeypatch):
-        monkeypatch.setattr(mount_cmd_module, "load_smb_password", lambda *a, **k: "hunter2")
+        monkeypatch.setattr(
+            mount_cmd_module.mount_worker,
+            "credentials_for_mount",
+            lambda *a: ("hunter2", Path("/creds")),
+        )
         monkeypatch.setattr(mount_cmd_module, "write_cifs_credentials_file", lambda *a, **k: None)
         monkeypatch.setattr(
             mount_cmd_module.mount,
@@ -368,7 +442,45 @@ class TestExistingStartBehaviorIntact:
         assert "Mounted." in result.output
 
     def test_start_requires_password(self, monkeypatch):
-        monkeypatch.setattr(mount_cmd_module, "load_smb_password", lambda *a, **k: None)
+        monkeypatch.setattr(
+            mount_cmd_module.mount_worker,
+            "credentials_for_mount",
+            lambda *a: (None, Path("/creds")),
+        )
         result = _invoke(["start"], _fake_config(smb=_fake_smb()))
         assert result.exit_code != 0
-        assert "no SMB password stored" in result.output
+        assert "No SMB password stored" in result.output
+
+    def test_start_rolls_back_only_mounts_created_before_later_failure(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            mount_cmd_module.mount_worker,
+            "credentials_for_mount",
+            lambda config, target: ("secret", Path(f"/{target.credential_kind}-creds")),
+        )
+        monkeypatch.setattr(mount_cmd_module, "write_cifs_credentials_file", lambda *a: None)
+        attempts = []
+        unmounted = []
+
+        def mount_target(**kwargs):
+            attempts.append(kwargs["mount_point"])
+            if kwargs["mount_point"] == "/mnt/saves-rw":
+                raise MountError("remote unavailable")
+            return SimpleNamespace(mounted=True, already_mounted=False, detail="mounted")
+
+        monkeypatch.setattr(mount_cmd_module.mount, "mount_cifs_source", mount_target)
+        monkeypatch.setattr(
+            mount_cmd_module.mount,
+            "unmount_cifs_source",
+            lambda path: unmounted.append(path) or True,
+        )
+
+        result = _invoke(
+            ["start"],
+            _fake_config(smb=_fake_smb(), saves_mount="/mnt/saves-rw"),
+        )
+
+        assert result.exit_code != 0
+        assert attempts == ["/mnt/roms", "/mnt/saves-rw"]
+        assert unmounted == ["/mnt/roms"]

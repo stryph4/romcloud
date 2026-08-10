@@ -9,6 +9,7 @@ Default installation path: ``/userdata/system/romcloud/config/romcloud.toml``
 
 from __future__ import annotations
 
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,11 +35,15 @@ from romcloud.infrastructure.credentials import migrate_legacy_smb_credentials
 # ── defaults ──────────────────────────────────────────────────────────────────
 
 _DEFAULT_ROMCLOUD_HOME = Path("/userdata/system/romcloud")
-_DEFAULT_CACHE_ROOT = Path("/userdata/romcloud-cache")
+_DEFAULT_RUNTIME_ROOT = Path("/userdata/romcloud")
+_DEFAULT_REMOTE_DATA_ROOT = _DEFAULT_RUNTIME_ROOT / "remote"
+_DEFAULT_CACHE_ROOT = _DEFAULT_RUNTIME_ROOT / "cache"
 _DEFAULT_LOCAL_ROMS = Path("/userdata/roms")
 _DEFAULT_SAVES_LOCAL_PATH = Path("/userdata/saves")
-_DEFAULT_SAVES_REMOTE_SUBDIR = "romcloud-saves"
-_DEFAULT_SAVES_REMOTE_MOUNT_PATH = Path("/userdata/romcloud-saves-source")
+
+_LEGACY_SOURCE_ROOT = "/userdata/romcloud-source"
+_LEGACY_CACHE_ROOT = "/userdata/romcloud-cache"
+_LEGACY_SAVES_KEYS = frozenset({"remote_mount_path", "remote_subdir"})
 
 
 # ── sub-configs ───────────────────────────────────────────────────────────────
@@ -72,6 +77,21 @@ class SMBConfig:
 
 
 @dataclass(frozen=True)
+class RemoteDataConfig:
+    """General writable storage owned by ROMCloud synchronized features.
+
+    ``root`` is the filesystem path ROMCloud uses. For a local/USB target it
+    is the user-selected directory. For SMB it is the operational mount point
+    (normally ``/userdata/romcloud/remote``), while ``smb`` identifies the
+    independently selected network target.
+    """
+
+    provider: str
+    root: str
+    smb: Optional[SMBConfig] = None
+
+
+@dataclass(frozen=True)
 class CacheConfig:
     path: str
     max_size_gb: float = 50.0
@@ -86,18 +106,14 @@ class LoggingConfig:
 
 @dataclass(frozen=True)
 class SavesConfig:
-    """SaveSync v1 settings.
+    """SaveSync v1 local selection/settings.
 
-    ``remote_subdir`` is a directory relative to the remote storage root.
-    For SMB deployments, ``remote_mount_path`` is a dedicated read-write
-    mount of the same share; the ROM/catalog mount remains read-only. Plain
-    local/USB deployments continue to use ``source.rom_root`` directly and
-    ignore ``remote_mount_path``.
+    The remote dataset location is intentionally not configurable here. It
+    is always ``<remote_data.root>/saves`` when general remote data storage
+    is configured.
     """
 
     local_path: str = str(_DEFAULT_SAVES_LOCAL_PATH)
-    remote_subdir: str = _DEFAULT_SAVES_REMOTE_SUBDIR
-    remote_mount_path: str = str(_DEFAULT_SAVES_REMOTE_MOUNT_PATH)
     xbox_enabled: bool = False
 
 
@@ -109,6 +125,7 @@ class AppConfig:
     data_path: str
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     smb: Optional[SMBConfig] = None
+    remote_data: Optional[RemoteDataConfig] = None
     saves: SavesConfig = field(default_factory=SavesConfig)
 
     @property
@@ -129,6 +146,13 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
         )
 
     try:
+        migrate_legacy_storage_config(path)
+    except OSError as exc:
+        raise ConfigurationError(
+            f"Failed to migrate legacy config {path}: {exc}"
+        ) from exc
+
+    try:
         with path.open("rb") as fh:
             data = tomllib.load(fh)
     except Exception as exc:
@@ -137,6 +161,88 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
     config = _parse(data, path)
     migrate_legacy_smb_credentials(config.credentials_path)
     return config
+
+
+def migrate_legacy_storage_config(
+    path: Path,
+    *,
+    legacy_source_root: str = _LEGACY_SOURCE_ROOT,
+    source_root: str = str(_DEFAULT_RUNTIME_ROOT / "source"),
+    legacy_cache_root: str = _LEGACY_CACHE_ROOT,
+    cache_root: str = str(_DEFAULT_CACHE_ROOT),
+) -> bool:
+    """Atomically reconcile the pre-0.9.2 storage schema in *path*.
+
+    Only the two exact historical ROMCloud defaults are replaced. Legacy
+    SaveSync destination keys are removed because they cannot safely identify
+    the independently selected writable target required by ``[remote_data]``.
+    The rest of the file is patched in place rather than serialized from
+    :class:`AppConfig`, preserving comments, unknown sections, and unrelated
+    user settings.
+    """
+    raw = path.read_text(encoding="utf-8")
+    try:
+        data = tomllib.loads(raw)
+    except Exception:  # The normal load path will report the parse error.
+        return False
+
+    source_raw = data.get("source", {})
+    cache_raw = data.get("cache", {})
+    saves_raw = data.get("saves", {})
+    migrate_source = isinstance(source_raw, dict) and (
+        source_raw.get("rom_root") == legacy_source_root
+    )
+    migrate_cache = isinstance(cache_raw, dict) and (
+        cache_raw.get("path") == legacy_cache_root
+    )
+    remove_saves_keys = (
+        _LEGACY_SAVES_KEYS.intersection(saves_raw)
+        if isinstance(saves_raw, dict)
+        else frozenset()
+    )
+    if not (migrate_source or migrate_cache or remove_saves_keys):
+        return False
+
+    section = ""
+    rewritten: list[str] = []
+    for line in raw.splitlines(keepends=True):
+        section_match = re.match(r"^\s*\[([^\[\]]+)\]\s*(?:#.*)?(?:\r?\n)?$", line)
+        if section_match:
+            section = section_match.group(1).strip()
+            rewritten.append(line)
+            continue
+
+        key_match = re.match(r"^\s*([A-Za-z0-9_-]+)\s*=", line)
+        key = key_match.group(1) if key_match else None
+        if section == "saves" and key in remove_saves_keys:
+            continue
+        if section == "source" and key == "rom_root" and migrate_source:
+            line = _replace_exact_toml_string(
+                line, "rom_root", legacy_source_root, source_root
+            )
+        elif section == "cache" and key == "path" and migrate_cache:
+            line = _replace_exact_toml_string(
+                line, "path", legacy_cache_root, cache_root
+            )
+        rewritten.append(line)
+
+    result = "".join(rewritten)
+    if result == raw:
+        return False
+    atomic_write_text(path, result, mode=path.stat().st_mode & 0o777)
+    return True
+
+
+def _replace_exact_toml_string(line: str, key: str, old: str, new: str) -> str:
+    """Replace a simple historical TOML string while retaining its formatting."""
+    pattern = re.compile(
+        rf"^(\s*{re.escape(key)}\s*=\s*)(['\"]){re.escape(old)}\2(\s*(?:#.*)?)(\r?\n)?$"
+    )
+    match = pattern.match(line)
+    if match is None:  # Valid but non-simple TOML remains untouched conservatively.
+        return line
+    newline = match.group(4) or ""
+    return f'{match.group(1)}"{new}"{match.group(3)}{newline}'
 
 
 def _parse(data: dict, path: Path) -> AppConfig:  # noqa: C901
@@ -203,42 +309,63 @@ def _parse(data: dict, path: Path) -> AppConfig:  # noqa: C901
         path=log_raw.get("path"),
     )
 
+    remote_data = None
+    remote_raw = data.get("remote_data")
+    if remote_raw is not None:
+        provider_id = str(remote_raw.get("provider", "local")).lower()
+        if provider_id not in {"local", "smb"}:
+            raise ConfigurationError(
+                f"{path}: remote_data.provider must be \"local\" or \"smb\"."
+            )
+        default_root = (
+            str(_DEFAULT_REMOTE_DATA_ROOT) if provider_id == "smb" else ""
+        )
+        remote_root = str(remote_raw.get("root", default_root)).strip()
+        if not remote_root or not Path(remote_root).is_absolute():
+            raise ConfigurationError(
+                f"{path}: remote_data.root must be an explicit absolute path."
+            )
+
+        remote_smb = None
+        if provider_id == "smb":
+            remote_smb_raw = remote_raw.get("smb")
+            if not isinstance(remote_smb_raw, dict):
+                raise ConfigurationError(
+                    f"{path}: remote_data.provider = \"smb\" requires [remote_data.smb]."
+                )
+            try:
+                remote_smb = SMBConfig(
+                    server=remote_smb_raw["server"],
+                    share=remote_smb_raw["share"],
+                    username=remote_smb_raw.get("username", "guest"),
+                    port=int(remote_smb_raw.get("port", 445)),
+                )
+            except KeyError as exc:
+                raise ConfigurationError(
+                    f"Missing required [remote_data.smb] key: {exc}"
+                ) from exc
+
+        remote_data = RemoteDataConfig(
+            provider=provider_id,
+            root=remote_root,
+            smb=remote_smb,
+        )
+
     saves_raw = data.get("saves", {})
     saves = SavesConfig(
         local_path=saves_raw.get("local_path", str(_DEFAULT_SAVES_LOCAL_PATH)),
-        remote_subdir=saves_raw.get("remote_subdir", _DEFAULT_SAVES_REMOTE_SUBDIR),
-        remote_mount_path=saves_raw.get(
-            "remote_mount_path", str(_DEFAULT_SAVES_REMOTE_MOUNT_PATH)
-        ),
         xbox_enabled=bool(saves_raw.get("xbox_enabled", False)),
     )
 
-    remote_subdir = Path(saves.remote_subdir)
-    if (
-        not saves.remote_subdir
-        or remote_subdir.is_absolute()
-        or ".." in remote_subdir.parts
-    ):
-        raise ConfigurationError(
-            f"{path}: saves.remote_subdir must be a relative directory without '..'."
-        )
-
-    if smb is not None:
-        rom_mount = Path(source.rom_root)
-        saves_mount = Path(saves.remote_mount_path)
-        if not saves_mount.is_absolute():
-            raise ConfigurationError(
-                f"{path}: saves.remote_mount_path must be an absolute path."
-            )
-        if (
-            saves_mount == rom_mount
-            or saves_mount in rom_mount.parents
-            or rom_mount in saves_mount.parents
-        ):
-            raise ConfigurationError(
-                f"{path}: saves.remote_mount_path must be separate from source.rom_root "
-                "so the catalog mount can remain read-only."
-            )
+    validate_remote_data_boundary(
+        source=source,
+        source_smb=smb,
+        cache=cache,
+        data_path=data_path,
+        local_saves_path=saves.local_path,
+        remote_data=remote_data,
+        context=str(path),
+    )
 
     return AppConfig(
         source=source,
@@ -247,6 +374,7 @@ def _parse(data: dict, path: Path) -> AppConfig:  # noqa: C901
         data_path=data_path,
         logging=logging,
         smb=smb,
+        remote_data=remote_data,
         saves=saves,
     )
 
@@ -261,6 +389,15 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
     fully written.
     """
     path = Path(config_path) if config_path else default_config_path()
+    validate_remote_data_boundary(
+        source=config.source,
+        source_smb=config.smb,
+        cache=config.cache,
+        data_path=config.data_path,
+        local_saves_path=config.saves.local_path,
+        remote_data=config.remote_data,
+        context=str(path),
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
 
     lines = [
@@ -308,14 +445,29 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
             f"port = {config.smb.port}\n",
         ]
 
+    if config.remote_data is not None:
+        lines += [
+            "\n",
+            "[remote_data]\n",
+            "# General writable storage for synchronized ROMCloud data.\n",
+            f'provider = "{config.remote_data.provider}"\n',
+            f'root = "{config.remote_data.root}"\n',
+        ]
+        if config.remote_data.smb is not None:
+            lines += [
+                "\n",
+                "[remote_data.smb]\n",
+                f'server = "{config.remote_data.smb.server}"\n',
+                f'share = "{config.remote_data.smb.share}"\n',
+                f'username = "{config.remote_data.smb.username}"\n',
+                f"port = {config.remote_data.smb.port}\n",
+            ]
+
     lines += [
         "\n",
         "[saves]\n",
         "# SaveSync v1 — see `romcloud saves --help`.\n",
         f'local_path = "{config.saves.local_path}"\n',
-        f'remote_subdir = "{config.saves.remote_subdir}"\n',
-        "# Dedicated read-write mount of the SMB share; ignored for local/USB sources.\n",
-        f'remote_mount_path = "{config.saves.remote_mount_path}"\n',
         f"xbox_enabled = {'true' if config.saves.xbox_enabled else 'false'}\n",
     ]
 
@@ -325,3 +477,60 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
 
 def default_config_path() -> Path:
     return _DEFAULT_ROMCLOUD_HOME / "config" / "romcloud.toml"
+
+
+def validate_remote_data_boundary(
+    *,
+    source: SourceConfig,
+    source_smb: Optional[SMBConfig],
+    cache: CacheConfig,
+    data_path: str,
+    local_saves_path: str,
+    remote_data: Optional[RemoteDataConfig],
+    context: str,
+) -> None:
+    """Keep user-controlled synchronized data outside ROM/runtime state.
+
+    Rejecting both parent and child relationships prevents SaveSync from
+    ever treating the read-only ROM tree, local cache, or persistent system
+    state as its writable ownership boundary.
+    """
+    if remote_data is None:
+        return
+    if (
+        source_smb is not None
+        and remote_data.provider == "smb"
+        and remote_data.smb is not None
+        and source_smb.server.casefold() == remote_data.smb.server.casefold()
+        and source_smb.share.strip("/").casefold()
+        == remote_data.smb.share.strip("/").casefold()
+    ):
+        raise ConfigurationError(
+            f"{context}: remote_data.smb must not reuse the ROM source SMB target; "
+            "select a separate writable share."
+        )
+    remote_root = Path(remote_data.root)
+    if not remote_root.is_absolute():
+        raise ConfigurationError(
+            f"{context}: remote_data.root must be an explicit absolute path."
+        )
+    for label, other in (
+        ("source.rom_root", Path(source.rom_root)),
+        ("cache.path", Path(cache.path)),
+        ("data.path", Path(data_path)),
+        ("ROMCloud system home", _DEFAULT_ROMCLOUD_HOME),
+        ("saves.local_path", Path(local_saves_path)),
+    ):
+        if paths_overlap(remote_root, other):
+            raise ConfigurationError(
+                f"{context}: remote_data.root must not overlap {label}."
+            )
+
+
+def paths_overlap(first: Path, second: Path) -> bool:
+    try:
+        first = first.resolve(strict=False)
+        second = second.resolve(strict=False)
+    except OSError:
+        pass
+    return first == second or first in second.parents or second in first.parents

@@ -148,6 +148,13 @@ def format_result(action: str, result: BackendResult) -> str:
         body = f"{source_prefix} | {'reachable' if reachable else 'unreachable'}" if source_prefix else (
             "reachable" if reachable else "unreachable"
         )
+        if result.data.get("remote_data_configured"):
+            remote = (
+                "writable"
+                if result.data.get("remote_data_reachable")
+                else "unreachable/read-only"
+            )
+            body += f" | ROMCloud data: {remote}"
         return f"{action}: {body}"
     return f"{action}: {result.data}"
 
@@ -162,7 +169,13 @@ def classify_message_kind(action: str, result: BackendResult) -> str:
     """
     if not result.ok:
         return "error"
-    if action == "healthcheck" and result.data.get("source_reachable") is False:
+    if action == "healthcheck" and (
+        result.data.get("source_reachable") is False
+        or (
+            result.data.get("remote_data_configured")
+            and result.data.get("remote_data_reachable") is False
+        )
+    ):
         return "warning"
     return "success"
 
@@ -741,6 +754,13 @@ def _savesync_body_lines(savesync_screen: SaveSyncScreenState) -> list[str]:
     status = savesync_screen.status
 
     if step == DASHBOARD:
+        if status.get("remote_configured") is False:
+            return [
+                "ROMCloud data storage is not configured.",
+                "SaveSync is unavailable until a writable destination is configured.",
+                "",
+                *DASHBOARD_ITEMS,
+            ]
         reachable = status.get("remote_reachable")
         xbox_enabled = status.get("xbox_enabled", False)
         last_upload = status.get("last_upload")
@@ -859,18 +879,40 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
         if not wizard.systems:
             return ["No recognized Batocera system folders were found."]
         return [f"{len(wizard.systems)} systems: {', '.join(wizard.systems)}"]
+    if wizard.step == WizardStep.REMOTE_DATA:
+        return [
+            "Choose separate writable storage for synchronized ROMCloud data.",
+            "SaveSync is unavailable if this step is skipped.",
+        ]
+    if wizard.step == WizardStep.REMOTE_DISCOVER:
+        return ["Connecting and finding writable-data shares..."] if wizard.runner else []
+    if wizard.step == WizardStep.REMOTE_VALIDATE:
+        return [
+            f"Checking //{wizard.remote_server}/{wizard.remote_share}..."
+        ] if wizard.runner else []
     if wizard.step == WizardStep.REVIEW:
         return [
             f"SMB: //{wizard.server}/{wizard.share}",
             f"Systems: {len(wizard.systems)}",
+            (
+                f"ROMCloud data: //{wizard.remote_server}/{wizard.remote_share}"
+                if wizard.remote_data_type == "smb"
+                else f"ROMCloud data: {wizard.remote_data_root}"
+                if wizard.remote_data_type == "local"
+                else "ROMCloud data: not configured (SaveSync unavailable)"
+            ),
             f"Cache: {wizard.cache_root} ({wizard.max_size_gb:g} GB max)",
         ]
     if wizard.step == WizardStep.APPLY:
-        return ["Mounting, refreshing the catalog, and updating EmulationStation..."] if wizard.runner else []
+        return [
+            "Mounting source/data storage, validating writes, refreshing the catalog, "
+            "and updating EmulationStation..."
+        ] if wizard.runner else []
     if wizard.step == WizardStep.DONE:
         return [
             f"SMB source: //{wizard.applied_summary.get('server', wizard.server)}/{wizard.applied_summary.get('share', wizard.share)}",
             f"Detected systems: {wizard.applied_summary.get('system_count', len(wizard.systems))}",
+            f"ROMCloud data: {wizard.applied_summary.get('remote_data_type', wizard.remote_data_type)}",
             f"Cache size: {wizard.applied_summary.get('max_size_gb', wizard.max_size_gb):g} GB",
             "ROMCloud is ready. Return to EmulationStation and restart or rescan it to show new games.",
         ]
@@ -931,5 +973,3 @@ def _render_wizard(  # noqa: ANN001
         hint = fonts["hint"].render(_WIZARD_HINT, True, _HINT_COLOR)
         screen.blit(hint, (layout.hint_rect.x, layout.hint_rect.y))
     pygame.display.flip()
-
-

@@ -9,10 +9,11 @@ Design (see the SaveSync v1 spec):
   preview a full diff, stage the new dataset without touching the
   existing one, verify the staged copy, then atomically swap it into
   place. State only advances after that verified commit.
-- The "remote" SaveSync dataset uses a dedicated read-write mount of the
-  same SMB share as the read-only ROM catalog mount. Local/USB deployments
-  keep using their ordinary filesystem root. Both remain plain filesystem
-  paths so staging and directory renames stay on one filesystem.
+- The remote SaveSync dataset is always ``<remote_data.root>/saves``. An SMB
+  destination uses its own read-write mount and may be on a different server,
+  share, and credentials from the read-only ROM source. Local/USB destinations
+  remain plain filesystem paths, so staging and directory renames stay on one
+  filesystem.
 - Both the CLI (``romcloud saves ...``) and the graphical UI (via
   ``romcloud uidata savesync-*``) call this same service — neither
   duplicates selection, diffing, or commit logic.
@@ -56,10 +57,10 @@ class SaveSyncService:
     def __init__(
         self,
         *,
-        provider: StorageProvider,
-        connectivity_root: str,
+        provider: Optional[StorageProvider],
+        connectivity_root: Optional[str],
         local_root: str,
-        remote_root: str,
+        remote_root: Optional[str],
         state_path: Path,
         xbox_enabled: bool = False,
         policy: SaveSelectionPolicy = DEFAULT_SAVE_SELECTION_POLICY,
@@ -67,7 +68,7 @@ class SaveSyncService:
         self._provider = provider
         self._connectivity_root = connectivity_root
         self._local_root = Path(local_root)
-        self._remote_root = Path(remote_root)
+        self._remote_root = Path(remote_root) if remote_root is not None else None
         self._state_path = Path(state_path)
         self._xbox_enabled = xbox_enabled
         self._policy = policy
@@ -75,7 +76,15 @@ class SaveSyncService:
     # ── connectivity ──────────────────────────────────────────────────────
 
     def is_remote_reachable(self) -> bool:
-        return self._provider.is_reachable(self._connectivity_root)
+        return (
+            self._provider is not None
+            and self._connectivity_root is not None
+            and self._provider.is_reachable(self._connectivity_root)
+        )
+
+    @property
+    def is_remote_configured(self) -> bool:
+        return self._provider is not None and self._remote_root is not None
 
     # ── xbox opt-in (disabled by default; see SaveSelectionPolicy) ───────
 
@@ -113,6 +122,7 @@ class SaveSyncService:
         return self._preview("download")
 
     def _preview(self, direction: str) -> SaveDiff:
+        self._require_remote()
         if not self.is_remote_reachable():
             raise SaveSyncConnectivityError(
                 f"Remote save location is not reachable: {self._connectivity_root}"
@@ -120,6 +130,7 @@ class SaveSyncService:
         # A killed process may have stopped between the two directory renames
         # used when replacing an existing dataset. Restore the last complete
         # dataset (or remove abandoned staging) before calculating a diff.
+        assert self._remote_root is not None
         save_tree.recover_interrupted_commit(self._remote_root)
         save_tree.recover_interrupted_commit(self._local_root)
         enabled_optional = self._enabled_optional_systems()
@@ -131,10 +142,21 @@ class SaveSyncService:
     # ── commit (stage → verify → atomic swap → advance state) ───────────
 
     def commit_upload(self, diff: SaveDiff) -> SaveSyncRecord:
+        self._require_remote()
+        assert self._remote_root is not None
         return self._commit(diff, source_root=self._local_root, dest_root=self._remote_root)
 
     def commit_download(self, diff: SaveDiff) -> SaveSyncRecord:
+        self._require_remote()
+        assert self._remote_root is not None
         return self._commit(diff, source_root=self._remote_root, dest_root=self._local_root)
+
+    def _require_remote(self) -> None:
+        if not self.is_remote_configured:
+            raise SaveSyncConnectivityError(
+                "ROMCloud remote data storage is not configured; configure a writable "
+                "destination before using SaveSync."
+            )
 
     def _commit(self, diff: SaveDiff, *, source_root: Path, dest_root: Path) -> SaveSyncRecord:
         if not self.is_remote_reachable():

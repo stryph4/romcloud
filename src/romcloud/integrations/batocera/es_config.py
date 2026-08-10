@@ -34,7 +34,7 @@ Known limitation — folder-specific settings
 ----------------------------------------------
 ``snes.folder["/userdata/roms/snes"].*`` overrides are keyed on the ROM's
 containing directory. Cached ROMs live under
-``/userdata/romcloud-cache/<system>/...``, which differs from the original
+``/userdata/romcloud/cache/<system>/...``, which differs from the original
 ``/userdata/roms/<system>/`` directory used as the folder key — those
 overrides will not apply to cached ROMs. System-level (``snes.*``) and
 per-game (``snes["Game.sfc"].*``) settings are unaffected and work
