@@ -136,15 +136,18 @@ class CatalogService:
                         game.source_root,
                         primary.relative_path,
                     )
+                    if existing is None:
+                        existing = self._find_legacy_container_game(game)
                     if existing is not None:
                         if _asset_paths_differ(existing.assets, game.assets):
                             game.id = existing.id
                             game.added_at = existing.added_at
                             game.last_played = existing.last_played
                             self._game_repo.save(game)
+                            self._rewrite_owned_proxy(game)
                             updated += 1
                             log.info(
-                                "Updated companion assets for %r [%s]", game.title, system
+                                "Updated asset metadata for %r [%s]", game.title, system
                             )
                         else:
                             skipped += 1
@@ -304,6 +307,7 @@ class CatalogService:
         warnings: list[str] = []
         handled_root_cue_names: set[str] = set()
         superseded_dirs: set[str] = set()
+        nested_entries: dict[str, list[RemoteEntry]] = {}
 
         # Pass 1: top-level .cue files are their own logical game.
         for entry in entries:
@@ -337,6 +341,7 @@ class CatalogService:
                 )
             except Exception:  # noqa: BLE001 — fall back to opaque directory game
                 nested = []
+            nested_entries[entry.relative_path] = nested
 
             nested_cue_entries = [
                 n for n in nested
@@ -373,7 +378,20 @@ class CatalogService:
             if entry.is_directory:
                 if entry.relative_path in superseded_dirs:
                     continue
-                games.append(self._make_directory_game(system, entry))
+                nested = nested_entries.get(entry.relative_path, [])
+                nested_files = [
+                    item for item in nested
+                    if not item.is_directory and not item.name.endswith(".romcloud")
+                ]
+                sole_file_matches_container = (
+                    len(nested) == 1
+                    and len(nested_files) == 1
+                    and Path(nested_files[0].name).stem.casefold() == entry.name.casefold()
+                )
+                if sole_file_matches_container:
+                    games.append(self._make_file_game(system, nested_files[0]))
+                else:
+                    games.append(self._make_directory_game(system, entry))
             else:
                 if entry.name in handled_root_cue_names:
                     continue
@@ -550,6 +568,26 @@ class CatalogService:
             assets=[asset],
         )
 
+    def _find_legacy_container_game(self, game: Game) -> Optional[Game]:
+        """Find the exact directory game superseded by a sole nested file."""
+        primary = game.primary_asset
+        if primary is None:
+            return None
+        parent = Path(primary.relative_path).parent
+        if str(parent) in ("", ".", game.system):
+            return None
+        existing = self._game_repo.find_by_source_path(
+            game.source_provider,
+            game.source_root,
+            str(parent),
+        )
+        if existing is None or existing.system != game.system or len(existing.assets) != 1:
+            return None
+        old_primary = existing.primary_asset
+        if old_primary is None or old_primary.relative_path != str(parent):
+            return None
+        return existing
+
     # ── proxy I/O ─────────────────────────────────────────────────────────────
 
     def _write_proxy(self, game: Game) -> None:
@@ -564,6 +602,20 @@ class CatalogService:
         if proxy_path.exists() and not self._proxy_repo.owns_path(str(proxy_path)):
             proxy_path = proxy_dir / f"{safe_title}.{game.id[:8]}.romcloud"
 
+        self._write_proxy_payload(proxy_path, game)
+
+        record = ProxyRecord.create(game_id=game.id, proxy_path=str(proxy_path))
+        self._proxy_repo.save(record)
+
+    def _rewrite_owned_proxy(self, game: Game) -> None:
+        """Refresh an existing owned proxy without changing its path."""
+        record = self._proxy_repo.get(game.id)
+        if record is None:
+            self._write_proxy(game)
+            return
+        self._write_proxy_payload(Path(record.proxy_path), game)
+
+    def _write_proxy_payload(self, proxy_path: Path, game: Game) -> None:
         payload = {
             "romcloud_version": _PROXY_VERSION,
             "game_id": game.id,
@@ -583,9 +635,6 @@ class CatalogService:
         proxy_path.write_text(
             json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
         )
-
-        record = ProxyRecord.create(game_id=game.id, proxy_path=str(proxy_path))
-        self._proxy_repo.save(record)
 
     def _game_from_proxy_payload(self, game_id: str, payload: dict) -> Game:
         assets = [
@@ -614,12 +663,12 @@ def _safe_filename(title: str) -> str:
 
 
 def _asset_paths_differ(old: list[GameAsset], new: list[GameAsset]) -> bool:
-    """True if the *set* of (relative_path, is_primary) pairs differs.
+    """True if the identifying asset metadata differs.
 
     Used to detect that an existing catalog entry needs its companion
-    assets updated (e.g. a cue's referenced tracks were just discovered),
-    without triggering churn from mere size-field fluctuations.
+    assets or exact source filename/path updated, without triggering churn
+    from mere size-field fluctuations.
     """
-    old_keys = {(a.relative_path, a.is_primary) for a in old}
-    new_keys = {(a.relative_path, a.is_primary) for a in new}
+    old_keys = {(a.filename, a.relative_path, a.is_primary) for a in old}
+    new_keys = {(a.filename, a.relative_path, a.is_primary) for a in new}
     return old_keys != new_keys

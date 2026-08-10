@@ -9,6 +9,8 @@ import pytest
 
 from romcloud.integrations.batocera.catalog import CatalogService
 from romcloud.core.exceptions import ProxyError
+from romcloud.core.models.game import Game, GameAsset
+from romcloud.core.models.proxy import ProxyRecord
 
 
 class TestCatalogServiceRefresh:
@@ -460,6 +462,143 @@ class TestCueCatalogMigration:
 
 
 class TestCatalogServiceResolveProxy:
+    def test_top_level_xbox_file_preserves_requested_exact_metadata(
+        self, provider, game_repo, proxy_repo, local_roms_dir, tmp_path
+    ):
+        source = tmp_path / "source"
+        (source / "xbox").mkdir(parents=True)
+        (source / "xbox" / "Aggressive Inline.iso").write_bytes(b"xbox-iso")
+        svc = _make_catalog_service(
+            provider, game_repo, proxy_repo, local_roms_dir, source
+        )
+
+        svc.refresh()
+
+        game = game_repo.find_by_system("xbox")[0]
+        assert game.primary_asset is not None
+        assert game.primary_asset.filename == "Aggressive Inline.iso"
+        assert game.primary_asset.relative_path == "xbox/Aggressive Inline.iso"
+        payload = json.loads(
+            (local_roms_dir / "xbox" / "Aggressive Inline.romcloud").read_text()
+        )
+        assert payload["assets"][0]["filename"] == "Aggressive Inline.iso"
+        assert payload["assets"][0]["relative_path"] == "xbox/Aggressive Inline.iso"
+
+    def test_xbox_single_file_container_preserves_exact_iso_metadata(
+        self, provider, game_repo, proxy_repo, local_roms_dir, tmp_path
+    ):
+        source = tmp_path / "source"
+        game_dir = source / "xbox" / "Aggressive Inline"
+        game_dir.mkdir(parents=True)
+        (game_dir / "Aggressive Inline.iso").write_bytes(b"xbox-iso")
+        svc = _make_catalog_service(
+            provider, game_repo, proxy_repo, local_roms_dir, source
+        )
+
+        result = svc.refresh()
+
+        assert result.added == 1
+        game = game_repo.find_by_system("xbox")[0]
+        assert game.primary_asset is not None
+        assert game.primary_asset.filename == "Aggressive Inline.iso"
+        assert game.primary_asset.relative_path == (
+            "xbox/Aggressive Inline/Aggressive Inline.iso"
+        )
+        payload = json.loads(
+            (local_roms_dir / "xbox" / "Aggressive Inline.romcloud").read_text()
+        )
+        assert payload["assets"][0]["filename"] == "Aggressive Inline.iso"
+        assert payload["assets"][0]["relative_path"] == (
+            "xbox/Aggressive Inline/Aggressive Inline.iso"
+        )
+
+    def test_non_xbox_single_file_container_preserves_exact_extension(
+        self, provider, game_repo, proxy_repo, local_roms_dir, tmp_path
+    ):
+        source = tmp_path / "source"
+        game_dir = source / "gamecube" / "Metroid Prime"
+        game_dir.mkdir(parents=True)
+        (game_dir / "Metroid Prime.rvz").write_bytes(b"gamecube-rvz")
+        svc = _make_catalog_service(
+            provider, game_repo, proxy_repo, local_roms_dir, source
+        )
+
+        svc.refresh()
+
+        game = game_repo.find_by_system("gamecube")[0]
+        assert game.primary_asset is not None
+        assert game.primary_asset.filename == "Metroid Prime.rvz"
+        assert game.primary_asset.relative_path == (
+            "gamecube/Metroid Prime/Metroid Prime.rvz"
+        )
+        payload = json.loads(
+            (local_roms_dir / "gamecube" / "Metroid Prime.romcloud").read_text()
+        )
+        assert payload["assets"][0]["filename"] == "Metroid Prime.rvz"
+        assert payload["assets"][0]["relative_path"] == (
+            "gamecube/Metroid Prime/Metroid Prime.rvz"
+        )
+
+    def test_refresh_repairs_legacy_container_asset_and_owned_proxy_in_place(
+        self, provider, game_repo, proxy_repo, local_roms_dir, tmp_path
+    ):
+        source = tmp_path / "source"
+        game_dir = source / "xbox" / "Aggressive Inline"
+        game_dir.mkdir(parents=True)
+        (game_dir / "Aggressive Inline.iso").write_bytes(b"xbox-iso")
+        legacy = Game.create(
+            system="xbox",
+            title="Aggressive Inline",
+            source_provider="local",
+            source_root=str(source),
+            assets=[
+                GameAsset(
+                    filename="Aggressive Inline",
+                    relative_path="xbox/Aggressive Inline",
+                    size_bytes=8,
+                    is_primary=True,
+                )
+            ],
+        )
+        game_repo.save(legacy)
+        proxy_path = local_roms_dir / "xbox" / "Aggressive Inline.romcloud"
+        proxy_path.parent.mkdir(parents=True)
+        proxy_path.write_text(json.dumps({
+            "romcloud_version": "1",
+            "game_id": legacy.id,
+            "title": legacy.title,
+            "system": legacy.system,
+            "source_provider": legacy.source_provider,
+            "source_root": legacy.source_root,
+            "assets": [{
+                "filename": "Aggressive Inline",
+                "relative_path": "xbox/Aggressive Inline",
+                "is_primary": True,
+            }],
+        }))
+        proxy_repo.save(ProxyRecord.create(legacy.id, str(proxy_path)))
+        svc = _make_catalog_service(
+            provider, game_repo, proxy_repo, local_roms_dir, source
+        )
+
+        result = svc.refresh()
+
+        assert result.added == 0
+        assert result.updated == 1
+        repaired = game_repo.get(legacy.id)
+        assert repaired is not None
+        assert repaired.primary_asset is not None
+        assert repaired.primary_asset.filename == "Aggressive Inline.iso"
+        assert repaired.primary_asset.relative_path == (
+            "xbox/Aggressive Inline/Aggressive Inline.iso"
+        )
+        payload = json.loads(proxy_path.read_text())
+        assert payload["game_id"] == legacy.id
+        assert payload["assets"][0]["filename"] == "Aggressive Inline.iso"
+        assert payload["assets"][0]["relative_path"] == (
+            "xbox/Aggressive Inline/Aggressive Inline.iso"
+        )
+
     def test_xbox_proxy_preserves_primary_iso_metadata(
         self, provider, game_repo, proxy_repo, local_roms_dir, tmp_path
     ):
