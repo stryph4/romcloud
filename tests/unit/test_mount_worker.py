@@ -214,14 +214,23 @@ class TestRunWorker:
                 "mount_point": "/mnt/roms",
                 "credentials_path": mw.cifs_credentials_path(config.credentials_path),
                 "port": 445,
-                "wait_timeout": mw.DEFAULT_WAIT_TIMEOUT,
-                "wait_interval": mw.DEFAULT_WAIT_INTERVAL,
+                "wait_timeout": mw.DEFAULT_ATTEMPT_TIMEOUT,
+                "wait_interval": mw.DEFAULT_ATTEMPT_INTERVAL,
             }
         ]
+        # The single mount attempt must never be handed the full overall
+        # retry budget — that was the root cause of the boot-time bug.
+        assert attempts[0]["wait_timeout"] < mw.DEFAULT_RETRY_TIMEOUT
         assert sleeps == []
         status = mw.read_worker_status(tmp_path)
         assert status.state == "success"
         assert not mw.lock_path(tmp_path).exists()
+
+    def test_default_attempt_timeout_is_short_not_full_retry_budget(self):
+        """Regression for the boot-time bug: a single attempt's timeout must
+        stay short (~5-10s) and strictly less than the overall retry budget."""
+        assert 5.0 <= mw.DEFAULT_ATTEMPT_TIMEOUT <= 10.0
+        assert mw.DEFAULT_ATTEMPT_TIMEOUT < mw.DEFAULT_RETRY_TIMEOUT
 
     def test_retry_budget_exhaustion_records_failed_status(self, tmp_path, monkeypatch):
         monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
@@ -245,7 +254,7 @@ class TestRunWorker:
             retry_initial_delay=0.5,
             retry_max_delay=1.0,
             sleep=lambda seconds: sleeps.append(seconds),
-            clock=_fake_clock([0.0, 0.5, 1.1]),
+            clock=_fake_clock([0.0, 0.3, 0.5, 0.6, 1.1]),
         )
 
         assert code == 0
@@ -280,7 +289,7 @@ class TestRunWorker:
             retry_initial_delay=1.0,
             retry_max_delay=2.0,
             sleep=lambda seconds: sleeps.append(seconds),
-            clock=_fake_clock([0.0, 1.0, 2.0, 3.0, 4.0]),
+            clock=_fake_clock([0.0, 0.5, 1.0, 2.0, 3.0, 4.0]),
         )
 
         assert code == 0
@@ -318,9 +327,57 @@ class TestRunWorker:
         monkeypatch.setattr(mw.mountlib, "mount_cifs_source", _raise_net)
 
         config = _fake_config(smb=_fake_smb())
-        code = mw.run_worker(tmp_path, config)
+        start = time.monotonic()
+        # A small, explicit retry budget keeps this deterministic and fast —
+        # the real-time behaviour (never raising, bounded exhaustion) is what
+        # is under test here, not the production 300s window.
+        code = mw.run_worker(
+            tmp_path,
+            config,
+            retry_timeout=0.3,
+            retry_initial_delay=0.05,
+            retry_max_delay=0.1,
+        )
+        elapsed = time.monotonic() - start
 
         assert code == 0
+        assert elapsed < 5.0  # bounded — must never retry indefinitely
+        assert mw.read_worker_status(tmp_path).state == "failed"
+
+    def test_multiple_real_attempts_occur_within_bounded_retry_window(self, tmp_path, monkeypatch):
+        """With real wall-clock timing (no fake clock), the retry loop must
+        actually retry more than once within a bounded overall window, and no
+        single attempt may be handed the full overall retry budget."""
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted", lambda *a, **k: False)
+        monkeypatch.setattr(mw, "load_smb_password", lambda *a, **k: "hunter2")
+        monkeypatch.setattr(mw, "write_cifs_credentials_file", lambda *a, **k: None)
+
+        attempts = []
+
+        def fake_mount_cifs_source(**kwargs):
+            attempts.append(kwargs)
+            raise ProviderNotReachableError("SMB source unreachable")
+
+        monkeypatch.setattr(mw.mountlib, "mount_cifs_source", fake_mount_cifs_source)
+
+        config = _fake_config(smb=_fake_smb())
+        retry_timeout = 0.3
+        start = time.monotonic()
+        code = mw.run_worker(
+            tmp_path,
+            config,
+            attempt_timeout=0.05,
+            attempt_interval=0.01,
+            retry_timeout=retry_timeout,
+            retry_initial_delay=0.02,
+            retry_max_delay=0.05,
+        )
+        elapsed = time.monotonic() - start
+
+        assert code == 0
+        assert elapsed < 5.0
+        assert len(attempts) >= 2, "the retry loop must actually retry within the overall budget"
+        assert all(a["wait_timeout"] <= retry_timeout for a in attempts)
         assert mw.read_worker_status(tmp_path).state == "failed"
 
     def test_unexpected_exception_never_crashes_worker(self, tmp_path, monkeypatch):

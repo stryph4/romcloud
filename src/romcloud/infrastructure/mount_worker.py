@@ -61,11 +61,15 @@ from romcloud.infrastructure.logging import get_logger
 
 log = get_logger("mount.worker")
 
-DEFAULT_WAIT_TIMEOUT = 300.0  # 5 minutes — finite; never waits forever.
-DEFAULT_WAIT_INTERVAL = 5.0
+# Overall boot retry budget the detached worker owns end-to-end.
 DEFAULT_RETRY_TIMEOUT = 300.0
 DEFAULT_RETRY_INITIAL_DELAY = 2.0
 DEFAULT_RETRY_MAX_DELAY = 30.0
+
+# A single mount/reachability attempt must stay short so the retry loop can
+# actually retry within the overall budget above — never equal to it.
+DEFAULT_ATTEMPT_TIMEOUT = 8.0
+DEFAULT_ATTEMPT_INTERVAL = 2.0
 
 
 # ── path helpers ──────────────────────────────────────────────────────────────
@@ -316,8 +320,8 @@ def run_worker(
     romcloud_home: Path,
     config,
     *,
-    wait_timeout: float = DEFAULT_WAIT_TIMEOUT,
-    wait_interval: float = DEFAULT_WAIT_INTERVAL,
+    attempt_timeout: float = DEFAULT_ATTEMPT_TIMEOUT,
+    attempt_interval: float = DEFAULT_ATTEMPT_INTERVAL,
     retry_timeout: float = DEFAULT_RETRY_TIMEOUT,
     retry_initial_delay: float = DEFAULT_RETRY_INITIAL_DELAY,
     retry_max_delay: float = DEFAULT_RETRY_MAX_DELAY,
@@ -339,8 +343,8 @@ def run_worker(
             return _run_worker_locked(
                 romcloud_home,
                 config,
-                wait_timeout,
-                wait_interval,
+                attempt_timeout,
+                attempt_interval,
                 retry_timeout,
                 retry_initial_delay,
                 retry_max_delay,
@@ -354,8 +358,8 @@ def run_worker(
 def _run_worker_locked(
     romcloud_home: Path,
     config,
-    wait_timeout: float,
-    wait_interval: float,
+    attempt_timeout: float,
+    attempt_interval: float,
     retry_timeout: float,
     retry_initial_delay: float,
     retry_max_delay: float,
@@ -394,8 +398,8 @@ def _run_worker_locked(
             mount_point=mount_point,
             credentials_path=creds_path,
             port=config.smb.port,
-            wait_timeout=wait_timeout,
-            wait_interval=wait_interval,
+            attempt_timeout=attempt_timeout,
+            attempt_interval=attempt_interval,
             retry_timeout=retry_timeout,
             retry_initial_delay=retry_initial_delay,
             retry_max_delay=retry_max_delay,
@@ -425,25 +429,46 @@ def _mount_with_retry(
     mount_point: str,
     credentials_path: Path,
     port: int,
-    wait_timeout: float,
-    wait_interval: float,
+    attempt_timeout: float,
+    attempt_interval: float,
     retry_timeout: float,
     retry_initial_delay: float,
     retry_max_delay: float,
     sleep: Callable[[float], None],
     clock: Callable[[], float],
 ) -> mountlib.MountOutcome:
+    """Retry a single mount/reachability attempt within an overall budget.
+
+    The detached worker owns ``retry_timeout`` end-to-end. Each individual
+    attempt is capped at ``min(attempt_timeout, <time remaining in the
+    overall budget>)`` so no single attempt can ever consume the whole
+    budget — that was the root cause of the boot-time bug this guards
+    against.
+    """
     deadline = clock() + retry_timeout
     attempt = 1
     delay = max(0.0, retry_initial_delay)
 
     while True:
+        remaining = deadline - clock()
+        if remaining <= 0:
+            message = (
+                f"Timed out after {attempt - 1} attempt(s) waiting for SMB source {server!r} "
+                f"to become reachable: retry budget exhausted"
+            )
+            log.warning(
+                "Mount worker retry budget exhausted before attempt %d could start", attempt
+            )
+            raise ProviderNotReachableError(message)
+
+        per_attempt_timeout = min(attempt_timeout, remaining)
         log.info(
-            "Mount worker attempt %d: mounting //%s/%s at %s",
+            "Mount worker attempt %d: mounting //%s/%s at %s (timeout %.1fs)",
             attempt,
             server,
             share,
             mount_point,
+            per_attempt_timeout,
         )
         try:
             outcome = mountlib.mount_cifs_source(
@@ -452,8 +477,8 @@ def _mount_with_retry(
                 mount_point=mount_point,
                 credentials_path=credentials_path,
                 port=port,
-                wait_timeout=wait_timeout,
-                wait_interval=wait_interval,
+                wait_timeout=per_attempt_timeout,
+                wait_interval=attempt_interval,
             )
             if attempt > 1:
                 log.info("Mount worker succeeded after %d attempts: %s", attempt, outcome.detail)
