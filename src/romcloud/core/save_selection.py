@@ -21,6 +21,23 @@ XBOX_HDD_RELATIVE_PATH = "xbox_hdd.qcow2"
 opaque virtual hard drive file. Never parsed/extracted; treated exactly
 like any other whole file."""
 
+_HEX_GLOB = "[0-9A-Fa-f]"
+YUZU_ACCOUNT_SAVE_GLOB = (
+    "0000000000000000/"
+    f"{_HEX_GLOB * 32}/"  # Yuzu account/user id
+    f"{_HEX_GLOB * 16}/"  # Nintendo title id
+    "**"
+)
+"""Files within a Yuzu account save for one title.
+
+Batocera's ``/userdata/saves/yuzu`` can contain Yuzu's broader data tree,
+including keys, firmware/NAND content, caches, and logs.  Actual game-progress
+account saves use Yuzu's save hierarchy
+``0000000000000000/<32-hex user id>/<16-hex title id>/...``.  Once inside a
+validated title directory every descendant is treated as opaque game-owned
+save content: individual games choose their own filenames and subdirectories.
+"""
+
 
 def _match(path: str, pattern: str) -> bool:
     """Match *path* (posix-relative, no leading slash) against *pattern*.
@@ -63,7 +80,7 @@ _RULES: dict[str, SaveSystemRule] = {
     "pcsx2": SaveSystemRule(include=("Mcd*.ps2",), exclude=("sstates/**", "videos/**")),
     "ppsspp": SaveSystemRule(include=("PSP/SAVEDATA/**",), exclude=("PPSSPP_STATE/**",)),
     "xbox360": SaveSystemRule(include=("**",)),
-    "yuzu": SaveSystemRule(include=("**",)),
+    "yuzu": SaveSystemRule(include=(YUZU_ACCOUNT_SAVE_GLOB,)),
     XBOX_SYSTEM: SaveSystemRule(
         include=(XBOX_HDD_RELATIVE_PATH,), optional=True, default_enabled=False
     ),

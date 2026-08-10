@@ -7,7 +7,12 @@ from pathlib import Path
 import pytest
 
 from romcloud.infrastructure import save_tree
-from romcloud.core.save_selection import SaveSelectionPolicy, SaveSystemRule, XBOX_SYSTEM
+from romcloud.core.save_selection import (
+    DEFAULT_SAVE_SELECTION_POLICY,
+    SaveSelectionPolicy,
+    SaveSystemRule,
+    XBOX_SYSTEM,
+)
 
 
 @pytest.fixture
@@ -83,6 +88,29 @@ class TestScanTree:
         (root / "flatpak" / "whatever.dat").write_bytes(b"x")
 
         assert save_tree.scan_tree(root, policy) == {}
+
+    def test_real_yuzu_tree_selects_only_account_title_saves(self, tmp_path: Path):
+        root = tmp_path / "saves"
+        user = "0123456789ABCDEF0123456789ABCDEF"
+        title = "0100F2C0115B6000"
+        selected = f"yuzu/0000000000000000/{user}/{title}/slot 1/progress.dat"
+        excluded = (
+            "yuzu/keys/prod.keys",
+            "yuzu/cache/0100F2C0115B6000/index.bin",
+            "yuzu/nand/system/Contents/registered/0123456789abcdef.nca",
+            "yuzu/nand/system/Contents/registered/0123456789abcdef.cnmt.nca",
+            "yuzu/shader/0100F2C0115B6000/vulkan.bin",
+            "yuzu/log/yuzu_log.txt",
+            "yuzu/preview.pv.txt",
+        )
+        for relative_path in (selected, *excluded):
+            path = root / relative_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"data")
+
+        result = save_tree.scan_tree(root, DEFAULT_SAVE_SELECTION_POLICY)
+
+        assert set(result) == {selected}
 
 
 class TestMaterialize:

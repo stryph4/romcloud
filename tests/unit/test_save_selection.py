@@ -6,6 +6,7 @@ from romcloud.core.save_selection import (
     DEFAULT_SAVE_SELECTION_POLICY,
     XBOX_HDD_RELATIVE_PATH,
     XBOX_SYSTEM,
+    YUZU_ACCOUNT_SAVE_GLOB,
     SaveSelectionPolicy,
     SaveSystemRule,
 )
@@ -73,14 +74,62 @@ class TestPPSSPP:
         assert policy.is_included("ppsspp", "PPSSPP_STATE/ULUS12345_1.ppst") is False
 
 
-class TestGenericWholeTreeSystems:
+class TestXbox360:
     def test_xbox360_tree_included(self):
         policy = DEFAULT_SAVE_SELECTION_POLICY
         assert policy.is_included("xbox360", "0000000000000000/save/data.bin") is True
 
-    def test_yuzu_tree_included(self):
+
+class TestYuzu:
+    _USER = "0123456789ABCDEF0123456789ABCDEF"
+    _TITLE = "0100F2C0115B6000"
+
+    def test_account_title_save_tree_included(self):
         policy = DEFAULT_SAVE_SELECTION_POLICY
-        assert policy.is_included("yuzu", "nand/user/save/0/data") is True
+        base = f"0000000000000000/{self._USER}/{self._TITLE}"
+        assert policy.is_included("yuzu", f"{base}/save_data") is True
+        assert policy.is_included("yuzu", f"{base}/slot 1/progress.dat") is True
+
+    def test_rule_requires_exact_yuzu_id_shape(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        assert YUZU_ACCOUNT_SAVE_GLOB
+        assert policy.is_included(
+            "yuzu", f"0000000000000000/too-short/{self._TITLE}/save_data"
+        ) is False
+        assert policy.is_included(
+            "yuzu", f"0000000000000000/{self._USER}/not-a-title/save_data"
+        ) is False
+
+    def test_keys_excluded(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        assert policy.is_included("yuzu", "keys/prod.keys") is False
+
+    def test_cache_and_shader_data_excluded(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        assert policy.is_included("yuzu", "cache/0100F2C0115B6000/index.bin") is False
+        assert policy.is_included("yuzu", "shader/0100F2C0115B6000/opengl.bin") is False
+
+    def test_nand_system_firmware_excluded(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        assert policy.is_included(
+            "yuzu", "nand/system/Contents/registered/0123456789abcdef.nca"
+        ) is False
+        assert policy.is_included(
+            "yuzu", "nand/system/Contents/registered/0123456789abcdef.cnmt.nca"
+        ) is False
+
+    def test_logs_config_and_root_preview_metadata_excluded(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        assert policy.is_included("yuzu", "log/yuzu_log.txt") is False
+        assert policy.is_included("yuzu", "config/qt-config.ini") is False
+        assert policy.is_included("yuzu", "preview.pv.txt") is False
+
+    def test_unrelated_nand_user_content_excluded(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        assert policy.is_included(
+            "yuzu",
+            f"nand/user/save/0000000000000000/{self._USER}/{self._TITLE}/save_data",
+        ) is False
 
 
 class TestFlatpakExclusion:
