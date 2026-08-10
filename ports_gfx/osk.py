@@ -3,10 +3,10 @@
 Used by the graphical setup wizard (SMB server/username/password and cache
 entry) but reusable by any future text field — this module
 only owns text-entry *state* and *key geometry*; it renders nothing and
-knows nothing about any particular screen. Navigation reuses
-``layout.find_next_focus_index`` against the OSK's own computed key rects,
-exactly like the main menu — so a controller/keyboard/touch user gets the
-same navigation model everywhere in the app, not a second bespoke one.
+knows nothing about any particular screen. Navigation is row-aware so wide
+and irregular keys (especially Space and the bottom-row actions) always have
+predictable directional neighbours rather than depending on rectangle-centre
+heuristics.
 
 Physical keyboard text entry keeps working while the OSK is shown for the
 same field: ``pygame.TEXTINPUT`` events are still delivered to
@@ -209,6 +209,41 @@ class OskState:
 
     def select(self, index: int) -> None:
         self.selected_index = max(0, min(index, len(self.keys) - 1))
+
+    def directional_neighbor(self, dx: int, dy: int) -> int:
+        """Return a row-aware neighbour for one cardinal direction."""
+        if not (dx or dy):
+            return self.selected_index
+        keys = self.keys
+        current = keys[self.selected_index]
+
+        if dx:
+            row_indices = [i for i, key in enumerate(keys) if key.row == current.row]
+            position = row_indices.index(self.selected_index)
+            return row_indices[(position + (1 if dx > 0 else -1)) % len(row_indices)]
+
+        target_row = (current.row + (1 if dy > 0 else -1)) % _ROW_COUNT
+        candidates = [i for i, key in enumerate(keys) if key.row == target_row]
+        current_left = current.start
+        current_right = current.start + current.width
+        current_center = current.start + current.width / 2
+
+        def score(index: int) -> tuple[float, float]:
+            candidate = keys[index]
+            overlap = max(
+                0.0,
+                min(current_right, candidate.start + candidate.width)
+                - max(current_left, candidate.start),
+            )
+            center_distance = abs(
+                (candidate.start + candidate.width / 2) - current_center
+            )
+            return (-overlap, center_distance)
+
+        return min(candidates, key=score)
+
+    def move(self, dx: int, dy: int) -> None:
+        self.select(self.directional_neighbor(dx, dy))
 
 
 def compute_layout_rects(state: OskState, screen_w: int, screen_h: int) -> list[Rect]:

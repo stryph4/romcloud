@@ -166,6 +166,31 @@ class TestOskLayoutGeometry:
 
 
 class TestOskControllerNavigation:
+    def test_space_has_sensible_neighbors_in_every_direction(self):
+        state = OskState()
+        space = next(i for i, key in enumerate(state.keys) if key.kind == "space")
+        state.select(space)
+
+        left = state.directional_neighbor(-1, 0)
+        right = state.directional_neighbor(1, 0)
+        up = state.directional_neighbor(0, -1)
+        down = state.directional_neighbor(0, 1)
+
+        assert state.keys[left].kind == "symbols"
+        assert state.keys[right].kind in {"mask", "cancel"}
+        assert state.keys[up].row == 2
+        assert state.keys[down].row == 0
+
+    def test_every_special_key_has_four_valid_neighbors(self):
+        state = OskState(masked=True)
+        for index, key in enumerate(state.keys):
+            if key.kind == "char":
+                continue
+            state.select(index)
+            for direction in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                neighbor = state.directional_neighbor(*direction)
+                assert 0 <= neighbor < len(state.keys)
+
     def test_dpad_down_moves_focus_to_next_row(self):
         state = OskState()
         rects = compute_layout_rects(state, 1920, 1080)

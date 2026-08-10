@@ -490,7 +490,11 @@ class TestStartOperation:
         operation = start_operation("refresh", "/opt/romcloud/bin/romcloud", popen=fake_popen)
 
         assert operation.title == "Refresh Catalog"
-        assert captured["argv"] == ["/opt/romcloud/bin/romcloud", "refresh"]
+        assert captured["argv"] == [
+            "/opt/romcloud/bin/romcloud",
+            "uidata",
+            "refresh-progress",
+        ]
         assert operation.runner.state in (OperationState.RUNNING, OperationState.SUCCEEDED)
 
     def test_unknown_action_raises_key_error(self):

@@ -39,7 +39,7 @@ from romcloud.lifecycle.setup import (
     validate_local_source,
     validate_share,
 )
-from romcloud.core.progress import ProgressEvent, redact_text
+from romcloud.core.progress import ProgressEvent, emit_progress, redact_text
 from romcloud.infrastructure.config import load_config
 from romcloud.infrastructure.source_display import source_display_summary
 from romcloud.services.connections import (
@@ -199,23 +199,111 @@ def uidata_status(ctx: click.Context) -> None:
 def uidata_refresh(ctx: click.Context) -> None:
     """Refresh the catalog from the configured source; result as JSON."""
 
+    _run_catalog_refresh(ctx, progress=None)
+
+
+@uidata_group.command("refresh-progress")
+@click.pass_context
+def uidata_refresh_progress(ctx: click.Context) -> None:
+    """Refresh with structured stderr events for the graphical UI."""
+
+    _run_catalog_refresh(ctx, progress=_progress_sink({"progress": True}))
+
+
+def _run_catalog_refresh(ctx: click.Context, progress) -> None:  # noqa: ANN001
+
     def build() -> dict:
         _load_context_config(ctx)
         container = get_container(ctx)
-        result = container.catalog.refresh()
+        result = container.catalog.refresh(progress=progress)
         from romcloud.integrations.batocera import es_config
 
         es_result = es_config.refresh(container.game_repo.list_systems())
+        errors = [f"{system}: {message}" for system, message in result.errors]
         return {
+            "ok": not errors,
+            "error": (
+                f"Catalog refresh completed with {len(errors)} failed system(s)."
+                if errors
+                else ""
+            ),
             "added": result.added,
             "updated": result.updated,
             "skipped": result.skipped,
             "removed": result.removed,
-            "errors": [f"{system}: {message}" for system, message in result.errors],
+            "errors": errors,
             "warnings": result.warnings,
             "es_systems": es_result.included_systems,
             "es_missing_systems": es_result.missing_systems,
             "es_restart_required": True,
+        }
+
+    _run_action(ctx, build)
+
+
+@uidata_group.command("update-check")
+@click.pass_context
+def uidata_update_check(ctx: click.Context) -> None:
+    """Check for an update through the shared updater; result as JSON."""
+
+    def build() -> dict:
+        import sys
+
+        from romcloud.lifecycle.update import check_for_update
+
+        progress = _progress_sink({"progress": True})
+        home = Path(sys.prefix).parent
+        try:
+            result = check_for_update(home, progress=progress)
+        except Exception as exc:
+            emit_progress(
+                progress,
+                "update",
+                "check_completed",
+                "error",
+                "Could not check for ROMCloud updates",
+                detail=str(exc),
+            )
+            raise
+        current_version = result.current.version if result.current else "unknown"
+        return {
+            "update_available": result.update_available,
+            "current_version": current_version,
+            "available_version": result.latest_version or result.latest_commit.short_sha,
+            "available_commit": result.latest_commit.short_sha,
+        }
+
+    _run_action(ctx, build)
+
+
+@uidata_group.command("update-install")
+@click.pass_context
+def uidata_update_install(ctx: click.Context) -> None:
+    """Install an update through the shared lifecycle updater."""
+
+    def build() -> dict:
+        import sys
+
+        from romcloud.lifecycle.update import perform_update
+
+        progress = _progress_sink({"progress": True})
+        home = Path(sys.prefix).parent
+        try:
+            result = perform_update(home, Path(sys.executable), progress=progress)
+        except Exception as exc:
+            emit_progress(
+                progress,
+                "update",
+                "completed",
+                "error",
+                "ROMCloud update failed",
+                detail=str(exc),
+            )
+            raise
+        return {
+            "version": result.new.version,
+            "commit": result.new.commit_short,
+            "restart_required": True,
         }
 
     _run_action(ctx, build)
@@ -351,12 +439,32 @@ def uidata_savesync_preview(ctx: click.Context) -> None:
 
     def build() -> dict:
         request = _read_request()
+        progress = _progress_sink(request)
         direction = request.get("direction")
         if direction not in ("upload", "download"):
             raise ValueError("direction must be 'upload' or 'download'")
         _load_context_config(ctx)
         saves = get_container(ctx).saves
+        emit_progress(
+            progress,
+            "savesync",
+            "preview",
+            "running",
+            f"Preparing SaveSync {direction} preview",
+        )
         diff = saves.preview_upload() if direction == "upload" else saves.preview_download()
+        emit_progress(
+            progress,
+            "savesync",
+            "preview",
+            "success",
+            f"SaveSync {direction} preview ready",
+            metadata={
+                "added": len(diff.added),
+                "changed": len(diff.changed),
+                "removed": len(diff.removed),
+            },
+        )
         return {
             "diff": diff.to_dict(),
             "added": len(diff.added),
@@ -383,13 +491,29 @@ def uidata_savesync_commit(ctx: click.Context) -> None:
         from romcloud.core.models.savesync import SaveDiff
 
         request = _read_request()
+        progress = _progress_sink(request)
         direction = request.get("direction")
         if direction not in ("upload", "download"):
             raise ValueError("direction must be 'upload' or 'download'")
         diff = SaveDiff.from_dict(request["diff"])
         _load_context_config(ctx)
         saves = get_container(ctx).saves
+        emit_progress(
+            progress,
+            "savesync",
+            "commit",
+            "running",
+            f"Applying SaveSync {direction}",
+        )
         record = saves.commit_upload(diff) if direction == "upload" else saves.commit_download(diff)
+        emit_progress(
+            progress,
+            "savesync",
+            "commit",
+            "success",
+            f"SaveSync {direction} complete",
+            metadata={"artifact_count": record.artifact_count},
+        )
         return {"record": _record_dict(record)}
 
     _run_action(ctx, build)
@@ -406,9 +530,17 @@ def uidata_savesync_settings(ctx: click.Context) -> None:
         from romcloud.infrastructure.config import write_config
 
         request = _read_request()
+        progress = _progress_sink(request)
         config = _load_context_config(ctx)
         new_config = replace(config, saves=replace(config.saves, xbox_enabled=bool(request.get("xbox_enabled", config.saves.xbox_enabled))))
         write_config(new_config, ctx.obj["config_path"])
+        emit_progress(
+            progress,
+            "savesync",
+            "settings",
+            "success",
+            "SaveSync settings updated",
+        )
         return {"xbox_enabled": new_config.saves.xbox_enabled}
 
     _run_action(ctx, build)

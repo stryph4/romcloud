@@ -28,9 +28,9 @@ _BASE_BODY_FONT_PX = 28
 _TITLE_FONT_SCALE = 1.6
 _HINT_FONT_SCALE = 0.7
 
-_SAFE_AREA_FRACTION = 0.06  # overscan-safe margin, each side
+_SAFE_AREA_FRACTION = 0.035  # overscan-safe margin, each side
 _MIN_SAFE_MARGIN_PX = 16
-_MAX_SAFE_MARGIN_PX = 120
+_MAX_SAFE_MARGIN_PX = 64
 
 _MIN_CARD_WIDTH_PX = 260
 _CARD_SPACING_FRACTION = 0.02
@@ -39,6 +39,14 @@ _MIN_CARD_HEIGHT_PX = 56
 _MAX_CARD_HEIGHT_PX = 140
 
 _MESSAGE_AREA_FRACTION = 0.14  # bottom slice of the safe area, above the hint line
+
+_COMPACT_BREAKPOINT_PX = 960
+_ACTIVITY_MIN_WIDTH_PX = 320
+_PANE_GAP_FRACTION = 0.016
+_BUTTON_HEIGHT_FRACTION = 0.075
+_MIN_BUTTON_HEIGHT_PX = 44
+_MAX_BUTTON_HEIGHT_PX = 68
+_OSK_HEIGHT_FRACTION = 0.42
 
 
 @dataclass(frozen=True)
@@ -51,6 +59,22 @@ class Rect:
     @property
     def center(self) -> tuple[float, float]:
         return (self.x + self.w / 2, self.y + self.h / 2)
+
+    @property
+    def right(self) -> int:
+        return self.x + self.w
+
+    @property
+    def bottom(self) -> int:
+        return self.y + self.h
+
+    def intersects(self, other: "Rect") -> bool:
+        return (
+            self.x < other.right
+            and other.x < self.right
+            and self.y < other.bottom
+            and other.y < self.bottom
+        )
 
 
 @dataclass(frozen=True)
@@ -70,6 +94,23 @@ class Layout:
     card_rects: list[Rect]
     message_rect: Rect
     hint_rect: Rect
+    header_rect: Rect
+    content_rect: Rect
+    navigation_rect: Rect
+    activity_rect: Rect | None
+    footer_rect: Rect
+    wizard_content_rect: Rect
+    osk_rect: Rect
+    compact: bool
+
+
+@dataclass(frozen=True)
+class WizardRegions:
+    content: Rect
+    footer: Rect
+    back_button: Rect
+    continue_button: Rect
+    osk: Rect | None
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -141,25 +182,97 @@ def compute_card_rects(safe_area: Rect, item_count: int, columns: int) -> list[R
     return rects
 
 
+def compute_vertical_control_rects(area: Rect, item_count: int) -> list[Rect]:
+    """Compact single-column controls anchored at the top of *area*."""
+    if item_count <= 0:
+        return []
+    gap = int(_clamp(area.h * 0.012, 6, 14))
+    button_h = int(
+        _clamp(
+            area.h * _BUTTON_HEIGHT_FRACTION,
+            _MIN_BUTTON_HEIGHT_PX,
+            _MAX_BUTTON_HEIGHT_PX,
+        )
+    )
+    # If a long submenu needs more room, compress to the accessible minimum;
+    # callers can scroll when it still does not fit.
+    if item_count * button_h + (item_count - 1) * gap > area.h:
+        button_h = max(
+            _MIN_BUTTON_HEIGHT_PX,
+            (area.h - (item_count - 1) * gap) // item_count,
+        )
+    return [
+        Rect(area.x, area.y + index * (button_h + gap), area.w, button_h)
+        for index in range(item_count)
+    ]
+
+
 def compute_layout(screen_w: int, screen_h: int, item_count: int) -> Layout:
     safe_area = compute_safe_area(screen_w, screen_h)
-    columns = compute_columns(safe_area, item_count)
-    card_rects = compute_card_rects(safe_area, item_count, columns)
     fonts = compute_font_sizes(screen_h)
+    gap = int(_clamp(min(screen_w, screen_h) * _PANE_GAP_FRACTION, 10, 28))
+    header_h = max(fonts.title + 8, int(safe_area.h * 0.075))
+    hint_h = max(_MIN_BUTTON_HEIGHT_PX, fonts.hint + 18)
+    header_rect = Rect(safe_area.x, safe_area.y, safe_area.w, header_h)
+    footer_rect = Rect(
+        safe_area.x,
+        safe_area.bottom - hint_h,
+        safe_area.w,
+        hint_h,
+    )
+    content_rect = Rect(
+        safe_area.x,
+        header_rect.bottom + gap,
+        safe_area.w,
+        max(1, footer_rect.y - gap - (header_rect.bottom + gap)),
+    )
 
-    message_h = int(safe_area.h * _MESSAGE_AREA_FRACTION * 0.6)
-    hint_h = fonts.hint + 8
+    compact = content_rect.w < _COMPACT_BREAKPOINT_PX
+    activity_rect: Rect | None = None
+    if not compact:
+        nav_w = int(content_rect.w * 0.58)
+        activity_w = content_rect.w - gap - nav_w
+        if activity_w < _ACTIVITY_MIN_WIDTH_PX:
+            activity_w = _ACTIVITY_MIN_WIDTH_PX
+            nav_w = content_rect.w - gap - activity_w
+        navigation_rect = Rect(content_rect.x, content_rect.y, max(1, nav_w), content_rect.h)
+        activity_rect = Rect(
+            navigation_rect.right + gap,
+            content_rect.y,
+            max(1, activity_w),
+            content_rect.h,
+        )
+    else:
+        navigation_rect = content_rect
+
+    message_h = max(fonts.body + 8, int(navigation_rect.h * _MESSAGE_AREA_FRACTION * 0.5))
     message_rect = Rect(
-        x=safe_area.x,
-        y=safe_area.y + safe_area.h - hint_h - message_h,
-        w=safe_area.w,
+        x=navigation_rect.x,
+        y=navigation_rect.bottom - message_h,
+        w=navigation_rect.w,
         h=message_h,
     )
-    hint_rect = Rect(
-        x=safe_area.x,
-        y=safe_area.y + safe_area.h - hint_h,
-        w=safe_area.w,
-        h=hint_h,
+    hint_rect = footer_rect
+    controls_area = Rect(
+        navigation_rect.x,
+        navigation_rect.y,
+        navigation_rect.w,
+        max(1, message_rect.y - gap - navigation_rect.y),
+    )
+    card_rects = compute_vertical_control_rects(controls_area, item_count)
+
+    wizard_content_rect = Rect(
+        navigation_rect.x,
+        navigation_rect.y,
+        navigation_rect.w,
+        navigation_rect.h,
+    )
+    osk_h = int(wizard_content_rect.h * _OSK_HEIGHT_FRACTION)
+    osk_rect = Rect(
+        wizard_content_rect.x,
+        wizard_content_rect.bottom - osk_h,
+        wizard_content_rect.w,
+        max(1, osk_h),
     )
 
     return Layout(
@@ -167,10 +280,48 @@ def compute_layout(screen_w: int, screen_h: int, item_count: int) -> Layout:
         screen_h=screen_h,
         safe_area=safe_area,
         fonts=fonts,
-        columns=columns,
+        columns=1,
         card_rects=card_rects,
         message_rect=message_rect,
         hint_rect=hint_rect,
+        header_rect=header_rect,
+        content_rect=content_rect,
+        navigation_rect=navigation_rect,
+        activity_rect=activity_rect,
+        footer_rect=footer_rect,
+        wizard_content_rect=wizard_content_rect,
+        osk_rect=osk_rect,
+        compact=compact,
+    )
+
+
+def compute_wizard_regions(layout: Layout, *, osk_visible: bool = False) -> WizardRegions:
+    """Anchored wizard content/footer geometry for every content height."""
+    gap = int(_clamp(min(layout.screen_w, layout.screen_h) * 0.012, 8, 18))
+    button_gap = gap
+    button_w = max(1, (layout.navigation_rect.w - button_gap) // 2)
+    footer = layout.footer_rect
+    back = Rect(footer.x, footer.y, button_w, footer.h)
+    continue_button = Rect(
+        back.right + button_gap,
+        footer.y,
+        max(1, footer.right - (back.right + button_gap)),
+        footer.h,
+    )
+    osk = layout.osk_rect if osk_visible else None
+    content_bottom = (osk.y - gap) if osk is not None else layout.wizard_content_rect.bottom
+    content = Rect(
+        layout.wizard_content_rect.x,
+        layout.wizard_content_rect.y,
+        layout.wizard_content_rect.w,
+        max(1, content_bottom - layout.wizard_content_rect.y),
+    )
+    return WizardRegions(
+        content=content,
+        footer=footer,
+        back_button=back,
+        continue_button=continue_button,
+        osk=osk,
     )
 
 

@@ -14,6 +14,32 @@ from romcloud.core.models.proxy import ProxyRecord
 
 
 class TestCatalogServiceRefresh:
+    def test_emits_structured_per_system_progress_with_real_denominators(
+        self, catalog_service
+    ):
+        events = []
+
+        result = catalog_service.refresh(progress=events.append)
+
+        assert result.errors == []
+        stages = [event.stage for event in events]
+        assert stages[0] == "refresh_started"
+        assert stages[-1] == "refresh_completed"
+        queued = [event for event in events if event.stage == "system_queued"]
+        completed = [event for event in events if event.stage == "system_completed"]
+        assert {event.metadata["system"] for event in queued} == {"ps2", "nes", "snes"}
+        assert {event.metadata["system"] for event in completed} == {"ps2", "nes", "snes"}
+        determinate = [
+            event
+            for event in events
+            if event.stage == "system_progress" and event.total
+        ]
+        assert determinate
+        assert all(0 <= event.current <= event.total for event in determinate)
+        final = events[-1]
+        assert final.current == final.total == 3
+        assert final.metadata == {"succeeded": 3, "failed": 0}
+
     def test_adds_new_games(self, catalog_service, game_repo):
         result = catalog_service.refresh()
         # ps2 has 2 games, nes has 1 game; snes .romcloud file should be skipped

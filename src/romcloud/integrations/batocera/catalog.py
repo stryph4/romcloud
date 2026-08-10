@@ -21,6 +21,7 @@ from romcloud.core.cue_parser import resolve_cue_dependencies
 from romcloud.core.exceptions import GameNotFoundError, ProxyError, ProxyNotOwnedError
 from romcloud.core.models.game import Game, GameAsset, derive_title
 from romcloud.core.models.proxy import ProxyRecord
+from romcloud.core.progress import ProgressSink, emit_progress
 from romcloud.core.storage import RemoteEntry, StorageProvider
 from romcloud.integrations.batocera.systems import BATOCERA_SYSTEMS
 from romcloud.infrastructure.logging import get_logger
@@ -87,7 +88,7 @@ class CatalogService:
 
     # ── public API ────────────────────────────────────────────────────────────
 
-    def refresh(self) -> CatalogRefreshResult:
+    def refresh(self, progress: ProgressSink = None) -> CatalogRefreshResult:
         """Scan the remote ROM root; create proxy files for new games.
 
         Already-tracked games are skipped (not duplicated). An existing game
@@ -102,10 +103,29 @@ class CatalogService:
         errors: list[tuple[str, str]] = []
         warnings: list[str] = []
 
+        emit_progress(
+            progress,
+            "catalog_refresh",
+            "refresh_started",
+            "running",
+            "Starting catalog refresh",
+        )
+
         try:
             remote_systems = self._provider.list_systems(self._source_root)
         except Exception as exc:  # noqa: BLE001
             errors.append(("(root)", str(exc)))
+            emit_progress(
+                progress,
+                "catalog_refresh",
+                "refresh_completed",
+                "error",
+                "Catalog refresh failed before systems could be discovered",
+                detail=str(exc),
+                current=0,
+                total=0,
+                metadata={"succeeded": 0, "failed": 1},
+            )
             return CatalogRefreshResult(added, skipped, removed, errors, warnings=warnings, updated=updated)
 
         matched = [s for s in remote_systems if s in self._known_systems]
@@ -113,11 +133,54 @@ class CatalogService:
         if unmatched:
             log.debug("Ignoring unrecognised system folders: %s", unmatched)
 
+        system_total = len(matched)
         for system in matched:
+            emit_progress(
+                progress,
+                "catalog_refresh",
+                "system_queued",
+                "queued",
+                f"{system} queued",
+                metadata={"system": system},
+            )
+        emit_progress(
+            progress,
+            "catalog_refresh",
+            "systems_discovered",
+            "running",
+            f"{system_total} system{'s' if system_total != 1 else ''} queued",
+            current=0,
+            total=system_total,
+            metadata={"systems": matched},
+        )
+
+        completed_systems = 0
+        failed_systems = 0
+        for system in matched:
+            emit_progress(
+                progress,
+                "catalog_refresh",
+                "system_started",
+                "running",
+                f"Refreshing {system}",
+                metadata={"system": system},
+            )
             try:
                 entries = self._provider.list_entries(self._source_root, system)
                 games, consumed_paths, group_warnings = self._group_entries(system, entries)
                 warnings.extend(group_warnings)
+
+                game_total = len(games)
+                emit_progress(
+                    progress,
+                    "catalog_refresh",
+                    "system_progress",
+                    "running",
+                    f"Refreshing {system}: {game_total} entries discovered",
+                    current=0,
+                    total=game_total,
+                    metadata={"system": system, "discovered": game_total},
+                )
 
                 # Prune stale entries *before* adding new ones: a superseded
                 # game can derive the exact same proxy filename as its
@@ -126,9 +189,13 @@ class CatalogService:
                 # collision inside `_write_proxy`.
                 removed += self._prune_stale_entries(system, consumed_paths)
 
-                for game in games:
+                progress_interval = max(1, game_total // 100)
+                for game_index, game in enumerate(games, start=1):
                     primary = game.primary_asset
                     if primary is None:
+                        self._emit_system_progress(
+                            progress, system, game_index, game_total, progress_interval
+                        )
                         continue
 
                     existing = self._game_repo.find_by_source_path(
@@ -151,6 +218,9 @@ class CatalogService:
                             )
                         else:
                             skipped += 1
+                        self._emit_system_progress(
+                            progress, system, game_index, game_total, progress_interval
+                        )
                         continue
 
                     self._game_repo.save(game)
@@ -158,11 +228,87 @@ class CatalogService:
                     added += 1
                     log.info("Catalogued %r [%s]", game.title, system)
 
+                    self._emit_system_progress(
+                        progress, system, game_index, game_total, progress_interval
+                    )
+
+                # Empty systems and all-skipped systems still need an explicit
+                # terminal state; percentages are only based on the known
+                # grouped-game denominator above.
+                completed_systems += 1
+                emit_progress(
+                    progress,
+                    "catalog_refresh",
+                    "system_completed",
+                    "success",
+                    f"{system} complete",
+                    current=game_total,
+                    total=game_total,
+                    metadata={"system": system},
+                )
+
             except Exception as exc:  # noqa: BLE001
                 log.exception("Error scanning system %r", system)
                 errors.append((system, str(exc)))
+                failed_systems += 1
+                emit_progress(
+                    progress,
+                    "catalog_refresh",
+                    "system_failed",
+                    "error",
+                    f"{system} failed",
+                    detail=str(exc),
+                    metadata={"system": system},
+                )
+
+            emit_progress(
+                progress,
+                "catalog_refresh",
+                "overall_progress",
+                "running",
+                f"{completed_systems + failed_systems} of {system_total} systems finished",
+                current=completed_systems + failed_systems,
+                total=system_total,
+                metadata={"succeeded": completed_systems, "failed": failed_systems},
+            )
+
+        final_status = "error" if failed_systems else "success"
+        summary = f"Catalog refresh complete: {completed_systems} succeeded"
+        if failed_systems:
+            summary += f", {failed_systems} failed"
+        emit_progress(
+            progress,
+            "catalog_refresh",
+            "refresh_completed",
+            final_status,
+            summary,
+            current=system_total,
+            total=system_total,
+            metadata={"succeeded": completed_systems, "failed": failed_systems},
+        )
 
         return CatalogRefreshResult(added, skipped, removed, errors, warnings=warnings, updated=updated)
+
+    @staticmethod
+    def _emit_system_progress(
+        progress: ProgressSink,
+        system: str,
+        current: int,
+        total: int,
+        interval: int,
+    ) -> None:
+        if current != total and current % interval:
+            return
+        emit_progress(
+            progress,
+            "catalog_refresh",
+            "system_progress",
+            "running",
+            f"Refreshing {system}",
+            current=current,
+            total=total,
+            metadata={"system": system},
+        )
 
     def resolve_proxy(self, proxy_path: str) -> Game:
         """Resolve a ``.romcloud`` proxy file to its :class:`~romcloud.core.models.game.Game`.

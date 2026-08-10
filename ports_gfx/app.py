@@ -32,11 +32,28 @@ import sys
 from typing import Optional
 
 from ports_gfx.actions import ACTION_DIRECTIONS, Action
-from ports_gfx.client import BackendResult, call_backend
+from ports_gfx.activity import ActivityLog
+from ports_gfx.catalog_progress import CatalogRefreshProgress
+from ports_gfx.client import BackendResult, call_backend, operation_result
 from ports_gfx.input_debug import InputDebugLogger
 from ports_gfx.input_manager import InputEvent, InputManager
-from ports_gfx.layout import Layout, Rect, compute_card_rects, compute_layout, find_next_focus_index
-from ports_gfx.menu import CONTROLLER_TEST_ACTION, EXIT_ACTION, MenuItem, MenuState
+from ports_gfx.layout import (
+    Layout,
+    Rect,
+    compute_layout,
+    compute_vertical_control_rects,
+    compute_wizard_regions,
+    find_next_focus_index,
+)
+from ports_gfx.menu import (
+    BACK_ACTION,
+    CATEGORY_ACTION_PREFIX,
+    CONTROLLER_TEST_ACTION,
+    EXIT_ACTION,
+    MenuItem,
+    MenuState,
+    NavigationState,
+)
 from ports_gfx.operation import OperationRunner, OperationState
 from ports_gfx.operation_screen import (
     OPERATION_SCREEN,
@@ -60,6 +77,7 @@ from ports_gfx.savesync_screen import (
     SETTINGS,
     SaveSyncScreenState,
 )
+from ports_gfx.update_state import UpdateCheckState
 from ports_gfx.wizard import WizardState, WizardStep
 
 SAVESYNC_ACTION = "savesync"
@@ -83,6 +101,35 @@ MENU_ITEMS: tuple[MenuItem, ...] = (
     MenuItem("Exit", EXIT_ACTION),
 )
 
+ROOT_MENU_ITEMS: tuple[MenuItem, ...] = tuple(
+    MenuItem(label, f"{CATEGORY_ACTION_PREFIX}{label}")
+    for label in ("Library", "Storage", "SaveSync", "Maintenance", "Settings")
+)
+
+MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
+    "Library": (
+        MenuItem("Catalog Status", "status"),
+        MenuItem("Refresh Catalog", "refresh"),
+        MenuItem("Cache Status", "cache-status"),
+    ),
+    "Storage": (
+        MenuItem("Storage Setup", SETUP_ACTION),
+        MenuItem("Connection Status", "connection-status"),
+        MenuItem("Mount / Reconnect", "connection-mount"),
+        MenuItem("Unmount", "connection-unmount"),
+    ),
+    "SaveSync": (MenuItem("SaveSync", SAVESYNC_ACTION),),
+    "Maintenance": (
+        MenuItem("Check for Updates", "update-check"),
+        MenuItem("Update ROMCloud", "update-install"),
+    ),
+    "Settings": (
+        MenuItem("Health Check", "healthcheck"),
+        MenuItem("Controller Test", CONTROLLER_TEST_ACTION),
+        MenuItem("Exit", EXIT_ACTION),
+    ),
+}
+
 # Actions dispatched through the reusable long-running operation screen
 # (see operation_screen.py) instead of a quick blocking uidata JSON call.
 # Reusing this screen for a later action (update, repair, diagnostics,
@@ -91,13 +138,14 @@ MENU_ITEMS: tuple[MenuItem, ...] = (
 # point (never a new backend command).
 _OPERATIONS: dict[str, OperationSpec] = {
     "connection-mount": OperationSpec(
-        title="Connect Storage", args=("uidata", "connection-mount")
+        title="Mount / Reconnect", args=("uidata", "connection-mount")
     ),
     "connection-unmount": OperationSpec(
-        title="Disconnect Storage", args=("uidata", "connection-unmount")
+        title="Unmount", args=("uidata", "connection-unmount")
     ),
-    "refresh": OperationSpec(title="Refresh Catalog", args=("refresh",)),
-    "update-check": OperationSpec(title="Check for Updates", args=("update", "--check")),
+    "refresh": OperationSpec(title="Refresh Catalog", args=("uidata", "refresh-progress")),
+    "update-check": OperationSpec(title="Check for Updates", args=("uidata", "update-check")),
+    "update-install": OperationSpec(title="Update ROMCloud", args=("uidata", "update-install")),
 }
 
 _BG_COLOR = (18, 18, 24)
@@ -337,7 +385,7 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
         screen = _open_display(pygame, screen_w, screen_h)
         pygame.display.set_caption("ROMCloud")
 
-        state = MenuState(list(MENU_ITEMS))
+        state = NavigationState(ROOT_MENU_ITEMS, MENU_CATEGORIES)
         setup_status = call_backend(romcloud_bin, "setup-status")
         wizard: WizardState | None = None
         if initial_screen_for_status(setup_status) == "wizard":
@@ -365,6 +413,10 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
         controller_test = _ControllerTestScreenState()
         operation_screen: Optional[OperationScreenState] = None
         savesync_screen: Optional[SaveSyncScreenState] = None
+        activity = ActivityLog(max_events=250)
+        catalog_progress = CatalogRefreshProgress()
+        update_check = UpdateCheckState()
+        update_check.start(romcloud_bin)
         current_screen = "wizard" if wizard is not None else "menu"
         message: Optional[str] = None
         message_kind = "info"
@@ -374,6 +426,7 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
             message_kind = classify_message_kind("connection-status", connection)
 
         running = True
+        text_input_active = False
         while running:
             dt_ms = clock.tick(_TARGET_FPS)
             dt = dt_ms / 1000.0
@@ -388,6 +441,16 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
                     layout = compute_layout(screen_w, screen_h, len(state.items))
                     fonts = _build_fonts(pygame, layout)
                     continue
+                if (
+                    event.type == getattr(pygame, "MOUSEWHEEL", object())
+                    and layout.activity_rect is not None
+                ):
+                    rows = max(
+                        1,
+                        layout.activity_rect.h // max(1, layout.fonts.hint + 7),
+                    )
+                    activity.scroll(-int(getattr(event, "y", 0)), rows)
+                    continue
 
                 if input_debug is not None:
                     try:
@@ -396,7 +459,9 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
                         pass
 
                 if current_screen == "menu":
-                    rects = layout.card_rects
+                    rects = list(layout.card_rects)
+                    if update_check.update_available:
+                        rects.append(_update_banner_rect(layout))
                 elif current_screen == "wizard" and wizard is not None:
                     rects = _wizard_rects(layout, wizard)
                 elif current_screen == OPERATION_SCREEN:
@@ -436,7 +501,23 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
 
                 if current_screen == "menu":
                     item = state.selected_item
-                    if ievent.action == Action.CONFIRM and item.action == SAVESYNC_ACTION:
+                    if (
+                        ievent.touch_index == len(state.items)
+                        and update_check.update_available
+                    ):
+                        state.open_category("Maintenance", action="update-install")
+                        layout = compute_layout(screen_w, screen_h, len(state.items))
+                    elif ievent.action == Action.MENU and update_check.update_available:
+                        state.open_category("Maintenance", action="update-install")
+                        layout = compute_layout(screen_w, screen_h, len(state.items))
+                    elif (
+                        ievent.action == Action.CONFIRM
+                        and item.action == "update-install"
+                        and update_check.checking
+                    ):
+                        message = "Update check is still running. Please wait."
+                        message_kind = "info"
+                    elif ievent.action == Action.CONFIRM and item.action == SAVESYNC_ACTION:
                         savesync_screen = SaveSyncScreenState(romcloud_bin=romcloud_bin)
                         savesync_screen.refresh_status()
                         current_screen = "savesync"
@@ -449,6 +530,7 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
                         )
                         if new_operation is not None:
                             operation_screen = new_operation
+                        layout = compute_layout(screen_w, screen_h, len(state.items))
                 elif current_screen == "savesync" and savesync_screen is not None:
                     current_screen = _handle_savesync_event(ievent, savesync_screen)
                     if current_screen == "menu":
@@ -456,16 +538,59 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
                 elif current_screen == "wizard" and wizard is not None:
                     if ievent.action == Action.BACK and wizard.step == WizardStep.WELCOME:
                         running = False
+                    elif (
+                        ievent.touch_index is not None
+                        and not wizard.osk_visible
+                        and ievent.touch_index == len(_wizard_option_rows(layout, wizard))
+                    ):
+                        if wizard.step == WizardStep.WELCOME:
+                            running = False
+                        else:
+                            wizard.back()
                     else:
+                        if ievent.touch_index is not None and not wizard.osk_visible:
+                            rows = _wizard_option_rows(layout, wizard)
+                            if 0 <= ievent.touch_index < len(rows):
+                                actual_index = rows[ievent.touch_index][0]
+                                ievent = InputEvent(
+                                    action=ievent.action,
+                                    touch_index=actual_index,
+                                    text=ievent.text,
+                                    source=ievent.source,
+                                )
                         wizard.handle_event(ievent, rects, romcloud_bin)
                 elif current_screen == "controller_test":
                     current_screen = _handle_controller_test_event(
                         ievent, controller_test, input_manager,
                     )
                 elif current_screen == OPERATION_SCREEN and operation_screen is not None:
+                    if operation_screen.title == "Refresh Catalog":
+                        if ievent.action == Action.UP:
+                            catalog_progress.scroll(-1, 6)
+                        elif ievent.action == Action.DOWN:
+                            catalog_progress.scroll(1, 6)
                     current_screen = handle_operation_event(ievent, operation_screen)
                     if current_screen == "menu":
-                        if operation_screen.title in ("Connect Storage", "Disconnect Storage"):
+                        if operation_screen.title == "Check for Updates":
+                            update_check = UpdateCheckState.completed(
+                                operation_result(operation_screen.runner)
+                            )
+                            message = (
+                                update_check.banner
+                                if update_check.update_available
+                                else "ROMCloud is up to date"
+                                if update_check.status == "current"
+                                else f"Update check failed: {update_check.error}"
+                            )
+                            message_kind = (
+                                "warning" if update_check.update_available else
+                                "success" if update_check.status == "current" else "error"
+                            )
+                        elif operation_screen.title == "Update ROMCloud" and operation_screen.succeeded:
+                            update_check.update_available = False
+                            message = "ROMCloud updated. Restart ROMCloud to load the new GUI."
+                            message_kind = "success"
+                        elif operation_screen.title in ("Mount / Reconnect", "Unmount"):
                             connection = call_backend(romcloud_bin, "connection-status")
                             message = format_result("connection-status", connection)
                             message_kind = classify_message_kind("connection-status", connection)
@@ -477,18 +602,38 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
             # event arrived this frame — the whole point of the operation
             # screen is that the backend keeps working (and producing
             # output) while the UI keeps rendering and waiting for input.
+            for line in update_check.poll():
+                activity.ingest(line.text)
+
             if current_screen == OPERATION_SCREEN and operation_screen is not None:
-                operation_screen.poll()
+                for line in operation_screen.poll():
+                    event = activity.ingest(line.text)
+                    if event is not None:
+                        catalog_progress.ingest(event)
             elif current_screen == "savesync" and savesync_screen is not None:
-                savesync_screen.poll()
+                for line in savesync_screen.poll():
+                    activity.ingest(line.text)
                 savesync_screen.update_confirm(dt)
             elif current_screen == "wizard" and wizard is not None:
-                wizard.poll()
+                for line in wizard.poll():
+                    activity.ingest(line.text)
                 if wizard.finished:
                     current_screen = "menu"
                     wizard = None
                     message = "Setup complete"
                     message_kind = "success"
+
+            should_capture_text = bool(
+                current_screen == "wizard"
+                and wizard is not None
+                and wizard.is_text_mode
+            )
+            if should_capture_text != text_input_active:
+                method_name = "start_text_input" if should_capture_text else "stop_text_input"
+                method = getattr(getattr(pygame, "key", None), method_name, None)
+                if method is not None:
+                    method()
+                text_input_active = should_capture_text
 
             if current_screen == "menu":
                 for action in input_manager.update(dt):
@@ -499,15 +644,35 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
                     wizard.update_direction(action, rects)
 
             if current_screen == "menu":
-                _render_menu(pygame, screen, fonts, layout, state, message, message_kind)
+                _render_menu(
+                    pygame,
+                    screen,
+                    fonts,
+                    layout,
+                    state,
+                    message,
+                    message_kind,
+                    activity,
+                    update_check,
+                )
             elif current_screen == "controller_test":
                 _render_controller_test(pygame, screen, fonts, layout, input_manager, controller_test)
             elif current_screen == OPERATION_SCREEN and operation_screen is not None:
-                _render_operation(pygame, screen, fonts, layout, operation_screen)
+                _render_operation(
+                    pygame,
+                    screen,
+                    fonts,
+                    layout,
+                    operation_screen,
+                    activity,
+                    catalog_progress,
+                )
             elif current_screen == "savesync" and savesync_screen is not None:
-                _render_savesync(pygame, screen, fonts, layout, savesync_screen)
+                _render_savesync(
+                    pygame, screen, fonts, layout, savesync_screen, activity
+                )
             elif current_screen == "wizard" and wizard is not None:
-                _render_wizard(pygame, screen, fonts, layout, wizard)
+                _render_wizard(pygame, screen, fonts, layout, wizard, activity)
 
         return 0
     finally:
@@ -519,17 +684,23 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
         pygame.quit()
 
 
-def _apply_direction(state: MenuState, layout: Layout, action: Action) -> None:
+def _apply_direction(
+    state: MenuState | NavigationState, layout: Layout, action: Action
+) -> None:
     direction = ACTION_DIRECTIONS.get(action)
     if direction is None:
         return
-    new_index = find_next_focus_index(layout.card_rects, state.selected_index, *direction)
-    state.select(new_index)
+    dx, dy = direction
+    # Navigation is intentionally a compact vertical control list.  Left and
+    # right retain the historical next/previous behavior for accessibility
+    # and for controllers whose hats are exposed oddly by SDL.
+    step = dy if dy else dx
+    state.select((state.selected_index + step) % len(state.items))
 
 
 def _handle_menu_event(
     ievent: InputEvent,
-    state: MenuState,
+    state: MenuState | NavigationState,
     layout: Layout,
     romcloud_bin: str,
     running: bool,
@@ -548,7 +719,11 @@ def _handle_menu_event(
 
     if action == Action.CONFIRM:
         item = state.selected_item
-        if item.action == EXIT_ACTION:
+        if isinstance(state, NavigationState) and state.enter_selected_category():
+            return running, next_screen, message, message_kind, None
+        if item.action == BACK_ACTION and isinstance(state, NavigationState):
+            state.back()
+        elif item.action == EXIT_ACTION:
             running = False
         elif item.action == CONTROLLER_TEST_ACTION:
             next_screen = "controller_test"
@@ -563,7 +738,8 @@ def _handle_menu_event(
         return running, next_screen, message, message_kind, None
 
     if action == Action.BACK:
-        running = False
+        if not isinstance(state, NavigationState) or not state.back():
+            running = False
         return running, next_screen, message, message_kind, None
 
     return running, next_screen, message, message_kind, None
@@ -655,14 +831,31 @@ def _render_menu(  # noqa: ANN001
     screen,
     fonts: dict,
     layout: Layout,
-    state: MenuState,
+    state: MenuState | NavigationState,
     message: Optional[str],
     message_kind: str,
+    activity: ActivityLog,
+    update_check: UpdateCheckState,
 ) -> None:
     screen.fill(_BG_COLOR)
 
-    title = fonts["title"].render("ROMCloud", True, _FG_COLOR)
+    title_text = state.title if isinstance(state, NavigationState) else "ROMCloud"
+    title = fonts["title"].render(title_text, True, _FG_COLOR)
     screen.blit(title, (layout.safe_area.x, layout.safe_area.y))
+
+    if update_check.update_available:
+        banner_area = _update_banner_rect(layout)
+        pygame.draw.rect(
+            screen,
+            _CARD_BG,
+            (banner_area.x, banner_area.y, banner_area.w, banner_area.h),
+            border_radius=5,
+        )
+        banner = fonts["hint"].render(
+            f"{update_check.banner}   [Update ROMCloud]", True, _WARNING_COLOR
+        )
+        banner_rect = banner.get_rect(center=banner_area.center)
+        screen.blit(banner, banner_rect)
 
     for i, (item, rect) in enumerate(zip(state.items, layout.card_rects)):
         color = _SELECTED_BG if i == state.selected_index else _CARD_BG
@@ -677,10 +870,70 @@ def _render_menu(  # noqa: ANN001
         text = fonts["body"].render(message[:max_chars], True, color)
         screen.blit(text, (layout.message_rect.x, layout.message_rect.y))
 
-    hint = fonts["hint"].render(_HINT_TEXT, True, _HINT_COLOR)
+    _render_activity_panel(pygame, screen, fonts, layout, activity)
+
+    hint_text = _HINT_TEXT
+    if update_check.update_available:
+        hint_text = "Tab opens Update ROMCloud   " + hint_text
+    hint = fonts["hint"].render(hint_text, True, _HINT_COLOR)
     screen.blit(hint, (layout.hint_rect.x, layout.hint_rect.y))
 
     pygame.display.flip()
+
+
+def _update_banner_rect(layout: Layout) -> Rect:
+    width = min(layout.header_rect.w // 2, max(260, layout.header_rect.w * 2 // 5))
+    return Rect(
+        layout.header_rect.right - width,
+        layout.header_rect.y,
+        width,
+        layout.header_rect.h,
+    )
+
+
+def _render_activity_panel(  # noqa: ANN001
+    pygame,
+    screen,
+    fonts: dict,
+    layout: Layout,
+    activity: ActivityLog,
+    *,
+    details: bool | None = None,
+) -> None:
+    rect = layout.activity_rect
+    if rect is None:
+        return
+    pygame.draw.rect(screen, _CARD_BG, (rect.x, rect.y, rect.w, rect.h), border_radius=6)
+    title = fonts["body"].render("Activity", True, _FG_COLOR)
+    screen.blit(title, (rect.x + 12, rect.y + 10))
+    line_h = layout.fonts.hint + 7
+    top = rect.y + layout.fonts.body + 22
+    rows = max(1, (rect.bottom - top - 10) // line_h)
+    show_details = activity.details_expanded if details is None else details
+    user_events = [
+        event
+        for event in activity.events
+        if event.stage not in {"system_progress", "overall_progress"}
+    ]
+    offset = max(0, min(activity.scroll_offset, max(0, len(user_events) - rows)))
+    end = len(user_events) - offset
+    events = user_events[max(0, end - rows) : end]
+    y = top
+    max_chars = max(1, (rect.w - 24) // max(7, layout.fonts.hint // 2))
+    for event in events:
+        color = _ERROR_COLOR if event.status == "error" else (
+            _SUCCESS_COLOR if event.status == "success" else _FG_COLOR
+        )
+        line = event.display_line
+        text = fonts["hint"].render(line[:max_chars], True, color)
+        screen.blit(text, (rect.x + 12, y))
+        y += line_h
+        if show_details and event.detail and y + line_h <= rect.bottom:
+            detail = fonts["hint"].render(
+                f"  {event.detail}"[:max_chars], True, _HINT_COLOR
+            )
+            screen.blit(detail, (rect.x + 12, y))
+            y += line_h
 
 
 def _render_controller_test(  # noqa: ANN001
@@ -742,6 +995,8 @@ def _render_operation(  # noqa: ANN001
     fonts: dict,
     layout: Layout,
     operation: OperationScreenState,
+    activity: ActivityLog,
+    catalog_progress: CatalogRefreshProgress,
 ) -> None:
     """Renders the reusable long-running operation screen — a title, a
     state label, and a bounded/scrolled/wrapped view of the subprocess's
@@ -750,33 +1005,52 @@ def _render_operation(  # noqa: ANN001
     screen.fill(_BG_COLOR)
 
     title = fonts["title"].render(operation.title, True, _FG_COLOR)
-    screen.blit(title, (layout.safe_area.x, layout.safe_area.y))
+    screen.blit(title, (layout.header_rect.x, layout.header_rect.y))
 
     state = operation.state
     state_color = _SUCCESS_COLOR if state == OperationState.SUCCEEDED else (
         _ERROR_COLOR if state == OperationState.FAILED else _FG_COLOR
     )
-    state_y = layout.safe_area.y + layout.fonts.title + 8
+    state_y = layout.navigation_rect.y
     state_label = fonts["body"].render(_STATE_LABELS[state], True, state_color)
     screen.blit(state_label, (layout.safe_area.x, state_y))
 
     output_top = state_y + layout.fonts.body + 12
-    output_bottom = layout.hint_rect.y - 8
+    output_bottom = layout.navigation_rect.bottom - 8
     line_h = layout.fonts.body + 4
     viewport_rows = max(1, (output_bottom - output_top) // line_h)
 
-    max_chars = max(1, layout.safe_area.w // 10)
-    lines = wrap_lines(
-        display_lines(operation.runner, details=operation.details_expanded), max_chars
-    )
-    start, end = visible_window(len(lines), viewport_rows, operation.scroll_offset)
+    if operation.title == "Refresh Catalog" and catalog_progress.systems:
+        _render_catalog_progress(
+            pygame,
+            screen,
+            fonts,
+            layout.navigation_rect,
+            catalog_progress,
+            top=output_top,
+        )
+    else:
+        max_chars = max(1, layout.navigation_rect.w // 10)
+        lines = wrap_lines(
+            display_lines(operation.runner, details=operation.details_expanded), max_chars
+        )
+        start, end = visible_window(len(lines), viewport_rows, operation.scroll_offset)
 
-    y = output_top
-    for line in lines[start:end]:
-        color = _ERROR_COLOR if line.startswith("! ") else _FG_COLOR
-        text = fonts["body"].render(line, True, color)
-        screen.blit(text, (layout.safe_area.x, y))
-        y += line_h
+        y = output_top
+        for line in lines[start:end]:
+            color = _ERROR_COLOR if line.startswith("! ") else _FG_COLOR
+            text = fonts["body"].render(line, True, color)
+            screen.blit(text, (layout.navigation_rect.x, y))
+            y += line_h
+
+    _render_activity_panel(
+        pygame,
+        screen,
+        fonts,
+        layout,
+        activity,
+        details=operation.details_expanded,
+    )
 
     detail_hint = "   Left/Right technical details"
     hint_text = (
@@ -786,6 +1060,78 @@ def _render_operation(  # noqa: ANN001
     screen.blit(hint, (layout.hint_rect.x, layout.hint_rect.y))
 
     pygame.display.flip()
+
+
+def _draw_progress_bar(  # noqa: ANN001
+    pygame,
+    screen,
+    rect: Rect,
+    fraction: float | None,
+    *,
+    failed: bool = False,
+) -> None:
+    pygame.draw.rect(screen, _CARD_BG, (rect.x, rect.y, rect.w, rect.h), border_radius=4)
+    if fraction is None:
+        # A short fixed segment communicates indeterminate work without
+        # claiming a fabricated percentage.
+        segment_w = max(8, rect.w // 5)
+        pygame.draw.rect(
+            screen,
+            _WARNING_COLOR,
+            (rect.x, rect.y, segment_w, rect.h),
+            border_radius=4,
+        )
+        return
+    fill_w = int(rect.w * max(0.0, min(1.0, fraction)))
+    if fill_w:
+        pygame.draw.rect(
+            screen,
+            _ERROR_COLOR if failed else _SUCCESS_COLOR,
+            (rect.x, rect.y, fill_w, rect.h),
+            border_radius=4,
+        )
+
+
+def _render_catalog_progress(  # noqa: ANN001
+    pygame,
+    screen,
+    fonts: dict,
+    area: Rect,
+    progress: CatalogRefreshProgress,
+    *,
+    top: int,
+) -> None:
+    label = fonts["hint"].render("Overall", True, _FG_COLOR)
+    screen.blit(label, (area.x, top))
+    bar_h = max(8, fonts["hint"].get_height() // 2)
+    overall_bar = Rect(area.x, top + fonts["hint"].get_height() + 3, area.w, bar_h)
+    _draw_progress_bar(pygame, screen, overall_bar, progress.overall_fraction)
+    y = overall_bar.bottom + 14
+    row_h = max(44, fonts["body"].get_height() + bar_h + 10)
+    rows = max(1, (area.bottom - y) // row_h)
+    for row in progress.visible_systems(rows):
+        status = "Failed" if row.status == "error" else (
+            "Done" if row.status == "success" else "Waiting" if row.status == "queued" else "Running"
+        )
+        suffix = ""
+        if row.determinate and row.current is not None and row.total is not None:
+            suffix = f" {row.current}/{row.total}"
+        line = fonts["hint"].render(
+            f"{row.system}   {status}{suffix}",
+            True,
+            _ERROR_COLOR if row.status == "error" else _FG_COLOR,
+        )
+        screen.blit(line, (area.x, y))
+        bar = Rect(area.x, y + fonts["hint"].get_height() + 2, area.w, bar_h)
+        fraction = 1.0 if row.status == "success" and row.total == 0 else row.fraction
+        _draw_progress_bar(
+            pygame,
+            screen,
+            bar,
+            fraction,
+            failed=row.status == "error",
+        )
+        y += row_h
 
 
 def _savesync_body_lines(savesync_screen: SaveSyncScreenState) -> list[str]:
@@ -859,13 +1205,14 @@ def _render_savesync(  # noqa: ANN001
     fonts: dict,
     layout: Layout,
     savesync_screen: SaveSyncScreenState,
+    activity: ActivityLog,
 ) -> None:
     screen.fill(_BG_COLOR)
 
     title = fonts["title"].render("SaveSync", True, _FG_COLOR)
-    screen.blit(title, (layout.safe_area.x, layout.safe_area.y))
+    screen.blit(title, (layout.header_rect.x, layout.header_rect.y))
 
-    y = layout.safe_area.y + layout.fonts.title + 16
+    y = layout.navigation_rect.y
     line_h = layout.fonts.body + 6
     for i, line in enumerate(_savesync_body_lines(savesync_screen)):
         is_selected_item = (
@@ -875,13 +1222,13 @@ def _render_savesync(  # noqa: ANN001
         )
         color = _SELECTED_BG if is_selected_item else _FG_COLOR
         text = fonts["body"].render(line, True, color)
-        screen.blit(text, (layout.safe_area.x, y))
+        screen.blit(text, (layout.navigation_rect.x, y))
         y += line_h
 
     if savesync_screen.step == CONFIRMING:
-        bar_x = layout.safe_area.x
+        bar_x = layout.navigation_rect.x
         bar_y = y + line_h // 2
-        bar_w = max(1, min(layout.safe_area.w, 560))
+        bar_w = max(1, min(layout.navigation_rect.w, 560))
         bar_h = max(8, layout.fonts.body // 2)
         pygame.draw.rect(screen, _CARD_BG, (bar_x, bar_y, bar_w, bar_h), border_radius=4)
         fill_w = int(bar_w * savesync_screen.confirm.progress)
@@ -893,6 +1240,8 @@ def _render_savesync(  # noqa: ANN001
                 border_radius=4,
             )
 
+    _render_activity_panel(pygame, screen, fonts, layout, activity)
+
     hint = fonts["hint"].render(_HINT_TEXT, True, _HINT_COLOR)
     screen.blit(hint, (layout.hint_rect.x, layout.hint_rect.y))
 
@@ -900,25 +1249,68 @@ def _render_savesync(  # noqa: ANN001
 
 
 def _wizard_content_rect(layout: Layout) -> Rect:
-    top = layout.safe_area.y + layout.fonts.title + layout.fonts.hint + 20
-    bottom = layout.hint_rect.y - 8
-    return Rect(
-        x=layout.safe_area.x,
-        y=top,
-        w=layout.safe_area.w,
-        h=max(1, bottom - top),
+    return compute_wizard_regions(layout).content
+
+
+_WIZARD_CONTINUE_LABELS = {
+    "Start Setup",
+    "Resume / Repair Setup",
+    "Review / Change Setup",
+    "Continue",
+    "Finish",
+    "Retry",
+}
+
+
+def _wizard_option_rows(
+    layout: Layout, wizard: WizardState
+) -> list[tuple[int, str, Rect]]:
+    """Visible option rows, keeping the footer action statically anchored."""
+    options = wizard.options
+    if not options:
+        return []
+    regions = compute_wizard_regions(layout, osk_visible=False)
+    continuation_index = (
+        len(options) - 1 if options[-1] in _WIZARD_CONTINUE_LABELS else None
     )
+    ordinary_count = len(options) - (1 if continuation_index is not None else 0)
+    content = regions.content
+    controls_top = content.y + min(content.h // 3, layout.fonts.body * 4)
+    controls = Rect(
+        content.x,
+        controls_top,
+        content.w,
+        max(1, content.bottom - controls_top),
+    )
+    gap = max(6, int(controls.h * 0.012))
+    max_rows = max(1, (controls.h + gap) // (44 + gap))
+    start = 0
+    if ordinary_count > max_rows and wizard.selected_index < ordinary_count:
+        start = max(
+            0,
+            min(wizard.selected_index - max_rows + 1, ordinary_count - max_rows),
+        )
+    ordinary_indices = list(range(start, min(ordinary_count, start + max_rows)))
+    rects = compute_vertical_control_rects(controls, len(ordinary_indices))
+    rows = [
+        (actual_index, options[actual_index], rect)
+        for actual_index, rect in zip(ordinary_indices, rects)
+    ]
+    if continuation_index is not None:
+        rows.append(
+            (continuation_index, options[continuation_index], regions.continue_button)
+        )
+    return rows
 
 
 def _wizard_rects(layout: Layout, wizard: WizardState) -> list[Rect]:
-    content = _wizard_content_rect(layout)
-    if wizard.osk is not None:
-        return compute_osk_layout(content, wizard.osk.keys)
-    count = len(wizard.options)
-    if count == 0:
-        return []
-    columns = 1 if count <= 4 else min(3, count)
-    return compute_card_rects(content, count, columns)
+    regions = compute_wizard_regions(layout, osk_visible=wizard.osk_visible)
+    if wizard.osk is not None and wizard.osk_visible:
+        assert regions.osk is not None
+        return compute_osk_layout(regions.osk, wizard.osk.keys)
+    # Pointer-only Back target. Controller/keyboard Back remains semantic and
+    # does not enter the ordinary option focus order.
+    return [*(row[2] for row in _wizard_option_rows(layout, wizard)), regions.back_button]
 
 
 def _wizard_body_lines(wizard: WizardState) -> list[str]:
@@ -1048,6 +1440,7 @@ def _render_wizard(  # noqa: ANN001
     fonts: dict,
     layout: Layout,
     wizard: WizardState,
+    activity: ActivityLog,
 ) -> None:
     screen.fill(_BG_COLOR)
     title = fonts["title"].render(wizard.title, True, _FG_COLOR)
@@ -1057,9 +1450,17 @@ def _render_wizard(  # noqa: ANN001
     progress_rect = progress.get_rect(topright=(layout.safe_area.x + layout.safe_area.w, layout.safe_area.y))
     screen.blit(progress, progress_rect)
 
-    content = _wizard_content_rect(layout)
-    if wizard.osk is not None:
-        text_rect = compute_osk_text_rect(content)
+    regions = compute_wizard_regions(layout, osk_visible=wizard.osk_visible)
+    content = regions.content
+    if wizard.osk is not None and wizard.osk_visible:
+        assert regions.osk is not None
+        context_lines = _wizard_body_lines(wizard)[:2]
+        context_y = content.y
+        for line in context_lines:
+            context = fonts["hint"].render(line, True, _HINT_COLOR)
+            screen.blit(context, (content.x, context_y))
+            context_y += layout.fonts.hint + 4
+        text_rect = compute_osk_text_rect(regions.osk)
         pygame.draw.rect(screen, _CARD_BG, (text_rect.x, text_rect.y, text_rect.w, text_rect.h), border_radius=6)
         display_value = wizard.osk.displayed_text or " "
         max_chars = max(1, text_rect.w // max(8, layout.fonts.body // 2))
@@ -1075,31 +1476,70 @@ def _render_wizard(  # noqa: ANN001
         line_h = layout.fonts.body + 7
         max_chars = max(1, content.w // max(8, layout.fonts.body // 2))
         body_lines = _wizard_body_lines(wizard)
-        activity_lines = wizard.activity.user_lines(limit=4)
-        if activity_lines:
-            body_lines.extend(["", "Activity", *activity_lines])
-        if wizard.show_details:
-            detail_lines = wizard.activity.detail_lines(limit=3)
-            body_lines.extend(["", "Technical details", *(detail_lines or ["No technical details reported."])])
+        if wizard.osk is not None:
+            body_lines.extend(
+                ["", f"Current value: {wizard.osk.displayed_text}", "Tab opens the on-screen keyboard"]
+            )
         for line in body_lines:
             for wrapped in wrap_lines([line], max_chars):
                 text = fonts["body"].render(wrapped, True, _FG_COLOR)
                 screen.blit(text, (content.x, y))
                 y += line_h
 
-        for index, (label_text, rect) in enumerate(zip(wizard.options, _wizard_rects(layout, wizard))):
+        for index, label_text, rect in _wizard_option_rows(layout, wizard):
             color = _SELECTED_BG if index == wizard.selected_index else _CARD_BG
             pygame.draw.rect(screen, color, (rect.x, rect.y, rect.w, rect.h), border_radius=6)
             max_label_chars = max(1, rect.w // max(8, layout.fonts.body // 2))
             label = fonts["body"].render(label_text[:max_label_chars], True, _FG_COLOR)
             screen.blit(label, label.get_rect(center=rect.center))
 
+    _render_activity_panel(
+        pygame,
+        screen,
+        fonts,
+        layout,
+        activity,
+        details=wizard.show_details,
+    )
+
     if wizard.error:
         max_chars = max(1, layout.message_rect.w // max(8, layout.fonts.body // 2))
         error = fonts["body"].render(wizard.error[:max_chars], True, _ERROR_COLOR)
         screen.blit(error, (layout.message_rect.x, layout.message_rect.y))
 
-    if _WIZARD_HINT:
-        hint = fonts["hint"].render(_WIZARD_HINT, True, _HINT_COLOR)
-        screen.blit(hint, (layout.hint_rect.x, layout.hint_rect.y))
+    pygame.draw.rect(
+        screen,
+        _CARD_BG,
+        (
+            regions.back_button.x,
+            regions.back_button.y,
+            regions.back_button.w,
+            regions.back_button.h,
+        ),
+        border_radius=5,
+    )
+    back_label = fonts["hint"].render("Back", True, _FG_COLOR)
+    screen.blit(back_label, back_label.get_rect(center=regions.back_button.center))
+    continue_enabled = bool(
+        wizard.options
+        and wizard.options[-1] in _WIZARD_CONTINUE_LABELS
+    )
+    pygame.draw.rect(
+        screen,
+        _SELECTED_BG if continue_enabled else _CARD_BG,
+        (
+            regions.continue_button.x,
+            regions.continue_button.y,
+            regions.continue_button.w,
+            regions.continue_button.h,
+        ),
+        border_radius=5,
+    )
+    continue_label = fonts["hint"].render(
+        "Continue", True, _FG_COLOR if continue_enabled else _HINT_COLOR
+    )
+    screen.blit(
+        continue_label,
+        continue_label.get_rect(center=regions.continue_button.center),
+    )
     pygame.display.flip()

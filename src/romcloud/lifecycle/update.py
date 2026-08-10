@@ -78,6 +78,7 @@ from romcloud.core.exceptions import (
     UpdateDownloadError,
     UpdateInstallError,
 )
+from romcloud.core.progress import ProgressSink, emit_progress
 from romcloud.lifecycle.install import DEFAULT_PORTS_DIR as _DEFAULT_PORTS_DIR
 from romcloud.infrastructure.logging import get_logger
 
@@ -88,6 +89,7 @@ DEFAULT_BRANCH = "main"
 
 _GITHUB_API_BASE = "https://api.github.com"
 _GITHUB_WEB_BASE = "https://github.com"
+_GITHUB_RAW_BASE = "https://raw.githubusercontent.com"
 _USER_AGENT = "romcloud-updater"
 
 OpenerType = Callable[..., object]
@@ -122,6 +124,7 @@ class CheckResult:
     current: Optional[BuildInfo]
     latest_commit: CommitInfo
     update_available: bool
+    latest_version: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -144,6 +147,31 @@ def commit_api_url(repo: str, branch: str) -> str:
 def archive_download_url(repo: str, ref: str) -> str:
     """URL for a GitHub source archive at *ref* (a branch, tag, or commit SHA)."""
     return f"{_GITHUB_WEB_BASE}/{repo}/archive/{ref}.zip"
+
+
+def project_version_url(repo: str, ref: str) -> str:
+    return f"{_GITHUB_RAW_BASE}/{repo}/{ref}/pyproject.toml"
+
+
+def get_project_version_at_commit(
+    repo: str,
+    ref: str,
+    *,
+    opener: OpenerType = urllib.request.urlopen,
+) -> str | None:
+    """Fetch only pyproject metadata for a user-facing available version."""
+    if tomllib is None:
+        return None
+    request = urllib.request.Request(
+        project_version_url(repo, ref), headers={"User-Agent": _USER_AGENT}
+    )
+    try:
+        with opener(request, timeout=15.0) as response:
+            data = tomllib.loads(response.read().decode("utf-8"))
+        value = data.get("project", {}).get("version")
+        return str(value) if value else None
+    except Exception:  # noqa: BLE001 - display metadata never fails an update check
+        return None
 
 
 def fetch_json(url: str, *, opener: OpenerType = urllib.request.urlopen, timeout: float = 15.0) -> dict:
@@ -340,10 +368,15 @@ def check_for_update(
     repo: str = DEFAULT_REPO,
     branch: str = DEFAULT_BRANCH,
     opener: OpenerType = urllib.request.urlopen,
+    progress: ProgressSink = None,
 ) -> CheckResult:
     """Check whether a newer commit is available, without installing anything."""
+    emit_progress(
+        progress, "update", "check_started", "running", "Checking for ROMCloud updates"
+    )
     current = read_build_info(romcloud_home)
     latest = get_latest_commit(repo, branch, opener=opener)
+    latest_version: str | None = None
     if current is None:
         update_available = True
     elif current.commit is None:
@@ -356,7 +389,32 @@ def check_for_update(
             update_available = current.version != latest_version
     else:
         update_available = current.commit != latest.sha
-    return CheckResult(current=current, latest_commit=latest, update_available=update_available)
+    if progress is not None and latest_version is None:
+        latest_version = get_project_version_at_commit(
+            repo, latest.sha, opener=opener
+        )
+    message = (
+        "A ROMCloud update is available"
+        if update_available
+        else "ROMCloud is up to date"
+    )
+    emit_progress(
+        progress,
+        "update",
+        "check_completed",
+        "success",
+        message,
+        metadata={
+            "update_available": update_available,
+            "available_version": latest_version or latest.short_sha,
+        },
+    )
+    return CheckResult(
+        current=current,
+        latest_commit=latest,
+        update_available=update_available,
+        latest_version=latest_version,
+    )
 
 
 def _read_latest_project_version(
@@ -399,6 +457,7 @@ def perform_update(
     runner: RunnerType = subprocess.run,
     ports_dir: Optional[Path] = None,
     system_python: Optional[str] = None,
+    progress: ProgressSink = None,
 ) -> UpdateResult:
     """Download the latest commit's archive, upgrade the persistent venv,
     and reconcile every ROMCloud-managed runtime artifact (wrappers,
@@ -417,18 +476,30 @@ def perform_update(
     always removed, on success or failure.
     """
     previous = read_build_info(romcloud_home)
+    emit_progress(
+        progress, "update", "resolve", "running", "Resolving the latest ROMCloud release"
+    )
     latest = get_latest_commit(repo, branch, opener=opener)
 
     tmp_root = _make_temp_dir(romcloud_home)
     try:
         archive_path = tmp_root / "romcloud-update.zip"
+        emit_progress(
+            progress, "update", "download", "running", "Downloading the update"
+        )
         download_file(archive_download_url(repo, latest.sha), archive_path, opener=opener)
 
         extract_dir = tmp_root / "extracted"
+        emit_progress(
+            progress, "update", "verify", "running", "Verifying and unpacking the update"
+        )
         safe_extract_zip(archive_path, extract_dir)
         project_root = find_extracted_project_root(extract_dir)
 
         log.info("Upgrading venv at %s from %s", venv_python, project_root)
+        emit_progress(
+            progress, "update", "install", "running", "Installing the ROMCloud update"
+        )
         result = runner(
             [str(venv_python), "-m", "pip", "install", "--upgrade", "--quiet", str(project_root)],
             capture_output=True,
@@ -440,6 +511,13 @@ def perform_update(
 
         resolved_ports_dir = Path(ports_dir) if ports_dir else _DEFAULT_PORTS_DIR
         log.info("Reconciling installed runtime artifacts from %s", project_root)
+        emit_progress(
+            progress,
+            "update",
+            "reconcile",
+            "running",
+            "Updating ROMCloud launchers and integrations",
+        )
         reconcile_result = runner(
             [
                 str(venv_python),
@@ -474,6 +552,14 @@ def perform_update(
         )
         write_build_info(romcloud_home, new_info)
         log.info("Updated ROMCloud to %s (%s)", new_info.version, new_info.commit_short)
+        emit_progress(
+            progress,
+            "update",
+            "completed",
+            "success",
+            f"ROMCloud {new_info.version} installed successfully",
+            metadata={"version": new_info.version, "restart_required": True},
+        )
         return UpdateResult(previous=previous, new=new_info, reconcile_log=reconcile_log.strip())
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)

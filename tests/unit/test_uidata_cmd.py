@@ -179,6 +179,68 @@ class TestRefresh:
         assert payload["es_restart_required"] is True
 
 
+class TestUpdateBridge:
+    def test_check_uses_shared_updater_without_network(self, tmp_path, monkeypatch):
+        from romcloud.lifecycle import update as update_module
+
+        current = update_module.BuildInfo(
+            version="1.0.0",
+            commit="a" * 40,
+            commit_short="a" * 12,
+            build_date="x",
+            source="test",
+        )
+        latest = update_module.CommitInfo(sha="b" * 40, date="x", message="new")
+        monkeypatch.setattr(
+            update_module,
+            "check_for_update",
+            lambda home, progress=None: update_module.CheckResult(
+                current=current,
+                latest_commit=latest,
+                update_available=True,
+                latest_version="1.1.0",
+            ),
+        )
+
+        result = CliRunner().invoke(
+            cli,
+            ["--config", str(tmp_path / "missing.toml"), "uidata", "update-check"],
+        )
+
+        assert result.exit_code == 0
+        payload = json.loads(result.stdout.strip())
+        assert payload["update_available"] is True
+        assert payload["available_version"] == "1.1.0"
+
+    def test_install_uses_shared_lifecycle_and_reports_restart(self, tmp_path, monkeypatch):
+        from romcloud.lifecycle import update as update_module
+
+        new = update_module.BuildInfo(
+            version="1.1.0",
+            commit="b" * 40,
+            commit_short="b" * 12,
+            build_date="x",
+            source="test",
+        )
+        monkeypatch.setattr(
+            update_module,
+            "perform_update",
+            lambda home, python, progress=None: update_module.UpdateResult(
+                previous=None, new=new
+            ),
+        )
+
+        result = CliRunner().invoke(
+            cli,
+            ["--config", str(tmp_path / "missing.toml"), "uidata", "update-install"],
+        )
+
+        assert result.exit_code == 0
+        payload = json.loads(result.stdout.strip())
+        assert payload["version"] == "1.1.0"
+        assert payload["restart_required"] is True
+
+
 class TestHealthcheck:
     def test_emits_source_reachability(self, tmp_path):
         result = _write_and_invoke(tmp_path, ["healthcheck"])

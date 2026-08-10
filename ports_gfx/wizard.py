@@ -9,7 +9,7 @@ from ports_gfx.actions import ACTION_DIRECTIONS, Action
 from ports_gfx.activity import ActivityLog
 from ports_gfx.client import BackendResult, operation_result, start_backend_operation
 from ports_gfx.input_manager import InputEvent
-from ports_gfx.layout import Rect, find_next_focus_index
+from ports_gfx.layout import Rect
 from ports_gfx.operation import OperationRunner
 from ports_gfx.osk import OskState
 
@@ -96,6 +96,8 @@ class WizardState:
         self.issues = [str(issue) for issue in data.get("issues", [])]
         self.error = status.error if status and not status.ok else ""
         self.osk: OskState | None = None
+        self.osk_visible = False
+        self._osk_restore_index = 0
         self.cache_osk_field: str | None = None
         self.runner: OperationRunner | None = None
         self.finished = False
@@ -211,9 +213,10 @@ class WizardState:
         return self.osk is not None
 
     def widget_rects(self, default_rects: Sequence[Rect], osk_rects: Sequence[Rect]) -> Sequence[Rect]:
-        return osk_rects if self.osk is not None else default_rects
+        return osk_rects if self.osk is not None and self.osk_visible else default_rects
 
-    def enter_text_step(self, step: WizardStep) -> None:
+    def enter_text_step(self, step: WizardStep, *, show_osk: bool = True) -> None:
+        self._osk_restore_index = self.selected_index
         self.step = step
         initial = {
             WizardStep.SERVER: self.server,
@@ -230,6 +233,7 @@ class WizardState:
             initial_text=initial,
             masked=step in (WizardStep.PASSWORD, WizardStep.REMOTE_PASSWORD),
         )
+        self.osk_visible = show_osk
         self.selected_index = self.osk.selected_index
         self.error = ""
 
@@ -248,9 +252,15 @@ class WizardState:
 
         if event.action in ACTION_DIRECTIONS:
             dx, dy = ACTION_DIRECTIONS[event.action]
-            self.select(find_next_focus_index(rects, self.selected_index, dx, dy))
+            step = dy if dy else dx
+            count = len(self.options)
+            if count:
+                self.selected_index = (self.selected_index + step) % count
         elif event.action == Action.CONFIRM:
-            self._confirm(romcloud_bin)
+            self._confirm(
+                romcloud_bin,
+                show_osk=event.source not in ("mouse", "keyboard"),
+            )
         elif event.action == Action.BACK:
             self.back()
         elif event.action == Action.MENU:
@@ -265,15 +275,27 @@ class WizardState:
             self.osk.backspace()
             return
         if event.action == Action.BACK:
+            if self.osk_visible and event.source is not None:
+                self.osk_visible = False
+                self.selected_index = self._osk_restore_index
+                return
             self._cancel_osk()
+            return
+        if event.action == Action.MENU:
+            self.osk_visible = not self.osk_visible
             return
         if event.touch_index is not None:
             self.osk.select(event.touch_index)
         if event.action in ACTION_DIRECTIONS:
             dx, dy = ACTION_DIRECTIONS[event.action]
-            self.osk.select(find_next_focus_index(rects, self.osk.selected_index, dx, dy))
+            if self.osk_visible:
+                self.osk.move(dx, dy)
             return
         if event.action != Action.CONFIRM:
+            return
+
+        if not self.osk_visible:
+            self._commit_osk(romcloud_bin)
             return
 
         self.osk.activate(self.osk.selected_index)
@@ -315,12 +337,14 @@ class WizardState:
                 return
             self.cache_osk_field = None
             self.osk = None
+            self.osk_visible = False
             return
 
         current = self.step
+        keep_osk_visible = self.osk_visible
         if current == WizardStep.SERVER:
             self.server = value
-            self.enter_text_step(WizardStep.PORT)
+            self.enter_text_step(WizardStep.PORT, show_osk=keep_osk_visible)
         elif current == WizardStep.PORT:
             try:
                 port = int(value)
@@ -333,13 +357,14 @@ class WizardState:
                 self.osk.confirmed = False
                 return
             self.port = port
-            self.enter_text_step(WizardStep.USERNAME)
+            self.enter_text_step(WizardStep.USERNAME, show_osk=keep_osk_visible)
         elif current == WizardStep.USERNAME:
             self.username = value
-            self.enter_text_step(WizardStep.PASSWORD)
+            self.enter_text_step(WizardStep.PASSWORD, show_osk=keep_osk_visible)
         elif current == WizardStep.PASSWORD:
             self.password = value
             self.osk = None
+            self.osk_visible = False
             self._start_operation(WizardStep.DISCOVER, "setup-discover", romcloud_bin)
         elif current == WizardStep.REMOTE_LOCAL:
             if not value.startswith("/"):
@@ -349,11 +374,12 @@ class WizardState:
             self.remote_data_type = "local"
             self.remote_data_root = value
             self.osk = None
+            self.osk_visible = False
             self.step = WizardStep.CACHE
             self.selected_index = 0
         elif current == WizardStep.REMOTE_SERVER:
             self.remote_server = value
-            self.enter_text_step(WizardStep.REMOTE_PORT)
+            self.enter_text_step(WizardStep.REMOTE_PORT, show_osk=keep_osk_visible)
         elif current == WizardStep.REMOTE_PORT:
             try:
                 port = int(value)
@@ -366,14 +392,15 @@ class WizardState:
                 self.osk.confirmed = False
                 return
             self.remote_port = port
-            self.enter_text_step(WizardStep.REMOTE_USERNAME)
+            self.enter_text_step(WizardStep.REMOTE_USERNAME, show_osk=keep_osk_visible)
         elif current == WizardStep.REMOTE_USERNAME:
             self.remote_username = value
-            self.enter_text_step(WizardStep.REMOTE_PASSWORD)
+            self.enter_text_step(WizardStep.REMOTE_PASSWORD, show_osk=keep_osk_visible)
         elif current == WizardStep.REMOTE_PASSWORD:
             self.remote_password = value
             self.remote_reuse_source_credentials = False
             self.osk = None
+            self.osk_visible = False
             self._start_operation(
                 WizardStep.REMOTE_DISCOVER, "setup-discover", romcloud_bin
             )
@@ -382,6 +409,8 @@ class WizardState:
         if self.cache_osk_field is not None:
             self.cache_osk_field = None
             self.osk = None
+            self.osk_visible = False
+            self.selected_index = self._osk_restore_index
             return
         previous = {
             WizardStep.SERVER: WizardStep.SOURCE,
@@ -398,17 +427,18 @@ class WizardState:
             self.enter_text_step(previous)
         else:
             self.osk = None
+            self.osk_visible = False
             self.step = previous
-            self.selected_index = 0
+            self.selected_index = self._osk_restore_index
 
-    def _confirm(self, romcloud_bin: str) -> None:
+    def _confirm(self, romcloud_bin: str, *, show_osk: bool = True) -> None:
         self.error = ""
         if self.step == WizardStep.WELCOME:
             self.step = WizardStep.SOURCE
         elif self.step == WizardStep.SOURCE:
             if self.selected_index == 0:
                 self.source_type = "smb"
-                self.enter_text_step(WizardStep.SERVER)
+                self.enter_text_step(WizardStep.SERVER, show_osk=show_osk)
             else:
                 self.source_type = "local"
                 self._start_local_browse("source", self.rom_root if self.mode != "fresh" else "/userdata", romcloud_bin)
@@ -451,7 +481,7 @@ class WizardState:
                 self.remote_server = ""
                 self.remote_username = ""
                 self.remote_password = ""
-                self.enter_text_step(WizardStep.REMOTE_SERVER)
+                self.enter_text_step(WizardStep.REMOTE_SERVER, show_osk=show_osk)
         elif self.step == WizardStep.REMOTE_DISCOVER:
             self._start_operation(
                 WizardStep.REMOTE_DISCOVER, "setup-discover", romcloud_bin
@@ -477,6 +507,7 @@ class WizardState:
                     else getattr(self, self.cache_osk_field)
                 )
                 self.osk = OskState(initial_text=initial)
+                self.osk_visible = show_osk
             else:
                 if self.min_free_gb < 0 or self.max_size_gb <= 0:
                     self.error = "Cache sizes are invalid."
@@ -543,28 +574,33 @@ class WizardState:
             return
         dx, dy = ACTION_DIRECTIONS[action]
         if self.osk is not None:
-            self.osk.select(find_next_focus_index(rects, self.osk.selected_index, dx, dy))
+            if self.osk_visible:
+                self.osk.move(dx, dy)
         else:
-            self.select(find_next_focus_index(rects, self.selected_index, dx, dy))
+            step = dy if dy else dx
+            count = len(self.options)
+            if count:
+                self.selected_index = (self.selected_index + step) % count
 
-    def poll(self) -> None:
+    def poll(self) -> list:
         if self.runner is None:
-            return
-        for line in self.runner.poll():
+            return []
+        drained = self.runner.poll()
+        for line in drained:
             self.activity.ingest(line.text)
         if not self.runner.is_finished:
-            return
+            return drained
         result = operation_result(self.runner)
         self.runner = None
         if not result.ok:
             self.error = result.error
-            return
+            return drained
 
         if self.step == WizardStep.DISCOVER:
             self.shares = [dict(item) for item in result.data.get("shares", [])]
             if not self.shares:
                 self.error = "No accessible shares were found."
-                return
+                return drained
             self.step = WizardStep.SHARE
             self.selected_index = 0
         elif self.step == WizardStep.DETECT:
@@ -586,7 +622,7 @@ class WizardState:
             self.remote_shares = [dict(item) for item in result.data.get("shares", [])]
             if not self.remote_shares:
                 self.error = "No accessible data shares were found."
-                return
+                return drained
             self.step = WizardStep.REMOTE_SHARE
             self.selected_index = 0
         elif self.step == WizardStep.REMOTE_VALIDATE:
@@ -599,6 +635,7 @@ class WizardState:
             self.remote_password = ""
             self.step = WizardStep.DONE
             self.selected_index = 0
+        return drained
 
     def request_payload(self) -> dict[str, Any]:
         return {

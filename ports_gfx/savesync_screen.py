@@ -121,12 +121,12 @@ class SaveSyncScreenState:
 
     # ── polling (call once per frame; never blocks) ─────────────────────
 
-    def poll(self) -> None:
+    def poll(self) -> list:
         if self._runner is None:
-            return
-        self._runner.poll()
+            return []
+        drained = self._runner.poll()
         if not self._runner.is_finished:
-            return
+            return drained
 
         result = operation_result(self._runner)
         self._runner = None
@@ -152,8 +152,14 @@ class SaveSyncScreenState:
             else:
                 self.error = result.error
             self.step = SETTINGS
+        return drained
 
     # ── internal ──────────────────────────────────────────────────────────
 
     def _start_operation(self, action: str, payload: dict[str, Any]) -> None:
-        self._runner = start_backend_operation(self.romcloud_bin, action, payload, popen=self.popen)
+        self._runner = start_backend_operation(
+            self.romcloud_bin,
+            action,
+            {**payload, "progress": True},
+            popen=self.popen,
+        )

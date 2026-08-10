@@ -35,25 +35,37 @@ class InputEvent:
     ``Action.TEXT_INPUT``.
     """
 
-    __slots__ = ("action", "touch_index", "text")
+    __slots__ = ("action", "touch_index", "text", "source")
 
     def __init__(
         self,
         action: Optional[Action] = None,
         touch_index: Optional[int] = None,
         text: Optional[str] = None,
+        source: Optional[str] = None,
     ) -> None:
         self.action = action
         self.touch_index = touch_index
         self.text = text
+        self.source = source
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, InputEvent):
             return NotImplemented
-        return (self.action, self.touch_index, self.text) == (other.action, other.touch_index, other.text)
+        same_payload = (self.action, self.touch_index, self.text) == (
+            other.action,
+            other.touch_index,
+            other.text,
+        )
+        return same_payload and (
+            self.source == other.source or self.source is None or other.source is None
+        )
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid only
-        return f"InputEvent(action={self.action!r}, touch_index={self.touch_index!r}, text={self.text!r})"
+        return (
+            f"InputEvent(action={self.action!r}, touch_index={self.touch_index!r}, "
+            f"text={self.text!r}, source={self.source!r})"
+        )
 
 
 _NONE_EVENT = InputEvent()
@@ -94,49 +106,50 @@ class InputManager:
             action = action_for_key(pygame, event.key, text_mode=text_mode)
             if action is not None:
                 self.last_input_mode = "keyboard"
-            return InputEvent(action=action)
+            return InputEvent(action=action, source="keyboard")
 
         if event_type == getattr(pygame, "KEYUP", object()):
             action = action_for_key_up(pygame, event.key)
-            return InputEvent(action=action) if action is not None else _NONE_EVENT
+            return InputEvent(action=action, source="keyboard") if action is not None else _NONE_EVENT
 
         if event_type == getattr(pygame, "TEXTINPUT", object()):
             text = text_for_input_event(event)
             if not text:
                 return _NONE_EVENT
             self.last_input_mode = "keyboard"
-            return InputEvent(action=Action.TEXT_INPUT, text=text)
+            return InputEvent(action=Action.TEXT_INPUT, text=text, source="keyboard")
 
         if event_type == getattr(pygame, "MOUSEBUTTONDOWN", object()):
             if not self._pointer_debouncer.should_handle(now):
                 return _NONE_EVENT
             index = resolve_hit(rects, point_from_mouse_event(event))
-            return self._touch_result(index)
+            return self._touch_result(index, source="mouse")
 
         if event_type == getattr(pygame, "FINGERDOWN", object()):
             if not self._pointer_debouncer.should_handle(now):
                 return _NONE_EVENT
             index = resolve_hit(rects, point_from_finger_event(event, screen_w, screen_h))
-            return self._touch_result(index)
+            return self._touch_result(index, source="touch")
 
         if event_type in {
             getattr(pygame, "MOUSEBUTTONUP", object()),
             getattr(pygame, "FINGERUP", object()),
         }:
             self.last_input_mode = "touch"
-            return InputEvent(action=Action.CONFIRM_RELEASED)
+            source = "mouse" if event_type == getattr(pygame, "MOUSEBUTTONUP", object()) else "touch"
+            return InputEvent(action=Action.CONFIRM_RELEASED, source=source)
 
         action = self.controllers.handle_event(event)
         if action is not None:
             self.last_input_mode = "controller"
-            return InputEvent(action=action)
+            return InputEvent(action=action, source="controller")
         return _NONE_EVENT
 
-    def _touch_result(self, index: Optional[int]) -> InputEvent:
+    def _touch_result(self, index: Optional[int], *, source: str = "touch") -> InputEvent:
         if index is None:
             return _NONE_EVENT
         self.last_input_mode = "touch"
-        return InputEvent(action=Action.CONFIRM, touch_index=index)
+        return InputEvent(action=Action.CONFIRM, touch_index=index, source=source)
 
     def update(self, dt: float) -> list[Action]:
         """Call once per frame; returns any repeat-fired directional
