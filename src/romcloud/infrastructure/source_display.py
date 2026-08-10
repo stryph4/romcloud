@@ -30,7 +30,14 @@ def source_display_summary(config: AppConfig) -> dict[str, str]:
             {
                 "source_server": config.smb.server,
                 "source_share": config.smb.share,
-                "source_description": f"{config.smb.server}:{config.smb.share}",
+                "source_description": (
+                    f"{config.smb.server}:{config.smb.share}"
+                    + (
+                        f"/{config.smb.remote_path}"
+                        if config.smb.remote_path
+                        else ""
+                    )
+                ),
             }
         )
     else:

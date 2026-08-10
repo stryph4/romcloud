@@ -191,6 +191,13 @@ class TestHandleOperationEvent:
         assert result == OPERATION_SCREEN
         assert screen.scroll_offset == 0
 
+    def test_left_or_right_toggles_technical_details(self):
+        screen = self._screen(finished=False)
+        handle_operation_event(InputEvent(action=Action.RIGHT), screen)
+        assert screen.details_expanded is True
+        handle_operation_event(InputEvent(action=Action.LEFT), screen)
+        assert screen.details_expanded is False
+
 
 class TestDeviceAgnosticNavigation:
     """The operation screen must be fully controller/keyboard/touch

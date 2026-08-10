@@ -156,6 +156,7 @@ def is_mounted_cifs_target(
     server: Optional[str] = None,
     share: Optional[str] = None,
     read_only: Optional[bool] = None,
+    remote_path: Optional[str] = None,
 ) -> bool:
     """Require a CIFS mount at *target* with the expected identity and mode.
 
@@ -185,6 +186,10 @@ def is_mounted_cifs_target(
         return False
     if read_only is False and "rw" not in options:
         return False
+    if remote_path:
+        expected_prefix = f"prefixpath={remote_path}"
+        if expected_prefix not in options:
+            return False
     return True
 
 
@@ -194,6 +199,7 @@ def is_target_mounted_cifs(
     server: Optional[str] = None,
     share: Optional[str] = None,
     read_only: Optional[bool] = None,
+    remote_path: Optional[str] = None,
     proc_mounts_path: str = _DEFAULT_PROC_MOUNTS,
 ) -> bool:
     """Read the mount table and apply :func:`is_mounted_cifs_target`."""
@@ -208,6 +214,7 @@ def is_target_mounted_cifs(
         server=server,
         share=share,
         read_only=read_only,
+        remote_path=remote_path,
     )
 
 
@@ -286,6 +293,7 @@ def build_mount_argv(
     credentials_path: Path,
     *,
     read_only: bool = True,
+    remote_path: str = "",
 ) -> list[str]:
     """Build the `mount -t cifs` argv. Never includes the password.
 
@@ -294,6 +302,8 @@ def build_mount_argv(
     ``read_only=False`` for its independently configured writable mount.
     """
     options = f"credentials={credentials_path},{'ro' if read_only else 'rw'}"
+    if remote_path:
+        options += f",prefixpath={remote_path}"
     return ["mount", "-t", "cifs", f"//{server}/{share}", str(mount_point), "-o", options]
 
 
@@ -324,6 +334,7 @@ def mount_cifs_source(
     credentials_path: Path,
     *,
     read_only: bool = True,
+    remote_path: str = "",
     port: int = _DEFAULT_SMB_PORT,
     wait_timeout: float = 60.0,
     wait_interval: float = 2.0,
@@ -351,6 +362,7 @@ def mount_cifs_source(
             server=None if read_only else server,
             share=share,
             read_only=read_only,
+            remote_path=remote_path,
             proc_mounts_path=proc_mounts_path,
         )
         if not identity_matches:
@@ -373,7 +385,14 @@ def mount_cifs_source(
         )
 
     Path(mount_point).mkdir(parents=True, exist_ok=True)
-    argv = build_mount_argv(server, share, mount_point, credentials_path, read_only=read_only)
+    argv = build_mount_argv(
+        server,
+        share,
+        mount_point,
+        credentials_path,
+        read_only=read_only,
+        remote_path=remote_path,
+    )
     log.info("Mounting %s at %s", f"//{server}/{share}", mount_point)
     result = runner(argv, capture_output=True, text=True)
     if result.returncode != 0:

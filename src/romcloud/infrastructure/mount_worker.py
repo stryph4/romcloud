@@ -141,6 +141,7 @@ def _configured_mount_is_ready(item: ConfiguredMount) -> bool:
         server=None if item.read_only else item.smb.server,
         share=item.smb.share,
         read_only=item.read_only,
+        remote_path=getattr(item.smb, "remote_path", ""),
     )
 
 
@@ -488,6 +489,7 @@ def _run_worker_locked(
                 credentials_path=creds_path,
                 read_only=target.read_only,
                 port=target.smb.port,
+                remote_path=getattr(target.smb, "remote_path", ""),
                 use_endpoint_cache=target.credential_kind == "source",
                 attempt_timeout=attempt_timeout,
                 attempt_interval=attempt_interval,
@@ -523,6 +525,7 @@ def _mount_with_cached_endpoint_fallback(
     mount_point: str,
     credentials_path: Path,
     read_only: bool = True,
+    remote_path: str = "",
     use_endpoint_cache: bool = True,
     port: int,
     attempt_timeout: float,
@@ -557,6 +560,8 @@ def _mount_with_cached_endpoint_fallback(
             mount_kwargs = {}
             if not read_only:
                 mount_kwargs["read_only"] = False
+            if remote_path:
+                mount_kwargs["remote_path"] = remote_path
             outcome = mountlib.mount_cifs_source(
                 server=cached.endpoint,
                 share=share,
@@ -585,6 +590,7 @@ def _mount_with_cached_endpoint_fallback(
         mount_point=mount_point,
         credentials_path=credentials_path,
         read_only=read_only,
+        remote_path=remote_path,
         port=port,
         attempt_timeout=attempt_timeout,
         attempt_interval=attempt_interval,
@@ -612,6 +618,7 @@ def _mount_with_retry(
     mount_point: str,
     credentials_path: Path,
     read_only: bool = True,
+    remote_path: str = "",
     port: int,
     attempt_timeout: float,
     attempt_interval: float,
@@ -658,6 +665,8 @@ def _mount_with_retry(
             mount_kwargs = {}
             if not read_only:
                 mount_kwargs["read_only"] = False
+            if remote_path:
+                mount_kwargs["remote_path"] = remote_path
             outcome = mountlib.mount_cifs_source(
                 server=server,
                 share=share,

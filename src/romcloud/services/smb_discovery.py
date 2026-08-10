@@ -140,6 +140,15 @@ class ShareValidationResult:
     error_kind: Optional[SMBErrorKind] = None
     detail: str = ""
     top_level_entries: Tuple[str, ...] = ()
+    entries: Tuple["SMBDirectoryEntry", ...] = ()
+
+
+@dataclass(frozen=True)
+class SMBDirectoryEntry:
+    """Credential-free metadata for one item in an SMB directory."""
+
+    name: str
+    is_directory: bool
 
 
 @dataclass(frozen=True)
@@ -264,6 +273,18 @@ class SMBDiscoveryService:
         listed/read. This is the one operation that must succeed before any
         configuration or credentials may be persisted."""
         return self._transport.list_share_directory(target, credentials, share)
+
+    def browse_directory(
+        self,
+        target: SMBServerTarget,
+        credentials: SMBCredentials,
+        share: str,
+        path: str = "",
+    ) -> ShareValidationResult:
+        """Enumerate one validated directory without exposing transport details."""
+        return self._transport.list_share_directory(
+            target, credentials, share, path
+        )
 
     def detect_systems(self, validation: ShareValidationResult) -> SystemDetectionResult:
         """Classify a validated share's top-level entries into recognized

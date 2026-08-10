@@ -47,13 +47,16 @@ def test_controller_keyboard_and_touch_use_the_same_next_back_actions():
         assert wizard.step == WizardStep.WELCOME
 
 
-def test_server_and_username_are_entered_with_osk():
+def test_server_port_and_username_are_entered_with_osk():
     wizard = WizardState()
     wizard.enter_text_step(WizardStep.SERVER)
     wizard.handle_event(InputEvent(Action.TEXT_INPUT, text="nas.local"), RECTS, "romcloud")
     wizard.osk.select(_confirm_key_index(wizard))
     wizard.handle_event(InputEvent(Action.CONFIRM), RECTS, "romcloud")
     assert wizard.server == "nas.local"
+    assert wizard.step == WizardStep.PORT
+    wizard.osk.select(_confirm_key_index(wizard))
+    wizard.handle_event(InputEvent(Action.CONFIRM), RECTS, "romcloud")
     assert wizard.step == WizardStep.USERNAME
     assert wizard.osk is not None
 
@@ -230,3 +233,44 @@ def test_back_cancels_running_operation():
     wizard.back()
     assert runner.cancelled is True
     assert wizard.step == WizardStep.PASSWORD
+
+
+def test_local_source_choice_opens_non_blocking_folder_browser(monkeypatch):
+    wizard = WizardState()
+    wizard.step = WizardStep.SOURCE
+    wizard.selected_index = 1
+    started = []
+    monkeypatch.setattr(
+        "ports_gfx.wizard.start_backend_operation",
+        lambda binary, action, payload: started.append((action, payload)) or _Runner(finished=False),
+    )
+
+    wizard._confirm("romcloud")  # noqa: SLF001
+
+    assert wizard.source_type == "local"
+    assert wizard.step == WizardStep.LOCAL_BROWSE
+    assert started[0][0] == "setup-browse-local"
+
+
+def test_remote_browser_only_offers_directories_as_selectable_targets(monkeypatch):
+    wizard = WizardState()
+    wizard.step = WizardStep.SOURCE_BROWSE
+    wizard.runner = _Runner()
+    monkeypatch.setattr(
+        "ports_gfx.wizard.operation_result",
+        lambda runner: BackendResult(
+            True,
+            {
+                "path": "Libraries",
+                "entries": [
+                    {"name": "Roms", "is_directory": True},
+                    {"name": "README.txt", "is_directory": False},
+                ],
+            },
+        ),
+    )
+
+    wizard.poll()
+
+    assert wizard.options == ["Select this folder", "Up one folder", "Folder: Roms"]
+    assert wizard.browser_entries[-1]["is_directory"] is False

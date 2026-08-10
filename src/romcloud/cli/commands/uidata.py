@@ -32,12 +32,21 @@ import click
 from romcloud.cli.context import get_container
 from romcloud.lifecycle.setup import (
     apply_setup,
+    browse_local,
+    browse_smb_directory,
     discover_shares,
     setup_state,
+    validate_local_source,
     validate_share,
 )
+from romcloud.core.progress import ProgressEvent, redact_text
 from romcloud.infrastructure.config import load_config
 from romcloud.infrastructure.source_display import source_display_summary
+from romcloud.services.connections import (
+    connection_status,
+    mount_connections,
+    unmount_connections,
+)
 
 
 def _emit(ctx: click.Context, payload: dict) -> None:
@@ -77,6 +86,38 @@ def _read_request() -> dict:
     return payload
 
 
+def _progress_sink(request: dict):
+    """Return an opt-in stderr event sink for the graphical client."""
+    if not request.get("progress"):
+        return None
+    secrets = tuple(
+        str(request.get(key, ""))
+        for key in ("password", "remote_password")
+    )
+
+    def emit(event: ProgressEvent) -> None:
+        click.echo(event.wire_line(*secrets), err=True)
+
+    return emit
+
+
+def _run_request_action(ctx: click.Context, action) -> None:
+    def build():
+        request = _read_request()
+        progress = _progress_sink(request)
+        try:
+            return action(request, progress) if progress is not None else action(request)
+        except Exception as exc:
+            safe = redact_text(
+                str(exc),
+                str(request.get("password", "")),
+                str(request.get("remote_password", "")),
+            )
+            raise ValueError(safe) from None
+
+    _run_action(ctx, build)
+
+
 @uidata_group.command("setup-status")
 @click.pass_context
 def uidata_setup_status(ctx: click.Context) -> None:
@@ -92,21 +133,44 @@ def uidata_setup_status(ctx: click.Context) -> None:
 @click.pass_context
 def uidata_setup_discover(ctx: click.Context) -> None:
     """Discover accessible SMB shares from a secret-bearing stdin request."""
-    _run_action(ctx, lambda: discover_shares(_read_request()))
+    _run_request_action(ctx, discover_shares)
 
 
 @uidata_group.command("setup-validate")
 @click.pass_context
 def uidata_setup_validate(ctx: click.Context) -> None:
     """Validate a selected SMB share and report recognized systems."""
-    _run_action(ctx, lambda: validate_share(_read_request()))
+    def validate(request, progress):
+        action = validate_local_source if request.get("source_type") == "local" else validate_share
+        return action(request, progress)
+
+    _run_request_action(ctx, validate)
+
+
+@uidata_group.command("setup-browse-smb")
+@click.pass_context
+def uidata_setup_browse_smb(ctx: click.Context) -> None:
+    """Enumerate one directory inside a previously authenticated SMB share."""
+    _run_request_action(ctx, browse_smb_directory)
+
+
+@uidata_group.command("setup-browse-local")
+@click.pass_context
+def uidata_setup_browse_local(ctx: click.Context) -> None:
+    """Enumerate a local filesystem directory for the setup folder picker."""
+    _run_request_action(ctx, lambda request, progress=None: browse_local(request))
 
 
 @uidata_group.command("setup-apply")
 @click.pass_context
 def uidata_setup_apply(ctx: click.Context) -> None:
     """Apply, mount, scan, and integrate a validated graphical setup."""
-    _run_action(ctx, lambda: apply_setup(Path(ctx.obj["config_path"]), _read_request()))
+    _run_request_action(
+        ctx,
+        lambda request, progress=None: apply_setup(
+            Path(ctx.obj["config_path"]), request, progress
+        ),
+    )
 
 
 @uidata_group.command("status")
@@ -196,6 +260,42 @@ def uidata_cache_status(ctx: click.Context) -> None:
             "max_bytes": summary["max_bytes"],
             "min_free_bytes": summary["min_free_bytes"],
         }
+
+    _run_action(ctx, build)
+
+
+@uidata_group.command("connection-status")
+@click.pass_context
+def uidata_connection_status(ctx: click.Context) -> None:
+    """Return an approachable connection state and configured targets."""
+
+    def build() -> dict:
+        config = _load_context_config(ctx)
+        return connection_status(config)
+
+    _run_action(ctx, build)
+
+
+@uidata_group.command("connection-mount")
+@click.pass_context
+def uidata_connection_mount(ctx: click.Context) -> None:
+    """Mount configured network locations with streamed progress events."""
+
+    def build() -> dict:
+        config = _load_context_config(ctx)
+        return mount_connections(config, _progress_sink({"progress": True}))
+
+    _run_action(ctx, build)
+
+
+@uidata_group.command("connection-unmount")
+@click.pass_context
+def uidata_connection_unmount(ctx: click.Context) -> None:
+    """Unmount configured network locations with streamed progress events."""
+
+    def build() -> dict:
+        config = _load_context_config(ctx)
+        return unmount_connections(config, _progress_sink({"progress": True}))
 
     _run_action(ctx, build)
 

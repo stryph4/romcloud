@@ -94,6 +94,30 @@ class TestSetupBridge:
         assert payload["ok"] is False
         assert "Traceback" not in result.output
 
+    def test_unexpected_setup_error_redacts_request_password(self, tmp_path, monkeypatch):
+        import romcloud.cli.commands.uidata as uidata_module
+
+        password = "gui-visible-secret"
+        monkeypatch.setattr(
+            uidata_module,
+            "discover_shares",
+            lambda payload: (_ for _ in ()).throw(
+                RuntimeError(f"backend echoed {password}")
+            ),
+        )
+
+        result = CliRunner().invoke(
+            cli,
+            ["--config", str(tmp_path / "missing.toml"), "uidata", "setup-discover"],
+            input=json.dumps(
+                {"server": "nas", "username": "alice", "password": password}
+            ),
+        )
+
+        assert result.exit_code == 1
+        assert password not in result.output
+        assert "***" in result.output
+
 
 class TestStatus:
     def test_emits_single_json_object(self, tmp_path):

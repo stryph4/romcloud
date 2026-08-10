@@ -32,10 +32,11 @@ from pathlib import Path
 import click
 
 from romcloud.cli.context import get_container
-from romcloud.core.exceptions import ConfigurationError, ROMCloudError
+from romcloud.core.exceptions import ROMCloudError
 from romcloud.infrastructure import mount, mount_worker
 from romcloud.infrastructure.credentials import write_cifs_credentials_file
 from romcloud.integrations.batocera import mount_service
+from romcloud.services.connections import mount_connections, unmount_connections
 
 
 @click.group("mount")
@@ -78,7 +79,8 @@ def mount_status_cmd(ctx: click.Context) -> None:
     for target in targets:
         mode = "read-only" if target.read_only else "read-write"
         click.echo(
-            f"  {target.label}: //{target.smb.server}/{target.smb.share} "
+            f"  {target.label}: //{target.smb.server}/{target.smb.share}"
+            f"{f'/{target.smb.remote_path}' if getattr(target.smb, 'remote_path', '') else ''} "
             f"→ {target.mount_point} ({mode})"
         )
     click.echo(f"  State:       {diag.label}")
@@ -102,38 +104,14 @@ def mount_start_cmd(ctx: click.Context) -> None:
     """
     config = _require_mounts(ctx)
 
-    mounted_during_start: list[str] = []
     try:
-        outcomes = []
-        for target in mount_worker.configured_mounts(config):
-            password, creds_path = mount_worker.credentials_for_mount(config, target)
-            if not password:
-                raise ConfigurationError(
-                    f"No SMB password stored for {target.label}; run `romcloud configure`"
-                )
-            write_cifs_credentials_file(creds_path, target.smb.username, password)
-            outcome = mount.mount_cifs_source(
-                server=target.smb.server,
-                share=target.smb.share,
-                mount_point=target.mount_point,
-                credentials_path=creds_path,
-                read_only=target.read_only,
-                port=target.smb.port,
-            )
-            outcomes.append(outcome)
-            if not outcome.already_mounted:
-                mounted_during_start.append(target.mount_point)
+        result = mount_connections(config, credential_writer=write_cifs_credentials_file)
     except (ROMCloudError, OSError) as exc:
-        for mount_point in reversed(mounted_during_start):
-            try:
-                mount.unmount_cifs_source(mount_point)
-            except Exception:  # noqa: BLE001 - preserve the original mount error
-                pass
         click.echo(f"error: {exc}", err=True)
         ctx.exit(1)
         return
 
-    click.echo("Already mounted." if all(item.already_mounted for item in outcomes) else "Mounted.")
+    click.echo("Mounted." if result["changed"] else "Already mounted.")
 
 
 @mount_group.command("boot-start")
@@ -191,23 +169,13 @@ def mount_worker_cmd(ctx: click.Context) -> None:
 def mount_stop_cmd(ctx: click.Context) -> None:
     """Stop the mount worker, then unmount every configured SMB location."""
     config = _require_mounts(ctx)
-    romcloud_home = _romcloud_home(config)
-
-    mount_worker.stop_worker(romcloud_home)
-
-    unmounted: list[bool] = []
-    errors: list[str] = []
-    for target in reversed(mount_worker.configured_mounts(config)):
-        try:
-            unmounted.append(mount.unmount_cifs_source(target.mount_point))
-        except ROMCloudError as exc:
-            errors.append(f"{target.label}: {exc}")
-    if errors:
-        click.echo(f"error: {'; '.join(errors)}", err=True)
+    try:
+        result = unmount_connections(config)
+    except ROMCloudError as exc:
+        click.echo(f"error: {exc}", err=True)
         ctx.exit(1)
         return
-
-    click.echo("Unmounted." if any(unmounted) else "Was not mounted.")
+    click.echo("Unmounted." if result["changed"] else "Was not mounted.")
 
 
 @mount_group.command("install")

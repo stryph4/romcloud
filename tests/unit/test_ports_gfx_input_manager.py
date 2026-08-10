@@ -72,6 +72,19 @@ class TestTouchRouting:
         assert r1.action == Action.CONFIRM
         assert r2 == InputEvent()
 
+    def test_pointer_release_ends_hold_to_confirm(self, tmp_path: Path):
+        manager = _manager(tmp_path)
+        pygame = manager._pygame
+
+        result = manager.handle_event(
+            FakeEvent(type=pygame.FINGERUP, x=0.5, y=0.5),
+            screen_w=1920,
+            screen_h=1080,
+        )
+
+        assert result.action == Action.CONFIRM_RELEASED
+        assert manager.last_input_mode == "touch"
+
 
 class TestControllerRouting:
     def test_controller_event_routes_through_and_sets_mode(self, tmp_path: Path):

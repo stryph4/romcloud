@@ -119,6 +119,13 @@ class InputManager:
             index = resolve_hit(rects, point_from_finger_event(event, screen_w, screen_h))
             return self._touch_result(index)
 
+        if event_type in {
+            getattr(pygame, "MOUSEBUTTONUP", object()),
+            getattr(pygame, "FINGERUP", object()),
+        }:
+            self.last_input_mode = "touch"
+            return InputEvent(action=Action.CONFIRM_RELEASED)
+
         action = self.controllers.handle_event(event)
         if action is not None:
             self.last_input_mode = "controller"

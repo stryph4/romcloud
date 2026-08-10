@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from romcloud.bootstrap.container import Container
+from romcloud.core.progress import ProgressSink, emit_progress
 from romcloud.infrastructure.atomic_file import atomic_write_text
 from romcloud.infrastructure.config import (
     AppConfig,
@@ -33,7 +34,12 @@ from romcloud.infrastructure.mount import mount_cifs_source
 from romcloud.infrastructure import mount_worker
 from romcloud.infrastructure.smb_discovery_client import build_default_smb_discovery_service
 from romcloud.integrations.batocera import es_config, mount_service
-from romcloud.services.smb_discovery import SMBCredentials, SMBServerTarget
+from romcloud.services.smb_discovery import SMBErrorKind, SMBCredentials, SMBServerTarget
+from romcloud.services.directory_browser import (
+    browse_local_directory,
+    normalize_remote_directory,
+    remote_parent,
+)
 
 DEFAULT_ROM_ROOT = "/userdata/romcloud/source"
 DEFAULT_REMOTE_DATA_ROOT = "/userdata/romcloud/remote"
@@ -49,6 +55,8 @@ class SetupRequest:
     share: str
     username: str
     password: str = field(repr=False)
+    source_type: str = "smb"
+    source_remote_path: str = ""
     rom_root: str = DEFAULT_ROM_ROOT
     cache_root: str = DEFAULT_CACHE_ROOT
     max_size_gb: float = DEFAULT_MAX_SIZE_GB
@@ -62,6 +70,7 @@ class SetupRequest:
     remote_password: str = field(default="", repr=False)
     remote_port: int = 445
     remote_reuse_source_credentials: bool = False
+    remote_remote_path: str = ""
 
     @classmethod
     def from_payload(
@@ -81,6 +90,10 @@ class SetupRequest:
             share=str(payload.get("share", "")).strip(),
             username=username,
             password=password,
+            source_type=str(payload.get("source_type", "smb")).strip().lower(),
+            source_remote_path=normalize_remote_directory(
+                str(payload.get("source_remote_path", ""))
+            ),
             rom_root=str(payload.get("rom_root", DEFAULT_ROM_ROOT)).strip(),
             cache_root=str(payload.get("cache_root", DEFAULT_CACHE_ROOT)).strip(),
             max_size_gb=_number(payload.get("max_size_gb", DEFAULT_MAX_SIZE_GB), "Maximum cache size"),
@@ -100,19 +113,25 @@ class SetupRequest:
             ),
             remote_port=(port if reuse_remote else int(payload.get("remote_port", 445))),
             remote_reuse_source_credentials=reuse_remote,
+            remote_remote_path=normalize_remote_directory(
+                str(payload.get("remote_remote_path", ""))
+            ),
         )
         request.validate(require_share=require_share, validate_cache=validate_cache)
         return request
 
     def validate(self, *, require_share: bool = True, validate_cache: bool = True) -> None:
-        if not self.server:
-            raise ValueError("SMB server is required.")
-        if require_share and not self.share:
-            raise ValueError("SMB share is required.")
-        if not self.username:
-            raise ValueError("SMB username is required.")
-        if not self.password:
-            raise ValueError("SMB password is required.")
+        if self.source_type not in {"local", "smb"}:
+            raise ValueError("ROM source type must be local or smb.")
+        if self.source_type == "smb":
+            if not self.server:
+                raise ValueError("SMB server is required.")
+            if require_share and not self.share:
+                raise ValueError("SMB share is required.")
+            if not self.username:
+                raise ValueError("SMB username is required.")
+            if not self.password:
+                raise ValueError("SMB password is required.")
         serialized_values = (
             self.server,
             self.share,
@@ -123,10 +142,12 @@ class SetupRequest:
             self.remote_server,
             self.remote_share,
             self.remote_username,
+            self.source_remote_path,
+            self.remote_remote_path,
         )
         if any('"' in value or "\n" in value or "\r" in value for value in serialized_values):
             raise ValueError("Setup values cannot contain quotes or line breaks.")
-        if not 1 <= self.port <= 65535:
+        if self.source_type == "smb" and not 1 <= self.port <= 65535:
             raise ValueError("SMB port must be between 1 and 65535.")
         if self.remote_data_type not in {"none", "local", "smb"}:
             raise ValueError("ROMCloud data storage type must be none, local, or smb.")
@@ -138,7 +159,7 @@ class SetupRequest:
                 raise ValueError("Remote-data SMB server, share, username, and password are required.")
             if not 1 <= self.remote_port <= 65535:
                 raise ValueError("Remote-data SMB port must be between 1 and 65535.")
-            if (
+            if self.source_type == "smb" and (
                 self.server.casefold() == self.remote_server.casefold()
                 and self.share.strip("/").casefold()
                 == self.remote_share.strip("/").casefold()
@@ -236,6 +257,7 @@ def setup_state(config_path: Path) -> dict[str, Any]:
             "share": config.smb.share,
             "username": config.smb.username,
             "port": config.smb.port,
+            "source_remote_path": config.smb.remote_path,
         })
     if config.remote_data is not None and config.remote_data.smb is not None:
         payload.update({
@@ -243,6 +265,7 @@ def setup_state(config_path: Path) -> dict[str, Any]:
             "remote_share": config.remote_data.smb.share,
             "remote_username": config.remote_data.smb.username,
             "remote_port": config.remote_data.smb.port,
+            "remote_remote_path": config.remote_data.smb.remote_path,
         })
     return payload
 
@@ -270,23 +293,38 @@ def _structural_issues(config: AppConfig) -> list[str]:
     return issues
 
 
-def discover_shares(payload: dict[str, Any]) -> dict[str, Any]:
+def discover_shares(
+    payload: dict[str, Any], progress: ProgressSink = None
+) -> dict[str, Any]:
     server, port, username, password = _connection_values(payload)
     discovery = build_default_smb_discovery_service()
     target = SMBServerTarget(server, port)
     credentials = SMBCredentials(username, password)
 
+    emit_progress(progress, "configure", "connect", "running", f"Connecting to {server}…")
     reachability = discovery.validate_server(target)
     if not reachability.ok:
+        emit_progress(progress, "configure", "connect", "error", "Could not reach the server.", detail=_redact(reachability.detail, password))
         raise ValueError(_redact(reachability.detail, password) or "SMB server is unreachable.")
+    emit_progress(progress, "configure", "connect", "success", "Connected to server")
     authentication = discovery.authenticate(target, credentials)
     if not authentication.ok:
+        emit_progress(progress, "configure", "authenticate", "error", "Authentication failed.", detail=_redact(authentication.detail, password))
         raise ValueError(
             _redact(authentication.detail, password)
             or str(authentication.error_kind or "Authentication failed.")
         )
+    emit_progress(progress, "configure", "authenticate", "success", "Authentication successful")
     result = discovery.list_shares(target, credentials)
     if not result.ok:
+        emit_progress(
+            progress,
+            "configure",
+            "shares",
+            "error",
+            "Could not list accessible shares.",
+            detail=_redact(result.detail, password),
+        )
         raise ValueError(
             _redact(result.detail, password)
             or str(result.error_kind or "No shares found.")
@@ -299,7 +337,9 @@ def discover_shares(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def validate_share(payload: dict[str, Any]) -> dict[str, Any]:
+def validate_share(
+    payload: dict[str, Any], progress: ProgressSink = None
+) -> dict[str, Any]:
     purpose = str(payload.get("purpose", "source"))
     server, port, username, password = _connection_values(payload)
     share_key = "remote_share" if purpose == "remote_data" else "share"
@@ -309,12 +349,29 @@ def validate_share(payload: dict[str, Any]) -> dict[str, Any]:
     discovery = build_default_smb_discovery_service()
     target = SMBServerTarget(server, port)
     credentials = SMBCredentials(username, password)
-    validation = discovery.validate_share(target, credentials, share)
+    path_key = "remote_remote_path" if purpose == "remote_data" else "source_remote_path"
+    remote_path = normalize_remote_directory(str(payload.get(path_key, "")))
+    emit_progress(progress, "configure", "directory", "running", "Checking the selected folder…")
+    validation = (
+        discovery.browse_directory(target, credentials, share, remote_path)
+        if remote_path
+        else discovery.validate_share(target, credentials, share)
+    )
     if not validation.ok:
-        raise ValueError(
-            _redact(validation.detail, password)
-            or str(validation.error_kind or "Share validation failed.")
+        detail = _redact(validation.detail, password)
+        emit_progress(
+            progress,
+            "configure",
+            "directory",
+            "error",
+            _friendly_smb_error(validation.error_kind),
+            detail=detail,
         )
+        raise ValueError(
+            _friendly_smb_error(validation.error_kind)
+        )
+    emit_progress(progress, "configure", "directory", "success", "Directory accessible")
+    emit_progress(progress, "configure", "read", "success", "Read access verified")
     if purpose == "remote_data":
         return {
             "systems": [],
@@ -329,9 +386,110 @@ def validate_share(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def apply_setup(config_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
+def browse_smb_directory(
+    payload: dict[str, Any], progress: ProgressSink = None
+) -> dict[str, Any]:
+    """List one share-relative SMB directory after connectivity/auth checks."""
+    purpose = str(payload.get("purpose", "source"))
+    server, port, username, password = _connection_values(payload)
+    share_key = "remote_share" if purpose == "remote_data" else "share"
+    path_key = "remote_remote_path" if purpose == "remote_data" else "source_remote_path"
+    share = str(payload.get(share_key, "")).strip()
+    path = normalize_remote_directory(str(payload.get(path_key, "")))
+    if not share:
+        raise ValueError("SMB share is required.")
+    discovery = build_default_smb_discovery_service()
+    target = SMBServerTarget(server, port)
+    credentials = SMBCredentials(username, password)
+    emit_progress(progress, "browse", "connect", "running", f"Opening //{server}/{share}…")
+    reachability = discovery.validate_server(target)
+    if not reachability.ok:
+        emit_progress(
+            progress,
+            "browse",
+            "connect",
+            "error",
+            "Could not reach the server.",
+            detail=_redact(reachability.detail, password),
+        )
+        raise ValueError(_redact(reachability.detail, password) or "SMB server is unreachable.")
+    authentication = discovery.authenticate(target, credentials)
+    if not authentication.ok:
+        emit_progress(
+            progress,
+            "browse",
+            "authenticate",
+            "error",
+            "Authentication failed.",
+            detail=_redact(authentication.detail, password),
+        )
+        raise ValueError(_redact(authentication.detail, password) or "Authentication failed.")
+    result = discovery.browse_directory(target, credentials, share, path)
+    if not result.ok:
+        detail = _redact(result.detail, password)
+        emit_progress(
+            progress,
+            "browse",
+            "directory",
+            "error",
+            _friendly_smb_error(result.error_kind),
+            detail=detail,
+        )
+        raise ValueError(
+            _friendly_smb_error(result.error_kind)
+        )
+    emit_progress(progress, "browse", "directory", "success", "Folder contents loaded")
+    entries = result.entries or tuple(
+        type("Directory", (), {"name": name, "is_directory": True})()
+        for name in result.top_level_entries
+    )
+    return {
+        "path": path,
+        "parent": remote_parent(path),
+        "entries": [
+            {
+                "name": entry.name,
+                "is_directory": bool(entry.is_directory),
+            }
+            for entry in entries
+        ],
+    }
+
+
+def browse_local(payload: dict[str, Any]) -> dict[str, object]:
+    return browse_local_directory(str(payload.get("path", "/userdata")))
+
+
+def validate_local_source(
+    payload: dict[str, Any], progress: ProgressSink = None
+) -> dict[str, Any]:
+    root = str(payload.get("rom_root", "")).strip()
+    emit_progress(progress, "configure", "directory", "running", "Checking the selected folder…")
+    from romcloud.infrastructure.providers.local import LocalFilesystemProvider
+
+    provider = LocalFilesystemProvider()
+    validation = provider.validate_access(root)
+    if not validation.ok:
+        raise ValueError(validation.detail or "Could not access the selected folder.")
+    emit_progress(progress, "configure", "directory", "success", "Directory accessible")
+    emit_progress(progress, "configure", "read", "success", "Read access verified")
+    systems = provider.list_systems(root)
+    return {
+        "systems": systems,
+        "count": len(systems),
+        "validation": validation.as_dict(),
+    }
+
+
+def apply_setup(
+    config_path: Path, payload: dict[str, Any], progress: ProgressSink = None
+) -> dict[str, Any]:
     request = SetupRequest.from_payload(payload)
-    validation_result = validate_share(payload)
+    validation_result = (
+        validate_share(payload)
+        if request.source_type == "smb"
+        else validate_local_source(payload)
+    )
     if request.remote_data_type == "smb":
         validate_share({**payload, "purpose": "remote_data"})
     state_path = config_path.parent / SETUP_STATE_FILENAME
@@ -348,21 +506,26 @@ def apply_setup(config_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
     mounted_during_setup: list[str] = []
 
     step = "write configuration"
+    emit_progress(progress, "configure", "save", "running", "Saving configuration…")
     _write_state(state_path, {"status": "applying", "step": step})
     try:
         write_config(config, str(config_path))
-        write_smb_password(config.credentials_path, request.password)
+        if request.source_type == "smb":
+            write_smb_password(config.credentials_path, request.password)
         if request.remote_data_type == "smb":
             write_remote_data_smb_password(
                 config.credentials_path, request.remote_password
             )
 
+        emit_progress(progress, "configure", "save", "success", "Configuration saved")
         step = "install mount service"
         _write_state(state_path, {"status": "applying", "step": step})
         romcloud_bin = config_path.parent.parent / "bin" / "romcloud"
-        mount_service.install_service(str(romcloud_bin))
+        if mount_worker.configured_mounts(config):
+            mount_service.install_service(str(romcloud_bin))
 
         step = "mount and test storage"
+        emit_progress(progress, "configure", "mount", "running", "Connecting storage…")
         _write_state(state_path, {"status": "applying", "step": step})
         for target in mount_worker.configured_mounts(config):
             password, cifs_path = mount_worker.credentials_for_mount(config, target)
@@ -375,9 +538,12 @@ def apply_setup(config_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
                 cifs_path,
                 read_only=target.read_only,
                 port=target.smb.port,
+                remote_path=getattr(target.smb, "remote_path", ""),
             )
             if outcome is not None and not outcome.already_mounted:
                 mounted_during_setup.append(target.mount_point)
+        if mount_worker.configured_mounts(config):
+            emit_progress(progress, "configure", "mount", "success", "Mounted successfully")
 
         container = Container(config)
         source_probe = container.provider.validate_access(config.source.rom_root)
@@ -385,6 +551,7 @@ def apply_setup(config_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError(
                 f"ROM library access validation failed: {source_probe.detail}"
             )
+        emit_progress(progress, "configure", "read", "success", "ROM read access verified")
 
         remote_probe = None
         if config.remote_data is not None:
@@ -396,18 +563,24 @@ def apply_setup(config_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
                     "Configured ROMCloud data location failed validation: "
                     f"{remote_probe.detail}"
                 )
+            emit_progress(progress, "configure", "write", "success", "Write test created")
+            emit_progress(progress, "configure", "read_back", "success", "Read-back verified")
+            emit_progress(progress, "configure", "cleanup", "success", "Test file removed")
 
         step = "refresh catalog"
+        emit_progress(progress, "configure", "catalog", "running", "Refreshing the game catalog…")
         _write_state(state_path, {"status": "applying", "step": step})
         refresh_result = container.catalog.refresh()
         if refresh_result.errors:
             details = "; ".join(f"{system}: {message}" for system, message in refresh_result.errors)
             raise RuntimeError(details)
+        emit_progress(progress, "configure", "catalog", "success", "Catalog refreshed")
 
         step = "update EmulationStation integration"
         _write_state(state_path, {"status": "applying", "step": step})
         managed_systems = container.game_repo.list_systems()
         es_config.install(managed_systems)
+        emit_progress(progress, "configure", "complete", "success", "ROMCloud setup complete")
     except Exception as exc:
         from romcloud.infrastructure.mount import unmount_cifs_source
 
@@ -417,15 +590,11 @@ def apply_setup(config_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
                 unmount_cifs_source(mount_point)
             except Exception as cleanup_exc:  # noqa: BLE001 - try every new mount
                 cleanup_errors.append(f"{mount_point}: {cleanup_exc}")
-        safe_error = str(exc).replace(request.password, "***")
-        if request.remote_password:
-            safe_error = safe_error.replace(request.remote_password, "***")
+        safe_error = _redact(str(exc), request.password, request.remote_password)
         if cleanup_errors:
-            cleanup_detail = "; ".join(cleanup_errors).replace(
-                request.password, "***"
+            cleanup_detail = _redact(
+                "; ".join(cleanup_errors), request.password, request.remote_password
             )
-            if request.remote_password:
-                cleanup_detail = cleanup_detail.replace(request.remote_password, "***")
             safe_error += f"; mount cleanup failed: {cleanup_detail}"
         if previous_config is not None:
             config_path.write_bytes(previous_config)
@@ -444,11 +613,19 @@ def apply_setup(config_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
                 state_path.unlink(missing_ok=True)
         else:
             _write_state(state_path, {"status": "failed", "failed_step": step, "error": safe_error})
+        emit_progress(
+            progress,
+            "configure",
+            step,
+            "error",
+            "Setup could not be completed.",
+            detail=safe_error,
+        )
         raise RuntimeError(f"{step}: {safe_error}") from exc
 
     state_path.unlink(missing_ok=True)
     return {
-        "source_type": "smb",
+        "source_type": request.source_type,
         "server": request.server,
         "share": request.share,
         "systems": validation_result["systems"],
@@ -483,6 +660,7 @@ def _build_config(config_path: Path, request: SetupRequest, existing: AppConfig 
                 share=request.remote_share,
                 username=request.remote_username,
                 port=request.remote_port,
+                remote_path=request.remote_remote_path,
             ),
         )
     return AppConfig(
@@ -495,11 +673,16 @@ def _build_config(config_path: Path, request: SetupRequest, existing: AppConfig 
         local_roms_path=existing.local_roms_path if existing else "/userdata/roms",
         data_path=existing.data_path if existing else str(home / "data"),
         logging=existing.logging if existing else LoggingConfig(level="INFO", path=str(home / "logs")),
-        smb=SMBConfig(
-            server=request.server,
-            share=request.share,
-            username=request.username,
-            port=request.port,
+        smb=(
+            SMBConfig(
+                server=request.server,
+                share=request.share,
+                username=request.username,
+                port=request.port,
+                remote_path=request.source_remote_path,
+            )
+            if request.source_type == "smb"
+            else None
         ),
         remote_data=remote_data,
         saves=existing.saves if existing else SavesConfig(),
@@ -531,6 +714,22 @@ def _redact(detail: str, *secrets: str) -> str:
         if secret:
             detail = detail.replace(secret, "***")
     return detail
+
+
+def _friendly_smb_error(kind: SMBErrorKind | None) -> str:
+    messages = {
+        SMBErrorKind.ACCESS_DENIED: (
+            "ROMCloud connected to the server, but this account does not have "
+            "permission to access the selected folder."
+        ),
+        SMBErrorKind.AUTH_FAILED: "Authentication failed. Check the username and password.",
+        SMBErrorKind.SERVER_NOT_FOUND: "Could not find the server.",
+        SMBErrorKind.CONNECTION_REFUSED: "Could not connect to the server.",
+        SMBErrorKind.TIMEOUT: "The server took too long to respond.",
+        SMBErrorKind.SHARE_UNAVAILABLE: "The selected share is no longer available.",
+        SMBErrorKind.TOOL_UNAVAILABLE: "SMB browsing is unavailable on this system.",
+    }
+    return messages.get(kind, "Could not access the selected folder.")
 
 
 def _read_state(path: Path) -> dict[str, Any]:

@@ -66,8 +66,13 @@ SAVESYNC_ACTION = "savesync"
 """Sentinel the UI layer interprets as "switch to the SaveSync screen"
 rather than dispatching to the backend — SaveSync is a first-class
 top-level menu entry, not a Settings submenu."""
+SETUP_ACTION = "setup"
 
 MENU_ITEMS: tuple[MenuItem, ...] = (
+    MenuItem("Storage Setup", SETUP_ACTION),
+    MenuItem("Connection Status", "connection-status"),
+    MenuItem("Mount / Reconnect", "connection-mount"),
+    MenuItem("Unmount", "connection-unmount"),
     MenuItem("Catalog Status", "status"),
     MenuItem("Refresh Catalog", "refresh"),
     MenuItem("Health Check", "healthcheck"),
@@ -85,6 +90,12 @@ MENU_ITEMS: tuple[MenuItem, ...] = (
 # the screen itself. Each argv is an existing, already-safe CLI entry
 # point (never a new backend command).
 _OPERATIONS: dict[str, OperationSpec] = {
+    "connection-mount": OperationSpec(
+        title="Connect Storage", args=("uidata", "connection-mount")
+    ),
+    "connection-unmount": OperationSpec(
+        title="Disconnect Storage", args=("uidata", "connection-unmount")
+    ),
     "refresh": OperationSpec(title="Refresh Catalog", args=("refresh",)),
     "update-check": OperationSpec(title="Check for Updates", args=("update", "--check")),
 }
@@ -121,7 +132,7 @@ _MIN_SANE_DIMENSION = 240
 
 _TARGET_FPS = 30
 _HINT_TEXT = "Up/Down/Left/Right select   Enter confirm   Esc exit"
-_WIZARD_HINT = ""
+_WIZARD_HINT = "A/Enter select   B/Esc back   Menu/Tab technical details"
 
 
 def format_result(action: str, result: BackendResult) -> str:
@@ -131,6 +142,11 @@ def format_result(action: str, result: BackendResult) -> str:
     """
     if not result.ok:
         return f"Error: {result.error}"
+    if action == "connection-status":
+        state = str(result.data.get("state", "unknown")).replace("_", " ").title()
+        source = result.data.get("source", "")
+        mount_point = result.data.get("mount_point", "")
+        return f"{state} | {source} → {mount_point}"
     if action in ("status", "healthcheck"):
         source_type = result.data.get("source_type")
         source_description = result.data.get("source_description")
@@ -169,6 +185,11 @@ def classify_message_kind(action: str, result: BackendResult) -> str:
     """
     if not result.ok:
         return "error"
+    if action == "connection-status":
+        if result.data.get("state") == "error":
+            return "error"
+        if result.data.get("state") in ("disconnected", "connecting"):
+            return "warning"
     if action == "healthcheck" and (
         result.data.get("source_reachable") is False
         or (
@@ -347,6 +368,10 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
         current_screen = "wizard" if wizard is not None else "menu"
         message: Optional[str] = None
         message_kind = "info"
+        if current_screen == "menu":
+            connection = call_backend(romcloud_bin, "connection-status")
+            message = format_result("connection-status", connection)
+            message_kind = classify_message_kind("connection-status", connection)
 
         running = True
         while running:
@@ -378,6 +403,8 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
                     # The whole safe area is one big "tap anywhere" target
                     # — the operation screen's only touch interaction is
                     # dismissing it once finished (see handle_operation_event).
+                    rects = (layout.safe_area,)
+                elif current_screen == "savesync":
                     rects = (layout.safe_area,)
                 else:
                     rects = ()
@@ -413,6 +440,9 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
                         savesync_screen = SaveSyncScreenState(romcloud_bin=romcloud_bin)
                         savesync_screen.refresh_status()
                         current_screen = "savesync"
+                    elif ievent.action == Action.CONFIRM and item.action == SETUP_ACTION:
+                        wizard = WizardState(call_backend(romcloud_bin, "setup-status"))
+                        current_screen = "wizard"
                     else:
                         running, current_screen, message, message_kind, new_operation = _handle_menu_event(
                             ievent, state, layout, romcloud_bin, running, message, message_kind,
@@ -435,7 +465,12 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
                 elif current_screen == OPERATION_SCREEN and operation_screen is not None:
                     current_screen = handle_operation_event(ievent, operation_screen)
                     if current_screen == "menu":
-                        message, message_kind = operation_summary_message(operation_screen)
+                        if operation_screen.title in ("Connect Storage", "Disconnect Storage"):
+                            connection = call_backend(romcloud_bin, "connection-status")
+                            message = format_result("connection-status", connection)
+                            message_kind = classify_message_kind("connection-status", connection)
+                        else:
+                            message, message_kind = operation_summary_message(operation_screen)
                         operation_screen = None
 
             # Drain output/state every frame regardless of whether an input
@@ -591,6 +626,7 @@ def _handle_savesync_event(ievent: InputEvent, savesync_screen: SaveSyncScreenSt
     if step == PREVIEW:
         if ievent.action == Action.CONFIRM:
             savesync_screen.begin_confirm()
+            savesync_screen.handle_confirm_event(ievent)
         elif ievent.action == Action.BACK:
             savesync_screen.return_to_dashboard()
         return "savesync"
@@ -730,7 +766,9 @@ def _render_operation(  # noqa: ANN001
     viewport_rows = max(1, (output_bottom - output_top) // line_h)
 
     max_chars = max(1, layout.safe_area.w // 10)
-    lines = wrap_lines(display_lines(operation.runner), max_chars)
+    lines = wrap_lines(
+        display_lines(operation.runner, details=operation.details_expanded), max_chars
+    )
     start, end = visible_window(len(lines), viewport_rows, operation.scroll_offset)
 
     y = output_top
@@ -740,7 +778,10 @@ def _render_operation(  # noqa: ANN001
         screen.blit(text, (layout.safe_area.x, y))
         y += line_h
 
-    hint_text = _OPERATION_HINT_FINISHED if operation.is_finished else _OPERATION_HINT_RUNNING
+    detail_hint = "   Left/Right technical details"
+    hint_text = (
+        _OPERATION_HINT_FINISHED if operation.is_finished else _OPERATION_HINT_RUNNING
+    ) + detail_hint
     hint = fonts["hint"].render(hint_text, True, _HINT_COLOR)
     screen.blit(hint, (layout.hint_rect.x, layout.hint_rect.y))
 
@@ -786,8 +827,7 @@ def _savesync_body_lines(savesync_screen: SaveSyncScreenState) -> list[str]:
             "Press Confirm and hold for 3 seconds to apply, Back to cancel.",
         ]
     if step == CONFIRMING:
-        percent = int(savesync_screen.confirm.progress * 100)
-        return [f"Hold Confirm... {percent}%", "Release to cancel."]
+        return ["Keep holding Confirm to continue.", "Release to cancel."]
     if step == COMMITTING:
         return ["Applying changes..."]
     if step == RESULT:
@@ -838,6 +878,21 @@ def _render_savesync(  # noqa: ANN001
         screen.blit(text, (layout.safe_area.x, y))
         y += line_h
 
+    if savesync_screen.step == CONFIRMING:
+        bar_x = layout.safe_area.x
+        bar_y = y + line_h // 2
+        bar_w = max(1, min(layout.safe_area.w, 560))
+        bar_h = max(8, layout.fonts.body // 2)
+        pygame.draw.rect(screen, _CARD_BG, (bar_x, bar_y, bar_w, bar_h), border_radius=4)
+        fill_w = int(bar_w * savesync_screen.confirm.progress)
+        if fill_w > 0:
+            pygame.draw.rect(
+                screen,
+                _SUCCESS_COLOR,
+                (bar_x, bar_y, fill_w, bar_h),
+                border_radius=4,
+            )
+
     hint = fonts["hint"].render(_HINT_TEXT, True, _HINT_COLOR)
     screen.blit(hint, (layout.hint_rect.x, layout.hint_rect.y))
 
@@ -868,9 +923,26 @@ def _wizard_rects(layout: Layout, wizard: WizardState) -> list[Rect]:
 
 def _wizard_body_lines(wizard: WizardState) -> list[str]:
     if wizard.step == WizardStep.WELCOME:
-        return wizard.issues or ["Set up an SMB-hosted ROM library."]
+        return wizard.issues or ["Choose where your ROMs, cache, and SaveSync data live."]
     if wizard.step == WizardStep.SOURCE:
         return ["Select where your ROM library is stored."]
+    if wizard.step in (
+        WizardStep.SOURCE_BROWSE,
+        WizardStep.REMOTE_BROWSE,
+        WizardStep.LOCAL_BROWSE,
+    ):
+        location = wizard.browser_path or "/ (share root)"
+        files = [
+            str(entry.get("name", ""))
+            for entry in wizard.browser_entries
+            if not entry.get("is_directory")
+        ]
+        lines = [f"Current folder: {location}"]
+        if files:
+            preview = ", ".join(files[:4])
+            suffix = "…" if len(files) > 4 else ""
+            lines.append(f"Files here: {preview}{suffix}")
+        return lines
     if wizard.step == WizardStep.DISCOVER:
         return ["Connecting and finding accessible shares..."] if wizard.runner else []
     if wizard.step == WizardStep.DETECT:
@@ -905,7 +977,12 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
         ] if wizard.runner else []
     if wizard.step == WizardStep.REVIEW:
         lines = [
-            f"ROM library: //{wizard.server}/{wizard.share} [Read only]",
+            (
+                f"ROM library: //{wizard.server}/{wizard.share}"
+                f"{f'/{wizard.source_remote_path}' if wizard.source_remote_path else ''} [Read only]"
+                if wizard.source_type == "smb"
+                else f"ROM library: {wizard.rom_root} [Local]"
+            ),
             "\u2713 Connected  \u2713 Read access verified",
             f"Systems: {len(wizard.systems)}",
             (
@@ -928,7 +1005,11 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
         ] if wizard.runner else []
     if wizard.step == WizardStep.DONE:
         lines = [
-            f"ROM library: //{wizard.applied_summary.get('server', wizard.server)}/{wizard.applied_summary.get('share', wizard.share)} [Read only]",
+            (
+                f"ROM library: //{wizard.applied_summary.get('server', wizard.server)}/{wizard.applied_summary.get('share', wizard.share)} [Read only]"
+                if wizard.source_type == "smb"
+                else f"ROM library: {wizard.rom_root} [Local]"
+            ),
             f"Detected systems: {wizard.applied_summary.get('system_count', len(wizard.systems))}",
         ]
         if wizard.applied_summary.get("source_validation", {}).get("connected"):
@@ -993,7 +1074,14 @@ def _render_wizard(  # noqa: ANN001
         y = content.y
         line_h = layout.fonts.body + 7
         max_chars = max(1, content.w // max(8, layout.fonts.body // 2))
-        for line in _wizard_body_lines(wizard):
+        body_lines = _wizard_body_lines(wizard)
+        activity_lines = wizard.activity.user_lines(limit=4)
+        if activity_lines:
+            body_lines.extend(["", "Activity", *activity_lines])
+        if wizard.show_details:
+            detail_lines = wizard.activity.detail_lines(limit=3)
+            body_lines.extend(["", "Technical details", *(detail_lines or ["No technical details reported."])])
+        for line in body_lines:
             for wrapped in wrap_lines([line], max_chars):
                 text = fonts["body"].render(wrapped, True, _FG_COLOR)
                 screen.blit(text, (content.x, y))

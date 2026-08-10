@@ -46,6 +46,7 @@ from romcloud.services.smb_discovery import (
     ListSharesResult,
     SMBCredentials,
     SMBErrorKind,
+    SMBDirectoryEntry,
     SMBServerTarget,
     ShareInfo,
     ShareValidationResult,
@@ -142,7 +143,8 @@ def build_authenticate_argv(target: SMBServerTarget, auth_file: Path) -> list[st
 
 
 def build_list_directory_argv(target: SMBServerTarget, auth_file: Path, share: str, path: str = "") -> list[str]:
-    command = f'cd "{path}"; ls' if path else "ls"
+    safe_path = path.replace("\\", "\\\\").replace('"', '\\"')
+    command = f'cd "{safe_path}"; ls' if safe_path else "ls"
     return [
         _SMBCLIENT_BIN,
         f"//{target.host}/{share}",
@@ -230,6 +232,22 @@ def parse_share_list(stdout: str) -> list[ShareInfo]:
 _LS_LINE_RE = re.compile(r"^\s*(?P<name>.+?)\s{2,}(?P<attrs>[A-Za-z]*[DAHSRN][A-Za-z]*)\s+\d+\s+.+$")
 
 
+def parse_directory_entries(stdout: str) -> list[SMBDirectoryEntry]:
+    """Parse both files and directories from ``smbclient ls`` output."""
+    entries: list[SMBDirectoryEntry] = []
+    for line in stdout.splitlines():
+        match = _LS_LINE_RE.match(line)
+        if not match:
+            continue
+        name = match.group("name").strip()
+        if name in (".", ".."):
+            continue
+        entries.append(
+            SMBDirectoryEntry(name=name, is_directory="D" in match.group("attrs"))
+        )
+    return entries
+
+
 def parse_directory_listing(stdout: str) -> list[str]:
     """Parse ``smbclient -c ls`` interactive output into directory names.
 
@@ -239,18 +257,7 @@ def parse_directory_listing(stdout: str) -> list[str]:
     than raising — ``smbclient`` output formatting can vary slightly across
     Samba versions.
     """
-    names: list[str] = []
-    for line in stdout.splitlines():
-        match = _LS_LINE_RE.match(line)
-        if not match:
-            continue
-        name = match.group("name").strip()
-        attrs = match.group("attrs")
-        if name in (".", ".."):
-            continue
-        if "D" in attrs:
-            names.append(name)
-    return names
+    return [entry.name for entry in parse_directory_entries(stdout) if entry.is_directory]
 
 
 # ── transport implementation ─────────────────────────────────────────────────
@@ -338,8 +345,15 @@ class SmbclientTransport:
             kind = _classify_error(returncode, stdout, stderr, context="share")
             return ShareValidationResult(ok=False, share=share, error_kind=kind, detail=_error_detail(stdout, stderr))
 
-        entries = parse_directory_listing(stdout)
-        return ShareValidationResult(ok=True, share=share, top_level_entries=tuple(entries))
+        entries = parse_directory_entries(stdout)
+        return ShareValidationResult(
+            ok=True,
+            share=share,
+            top_level_entries=tuple(
+                entry.name for entry in entries if entry.is_directory
+            ),
+            entries=tuple(entries),
+        )
 
 
 def _tool_error_detail(kind: SMBErrorKind) -> str:

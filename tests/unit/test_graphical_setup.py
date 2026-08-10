@@ -94,6 +94,9 @@ class _Discovery:
     def validate_share(self, target, credentials, share):
         return self.validation
 
+    def browse_directory(self, target, credentials, share, path=""):
+        return self.validation
+
     def detect_systems(self, validation):
         return SimpleNamespace(detected_systems=("psx",), count=1)
 
@@ -257,7 +260,64 @@ class TestDiscovery:
             graphical_setup.validate_share(_payload(password=password))
 
         assert password not in str(exc.value)
-        assert "***" in str(exc.value)
+        assert "password" in str(exc.value).lower()
+
+    def test_remote_directory_browsing_preserves_relative_path_and_file_types(
+        self, monkeypatch
+    ):
+        from romcloud.services.smb_discovery import SMBDirectoryEntry
+
+        discovery = _Discovery(
+            validation=ShareValidationResult(
+                True,
+                "ROMs",
+                entries=(
+                    SMBDirectoryEntry("ps2", True),
+                    SMBDirectoryEntry("README.txt", False),
+                ),
+            )
+        )
+        monkeypatch.setattr(
+            graphical_setup,
+            "build_default_smb_discovery_service",
+            lambda: discovery,
+        )
+
+        result = graphical_setup.browse_smb_directory(
+            _payload(source_remote_path="Roms")
+        )
+
+        assert result["path"] == "Roms"
+        assert result["parent"] == ""
+        assert result["entries"] == [
+            {"name": "ps2", "is_directory": True},
+            {"name": "README.txt", "is_directory": False},
+        ]
+
+    def test_validation_progress_is_structured_and_password_free(self, monkeypatch):
+        password = "never-show-this"
+        validation = ShareValidationResult(
+            False,
+            "ROMs",
+            error_kind=SMBErrorKind.ACCESS_DENIED,
+            detail=f"denied for {password}",
+        )
+        monkeypatch.setattr(
+            graphical_setup,
+            "build_default_smb_discovery_service",
+            lambda: _Discovery(validation=validation),
+        )
+        events = []
+
+        with pytest.raises(ValueError):
+            graphical_setup.validate_share(
+                _payload(password=password), progress=events.append
+            )
+
+        assert [event.stage for event in events] == ["directory", "directory"]
+        assert events[-1].status == "error"
+        assert password not in events[-1].detail
+        assert "***" in events[-1].detail
 
 
 class TestCacheValidation:
@@ -371,6 +431,39 @@ class TestApply:
         assert graphical_setup.setup_state(config_path)["state"] == "configured"
         assert not (config_path.parent / graphical_setup.SETUP_STATE_FILENAME).exists()
 
+    def test_local_source_from_graphical_setup_persists_without_smb(
+        self, tmp_path, monkeypatch
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        rom_root = tmp_path / "roms"
+        (rom_root / "psx").mkdir(parents=True)
+        _patch_apply_dependencies(monkeypatch)
+        monkeypatch.setattr(
+            graphical_setup,
+            "validate_local_source",
+            lambda payload: {
+                "systems": ["psx"],
+                "count": 1,
+                "validation": {"connected": True, "read_verified": True},
+            },
+        )
+
+        graphical_setup.apply_setup(
+            config_path,
+            _payload(
+                source_type="local",
+                server="",
+                share="",
+                username="",
+                password="",
+                rom_root=str(rom_root),
+            ),
+        )
+        config = graphical_setup.load_config(str(config_path))
+
+        assert config.source.rom_root == str(rom_root)
+        assert config.smb is None
+
     def test_source_read_validation_failure_is_clean_and_redacted(
         self, tmp_path, monkeypatch
     ):
@@ -475,6 +568,27 @@ class TestApply:
         assert config.remote_data.smb is not config.smb
         assert load_smb_password(config.credentials_path) == "secret-value"
         assert load_remote_data_smb_password(config.credentials_path) == "secret-value"
+
+    def test_selected_remote_directories_persist_for_both_mounts(
+        self, tmp_path, monkeypatch
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        _patch_apply_dependencies(monkeypatch)
+        payload = _payload(
+            source_remote_path="Roms/Console",
+            remote_data_type="smb",
+            remote_server="backup-nas.local",
+            remote_share="ROMCloud",
+            remote_remote_path="Data/ROMCloud",
+            remote_username="sync-user",
+            remote_password="sync-secret",
+        )
+
+        graphical_setup.apply_setup(config_path, payload)
+        config = graphical_setup.load_config(str(config_path))
+
+        assert config.smb.remote_path == "Roms/Console"
+        assert config.remote_data.smb.remote_path == "Data/ROMCloud"
 
     def test_local_remote_data_root_is_persisted_only_after_writable_validation(
         self, tmp_path, monkeypatch

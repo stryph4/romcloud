@@ -46,6 +46,22 @@ _LEGACY_CACHE_ROOT = "/userdata/romcloud-cache"
 _LEGACY_SAVES_KEYS = frozenset({"remote_mount_path", "remote_subdir"})
 
 
+def _validated_smb_remote_path(value: object, context: object = "configuration") -> str:
+    """Validate the persisted share-relative mount path without I/O."""
+    raw = str(value or "").replace("\\", "/").strip("/")
+    if not raw:
+        return ""
+    parts = raw.split("/")
+    if (
+        any(part in ("", ".", "..") for part in parts)
+        or any(char in raw for char in ('"', "\n", "\r", "\x00", ","))
+    ):
+        raise ConfigurationError(
+            f"{context}: SMB remote_path must be a safe path inside the selected share."
+        )
+    return "/".join(parts)
+
+
 # ── sub-configs ───────────────────────────────────────────────────────────────
 
 
@@ -74,6 +90,8 @@ class SMBConfig:
     share: str
     username: str = "guest"
     port: int = 445
+    remote_path: str = ""
+    """Optional share-relative directory mounted as the storage root."""
 
 
 @dataclass(frozen=True)
@@ -262,6 +280,7 @@ def _parse(data: dict, path: Path) -> AppConfig:  # noqa: C901
                 share=s["share"],
                 username=s.get("username", "guest"),
                 port=int(s.get("port", 445)),
+                remote_path=_validated_smb_remote_path(s.get("remote_path", ""), path),
             )
         except KeyError as exc:
             raise ConfigurationError(f"Missing required [smb] key: {exc}") from exc
@@ -339,6 +358,9 @@ def _parse(data: dict, path: Path) -> AppConfig:  # noqa: C901
                     share=remote_smb_raw["share"],
                     username=remote_smb_raw.get("username", "guest"),
                     port=int(remote_smb_raw.get("port", 445)),
+                    remote_path=_validated_smb_remote_path(
+                        remote_smb_raw.get("remote_path", ""), path
+                    ),
                 )
             except KeyError as exc:
                 raise ConfigurationError(
@@ -444,6 +466,8 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
             f'username = "{config.smb.username}"\n',
             f"port = {config.smb.port}\n",
         ]
+        if config.smb.remote_path:
+            lines.append(f'remote_path = "{config.smb.remote_path}"\n')
 
     if config.remote_data is not None:
         lines += [
@@ -462,6 +486,10 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
                 f'username = "{config.remote_data.smb.username}"\n',
                 f"port = {config.remote_data.smb.port}\n",
             ]
+            if config.remote_data.smb.remote_path:
+                lines.append(
+                    f'remote_path = "{config.remote_data.smb.remote_path}"\n'
+                )
 
     lines += [
         "\n",

@@ -144,6 +144,17 @@ class TestBuildArgv:
         assert "//nas.local/ROMs" in argv
         assert "/mnt/roms" in argv
 
+    def test_mount_argv_uses_selected_share_relative_directory(self):
+        argv = mount.build_mount_argv(
+            "nas.local",
+            "ROMs",
+            "/mnt/roms",
+            Path("/creds/file"),
+            remote_path="Libraries/Roms",
+        )
+        options = argv[argv.index("-o") + 1]
+        assert "prefixpath=Libraries/Roms" in options.split(",")
+
     def test_unmount_argv(self):
         assert mount.build_unmount_argv("/mnt/roms") == ["umount", "/mnt/roms"]
 

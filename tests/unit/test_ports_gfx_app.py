@@ -39,6 +39,10 @@ class TestMenuItems:
 
         actions = [item.action for item in MENU_ITEMS]
         assert actions == [
+            app_module.SETUP_ACTION,
+            "connection-status",
+            "connection-mount",
+            "connection-unmount",
             "status",
             "refresh",
             "healthcheck",
@@ -389,6 +393,19 @@ class TestHandleSavesyncEvent:
         screen = self._screen(step=PREVIEW)
         app_module._handle_savesync_event(InputEvent(action=Action.CONFIRM), screen)
         assert screen.step == CONFIRMING
+        assert screen.confirm.pressed is True
+
+    def test_confirming_uses_visual_progress_without_percentage_text(self):
+        from ports_gfx import app as app_module
+        from ports_gfx.savesync_screen import CONFIRMING
+
+        screen = self._screen(step=CONFIRMING)
+        screen.confirm.press()
+        screen.confirm.update(1.0)
+
+        lines = app_module._savesync_body_lines(screen)
+
+        assert not any("%" in line for line in lines)
 
     def test_preview_back_returns_to_dashboard(self):
         from ports_gfx import app as app_module

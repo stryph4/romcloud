@@ -16,10 +16,12 @@ this module or the rendering code.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Sequence
 
 from ports_gfx.actions import Action
+from ports_gfx.activity import parse_progress_line
 from ports_gfx.input_manager import InputEvent
 from ports_gfx.operation import OperationLine, OperationRunner, OperationState
 
@@ -52,6 +54,7 @@ class OperationScreenState:
     """While True, new output keeps the view pinned to the bottom;
     scrolling up disables it until the user scrolls back down (or the
     view is reset by starting a new operation)."""
+    details_expanded: bool = False
 
     @property
     def state(self) -> OperationState:
@@ -72,11 +75,28 @@ class OperationScreenState:
         return drained
 
 
-def display_lines(runner: OperationRunner) -> list[str]:
+def display_lines(runner: OperationRunner, *, details: bool = True) -> list[str]:
     """Format captured output for display — a stderr line is prefixed so
     it reads as visually distinct from ordinary stdout progress without
     the renderer needing to track per-line color state itself."""
-    return [f"! {line.text}" if line.stream == "stderr" else line.text for line in runner.lines]
+    rendered: list[str] = []
+    for line in runner.lines:
+        event = parse_progress_line(line.text)
+        if event is not None:
+            rendered.append(event.display_line)
+            if details and event.detail:
+                rendered.append(f"  {event.detail}")
+            continue
+        if line.stream == "stdout" and not details:
+            try:
+                payload = json.loads(line.text)
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict) and "ok" in payload:
+                continue
+        if line.stream == "stdout" or details:
+            rendered.append(f"! {line.text}" if line.stream == "stderr" else line.text)
+    return rendered
 
 
 def wrap_line(text: str, max_chars: int) -> list[str]:
@@ -152,6 +172,12 @@ def handle_operation_event(ievent: InputEvent, screen: OperationScreenState) -> 
         screen.scroll_offset = max(0, screen.scroll_offset - 1)
         if screen.scroll_offset == 0:
             screen.auto_scroll = True
+        return OPERATION_SCREEN
+
+    if action in (Action.LEFT, Action.RIGHT):
+        screen.details_expanded = not screen.details_expanded
+        screen.scroll_offset = 0
+        screen.auto_scroll = True
         return OPERATION_SCREEN
 
     if action in (Action.BACK, Action.CONFIRM, Action.MENU):
