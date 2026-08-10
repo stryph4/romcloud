@@ -247,6 +247,26 @@ class TestEmulatorLauncherPassthrough:
 
 
 class TestEmulatorLauncherWithRom:
+    def test_xbox_iso_with_spaces_is_one_extension_preserving_argument(
+        self, monkeypatch, fake_launcher
+    ):
+        _, bin_dir = fake_launcher
+        monkeypatch.setenv("PATH", bin_dir)
+        xbox_argv = [
+            _WRAPPER, "-system", "xbox", "-rom",
+            "/userdata/roms/xbox/Aeon Flux.romcloud",
+        ]
+        cached_iso = "/userdata/romcloud-cache/xbox/Aeon Flux.iso"
+        captured = {}
+        monkeypatch.setattr("os.execvp", lambda f, a: captured.update(args=list(a)))
+
+        EmulatorLauncher().exec_with_rom(xbox_argv, cached_iso)
+
+        assert find_rom_path(captured["args"]) == cached_iso
+        assert cached_iso in captured["args"]
+        assert "Aeon" not in captured["args"]
+        assert "Flux.iso" not in captured["args"]
+
     def test_exec_with_rom_passes_cached_path(self, monkeypatch, fake_launcher):
         _, bin_dir = fake_launcher
         monkeypatch.setenv("PATH", bin_dir)

@@ -460,6 +460,25 @@ class TestCueCatalogMigration:
 
 
 class TestCatalogServiceResolveProxy:
+    def test_xbox_proxy_preserves_primary_iso_metadata(
+        self, provider, game_repo, proxy_repo, local_roms_dir, tmp_path
+    ):
+        source = tmp_path / "source"
+        (source / "xbox").mkdir(parents=True)
+        (source / "xbox" / "Aeon Flux.iso").write_bytes(b"xbox-iso")
+        svc = _make_catalog_service(
+            provider, game_repo, proxy_repo, local_roms_dir, source
+        )
+
+        svc.refresh()
+        proxy = local_roms_dir / "xbox" / "Aeon Flux.romcloud"
+        game = svc.resolve_proxy(str(proxy))
+
+        assert game.system == "xbox"
+        assert game.primary_asset is not None
+        assert game.primary_asset.filename == "Aeon Flux.iso"
+        assert game.primary_asset.relative_path == "xbox/Aeon Flux.iso"
+
     def test_resolve_returns_game(self, catalog_service, local_roms_dir, game_repo):
         catalog_service.refresh()
         proxies = list(local_roms_dir.rglob("*.romcloud"))

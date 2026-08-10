@@ -70,19 +70,22 @@ class CacheService:
         entry = self._cache_repo.get(game_id)
         if entry is None:
             return False
-        # Also verify the recorded (primary asset) path still exists on disk.
-        if not Path(entry.cache_path).exists():
+        game = self._game_repo.get(game_id)
+        launch_path = self._canonical_launch_path(game)
+        # The catalog asset is authoritative for the launch filename.  Do not
+        # trust a stale cache row here: older/incorrect rows can omit the ROM
+        # suffix even though the correctly named cached asset exists.
+        if launch_path is None or not launch_path.exists():
             log.warning(
-                "Cache entry for %s points to missing path %s — invalidating",
+                "Cache entry for %s has no cached primary asset at %s — invalidating",
                 game_id,
-                entry.cache_path,
+                launch_path,
             )
             self._cache_repo.delete(game_id)
             return False
         if not entry.is_complete:
             return False
 
-        game = self._game_repo.get(game_id)
         if game is not None and not self._all_assets_present(game):
             log.warning(
                 "Cache entry for %s is missing one or more required companion "
@@ -118,11 +121,31 @@ class CacheService:
         entry = self._cache_repo.get(game_id)
         assert entry is not None  # guaranteed by is_cached
         game = self._game_repo.get(game_id)
+        path = self._canonical_launch_path(game)
+        if path is None:
+            return None
+        canonical = str(path)
+        if entry.cache_path != canonical:
+            log.warning(
+                "Repairing stale cache path for %s: %s -> %s",
+                game_id,
+                entry.cache_path,
+                canonical,
+            )
+            self._cache_repo.update_cache_path(game_id, canonical)
+        return canonical
+
+    def _canonical_launch_path(self, game: Optional[Game]) -> Optional[Path]:
+        """Resolve the primary asset without deriving a path from its title.
+
+        ``relative_path`` retains the source basename and real extension, so
+        this also avoids the ``Path.stem``/proxy-title trap for disc images.
+        """
         if game is None or game.primary_asset is None:
             return None
-        # entry.cache_path already points at the exact asset (file or
-        # directory) — see romcloud.core.cache_paths.
-        return entry.cache_path
+        return resolve_cache_path(
+            self._cache_root, game.system, game.primary_asset.relative_path
+        )
 
     def status_summary(self) -> dict:
         """Return a summary dict suitable for CLI display."""
@@ -161,10 +184,10 @@ class CacheService:
             The transfer failed.
         """
         if self.is_cached(game_id):
-            entry = self._cache_repo.get(game_id)
-            assert entry is not None
             self._touch_accessed(game_id)
-            return entry.cache_path
+            launch_path = self.get_launch_path(game_id)
+            assert launch_path is not None  # guaranteed by is_cached
+            return launch_path
 
         game = self._game_repo.get(game_id)
         if game is None:

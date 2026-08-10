@@ -39,6 +39,40 @@ class TestCacheServiceIsNotCached:
         assert cache_repo.get(game_with_file.id) is None
 
 
+class TestCanonicalLaunchPath:
+    def test_xbox_stale_extensionless_record_resolves_cached_iso(
+        self, cache_service, cache_repo, game_repo, cache_dir
+    ):
+        asset = GameAsset(
+            filename="Aeon Flux.iso",
+            relative_path="xbox/Aeon Flux.iso",
+            size_bytes=8,
+            is_primary=True,
+        )
+        game = Game.create("xbox", "Aeon Flux", "local", "/roms", [asset])
+        game_repo.save(game)
+        cached_iso = cache_dir / "xbox" / "Aeon Flux.iso"
+        cached_iso.parent.mkdir()
+        cached_iso.write_bytes(b"xbox-iso")
+
+        entry = CacheEntry.create(game.id, str(cache_dir / "xbox" / "Aeon Flux"))
+        entry.status = CacheStatus.COMPLETE
+        cache_repo.save(entry)
+
+        assert cache_service.is_cached(game.id)
+        assert cache_service.cache_game(game.id) == str(cached_iso)
+        assert cache_service.get_launch_path(game.id) == str(cached_iso)
+        assert cache_repo.get(game.id).cache_path == str(cached_iso)
+
+    def test_ps2_launch_path_still_preserves_spaces_and_iso_extension(
+        self, cache_service, game_with_file
+    ):
+        cached = cache_service.cache_game(game_with_file.id)
+
+        assert cache_service.get_launch_path(game_with_file.id) == cached
+        assert Path(cached).name == "Final Fantasy X.iso"
+
+
 class TestCacheGameCaching:
     def test_cache_game_succeeds(self, cache_service, game_with_file):
         path = cache_service.cache_game(game_with_file.id)
