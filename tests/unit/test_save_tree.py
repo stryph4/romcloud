@@ -113,6 +113,29 @@ class TestScanTree:
 
         assert set(result) == {selected}
 
+    def test_real_n64_tree_selects_dr_mario_but_not_states_or_runtime_artifacts(
+        self, tmp_path: Path
+    ):
+        root = tmp_path / "saves"
+        selected = "n64/Dr. Mario 64 (USA).srm"
+        excluded = (
+            "n64/Dr. Mario 64 (USA).state",
+            "n64/Dr. Mario 64 (USA).st0",
+            "n64/savestates/Dr. Mario 64 (USA).srm",
+            "n64/shaders/Dr. Mario 64 (USA).srm",
+            "n64/config/Dr. Mario 64 (USA).srm",
+            "n64/cache/Dr. Mario 64 (USA).srm",
+            "n64/logs/Dr. Mario 64 (USA).srm",
+        )
+        for relative_path in (selected, *excluded):
+            path = root / relative_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"data")
+
+        result = save_tree.scan_tree(root, DEFAULT_SAVE_SELECTION_POLICY)
+
+        assert set(result) == {selected}
+
 
 class TestMaterialize:
     def test_copies_from_fresh_source_when_no_unchanged_source(self, tmp_path: Path):

@@ -1138,6 +1138,14 @@ swaps are recovered conservatively, and sync state advances only after the
 commit succeeds. Original Xbox virtual-disk synchronization remains explicit
 opt-in because it transfers the entire `xbox_hdd.qcow2` artifact.
 
+The default selection policy includes native root-level `.srm` files for
+audited Batocera/RetroArch system directories, standalone N64 native save
+formats, NDS `.sav` files, MAME's `nvram/` tree, and the existing explicit
+DuckStation, PCSX2, PPSSPP, Xbox 360, Yuzu, and Original Xbox layouts. Matching
+is deliberately narrow: savestates, shaders, configs, caches, logs, shared
+disk images, and unvalidated structured emulator trees are not selected merely
+because they live under `/userdata/saves`.
+
 ---
 
 ## Planned UI

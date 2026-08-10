@@ -106,6 +106,32 @@ class TestConnectivityFailure:
         assert service.get_state().last_upload is None
 
 
+class TestBatoceraSaveSelection:
+    def test_n64_dr_mario_upload_reaches_remote_dataset(self, tmp_path, service):
+        local_save = (
+            tmp_path / "local-saves" / "n64" / "Dr. Mario 64 (USA).srm"
+        )
+        _write(local_save, b"dr-mario-progress")
+        _write(
+            tmp_path / "local-saves" / "n64" / "Dr. Mario 64 (USA).state",
+            b"savestate-not-game-save",
+        )
+
+        diff = service.preview_upload()
+        assert [entry.relative_path for entry in diff.entries] == [
+            "n64/Dr. Mario 64 (USA).srm"
+        ]
+
+        record = service.commit_upload(diff)
+
+        remote = tmp_path / "remote-saves" / "n64"
+        assert record.artifact_count == 1
+        assert (
+            remote / "Dr. Mario 64 (USA).srm"
+        ).read_bytes() == b"dr-mario-progress"
+        assert not (remote / "Dr. Mario 64 (USA).state").exists()
+
+
 class TestWritableRemoteBoundary:
     def test_smb_upload_never_stages_under_read_only_catalog_mount(
         self, tmp_path: Path, monkeypatch

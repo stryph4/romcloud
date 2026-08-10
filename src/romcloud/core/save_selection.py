@@ -56,10 +56,15 @@ class SaveSystemRule:
     ``include``/``exclude`` are glob patterns matched against a
     candidate's path *relative to that system's own save directory*
     (e.g. ``"memcards/shared_card_1.mcd"``, never including the leading
-    system name). ``exclude`` always wins over ``include``.
+    system name). ``root_include`` uses the same syntax but only matches
+    files directly in the system directory. This distinction is important
+    for Batocera's libretro layout, where native ``.srm`` files and
+    savestates share a directory and nested non-save trees must not match by
+    accident. ``exclude`` always wins over either kind of include.
     """
 
     include: tuple[str, ...]
+    root_include: tuple[str, ...] = ()
     exclude: tuple[str, ...] = ()
     optional: bool = False
     """True for a heavyweight, opt-in-only artifact (Original Xbox)."""
@@ -69,22 +74,90 @@ class SaveSystemRule:
     systems are always eligible."""
 
 
-# Verified against real Batocera v43 save layouts. A system not listed
-# here is intentionally unsupported in v1 (excluded) — see module
-# docstring — rather than an invented/guessed layout. 3DS/Citra and
-# Dolphin are deliberately absent: they require system-specific selection
-# of actual game-progress data that has not yet been validated.
+# Batocera's libretro generator places both save files and savestates directly
+# under /userdata/saves/<system>. RetroArch gives native save RAM the .srm
+# extension. These are the current Batocera system names whose default generator
+# is libretro; the N64 variants are also included because Batocera selects
+# libretro/mupen64plus-next on several supported hardware profiles. Keeping this
+# an explicit audited set avoids treating an arbitrary top-level directory as a
+# save system while allowing the same safe root-file rule to be reused.
+_RETROARCH_SRM_SYSTEMS = frozenset(
+    """
+    3do adam advision amiga500 amiga1200 amigacd32 amigacdtv amstradcpc pcw
+    apfm1000 arcadia archimedes arduboy astrocade atari2600 atari5200
+    atari7800 atari800 atarist atom atomiswave bbcmicro bk bennugd c64
+    camplynx cassettevision cave3rd cavestory cgenie channelf coco
+    colecovision crvision ctvboy dice dos dragon64 mc10 dreamcast electron
+    enterprise fbneo fds fm7 gaelco gamate gameandwatch gamecom gamegear
+    gamepock gb gb2players gba gbc gbc2players gmaster gong gp32 gx4000
+    intellivision jaguar jaguarcd laser310 lcdgames loopy lowresnx lutro lynx
+    macintosh mame mastersystem megadrive megadrive-msu megaduck mrboom msx1
+    msx2 msx2+ msxturbor mz2000 mz2500 mz700 mz800 mz80k multivision n64
+    n64dd namco22 naomi naomi2 nds neogeo neogeocd nes ngp ngpc odyssey2
+    oricatmos pc60 pc88 pc98 pcengine pcenginecd pcfx pdp1 pico pico8 pokemini
+    prboom psx pv1000 pv2000 pc80 quake reminiscence rx78 satellaview saturn
+    scv sega32x megacd sc3000 segaai beena sg1000 sgb sgb-msu1 socrates
+    spectravideo superbroswar sufami supracan snes snes-msu1 supergrafx
+    supervision sv8000 systemsp thomson ti99 tic80 trs80 tutor tvc tvgames
+    uzebox vc4000 vectrex vgmplay videopacplus vircon32 virtualboy vis vsmile
+    wasm4 wswan wswanc x1 x68000 xegs xrick zc210 zx81 zxspectrum
+    """.split()
+)
+
+
+# Verified against real Batocera v43 save layouts and the current Batocera
+# generators. Structured emulator-owned trees remain explicit. 3DS/Citra and
+# Dolphin are deliberately absent: selecting their actual game-progress data
+# safely requires more specific validated rules.
 _RULES: dict[str, SaveSystemRule] = {
-    "psx": SaveSystemRule(include=("*.srm",)),
-    "duckstation": SaveSystemRule(include=("memcards/**",), exclude=("*_resume.sav",)),
-    "pcsx2": SaveSystemRule(include=("Mcd*.ps2",), exclude=("sstates/**", "videos/**")),
-    "ppsspp": SaveSystemRule(include=("PSP/SAVEDATA/**",), exclude=("PPSSPP_STATE/**",)),
-    "xbox360": SaveSystemRule(include=("**",)),
-    "yuzu": SaveSystemRule(include=(YUZU_ACCOUNT_SAVE_GLOB,)),
-    XBOX_SYSTEM: SaveSystemRule(
-        include=(XBOX_HDD_RELATIVE_PATH,), optional=True, default_enabled=False
-    ),
+    system: SaveSystemRule(include=(), root_include=("*.srm",))
+    for system in _RETROARCH_SRM_SYSTEMS
 }
+_RULES.update(
+    {
+        # Standalone Mupen64Plus stores these native per-game artifacts in the
+        # same n64 directory as its savestates. Root-only matching keeps states
+        # out.
+        "n64": SaveSystemRule(
+            include=(),
+            root_include=("*.srm", "*.eep", "*.sra", "*.fla", "*.mpk", "*.sav"),
+        ),
+        "n64dd": SaveSystemRule(
+            include=(),
+            root_include=(
+                "*.srm",
+                "*.eep",
+                "*.sra",
+                "*.fla",
+                "*.mpk",
+                "*.sav",
+                "*.ndr",
+                "*.d6r",
+                "*.ram",
+            ),
+        ),
+        # Standalone melonDS uses per-game .sav files here. Its DLDI/DSi SD
+        # images are shared .bin files and intentionally do not match.
+        "nds": SaveSystemRule(include=(), root_include=("*.srm", "*.sav")),
+        # MAME's NVRAM subtree is game progress; cfg, input, state, diff,
+        # comments, and plugins are separate sibling trees and remain excluded.
+        "mame": SaveSystemRule(include=("nvram/**",), root_include=("*.srm",)),
+        "duckstation": SaveSystemRule(
+            include=("memcards/**",), exclude=("*_resume.sav",)
+        ),
+        "pcsx2": SaveSystemRule(
+            include=("Mcd*.ps2",), exclude=("sstates/**", "videos/**")
+        ),
+        "ppsspp": SaveSystemRule(
+            include=("PSP/SAVEDATA/**",), exclude=("PPSSPP_STATE/**",)
+        ),
+        "xbox360": SaveSystemRule(include=("**",)),
+        "yuzu": SaveSystemRule(include=(YUZU_ACCOUNT_SAVE_GLOB,)),
+        XBOX_SYSTEM: SaveSystemRule(
+            include=(XBOX_HDD_RELATIVE_PATH,), optional=True, default_enabled=False
+        ),
+    }
+)
 
 
 class SaveSelectionPolicy:
@@ -115,6 +188,10 @@ class SaveSelectionPolicy:
         normalized = relative_path.replace("\\", "/")
         if any(_match(normalized, pattern) for pattern in rule.exclude):
             return False
+        if "/" not in normalized and any(
+            _match(normalized, pattern) for pattern in rule.root_include
+        ):
+            return True
         return any(_match(normalized, pattern) for pattern in rule.include)
 
     def excluded_top_level_dirs(self) -> frozenset[str]:

@@ -15,7 +15,20 @@ from romcloud.core.save_selection import (
 class TestKnownSystems:
     def test_validated_systems_are_known(self):
         policy = DEFAULT_SAVE_SELECTION_POLICY
-        for system in ("psx", "duckstation", "pcsx2", "ppsspp", "xbox360", "yuzu", "xbox"):
+        for system in (
+            "n64",
+            "gb",
+            "gba",
+            "nes",
+            "snes",
+            "psx",
+            "duckstation",
+            "pcsx2",
+            "ppsspp",
+            "xbox360",
+            "yuzu",
+            "xbox",
+        ):
             assert policy.is_known_system(system) is True
 
     def test_unvalidated_systems_are_unsupported(self):
@@ -34,6 +47,115 @@ class TestPS1Native:
 
     def test_non_srm_excluded(self):
         assert DEFAULT_SAVE_SELECTION_POLICY.is_included("psx", "Game.mcr") is False
+
+
+class TestRetroArchNativeSaves:
+    def test_root_srm_included_for_audited_batocera_systems(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        for system in (
+            "gb",
+            "gbc",
+            "gba",
+            "nes",
+            "snes",
+            "megadrive",
+            "dreamcast",
+        ):
+            assert policy.is_included(system, "Game.srm") is True
+
+    def test_srm_rule_is_root_only(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        for relative_path in (
+            "states/Game.srm",
+            "savestates/Game.srm",
+            "shaders/Game.srm",
+            "config/Game.srm",
+            "cache/Game.srm",
+            "logs/Game.srm",
+        ):
+            assert policy.is_included("snes", relative_path) is False
+
+    def test_savestate_and_non_progress_formats_excluded(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        for relative_path in (
+            "Game.state",
+            "Game.state.auto",
+            "Game.cfg",
+            "retroarch.log",
+        ):
+            assert policy.is_included("snes", relative_path) is False
+
+
+class TestN64Native:
+    def test_dr_mario_srm_included(self):
+        assert DEFAULT_SAVE_SELECTION_POLICY.is_included(
+            "n64", "Dr. Mario 64 (USA).srm"
+        ) is True
+
+    def test_mupen_native_per_game_formats_included(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        for filename in (
+            "Game.eep",
+            "Game.sra",
+            "Game.fla",
+            "Game.mpk",
+            "Game.1.sav",
+        ):
+            assert policy.is_included("n64", filename) is True
+
+    def test_n64dd_persistent_disk_formats_included(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        for filename in ("Game.ndr", "Game.d6r", "Game.ram"):
+            assert policy.is_included("n64dd", filename) is True
+
+    def test_savestates_and_nested_artifacts_excluded(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        for relative_path in (
+            "Dr. Mario 64 (USA).state",
+            "Dr. Mario 64 (USA).st0",
+            "savestates/Dr. Mario 64 (USA).srm",
+            "shaders/Dr. Mario 64 (USA).srm",
+            "config/Dr. Mario 64 (USA).srm",
+            "cache/Dr. Mario 64 (USA).srm",
+            "logs/Dr. Mario 64 (USA).srm",
+        ):
+            assert policy.is_included("n64", relative_path) is False
+
+
+class TestNDSNative:
+    def test_root_sav_and_srm_included(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        assert policy.is_included("nds", "Game.sav") is True
+        assert policy.is_included("nds", "Game.srm") is True
+
+    def test_shared_images_and_savestates_excluded(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        for relative_path in (
+            "dldi.bin",
+            "dsisd.bin",
+            "Game.mln",
+            "states/Game.sav",
+        ):
+            assert policy.is_included("nds", relative_path) is False
+
+
+class TestMAMENative:
+    def test_nvram_included(self):
+        assert DEFAULT_SAVE_SELECTION_POLICY.is_included(
+            "mame", "nvram/pacman/nvram"
+        ) is True
+
+    def test_non_progress_mame_trees_excluded(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        for relative_path in (
+            "cfg/pacman.cfg",
+            "input/pacman.inp",
+            "state/pacman/auto.sta",
+            "diff/disk.chd",
+            "comments/pacman.xml",
+            "plugins/hiscore.dat",
+        ):
+            assert policy.is_included("mame", relative_path) is False
 
 
 class TestDuckstation:
