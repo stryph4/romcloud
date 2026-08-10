@@ -469,6 +469,101 @@ class TestTransferWithProgress:
         assert cache.cache_game_calls == 1
 
 
+class TestCacheMissLaunchResolution:
+    def test_xbox_nested_iso_reaches_launcher_as_file_not_recorded_container(
+        self, tmp_path, monkeypatch
+    ):
+        import romcloud.bootstrap.container as container_module
+        import romcloud.infrastructure.config as config_module
+        import romcloud.integrations.batocera.launcher as launcher_module
+        import romcloud.ui.graphical_progress as gp
+        from romcloud.core.models.cache import CachePolicy
+        from romcloud.core.models.game import Game, GameAsset
+        from romcloud.infrastructure.config import (
+            AppConfig,
+            CacheConfig,
+            SourceConfig,
+        )
+        from romcloud.infrastructure.database import Database
+        from romcloud.infrastructure.repositories.cache import CacheRepository
+        from romcloud.infrastructure.repositories.game import GameRepository
+        from romcloud.services.cache import CacheService
+
+        cache_root = tmp_path / "cache"
+        data_root = tmp_path / "data"
+        source_root = tmp_path / "source"
+        cache_root.mkdir()
+        source_root.mkdir()
+        config = AppConfig(
+            source=SourceConfig(provider="local", rom_root=str(source_root)),
+            cache=CacheConfig(path=str(cache_root)),
+            local_roms_path=str(tmp_path / "roms"),
+            data_path=str(data_root),
+        )
+        database = Database(str(data_root / "catalog.db"))
+        database.initialize()
+        game_repo = GameRepository(database)
+        cache_repo = CacheRepository(database)
+        relative_path = "xbox/Airforce Delta Storm/Airforce Delta Storm.iso"
+        game = Game.create(
+            system="xbox",
+            title="Airforce Delta Storm",
+            source_provider="local",
+            source_root=str(source_root),
+            assets=[
+                GameAsset(
+                    filename="Airforce Delta Storm.iso",
+                    relative_path=relative_path,
+                    size_bytes=3,
+                    is_primary=True,
+                )
+            ],
+        )
+        game_repo.save(game)
+
+        class LegacyContainerTransfer:
+            def transfer(self, transferred_game, on_progress=None):
+                iso_path = cache_root / relative_path
+                iso_path.parent.mkdir(parents=True)
+                iso_path.write_bytes(b"iso")
+                return str(iso_path.parent)
+
+        cache = CacheService(
+            cache_repo=cache_repo,
+            game_repo=game_repo,
+            transfer_service=LegacyContainerTransfer(),
+            cache_root=str(cache_root),
+            policy=CachePolicy.from_gb(1.0, 0.0),
+        )
+
+        class FakeCatalog:
+            def resolve_proxy(self, proxy_path):
+                return game
+
+        class FakeProvider:
+            def is_reachable(self, root):
+                return True
+
+        container = type(
+            "FakeContainer",
+            (),
+            {"catalog": FakeCatalog(), "provider": FakeProvider(), "cache": cache},
+        )()
+        monkeypatch.setattr(config_module, "load_config", lambda: config)
+        monkeypatch.setattr(container_module, "Container", lambda loaded: container)
+        monkeypatch.setattr(gp, "graphical_progress_binary", lambda loaded: None)
+        monkeypatch.setattr(launcher_module.sys.stdout, "isatty", lambda: False)
+
+        result = launcher_module._resolve_and_cache(
+            "/userdata/roms/xbox/Airforce Delta Storm.romcloud"
+        )
+
+        expected = cache_root / relative_path
+        assert result == str(expected)
+        assert expected.is_file()
+        assert Path(cache.get_entry(game.id).cache_path).is_dir()
+
+
 # ── run_launcher_wrapper: cancellation must not crash the wrapper ────────────
 
 

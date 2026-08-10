@@ -59,9 +59,11 @@ work correctly with cached paths.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import sys
+from pathlib import Path
 from typing import Optional
 
 from romcloud.core.exceptions import LaunchError
@@ -71,6 +73,13 @@ log = get_logger("batocera.launcher")
 
 # Override via environment variable for testing on non-Batocera machines.
 _EMULATOR_LAUNCHER: str = os.environ.get("ROMCLOUD_EMULATORLAUNCHER", "emulatorlauncher")
+
+
+def _source_sha256(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return "unavailable"
 
 
 # ── pure argv helpers ─────────────────────────────────────────────────────────
@@ -152,6 +161,11 @@ class EmulatorLauncher:
         patched = replace_rom_path(list(original_argv), cached_rom_path)
         target_argv = ["emulatorlauncher"] + patched[1:]
         log.info(
+            "launch diagnostic: final Batocera/configgen path=%r regular_file=%s",
+            find_rom_path(target_argv),
+            Path(cached_rom_path).is_file(),
+        )
+        log.info(
             "romcloud handoff: %s -rom %s [%d args total]",
             launcher,
             cached_rom_path,
@@ -223,16 +237,44 @@ def _resolve_and_cache(proxy_path: str) -> str:
     """
     from romcloud.bootstrap.container import Container
     from romcloud.infrastructure.config import load_config
+    from romcloud.infrastructure.logging import configure_logging
+    from romcloud.lifecycle.update import read_build_info
+    from romcloud.services import cache as cache_module
 
     config = load_config()
+    configure_logging(
+        level=config.logging.level,
+        log_dir=config.logging.path,
+        console=True,
+    )
     container = Container(config)
 
     game = container.catalog.resolve_proxy(proxy_path)
+    primary = game.primary_asset
+    entry = container.cache.get_entry(game.id)
+    resolved_before = container.cache.get_launch_path(game.id)
+    build = read_build_info(Path(config.data_path).parent)
+    log.info(
+        "launch diagnostic: proxy=%r primary_asset=%r recorded_cache_path=%r "
+        "get_launch_path=%r launcher_module=%s launcher_sha256=%s "
+        "cache_module=%s cache_sha256=%s build_commit=%r build_source=%r",
+        proxy_path,
+        primary.relative_path if primary is not None else None,
+        entry.cache_path if entry is not None else None,
+        resolved_before,
+        __file__,
+        _source_sha256(Path(__file__)),
+        cache_module.__file__,
+        _source_sha256(Path(cache_module.__file__)),
+        build.commit if build is not None else None,
+        build.source if build is not None else None,
+    )
 
     if container.cache.is_cached(game.id):
         container.cache.mark_launched(game.id)
         path = container.cache.get_launch_path(game.id)
         assert path is not None  # guaranteed by is_cached
+        log.info("launch diagnostic: cached-hit selected path=%r", path)
         return path
 
     if not container.provider.is_reachable(game.source_root):
@@ -242,6 +284,16 @@ def _resolve_and_cache(proxy_path: str) -> str:
         )
 
     path = _transfer_with_progress(container, config, game)
+
+    entry = container.cache.get_entry(game.id)
+    resolved_after = container.cache.get_launch_path(game.id)
+    log.info(
+        "launch diagnostic: cache-miss transfer_return=%r recorded_cache_path=%r "
+        "get_launch_path=%r",
+        path,
+        entry.cache_path if entry is not None else None,
+        resolved_after,
+    )
 
     container.cache.mark_launched(game.id)
     return path

@@ -239,7 +239,12 @@ class CacheService:
 
             updated_entry = self._cache_repo.get(game_id)
             assert updated_entry is not None
-            return updated_entry.cache_path
+            launch_path = self._launch_asset_path(updated_entry, game)
+            if launch_path is None or not launch_path.exists():
+                raise CacheError(
+                    f"Cache completed but the primary launch asset could not be resolved for {game_id}"
+                )
+            return str(launch_path)
 
         except Exception:
             self._cache_repo.update_status(game_id, CacheStatus.FAILED)
