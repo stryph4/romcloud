@@ -701,7 +701,24 @@ It preserves:
 
 ## Installation
 
-ROMCloud installation is still being streamlined.
+On Batocera, install the current `main` branch without requiring Git:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/stryph4/romcloud/main/scripts/bootstrap.sh | bash
+```
+
+The bootstrap only downloads a temporary source archive and invokes the
+repository's canonical `scripts/install.sh`; install, repair, and reconciliation
+behavior remains owned by the existing installer. To install a specific branch,
+tag, or commit instead, set `ROMCLOUD_REF`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/stryph4/romcloud/main/scripts/bootstrap.sh | ROMCLOUD_REF=v0.9.0 bash
+```
+
+The selected ref must exist in `stryph4/romcloud`. Temporary bootstrap files are
+removed on success, failure, or interruption. This flow requires `curl`, `tar`,
+`python3`, and a writable `/userdata`; Git and a global `pip3` are not required.
 
 The current Batocera installation uses a persistent Python virtual environment under:
 
