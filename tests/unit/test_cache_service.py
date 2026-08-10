@@ -40,29 +40,34 @@ class TestCacheServiceIsNotCached:
 
 
 class TestCanonicalLaunchPath:
-    def test_xbox_stale_extensionless_record_resolves_cached_iso(
+    def test_game_container_resolves_nested_primary_asset(
         self, cache_service, cache_repo, game_repo, cache_dir
     ):
         asset = GameAsset(
-            filename="Aeon Flux.iso",
-            relative_path="xbox/Aeon Flux.iso",
+            filename="Airforce Delta Storm.iso",
+            relative_path="xbox/Airforce Delta Storm.iso",
             size_bytes=8,
             is_primary=True,
         )
-        game = Game.create("xbox", "Aeon Flux", "local", "/roms", [asset])
+        game = Game.create(
+            "xbox", "Airforce Delta Storm", "local", "/roms", [asset]
+        )
         game_repo.save(game)
-        cached_iso = cache_dir / "xbox" / "Aeon Flux.iso"
-        cached_iso.parent.mkdir()
+        game_dir = cache_dir / "xbox" / "Airforce Delta Storm"
+        cached_iso = game_dir / "Airforce Delta Storm.iso"
+        game_dir.mkdir(parents=True)
         cached_iso.write_bytes(b"xbox-iso")
 
-        entry = CacheEntry.create(game.id, str(cache_dir / "xbox" / "Aeon Flux"))
+        entry = CacheEntry.create(game.id, str(game_dir))
         entry.status = CacheStatus.COMPLETE
         cache_repo.save(entry)
 
         assert cache_service.is_cached(game.id)
         assert cache_service.cache_game(game.id) == str(cached_iso)
         assert cache_service.get_launch_path(game.id) == str(cached_iso)
-        assert cache_repo.get(game.id).cache_path == str(cached_iso)
+        assert Path(cache_service.get_launch_path(game.id)).is_file()
+        assert cache_service.get_launch_path(game.id) != str(game_dir)
+        assert cache_repo.get(game.id).cache_path == str(game_dir)
 
     def test_ps2_launch_path_still_preserves_spaces_and_iso_extension(
         self, cache_service, game_with_file
@@ -71,6 +76,30 @@ class TestCanonicalLaunchPath:
 
         assert cache_service.get_launch_path(game_with_file.id) == cached
         assert Path(cached).name == "Final Fantasy X.iso"
+
+    def test_non_xbox_container_resolves_file_with_spaces(
+        self, cache_service, cache_repo, game_repo, cache_dir
+    ):
+        asset = GameAsset(
+            filename="Gran Turismo 4.chd",
+            relative_path="ps2/Gran Turismo 4.chd",
+            size_bytes=8,
+            is_primary=True,
+        )
+        game = Game.create("ps2", "Gran Turismo 4", "local", "/roms", [asset])
+        game_repo.save(game)
+        game_dir = cache_dir / "ps2" / "Gran Turismo 4"
+        cached_chd = game_dir / "Gran Turismo 4.chd"
+        game_dir.mkdir(parents=True)
+        cached_chd.write_bytes(b"ps2-data")
+
+        entry = CacheEntry.create(game.id, str(game_dir))
+        entry.status = CacheStatus.COMPLETE
+        cache_repo.save(entry)
+
+        assert cache_service.is_cached(game.id)
+        assert cache_service.get_launch_path(game.id) == str(cached_chd)
+        assert Path(cache_service.get_launch_path(game.id)).is_file()
 
 
 class TestCacheGameCaching:

@@ -28,7 +28,7 @@ from romcloud.core.exceptions import (
     InsufficientSpaceError,
 )
 from romcloud.core.models.cache import CacheEntry, CachePolicy, CacheStatus
-from romcloud.core.models.game import Game
+from romcloud.core.models.game import Game, GameAsset
 from romcloud.services.transfer import TransferService
 from romcloud.infrastructure.logging import get_logger
 from romcloud.infrastructure.repositories.cache import CacheRepository
@@ -71,10 +71,7 @@ class CacheService:
         if entry is None:
             return False
         game = self._game_repo.get(game_id)
-        launch_path = self._canonical_launch_path(game)
-        # The catalog asset is authoritative for the launch filename.  Do not
-        # trust a stale cache row here: older/incorrect rows can omit the ROM
-        # suffix even though the correctly named cached asset exists.
+        launch_path = self._launch_asset_path(entry, game)
         if launch_path is None or not launch_path.exists():
             log.warning(
                 "Cache entry for %s has no cached primary asset at %s — invalidating",
@@ -86,7 +83,7 @@ class CacheService:
         if not entry.is_complete:
             return False
 
-        if game is not None and not self._all_assets_present(game):
+        if game is not None and not self._all_assets_present(entry, game):
             log.warning(
                 "Cache entry for %s is missing one or more required companion "
                 "assets — treating as incomplete",
@@ -95,12 +92,12 @@ class CacheService:
             return False
         return True
 
-    def _all_assets_present(self, game: Game) -> bool:
+    def _all_assets_present(self, entry: CacheEntry, game: Game) -> bool:
         """True if every asset of *game* is present at its final cache path
         (and size-correct, where the expected size is known)."""
         for asset in game.assets:
-            path = resolve_cache_path(self._cache_root, game.system, asset.relative_path)
-            if not path.exists():
+            path = self._cached_asset_path(entry, game, asset)
+            if path is None or not path.exists():
                 return False
             if asset.size_bytes is not None:
                 actual = _dir_size(path)
@@ -121,31 +118,43 @@ class CacheService:
         entry = self._cache_repo.get(game_id)
         assert entry is not None  # guaranteed by is_cached
         game = self._game_repo.get(game_id)
-        path = self._canonical_launch_path(game)
-        if path is None:
-            return None
-        canonical = str(path)
-        if entry.cache_path != canonical:
-            log.warning(
-                "Repairing stale cache path for %s: %s -> %s",
-                game_id,
-                entry.cache_path,
-                canonical,
-            )
-            self._cache_repo.update_cache_path(game_id, canonical)
-        return canonical
+        path = self._launch_asset_path(entry, game)
+        return str(path) if path is not None else None
 
-    def _canonical_launch_path(self, game: Optional[Game]) -> Optional[Path]:
-        """Resolve the primary asset without deriving a path from its title.
-
-        ``relative_path`` retains the source basename and real extension, so
-        this also avoids the ``Path.stem``/proxy-title trap for disc images.
-        """
+    def _launch_asset_path(
+        self, entry: CacheEntry, game: Optional[Game]
+    ) -> Optional[Path]:
         if game is None or game.primary_asset is None:
             return None
-        return resolve_cache_path(
-            self._cache_root, game.system, game.primary_asset.relative_path
+        return self._cached_asset_path(entry, game, game.primary_asset)
+
+    def _cached_asset_path(
+        self, entry: CacheEntry, game: Game, asset: GameAsset
+    ) -> Path:
+        """Resolve *asset* across both supported on-disk cache layouts.
+
+        Current caches mirror the asset's system-relative path directly
+        below ``cache_root``.  Existing production caches may instead record
+        a per-game container in ``entry.cache_path`` and store each asset
+        below it by its original basename.  In the latter case the container
+        itself is never a valid launch target when the nested asset exists.
+        """
+        direct = resolve_cache_path(
+            self._cache_root, game.system, asset.relative_path
         )
+        if direct.exists():
+            return direct
+
+        container = Path(entry.cache_path)
+        if container.is_dir():
+            nested = container / Path(asset.relative_path).name
+            if nested.exists():
+                return nested
+
+        # Return the authoritative direct location for useful diagnostics and
+        # for callers checking an incomplete cache.  A recorded directory is
+        # deliberately not returned as a file asset.
+        return direct
 
     def status_summary(self) -> dict:
         """Return a summary dict suitable for CLI display."""
