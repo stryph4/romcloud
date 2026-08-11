@@ -354,10 +354,21 @@ def _reload_emulationstation() -> bool:
 def _valid_cached_game_ids(
     config: AppConfig, progress: ProgressSink = None
 ) -> set[str]:
+    """Return game_ids that are actually locally playable right now.
+
+    Driven entirely by complete cache entries (bulk-loaded once), never by
+    which games happen to already have a ``.romcloud`` proxy registration —
+    a cache-complete game with no prior proxy must still be considered
+    playable. Both cache entries and catalog games are loaded in a single
+    bulk query each; validating an individual game's resolved launch asset
+    only ever touches the filesystem, never the database, so this scales
+    with the number of *cached* games, not the whole catalog.
+    """
     container = Container(config)
-    records = container.proxy_repo.list_all()
+    entries = container.cache_repo.list_complete()
+    games = {game.id: game for game in container.game_repo.list_all()}
     valid: set[str] = set()
-    total = len(records)
+    total = len(entries)
     emit_progress(
         progress,
         "operating_mode",
@@ -368,9 +379,9 @@ def _valid_cached_game_ids(
         total=total,
     )
     interval = max(1, total // 100) if total else 1
-    for index, record in enumerate(records, start=1):
-        if container.cache.has_valid_cached_assets(record.game_id):
-            valid.add(record.game_id)
+    for index, entry in enumerate(entries, start=1):
+        if container.cache.is_valid_cached_entry(entry, games.get(entry.game_id)):
+            valid.add(entry.game_id)
         if index == total or index % interval == 0:
             emit_progress(
                 progress,
@@ -405,16 +416,21 @@ def reconcile_library_presentation(
     capability_policy(config).require(Capability.OFFLINE_MODE, "Change operating mode")
     from romcloud.lifecycle.manage import remove_owned_proxies, restore_owned_proxies
 
-    visible_ids = _valid_cached_game_ids(config) if offline else None
-    removed = remove_owned_proxies(config)
+    visible_ids = (
+        _valid_cached_game_ids(config)
+        if offline
+        else {record.game_id for record in Container(config).proxy_repo.list_all()}
+    )
+    # Materialize the desired set before removing anything else, so an
+    # already-correct proxy is never unlinked-then-recreated on a no-op
+    # re-entry into the same presentation.
     restored = restore_owned_proxies(config, game_ids=visible_ids)
+    removed = remove_owned_proxies(config, keep_game_ids=visible_ids)
     return LibraryPresentationReport(
         offline=offline,
         removed=removed,
         restored=restored,
-        visible=len(visible_ids) if visible_ids is not None else len(
-            Container(config).proxy_repo.list_all()
-        ),
+        visible=len(visible_ids),
     )
 
 

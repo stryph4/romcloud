@@ -401,3 +401,106 @@ def test_cli_exposes_three_modes(tmp_path: Path) -> None:
         result = runner.invoke(cli, ["--config", str(config_path), "library", command])
         assert result.exit_code == 0, result.output
         assert expected in result.output
+
+
+def _game_with_cache_entry(
+    config: AppConfig,
+    title: str,
+    *,
+    status: CacheStatus = CacheStatus.COMPLETE,
+    write_cached_file: bool = True,
+    container_dir: bool = False,
+) -> tuple[Game, Path]:
+    """Catalog + cache a game without registering a `.romcloud` proxy.
+
+    Simulates a cache-complete game whose proxy registration was never
+    created (e.g. an interrupted catalog refresh) — the scenario that
+    exposed the Offline Mode presentation bug on real hardware.
+    """
+    db = Database(str(Path(config.data_path) / "catalog.db"))
+    db.initialize()
+    filename = f"{title}.sfc"
+    asset = GameAsset(
+        filename=filename,
+        relative_path=f"snes/{filename}",
+        size_bytes=4,
+        is_primary=True,
+    )
+    game = Game.create("snes", title, "local", config.source.rom_root, [asset])
+    GameRepository(db).save(game)
+
+    if container_dir:
+        cache_path = Path(config.cache.path) / "snes" / title
+        cached_file = cache_path / filename
+    else:
+        cache_path = Path(config.cache.path) / "snes" / filename
+        cached_file = cache_path
+
+    if write_cached_file:
+        cached_file.parent.mkdir(parents=True, exist_ok=True)
+        cached_file.write_bytes(b"data")
+
+    entry = CacheEntry.create(game.id, str(cache_path))
+    entry.status = status
+    entry.size_bytes = 4
+    CacheRepository(db).save(entry)
+    return game, cached_file
+
+
+def test_offline_exposes_cache_complete_game_with_no_proxy_record(tmp_path: Path) -> None:
+    """Required invariant: a complete cache entry whose resolved launch
+    asset exists is locally playable and visible Offline, even when no
+    `.romcloud` proxy was ever registered for it."""
+    config = _config(tmp_path)
+    game, _cached_file = _game_with_cache_entry(config, "Aggressive Inline (USA)")
+    db = Database(str(Path(config.data_path) / "catalog.db"))
+    assert ProxyRepository(db).get(game.id) is None  # no registration yet
+
+    set_operating_mode(config, OperatingMode.OFFLINE)
+
+    proxy = Path(config.local_roms_path) / "snes" / "Aggressive Inline (USA).romcloud"
+    assert proxy.is_file()
+    assert ProxyRepository(db).get(game.id) is not None
+
+
+def test_offline_exposes_directory_container_cached_game_with_no_proxy_record(
+    tmp_path: Path,
+) -> None:
+    """Directory/container-backed cache layouts (e.g. Xbox) must resolve
+    through the same canonical launch-asset lookup as single-file games."""
+    config = _config(tmp_path)
+    game, cached_file = _game_with_cache_entry(
+        config, "Container Game", container_dir=True
+    )
+    assert cached_file.is_file()
+
+    set_operating_mode(config, OperatingMode.OFFLINE)
+
+    proxy = Path(config.local_roms_path) / "snes" / "Container Game.romcloud"
+    assert proxy.is_file()
+    db = Database(str(Path(config.data_path) / "catalog.db"))
+    assert ProxyRepository(db).get(game.id) is not None
+
+
+@pytest.mark.parametrize(
+    ("status", "write_cached_file"),
+    [
+        (CacheStatus.TRANSFERRING, True),
+        (CacheStatus.FAILED, True),
+        (CacheStatus.COMPLETE, False),
+    ],
+)
+def test_offline_hides_invalid_or_missing_cache_entries(
+    tmp_path: Path, status: CacheStatus, write_cached_file: bool
+) -> None:
+    config = _config(tmp_path)
+    game, _ = _game_with_cache_entry(
+        config, "Broken", status=status, write_cached_file=write_cached_file
+    )
+
+    set_operating_mode(config, OperatingMode.OFFLINE)
+
+    proxy = Path(config.local_roms_path) / "snes" / "Broken.romcloud"
+    assert not proxy.exists()
+    db = Database(str(Path(config.data_path) / "catalog.db"))
+    assert Container(config).cache_repo.get(game.id) is not None

@@ -115,16 +115,26 @@ def restore_owned_proxies(
 
     ``game_ids=None`` restores the full catalog. An explicit set supports
     cached-only presentation without changing catalog or proxy ownership rows.
+
+    A ``game_id`` selected for exposure that has no proxy registration at
+    all (e.g. an interrupted catalog refresh left a cache-complete game
+    without one) is registered and materialized here too — selection for
+    exposure must not silently no-op just because no prior record exists.
     """
     container = Container(config)
     restored = 0
+    all_records = container.proxy_repo.list_all()
+    known_ids = {record.game_id for record in all_records}
     records = [
         record
-        for record in container.proxy_repo.list_all()
+        for record in all_records
         if game_ids is None or record.game_id in game_ids
     ]
     games = {game.id: game for game in container.game_repo.list_all()}
-    total = len(records)
+    unregistered_ids = sorted(
+        (set(games) if game_ids is None else game_ids) - known_ids
+    )
+    total = len(records) + len(unregistered_ids)
     emit_progress(
         progress,
         "operating_mode",
@@ -161,6 +171,23 @@ def restore_owned_proxies(
                     json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
                 )
                 restored += 1
+        if index == total or index % interval == 0:
+            emit_progress(
+                progress,
+                "operating_mode",
+                "managed_entries",
+                "running",
+                f"Restoring ROMCloud entries: {index:,} / {total:,} games",
+                current=index,
+                total=total,
+                metadata={"restored": restored},
+            )
+    for offset, game_id in enumerate(unregistered_ids, start=1):
+        game = games.get(game_id)
+        if game is not None:
+            container.catalog.ensure_proxy(game)
+            restored += 1
+        index = len(records) + offset
         if index == total or index % interval == 0:
             emit_progress(
                 progress,

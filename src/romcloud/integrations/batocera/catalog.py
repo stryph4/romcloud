@@ -788,6 +788,31 @@ class CatalogService:
 
     # ── proxy I/O ─────────────────────────────────────────────────────────────
 
+    def ensure_proxy(self, game: Game) -> ProxyRecord:
+        """Register and materialize a proxy for a game that has none yet.
+
+        Used to recover games whose registration was never created (e.g. an
+        interrupted catalog refresh) — always writes the file, independent
+        of the ``write_proxies`` setting used for full catalog refreshes,
+        since the caller (mode-presentation reconciliation) always needs
+        the actual file to exist once a game is selected for exposure.
+        """
+        existing = self._proxy_repo.get(game.id)
+        if existing is not None:
+            return existing
+
+        proxy_dir = self._local_roms_root / game.system
+        proxy_dir.mkdir(parents=True, exist_ok=True)
+        safe_title = _safe_filename(game.title)
+        proxy_path = proxy_dir / f"{safe_title}.romcloud"
+        if proxy_path.exists() and not self._proxy_repo.owns_path(str(proxy_path)):
+            proxy_path = proxy_dir / f"{safe_title}.{game.id[:8]}.romcloud"
+
+        self._write_proxy_payload(proxy_path, game)
+        record = ProxyRecord.create(game_id=game.id, proxy_path=str(proxy_path))
+        self._proxy_repo.save(record)
+        return record
+
     def _write_proxy(self, game: Game) -> None:
         """Record proxy ownership and materialize it when presentation allows."""
         proxy_dir = self._local_roms_root / game.system

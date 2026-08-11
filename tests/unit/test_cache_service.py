@@ -102,6 +102,63 @@ class TestCanonicalLaunchPath:
         assert Path(cache_service.get_launch_path(game.id)).is_file()
 
 
+class TestIsValidCachedEntry:
+    """`is_valid_cached_entry` is the pure, no-DB-I/O counterpart of
+    `has_valid_cached_assets` that bulk callers (e.g. Offline Mode
+    presentation over the whole library) use so validating N cached games
+    never issues N database queries. It must agree with `has_valid_cached_assets`
+    for every layout `has_valid_cached_assets` already supports."""
+
+    def test_agrees_with_has_valid_cached_assets_for_direct_layout(
+        self, cache_service, cache_repo, game_repo, game_with_file
+    ):
+        cache_service.cache_game(game_with_file.id)
+        entry = cache_repo.get(game_with_file.id)
+        game = game_repo.get(game_with_file.id)
+
+        assert cache_service.is_valid_cached_entry(entry, game) is True
+        assert cache_service.has_valid_cached_assets(game_with_file.id) is True
+
+    def test_agrees_with_has_valid_cached_assets_for_container_layout(
+        self, cache_service, cache_repo, game_repo, cache_dir
+    ):
+        asset = GameAsset(
+            filename="Airforce Delta Storm.iso",
+            relative_path="xbox/Airforce Delta Storm.iso",
+            size_bytes=8,
+            is_primary=True,
+        )
+        game = Game.create("xbox", "Airforce Delta Storm", "local", "/roms", [asset])
+        game_repo.save(game)
+        game_dir = cache_dir / "xbox" / "Airforce Delta Storm"
+        game_dir.mkdir(parents=True)
+        (game_dir / "Airforce Delta Storm.iso").write_bytes(b"xbox-iso")
+        entry = CacheEntry.create(game.id, str(game_dir))
+        entry.status = CacheStatus.COMPLETE
+        cache_repo.save(entry)
+
+        loaded_entry = cache_repo.get(game.id)
+        loaded_game = game_repo.get(game.id)
+        assert cache_service.is_valid_cached_entry(loaded_entry, loaded_game) is True
+        assert cache_service.has_valid_cached_assets(game.id) is True
+
+    def test_false_when_entry_missing_or_incomplete(
+        self, cache_service, game_repo, game_with_file
+    ):
+        game = game_repo.get(game_with_file.id)
+        assert cache_service.is_valid_cached_entry(None, game) is False
+        entry = CacheEntry.create(game_with_file.id, "/nonexistent")
+        entry.status = CacheStatus.TRANSFERRING
+        assert cache_service.is_valid_cached_entry(entry, game) is False
+
+    def test_false_when_game_missing_or_asset_absent(
+        self, cache_service, cache_repo, game_with_file
+    ):
+        cache_service.cache_game(game_with_file.id)
+        entry = cache_repo.get(game_with_file.id)
+        assert cache_service.is_valid_cached_entry(entry, None) is False
+
+
 class TestCacheGameCaching:
     def test_cache_game_succeeds(self, cache_service, game_with_file):
         path = cache_service.cache_game(game_with_file.id)

@@ -30,6 +30,7 @@ from romcloud.core.exceptions import (
 from romcloud.core.capabilities import Capability, CapabilityPolicy
 from romcloud.core.models.game import Game
 from romcloud.core.models.librarysync import LibraryImportPreview, LibrarySyncReport
+from romcloud.core.models.proxy import ProxyRecord
 from romcloud.core.progress import ProgressSink, emit_progress
 from romcloud.core.storage import StorageProvider
 from romcloud.infrastructure.atomic_file import atomic_write_text
@@ -697,6 +698,9 @@ class LibrarySyncService:
             if record is not None:
                 by_system.setdefault(game.system, []).append((game, library_id, record))
         total = sum(len(entries) for entries in by_system.values())
+        # Loaded once for the whole render — resolving each game's local
+        # launch path must never issue its own per-game database query.
+        proxies_by_id = {record.game_id: record for record in self._proxies.list_all()}
         emit_progress(
             progress,
             "library_sync",
@@ -716,6 +720,7 @@ class LibrarySyncService:
                 total=total,
                 media_validation=media_validation,
                 materialize_media=materialize_media,
+                proxies_by_id=proxies_by_id,
             )
             emit_progress(
                 progress,
@@ -740,6 +745,7 @@ class LibrarySyncService:
         total: int = 0,
         media_validation: Optional[dict[str, dict]] = None,
         materialize_media: bool = True,
+        proxies_by_id: Optional[dict[str, ProxyRecord]] = None,
     ) -> int:
         media_validation = media_validation if media_validation is not None else {}
         system_root = self._local_roms_root / system
@@ -763,11 +769,16 @@ class LibrarySyncService:
         else:
             root = ET.Element("gameList")
 
-        owned = {
-            (candidate.findtext(OWNERSHIP_TAG) or "").strip(): candidate
-            for candidate in root.findall("game")
-            if (candidate.findtext(OWNERSHIP_TAG) or "").strip()
-        }
+        owned: dict[str, ET.Element] = {}
+        unowned_by_path: dict[str, ET.Element] = {}
+        for candidate in root.findall("game"):
+            marker = (candidate.findtext(OWNERSHIP_TAG) or "").strip()
+            if marker:
+                owned[marker] = candidate
+                continue
+            path_text = _safe_relative(candidate.findtext("path") or "")
+            if path_text is not None and path_text not in unowned_by_path:
+                unowned_by_path[path_text] = candidate
         desired: set[str] = set()
         count = 0
         for game, library_id, record in entries:
@@ -781,18 +792,17 @@ class LibrarySyncService:
                 total=total,
                 metadata={"system": system, "unit": "games"},
             )
-            launch_path = self._local_launch_path(game)
+            launch_path = self._local_launch_path(game, proxies_by_id)
             if launch_path is None:
                 continue
             desired.add(library_id)
             element = owned.get(library_id)
             if element is None:
                 # Adopt a matching local ROMCloud path (for pre-marker beta data)
-                # but never an unrelated local game.
-                element = next(
-                    (item for item in root.findall("game") if _safe_relative(item.findtext("path") or "") == _safe_relative(launch_path)),
-                    None,
-                )
+                # but never an unrelated local game. Looked up from an index
+                # built once above — a linear `root.findall` scan per game
+                # here would make rendering an O(catalog²) operation.
+                element = unowned_by_path.pop(_safe_relative(launch_path), None)
             if element is None:
                 element = ET.SubElement(root, "game")
             _set_child(element, "path", launch_path)
@@ -831,10 +841,16 @@ class LibrarySyncService:
             atomic_write_text(path, result)
         return count
 
-    def _local_launch_path(self, game: Game) -> Optional[str]:
+    def _local_launch_path(
+        self, game: Game, proxies_by_id: Optional[dict[str, ProxyRecord]] = None
+    ) -> Optional[str]:
         if self._mode == "direct_nas":
             return f"./ROMCloud/{_source_relative(game)}"
-        proxy = self._proxies.get(game.id)
+        proxy = (
+            proxies_by_id.get(game.id)
+            if proxies_by_id is not None
+            else self._proxies.get(game.id)
+        )
         if proxy is None:
             return None
         path = Path(proxy.proxy_path)
