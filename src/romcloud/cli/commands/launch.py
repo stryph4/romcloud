@@ -32,7 +32,7 @@ from romcloud.cli.context import get_container
 @click.option(
     "--override",
     is_flag=True,
-    help="Allow this one cache-backed launch while Direct/NAS mode is configured.",
+    help="Allow this one cache-backed launch while Connected Mode is active.",
 )
 @click.pass_context
 def launch_cmd(ctx: click.Context, proxy_path: str, no_ui: bool, override: bool) -> None:
@@ -42,10 +42,13 @@ def launch_cmd(ctx: click.Context, proxy_path: str, no_ui: bool, override: bool)
     EmulationStation ``<command>`` wrapper for actual Batocera launch.
     """
     container = get_container(ctx)
-    if container.config.game_access_mode == "direct_nas" and not override:
+    from romcloud.core.capabilities import OperatingMode
+    from romcloud.infrastructure.library_view import operating_mode
+
+    if operating_mode(container.config) is OperatingMode.CONNECTED and not override:
         raise click.ClickException(
-            "Proxy caching is unavailable in Direct/NAS mode. Batocera should launch "
-            "the exposed remote game directly; pass --override only for this command."
+            "Proxy caching is unavailable in Connected Mode. Batocera should launch "
+            "the exposed source game directly; pass --override only for this command."
         )
 
     try:
@@ -75,7 +78,8 @@ def launch_cmd(ctx: click.Context, proxy_path: str, no_ui: bool, override: bool)
     source_root = game.source_root
     if not container.provider.is_reachable(source_root):
         click.echo(
-            f"error: Game is not cached and source is unreachable ({source_root}).",
+            "error: Game is not cached and the configured source is unavailable. "
+            f"Reconnect it and try again ({source_root}).",
             err=True,
         )
         ctx.exit(1)

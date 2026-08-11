@@ -26,6 +26,8 @@ from romcloud.infrastructure.config import (
 )
 from romcloud.core.exceptions import ConfigurationError
 from romcloud.infrastructure.database import Database
+from romcloud.core.capabilities import OperatingMode
+from romcloud.infrastructure.library_view import write_operating_mode
 from romcloud.infrastructure.repositories.game import GameRepository
 from romcloud.infrastructure.repositories.proxy import ProxyRepository
 from romcloud.integrations.batocera.game_access import (
@@ -42,7 +44,7 @@ from romcloud.lifecycle import manage
 def _stub_es_refresh(monkeypatch):
     monkeypatch.setattr(
         "romcloud.integrations.batocera.game_access._refresh_emulationstation",
-        lambda config, systems: None,
+        lambda config, systems, **kwargs: None,
     )
 
 
@@ -197,6 +199,7 @@ def test_mode_switch_removes_only_owned_link_and_restores_proxy(tmp_path: Path) 
     local_game.write_bytes(b"local")
 
     smart = replace(direct, game_access_mode=SMART_CACHE_MODE)
+    write_operating_mode(smart, OperatingMode.CACHE)
     reconcile_game_access(smart)
 
     assert not (local / LINK_NAME).exists()
@@ -206,7 +209,7 @@ def test_mode_switch_removes_only_owned_link_and_restores_proxy(tmp_path: Path) 
 
 
 def test_large_existing_library_survives_both_mode_transitions(tmp_path: Path) -> None:
-    """A thousands-scale Smart Cache install switches both ways without data loss."""
+    """A thousands-scale cache-backed install switches without data loss."""
     smart = _config(tmp_path, SMART_CACHE_MODE)
     systems = ("snes", "psx")
     local_dirs: dict[str, Path] = {}
@@ -322,6 +325,7 @@ def test_large_existing_library_survives_both_mode_transitions(tmp_path: Path) -
     foreign_proxy.write_text('{"owner": "someone-else"}', encoding="utf-8")
 
     direct = replace(smart, game_access_mode=DIRECT_NAS_MODE)
+    write_operating_mode(direct, OperatingMode.CONNECTED)
     first_direct = reconcile_game_access(direct)
     second_direct = reconcile_game_access(direct)
 
@@ -339,6 +343,7 @@ def test_large_existing_library_survives_both_mode_transitions(tmp_path: Path) -
         ).fetchone()
     assert tuple(cached) == (str(cache_file), "complete", 1)
 
+    write_operating_mode(smart, OperatingMode.CACHE)
     first_smart = reconcile_game_access(smart)
     second_smart = reconcile_game_access(smart)
 
@@ -383,6 +388,6 @@ def test_cache_cli_requires_per_command_override_in_direct_mode(monkeypatch) -> 
     allowed = runner.invoke(cache_group, ["--override", "status"], obj={})
 
     assert blocked.exit_code == 1
-    assert "unavailable in Direct/NAS mode" in blocked.output
+    assert "unavailable in Connected Mode" in blocked.output
     assert allowed.exit_code == 0 and "Cache is empty" in allowed.output
     assert container.config.game_access_mode == DIRECT_NAS_MODE

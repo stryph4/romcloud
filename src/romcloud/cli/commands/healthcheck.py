@@ -9,7 +9,8 @@ import click
 
 from romcloud.cli.context import get_container
 from romcloud.infrastructure.source_display import source_display_summary
-from romcloud.infrastructure.config import DIRECT_NAS_MODE
+from romcloud.core.capabilities import OperatingMode
+from romcloud.infrastructure.library_view import operating_mode
 
 
 def _fmt_bytes(n: int) -> str:
@@ -55,8 +56,8 @@ def healthcheck_cmd(ctx: click.Context) -> None:
         str(local_roms),
     )
 
-    if config.game_access_mode != DIRECT_NAS_MODE:
-        # Cache directory and reserve apply only to Smart Cache.
+    if operating_mode(config) is not OperatingMode.CONNECTED:
+        # Cache directory and reserve apply to cache-backed operating modes.
         cache_path = Path(config.cache.path)
         check("Cache path writable", _can_write(cache_path), str(cache_path))
         if cache_path.exists() or cache_path.parent.exists():

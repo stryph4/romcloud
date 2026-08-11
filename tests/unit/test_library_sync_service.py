@@ -9,6 +9,7 @@ import pytest
 from click.testing import CliRunner
 
 from romcloud.bootstrap.container import Container
+from romcloud.core.capabilities import OperatingMode
 from romcloud.core.exceptions import CapabilityUnavailableError, LibrarySyncError
 from romcloud.core.models.game import Game, GameAsset
 from romcloud.infrastructure.config import (
@@ -18,7 +19,10 @@ from romcloud.infrastructure.config import (
     RemoteDataConfig,
     SourceConfig,
 )
-from romcloud.infrastructure.library_view import write_offline_library_state
+from romcloud.infrastructure.library_view import (
+    write_offline_library_state,
+    write_operating_mode,
+)
 from romcloud.services.library_sync import OWNERSHIP_TAG, library_id_for_game
 from romcloud.core.models.librarysync import LibrarySyncReport
 
@@ -504,12 +508,14 @@ def test_direct_paths_and_mode_switch_do_not_change_canonical(tmp_path: Path):
     canonical_before = _canonical(config).read_bytes()
 
     direct = replace(config, game_access_mode="direct_nas")
+    write_operating_mode(direct, OperatingMode.CONNECTED)
     Container(direct).library_sync.sync()
     direct_entry = _managed(_local_root(config))
     assert direct_entry.findtext("path") == "./ROMCloud/Game.chd"
     assert direct_entry.findtext("image") == "./ROMCloud/images/Game.png"
     assert _canonical(config).read_bytes() == canonical_before
 
+    write_operating_mode(config, OperatingMode.CACHE)
     Container(config).library_sync.sync()
     assert _managed(_local_root(config)).findtext("path") == "./Game.romcloud"
     assert _canonical(config).read_bytes() == canonical_before

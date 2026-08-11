@@ -143,7 +143,6 @@ MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
     "Settings": (
         MenuItem("Health Check", "healthcheck"),
         MenuItem("Controller Test", CONTROLLER_TEST_ACTION),
-        MenuItem("Exit", EXIT_ACTION),
     ),
 }
 
@@ -153,13 +152,15 @@ ACTIVE_MODE_ACTION = "operating-mode-active"
 
 def _fallback_operating_state(mode: str) -> dict[str, object]:
     """Compatibility fallback for older backends; current backends serialize policy."""
+    selected = "connected" if mode == "direct_nas" else "cache"
     return {
         "game_access_mode": mode,
-        "operating_mode": "nas",
-        "presentation_intent": "nas",
-        "nas_mode": True,
+        "operating_mode": selected,
+        "presentation_intent": selected,
+        "connected_mode": selected == "connected",
+        "cache_mode": selected == "cache",
         "offline_mode": False,
-        "offline_mode_supported": mode == "smart_cache",
+        "offline_mode_supported": True,
         "capabilities": {
             "catalog_refresh": True,
             "library_sync": True,
@@ -181,30 +182,38 @@ def root_menu_items_for_state(state: dict[str, object]) -> tuple[MenuItem, ...]:
     capabilities = state.get("capabilities", {})
     capabilities = capabilities if isinstance(capabilities, dict) else {}
     items = [MenuItem("Library", f"{CATEGORY_ACTION_PREFIX}Library")]
-    active_mode = str(state.get("operating_mode", "nas"))
+    active_mode = str(state.get("operating_mode", "cache"))
     items.append(
         MenuItem(
-            "NAS Mode",
-            ACTIVE_MODE_ACTION if active_mode == "nas" else "library-nas",
-            "Active" if active_mode == "nas" else "Reconnect and restore the full library.",
-            active=active_mode == "nas",
+            "Connected Mode",
+            ACTIVE_MODE_ACTION if active_mode == "connected" else "library-connected",
+            "Active" if active_mode == "connected" else "Use your configured ROM source directly.",
+            active=active_mode == "connected",
         )
     )
-    if bool(state.get("offline_mode_supported", False)):
-        items.append(
-            MenuItem(
-                "Offline Mode",
-                ACTIVE_MODE_ACTION if active_mode == "offline" else "library-offline",
-                "Active" if active_mode == "offline" else "Use only valid cached games.",
-                active=active_mode == "offline",
-            )
+    items.append(
+        MenuItem(
+            "Cache Mode",
+            ACTIVE_MODE_ACTION if active_mode == "cache" else "library-cache",
+            "Active" if active_mode == "cache" else "Keep your library available and cache games as you play.",
+            active=active_mode == "cache",
         )
+    )
+    items.append(
+        MenuItem(
+            "Offline Mode",
+            ACTIVE_MODE_ACTION if active_mode == "offline" else "library-offline",
+            "Active" if active_mode == "offline" else "Use only games already available on this device.",
+            active=active_mode == "offline",
+        )
+    )
     items.append(MenuItem("Storage", f"{CATEGORY_ACTION_PREFIX}Storage"))
     if capabilities.get("save_sync", True):
         items.append(MenuItem("SaveSync", SAVESYNC_ACTION))
     if capabilities.get("update_network", True):
         items.append(MenuItem("Maintenance", f"{CATEGORY_ACTION_PREFIX}Maintenance"))
     items.append(MenuItem("Settings", f"{CATEGORY_ACTION_PREFIX}Settings"))
+    items.append(MenuItem("Exit", EXIT_ACTION))
     return tuple(items)
 
 
@@ -213,12 +222,10 @@ def menu_categories_for_state(
 ) -> dict[str, tuple[MenuItem, ...]]:
     capabilities = state.get("capabilities", {})
     capabilities = capabilities if isinstance(capabilities, dict) else {}
-    mode = str(state.get("game_access_mode", "smart_cache"))
     library: list[MenuItem] = [MenuItem("Catalog Status", "status")]
     if capabilities.get("catalog_refresh", True):
         library.append(MenuItem("Refresh Catalog", "refresh"))
-    if mode != "direct_nas":
-        library.append(MenuItem("Cache Status", "cache-status"))
+    library.append(MenuItem("Cache Status", "cache-status"))
     if library_sync_enabled and capabilities.get("library_sync", True):
         library.append(MenuItem("Import Source Metadata", LIBRARY_SYNC_ACTION))
     storage = MENU_CATEGORIES["Storage"]
@@ -236,8 +243,15 @@ def menu_categories_for_mode(
     return menu_categories_for_state(
         {
             **_fallback_operating_state(mode),
-            "operating_mode": "offline" if offline_library_mode else "nas",
-            "nas_mode": not offline_library_mode,
+            "operating_mode": (
+                "offline"
+                if offline_library_mode
+                else "connected"
+                if mode == "direct_nas"
+                else "cache"
+            ),
+            "connected_mode": not offline_library_mode and mode == "direct_nas",
+            "cache_mode": not offline_library_mode and mode != "direct_nas",
             "offline_mode": offline_library_mode,
         },
         library_sync_enabled,
@@ -263,8 +277,11 @@ _OPERATIONS: dict[str, OperationSpec] = {
     "library-offline": OperationSpec(
         title="Offline Mode", args=("uidata", "library-offline")
     ),
-    "library-nas": OperationSpec(
-        title="NAS Mode", args=("uidata", "library-nas")
+    "library-cache": OperationSpec(
+        title="Cache Mode", args=("uidata", "library-cache")
+    ),
+    "library-connected": OperationSpec(
+        title="Connected Mode", args=("uidata", "library-connected")
     ),
     "update-check": OperationSpec(title="Check for Updates", args=("uidata", "update-check")),
     "update-install": OperationSpec(title="Update ROMCloud", args=("uidata", "update-install")),
@@ -325,17 +342,22 @@ def format_result(action: str, result: BackendResult) -> str:
         source_bits = [bit for bit in (source_type, source_description) if bit]
         source_prefix = " | ".join(source_bits)
         if action == "status":
-            if result.data.get("game_access_mode") == "direct_nas":
-                body = f"{source_prefix} | games={result.data.get('games_total', 0)} | Direct/NAS"
-                return f"{action}: {body}"
             stats = [
                 f"games={result.data.get('games_total', 0)}",
                 f"cached={result.data.get('cached', 0)}",
                 f"pinned={result.data.get('pinned', 0)}",
             ]
             body = f"{' | '.join(source_bits)} | {' '.join(stats)}" if source_prefix else " ".join(stats)
-            if result.data.get("offline_library_mode"):
-                body += " | Offline Mode"
+            operating_state = result.data.get("operating_state", {})
+            selected = (
+                operating_state.get("operating_mode")
+                if isinstance(operating_state, dict)
+                else None
+            )
+            if selected is None and result.data.get("offline_library_mode"):
+                selected = "offline"
+            if selected in {"connected", "cache", "offline"}:
+                body += f" | {str(selected).title()} Mode"
             return f"{action}: {body}"
         reachable = result.data.get("source_reachable")
         body = f"{source_prefix} | {'reachable' if reachable else 'unreachable'}" if source_prefix else (
@@ -983,7 +1005,9 @@ def _run(  # noqa: ANN001
                             connection = call_backend(romcloud_bin, "connection-status")
                             message = format_result("connection-status", connection)
                             message_kind = classify_message_kind("connection-status", connection)
-                        elif operation_screen.title in ("Offline Mode", "NAS Mode"):
+                        elif operation_screen.title in (
+                            "Connected Mode", "Cache Mode", "Offline Mode"
+                        ):
                             setup_status = call_backend(romcloud_bin, "setup-status")
                             operating_state = operating_state_from_status(setup_status.data)
                             library_sync_enabled = bool(
@@ -1529,6 +1553,15 @@ def _render_operation(  # noqa: ANN001
             catalog_progress,
             top=output_top,
         )
+    elif operation.title in ("Connected Mode", "Cache Mode", "Offline Mode"):
+        _render_mode_progress(
+            pygame,
+            screen,
+            fonts,
+            layout.navigation_rect,
+            activity,
+            top=output_top,
+        )
     else:
         max_chars = max(1, layout.navigation_rect.w // 10)
         lines = wrap_lines(
@@ -1597,6 +1630,48 @@ def _draw_progress_bar(  # noqa: ANN001
             (rect.x, rect.y, fill_w, rect.h),
             border_radius=4,
         )
+
+
+def _render_mode_progress(  # noqa: ANN001
+    pygame,
+    screen,
+    fonts: dict,
+    area: Rect,
+    activity: ActivityLog,
+    *,
+    top: int,
+) -> None:
+    """Render mode phases with the same truthful green/yellow bar language."""
+    event = next(
+        (
+            item
+            for item in reversed(activity.events)
+            if item.operation == "operating_mode"
+        ),
+        None,
+    )
+    if event is None:
+        message = "Preparing mode"
+        fraction = None
+        failed = False
+    else:
+        suffix = ""
+        if event.current is not None and event.total is not None:
+            suffix = f"  {event.current:,} / {event.total:,}"
+        message = f"{event.message}{suffix}"
+        if event.current is not None and event.total is not None:
+            fraction = 1.0 if event.total == 0 else event.current / event.total
+        elif event.status == "success" and event.stage == "complete":
+            fraction = 1.0
+        else:
+            fraction = None
+        failed = event.status == "error"
+
+    label = fonts["body"].render(message, True, _ERROR_COLOR if failed else _FG_COLOR)
+    screen.blit(label, (area.x, top))
+    bar_h = max(8, fonts["hint"].get_height() // 2)
+    bar = Rect(area.x, top + fonts["body"].get_height() + 8, area.w, bar_h)
+    _draw_progress_bar(pygame, screen, bar, fraction, failed=failed)
 
 
 def _render_catalog_progress(  # noqa: ANN001
@@ -2023,7 +2098,7 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
     if wizard.step == WizardStep.GAME_ACCESS:
         return [
             *context,
-            "Direct/NAS has no local downloads, cache management, pinning, eviction, or offline games.",
+            "You can switch among Connected, Cache, and Offline Mode later from the main menu.",
         ]
     if wizard.step == WizardStep.LIBRARY_SYNC:
         return [
@@ -2042,9 +2117,9 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
             "\u2713 Connected  \u2713 Read access verified",
             f"Systems: {len(wizard.systems)}",
             "Game access: " + (
-                "Direct / NAS (source required while playing)"
+                "Connected Mode (source required while playing)"
                 if wizard.game_access_mode == "direct_nas"
-                else "Smart Cache"
+                else "Cache Mode"
             ),
             (
                 f"ROMCloud data: //{wizard.remote_server}/{wizard.remote_share} [Read/write]"
@@ -2096,7 +2171,7 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
                 f"Cache size: {wizard.applied_summary.get('max_size_gb', wizard.max_size_gb):g} GB"
             )
         else:
-            lines.append("Direct/NAS: the source must remain reachable while playing.")
+            lines.append("Connected Mode: the source must remain reachable while playing.")
         if wizard.library_sync_enabled:
             lines.append(
                 "Optional metadata was not imported. Use Library > Import Source Metadata when ready."

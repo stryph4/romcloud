@@ -192,7 +192,7 @@ class SetupRequest:
             rom_root, Path("/userdata/roms")
         ):
             raise ValueError(
-                "Direct/NAS ROM source must be separate from /userdata/roms."
+                "Connected Mode ROM source must be separate from /userdata/roms."
             )
         if self.remote_data_type != "none":
             remote_root = (
@@ -260,10 +260,7 @@ def setup_state(config_path: Path) -> dict[str, Any]:
         "source_type": "smb" if config.smb is not None else "local",
         "game_access_mode": config.game_access_mode,
         "library_sync_enabled": config.library_sync.enabled,
-        "offline_library_mode": (
-            config.game_access_mode != DIRECT_NAS_MODE
-            and offline_library_enabled(config)
-        ),
+        "offline_library_mode": offline_library_enabled(config),
         "operating_state": capability_policy(config).serialize(),
         "rom_root": config.source.rom_root,
         "cache_root": config.cache.path,

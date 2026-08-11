@@ -6,7 +6,6 @@ import click
 
 from romcloud.core.exceptions import ProviderNotReachableError, ROMCloudError
 from romcloud.cli.context import get_container
-from romcloud.infrastructure.config import DIRECT_NAS_MODE
 
 
 @click.command("refresh")
@@ -56,7 +55,10 @@ def refresh_cmd(ctx: click.Context, system: str | None, dry_run: bool) -> None:
             ctx.exit(1)
             return
 
-        if container.config.game_access_mode != DIRECT_NAS_MODE:
+        from romcloud.core.capabilities import OperatingMode
+        from romcloud.infrastructure.capabilities import capability_policy
+
+        if capability_policy(container.config).effective_mode is not OperatingMode.CONNECTED:
             es_systems = getattr(
                 access_result, "es_included_systems", container.game_repo.list_systems()
             )
@@ -66,7 +68,7 @@ def refresh_cmd(ctx: click.Context, system: str | None, dry_run: bool) -> None:
             )
         else:
             click.echo(
-                "Updated Direct/NAS exposure "
+                "Updated Connected Mode exposure "
                 f"({access_result.created} link(s) created, {access_result.removed} removed)."
             )
         es_missing = getattr(access_result, "es_missing_systems", ())

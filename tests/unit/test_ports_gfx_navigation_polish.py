@@ -13,21 +13,25 @@ from ports_gfx.wizard import WizardState, WizardStep
 def test_root_items_preserve_the_requested_compact_order_and_actions():
     assert [item.label for item in ROOT_MENU_ITEMS] == [
         "Library",
-        "NAS Mode",
+        "Connected Mode",
+        "Cache Mode",
         "Offline Mode",
         "Storage",
         "SaveSync",
         "Maintenance",
         "Settings",
+        "Exit",
     ]
     assert [item.action for item in ROOT_MENU_ITEMS] == [
         "category:Library",
+        "library-connected",
         "operating-mode-active",
         "library-offline",
         "category:Storage",
         "savesync",
         "category:Maintenance",
         "category:Settings",
+        "exit",
     ]
 
 
@@ -53,19 +57,19 @@ def test_every_preexisting_action_is_mapped_once_without_renaming():
 
 def test_savesync_root_item_bypasses_the_category_level():
     nav = NavigationState(ROOT_MENU_ITEMS, MENU_CATEGORIES)
-    nav.select(4)
+    nav.select(5)
 
     assert nav.selected_item.label == "SaveSync"
     assert nav.selected_item.action == "savesync"
     assert not nav.enter_selected_category()
     assert nav.level == "root"
-    assert nav.selected_index == 4
+    assert nav.selected_index == 5
     assert "SaveSync" not in MENU_CATEGORIES
 
 
 def test_submenu_replaces_root_and_back_restores_root_focus():
     nav = NavigationState(ROOT_MENU_ITEMS, MENU_CATEGORIES)
-    nav.select(3)
+    nav.select(4)
     assert nav.enter_selected_category()
     assert nav.title == "Storage"
     assert [item.label for item in nav.items[:2]] == ["Storage Setup", "Connection Status"]
@@ -73,7 +77,7 @@ def test_submenu_replaces_root_and_back_restores_root_focus():
     assert nav.items[-1].action == BACK_ACTION
     assert nav.back()
     assert nav.title == "ROMCloud"
-    assert nav.selected_index == 3
+    assert nav.selected_index == 4
 
 
 def test_update_banner_target_can_open_existing_update_action():

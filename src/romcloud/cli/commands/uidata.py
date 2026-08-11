@@ -222,15 +222,14 @@ def uidata_status(ctx: click.Context) -> None:
             "library_sync_enabled": container.config.library_sync.enabled,
             "operating_state": capability_policy(container.config).serialize(),
         }
-        if container.config.game_access_mode != "direct_nas":
-            from romcloud.infrastructure.library_view import offline_library_enabled
+        from romcloud.infrastructure.library_view import offline_library_enabled
 
-            summary = container.cache.status_summary()
-            payload.update(
-                cached=summary["complete"],
-                pinned=summary["pinned"],
-                offline_library_mode=offline_library_enabled(container.config),
-            )
+        summary = container.cache.status_summary()
+        payload.update(
+            cached=summary["complete"],
+            pinned=summary["pinned"],
+            offline_library_mode=offline_library_enabled(container.config),
+        )
         payload.update(source_display_summary(container.config))
         return payload
 
@@ -244,7 +243,7 @@ def _run_library_mode_action(ctx: click.Context, mode: str) -> None:
         from romcloud.integrations.batocera.game_access import set_operating_mode
 
         progress = _progress_sink({"progress": True})
-        label = "Offline Mode" if mode == "offline" else "NAS Mode"
+        label = f"{mode.title()} Mode"
         emit_progress(
             progress, "library", "reconcile", "running", f"Showing {label}…"
         )
@@ -254,13 +253,13 @@ def _run_library_mode_action(ctx: click.Context, mode: str) -> None:
         )
         return {
             "offline_library_mode": report.offline,
-            "operating_mode": "offline" if report.offline else "nas",
+            "operating_mode": mode,
             "visible_proxies": report.visible,
             "removed_proxies": report.removed,
             "restored_proxies": report.restored,
             "save_sync_available": report.save_sync_available,
             "save_reconcile": report.save_reconcile,
-            "es_restart_required": True,
+            "es_restart_required": False,
         }
 
     _run_action(ctx, build)
@@ -269,22 +268,22 @@ def _run_library_mode_action(ctx: click.Context, mode: str) -> None:
 @uidata_group.command("library-offline")
 @click.pass_context
 def uidata_library_offline(ctx: click.Context) -> None:
-    """Switch Smart Cache presentation to valid cached games only."""
+    """Show only managed games that are playable locally."""
     _run_library_mode_action(ctx, "offline")
 
 
-@uidata_group.command("library-nas")
+@uidata_group.command("library-cache")
 @click.pass_context
-def uidata_library_nas(ctx: click.Context) -> None:
-    """Reconnect and restore the complete Smart Cache NAS presentation."""
-    _run_library_mode_action(ctx, "nas")
+def uidata_library_cache(ctx: click.Context) -> None:
+    """Restore the managed catalog and on-demand cache behavior."""
+    _run_library_mode_action(ctx, "cache")
 
 
-@uidata_group.command("library-online", hidden=True)
+@uidata_group.command("library-connected")
 @click.pass_context
-def uidata_library_online_compat(ctx: click.Context) -> None:
-    """Compatibility alias for pre-NAS-mode graphical clients."""
-    _run_library_mode_action(ctx, "nas")
+def uidata_library_connected(ctx: click.Context) -> None:
+    """Use the configured primary source directly."""
+    _run_library_mode_action(ctx, "connected")
 
 
 @uidata_group.command("refresh")
@@ -310,12 +309,13 @@ def _run_catalog_refresh(ctx: click.Context, progress) -> None:  # noqa: ANN001
         container = get_container(ctx)
         result = container.catalog.refresh(progress=progress)
         from romcloud.integrations.batocera.game_access import reconcile_game_access
-        from romcloud.infrastructure.config import DIRECT_NAS_MODE
+        from romcloud.core.capabilities import OperatingMode
+        from romcloud.infrastructure.library_view import operating_mode
 
         access_result = reconcile_game_access(
             container.config, render_library_metadata=False
         )
-        if container.config.game_access_mode == DIRECT_NAS_MODE:
+        if operating_mode(container.config) is OperatingMode.CONNECTED:
             es_systems: list[str] = []
             es_missing: list[str] = []
         else:
@@ -483,7 +483,7 @@ def uidata_healthcheck(ctx: click.Context) -> None:
 
 
 @uidata_group.command("cache-status")
-@click.option("--override", is_flag=True, help="Allow this request in Direct/NAS mode.")
+@click.option("--override", is_flag=True, help="Allow this request in Connected Mode.")
 @click.pass_context
 def uidata_cache_status(ctx: click.Context, override: bool) -> None:
     """Cache summary as JSON."""
@@ -491,9 +491,12 @@ def uidata_cache_status(ctx: click.Context, override: bool) -> None:
     def build() -> dict:
         _load_context_config(ctx)
         container = get_container(ctx)
-        if container.config.game_access_mode == "direct_nas" and not override:
+        from romcloud.core.capabilities import OperatingMode
+        from romcloud.infrastructure.library_view import operating_mode
+
+        if operating_mode(container.config) is OperatingMode.CONNECTED and not override:
             raise ValueError(
-                "Cache status is unavailable in Direct/NAS mode; pass --override "
+                "Cache status is unavailable in Connected Mode; pass --override "
                 "for this request only."
             )
         summary = container.cache.status_summary()

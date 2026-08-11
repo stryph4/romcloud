@@ -277,10 +277,12 @@ def reconcile_es_override(config_path: Path) -> Optional[bool]:
         return None
     try:
         from romcloud.bootstrap.container import Container
+        from romcloud.core.capabilities import OperatingMode
         from romcloud.infrastructure.config import load_config
+        from romcloud.infrastructure.library_view import operating_mode
 
         config = load_config(str(config_path))
-        if config.game_access_mode == "direct_nas":
+        if operating_mode(config) is OperatingMode.CONNECTED:
             es_config.remove(override_path=override_path)
             return True
         container = Container(config)

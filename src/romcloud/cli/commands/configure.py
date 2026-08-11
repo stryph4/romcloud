@@ -127,16 +127,16 @@ def configure_cmd(
     source_type = (source_type or "local").lower()
 
     if game_access_mode is None and not non_interactive:
-        click.echo("\nHow should Batocera access remote games?")
-        click.echo("  smart_cache  Download on first launch; supports local/offline play")
-        click.echo("  direct_nas   Play from storage; source must remain reachable")
+        click.echo("\nWhich initial ROMCloud operating mode should be used?")
+        click.echo("  smart_cache  Cache Mode; download on first launch")
+        click.echo("  direct_nas   Connected Mode; use the source directly")
         game_access_mode = click.prompt(
             "Game access mode",
             type=click.Choice([SMART_CACHE_MODE, DIRECT_NAS_MODE], case_sensitive=False),
             default=existing.game_access_mode if existing else SMART_CACHE_MODE,
         )
         if game_access_mode.lower() == DIRECT_NAS_MODE:
-            click.echo("Direct/NAS disables local cache, downloads, pinning, eviction, and offline games.")
+            click.echo("Connected Mode uses the configured source directly.")
     game_access_mode = (
         game_access_mode
         or (existing.game_access_mode if existing else SMART_CACHE_MODE)

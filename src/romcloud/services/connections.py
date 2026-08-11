@@ -59,8 +59,13 @@ def mount_connections(
     progress: ProgressSink = None,
     *,
     mount_fn=None,
+    credential_kinds: frozenset[str] | None = None,
 ) -> dict[str, object]:
     targets = mount_worker.configured_mounts(config)
+    if credential_kinds is not None:
+        targets = tuple(
+            target for target in targets if target.credential_kind in credential_kinds
+        )
     if not targets:
         raise ConfigurationError("This configuration uses a local folder and does not need mounting.")
     mount_fn = mount_fn or mount.mount_cifs_source

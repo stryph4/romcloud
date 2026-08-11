@@ -84,7 +84,7 @@ def uninstall_cmd(ctx: click.Context, yes: bool) -> None:
         raise click.ClickException(str(exc)) from exc
     click.echo(
         f"ROMCloud uninstalled. Removed proxies: {report.proxies_removed}; "
-        f"Direct/NAS links: {report.direct_links_removed}"
+        f"Connected Mode links: {report.direct_links_removed}"
     )
 
 

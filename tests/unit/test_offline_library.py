@@ -10,27 +10,24 @@ from click.testing import CliRunner
 from romcloud.bootstrap.container import Container
 from romcloud.cli.main import cli
 from romcloud.core.capabilities import OperatingMode
-from romcloud.core.exceptions import CapabilityUnavailableError, ModeTransitionError
+from romcloud.core.exceptions import ModeTransitionError
 from romcloud.core.models.cache import CacheEntry, CacheStatus
 from romcloud.core.models.game import Game, GameAsset
 from romcloud.core.models.proxy import ProxyRecord
+from romcloud.core.progress import ProgressEvent
 from romcloud.infrastructure.config import (
     AppConfig,
     CacheConfig,
     DIRECT_NAS_MODE,
-    LibrarySyncConfig,
-    RemoteDataConfig,
-    SavesConfig,
-    SMBConfig,
     SMART_CACHE_MODE,
     SourceConfig,
     write_config,
 )
 from romcloud.infrastructure.database import Database
 from romcloud.infrastructure.library_view import (
-    offline_library_enabled,
     operating_mode,
     state_path,
+    write_operating_mode,
 )
 from romcloud.infrastructure.repositories.cache import CacheRepository
 from romcloud.infrastructure.repositories.game import GameRepository
@@ -38,22 +35,29 @@ from romcloud.infrastructure.repositories.proxy import ProxyRepository
 from romcloud.integrations.batocera.game_access import (
     LINK_NAME,
     reconcile_game_access,
-    set_offline_library_mode,
+    set_operating_mode,
 )
 from romcloud.lifecycle.manage import restore_owned_proxies
 
 
 @pytest.fixture(autouse=True)
-def _stub_es_refresh(monkeypatch):
-    calls: list[tuple[str, ...]] = []
+def _stub_es(monkeypatch):
+    refreshes: list[tuple[tuple[str, ...], str]] = []
+    reloads: list[bool] = []
     monkeypatch.setattr(
         "romcloud.integrations.batocera.game_access._refresh_emulationstation",
-        lambda config, systems: calls.append(tuple(systems)),
+        lambda config, systems, **kwargs: refreshes.append(
+            (tuple(systems), OperatingMode(kwargs["mode"]).value)
+        ),
     )
-    return calls
+    monkeypatch.setattr(
+        "romcloud.integrations.batocera.game_access._reload_emulationstation",
+        lambda: reloads.append(True) or True,
+    )
+    return refreshes, reloads
 
 
-def _config(tmp_path: Path, mode: str = SMART_CACHE_MODE) -> AppConfig:
+def _config(tmp_path: Path, strategy: str = SMART_CACHE_MODE) -> AppConfig:
     source = tmp_path / "source"
     local = tmp_path / "roms"
     cache = tmp_path / "cache"
@@ -64,19 +68,19 @@ def _config(tmp_path: Path, mode: str = SMART_CACHE_MODE) -> AppConfig:
         cache=CacheConfig(str(cache)),
         local_roms_path=str(local),
         data_path=str(tmp_path / "data"),
-        game_access_mode=mode,
+        game_access_mode=strategy,
     )
 
 
 def _add_game(
     config: AppConfig,
-    db: Database,
     title: str,
     *,
     cached: bool = False,
     pinned: bool = False,
-    stale: bool = False,
 ) -> tuple[Game, Path, Path | None]:
+    db = Database(str(Path(config.data_path) / "catalog.db"))
+    db.initialize()
     filename = f"{title}.sfc"
     asset = GameAsset(
         filename=filename,
@@ -88,13 +92,14 @@ def _add_game(
     GameRepository(db).save(game)
     proxy = Path(config.local_roms_path) / "snes" / f"{title}.romcloud"
     ProxyRepository(db).save(ProxyRecord.create(game.id, str(proxy)))
+    source = Path(config.source.rom_root) / asset.relative_path
+    source.write_bytes(title.encode())
 
     cached_path = None
-    if cached or stale:
+    if cached:
         cached_path = Path(config.cache.path) / "snes" / filename
-        if cached and not stale:
-            cached_path.parent.mkdir(parents=True, exist_ok=True)
-            cached_path.write_bytes(title.encode())
+        cached_path.parent.mkdir(parents=True, exist_ok=True)
+        cached_path.write_bytes(title.encode())
         entry = CacheEntry.create(game.id, str(cached_path))
         entry.status = CacheStatus.COMPLETE
         entry.size_bytes = len(title.encode())
@@ -103,438 +108,273 @@ def _add_game(
     return game, proxy, cached_path
 
 
-def test_cached_only_presentation_is_reversible_safe_and_idempotent(tmp_path: Path) -> None:
-    config = _config(tmp_path)
-    db = Database(str(Path(config.data_path) / "catalog.db"))
-    db.initialize()
-    pinned, pinned_proxy, pinned_cache = _add_game(
-        config, db, "Pinned Cached", cached=True, pinned=True
-    )
-    unpinned, unpinned_proxy, unpinned_cache = _add_game(
-        config, db, "Unpinned Cached", cached=True
-    )
-    stale, stale_proxy, _ = _add_game(config, db, "Stale Cache", stale=True)
-    uncached, uncached_proxy, _ = _add_game(config, db, "Uncached")
+def _library(config: AppConfig):
+    cached = _add_game(config, "Cached", cached=True, pinned=True)
+    uncached = _add_game(config, "Uncached")
     restore_owned_proxies(config)
+    return cached, uncached
 
-    local_rom = Path(config.local_roms_path) / "snes" / "Local Game.sfc"
-    local_rom.write_bytes(b"local")
-    foreign = Path(config.local_roms_path) / "snes" / "Foreign.romcloud"
-    foreign.write_text('{"not": "romcloud-owned"}', encoding="utf-8")
-    catalog_before = [game.id for game in GameRepository(db).list_all()]
-    cache_before = CacheRepository(db).list_all()
-    cache_bytes = {
-        pinned_cache: pinned_cache.read_bytes(),
-        unpinned_cache: unpinned_cache.read_bytes(),
-    }
 
-    first = set_offline_library_mode(config, True)
-    second = set_offline_library_mode(config, True)
+@pytest.mark.parametrize(
+    ("strategy", "payload", "expected"),
+    [
+        (SMART_CACHE_MODE, None, OperatingMode.CACHE),
+        (DIRECT_NAS_MODE, None, OperatingMode.CONNECTED),
+        (SMART_CACHE_MODE, {"version": 1, "offline_library": True}, OperatingMode.OFFLINE),
+        (SMART_CACHE_MODE, {"version": 2, "mode": "offline"}, OperatingMode.OFFLINE),
+        (SMART_CACHE_MODE, {"version": 2, "mode": "nas"}, OperatingMode.CONNECTED),
+        (DIRECT_NAS_MODE, {"version": 2, "mode": "nas"}, OperatingMode.CONNECTED),
+    ],
+)
+def test_authoritative_three_state_persistence_and_migration(
+    tmp_path: Path, strategy: str, payload: dict | None, expected: OperatingMode
+) -> None:
+    config = _config(tmp_path, strategy)
+    if payload is not None:
+        state_path(config).parent.mkdir(parents=True, exist_ok=True)
+        state_path(config).write_text(json.dumps(payload), encoding="utf-8")
 
-    assert first.offline and second.offline
-    assert first.visible == second.visible == 2
-    assert pinned_proxy.is_file() and unpinned_proxy.is_file()
-    assert not stale_proxy.exists() and not uncached_proxy.exists()
-    assert foreign.exists() and local_rom.exists()
-    assert offline_library_enabled(config)
+    assert operating_mode(config) is expected
     assert json.loads(state_path(config).read_text()) == {
-        "version": 2,
-        "mode": "offline",
+        "version": 3,
+        "mode": expected.value,
     }
-    assert [game.id for game in GameRepository(db).list_all()] == catalog_before
-    assert CacheRepository(db).list_all() == cache_before
-    assert {path: path.read_bytes() for path in cache_bytes} == cache_bytes
-    assert CacheRepository(db).get(stale.id) is not None
-    assert CacheRepository(db).get(pinned.id).is_pinned
-    assert not CacheRepository(db).get(unpinned.id).is_pinned
-
-    restored = set_offline_library_mode(config, False)
-    repeated = set_offline_library_mode(config, False)
-
-    assert not restored.offline and not repeated.offline
-    assert all(
-        path.is_file()
-        for path in (pinned_proxy, unpinned_proxy, stale_proxy, uncached_proxy)
-    )
-    assert json.loads(state_path(config).read_text()) == {
-        "version": 2,
-        "mode": "nas",
-    }
-    assert foreign.exists() and local_rom.exists()
-    assert [game.id for game in GameRepository(db).list_all()] == catalog_before
-    assert CacheRepository(db).list_all() == cache_before
-    assert {path: path.read_bytes() for path in cache_bytes} == cache_bytes
-    assert uncached.id in catalog_before
 
 
-def test_offline_refresh_is_blocked_without_catalog_or_proxy_changes(tmp_path: Path) -> None:
+@pytest.mark.parametrize("selected", list(OperatingMode))
+def test_only_three_authoritative_values_can_be_persisted(
+    tmp_path: Path, selected: OperatingMode
+) -> None:
     config = _config(tmp_path)
-    db = Database(str(Path(config.data_path) / "catalog.db"))
-    db.initialize()
-    _add_game(config, db, "Existing Cached", cached=True)
-    restore_owned_proxies(config)
-    set_offline_library_mode(config, True)
-
-    new_source = Path(config.source.rom_root) / "snes" / "New Uncached.sfc"
-    new_source.write_bytes(b"new")
-    container = Container(config)
-    with pytest.raises(Exception, match="Offline Mode"):
-        container.catalog.refresh()
-
-    assert all(game.title != "New Uncached" for game in container.game_repo.list_all())
-    assert offline_library_enabled(config)
+    write_operating_mode(config, selected)
+    assert operating_mode(config) is selected
+    with pytest.raises(ValueError):
+        write_operating_mode(config, "nas")
 
 
-def test_direct_mode_clears_offline_state_and_returns_to_full_smart_cache(tmp_path: Path) -> None:
-    smart = _config(tmp_path)
-    db = Database(str(Path(smart.data_path) / "catalog.db"))
-    db.initialize()
-    _game, proxy, _cache = _add_game(smart, db, "Cached", cached=True)
-    restore_owned_proxies(smart)
-    set_offline_library_mode(smart, True)
-
-    direct = replace(smart, game_access_mode=DIRECT_NAS_MODE)
-    reconcile_game_access(direct)
-
-    assert not offline_library_enabled(direct)
-    assert not proxy.exists()
-    assert (Path(direct.local_roms_path) / "snes" / LINK_NAME).is_symlink()
-    with pytest.raises(CapabilityUnavailableError, match="Smart Cache"):
-        set_offline_library_mode(direct, True)
-
-    reconcile_game_access(smart)
-
-    assert proxy.is_file()
-    assert not (Path(smart.local_roms_path) / "snes" / LINK_NAME).exists()
-    assert not offline_library_enabled(smart)
-
-
-def test_library_cli_toggles_and_reports_state(tmp_path: Path, monkeypatch) -> None:
-    config = _config(tmp_path)
-    config_path = tmp_path / "config" / "romcloud.toml"
-    write_config(config, str(config_path))
-    runner = CliRunner()
-
-    offline = runner.invoke(
-        cli, ["--config", str(config_path), "library", "offline"]
-    )
-    status = runner.invoke(
-        cli, ["--config", str(config_path), "library", "status"]
-    )
-    gui_status = runner.invoke(
-        cli, ["--config", str(config_path), "uidata", "setup-status"]
-    )
-    catalog_status = runner.invoke(
-        cli, ["--config", str(config_path), "uidata", "status"]
-    )
-    nas = runner.invoke(
-        cli, ["--config", str(config_path), "library", "nas"]
-    )
-
-    assert offline.exit_code == 0, offline.output
-    assert "Offline Mode" in offline.output
-    assert status.exit_code == 0 and "Offline Mode" in status.output
-    assert json.loads(gui_status.output)["offline_library_mode"] is True
-    assert json.loads(catalog_status.output)["offline_library_mode"] is True
-    assert nas.exit_code == 0 and "NAS Mode" in nas.output
-    assert not offline_library_enabled(config)
-
-
-def test_library_cli_is_unavailable_in_direct_mode(tmp_path: Path) -> None:
+def test_connected_to_cache_is_database_backed_and_preserves_cache(
+    tmp_path: Path, monkeypatch
+) -> None:
     config = _config(tmp_path, DIRECT_NAS_MODE)
-    config_path = tmp_path / "config" / "romcloud.toml"
-    write_config(config, str(config_path))
-
-    result = CliRunner().invoke(
-        cli, ["--config", str(config_path), "library", "offline"]
+    (cached, cached_proxy, cached_path), (_uncached, uncached_proxy, _) = _library(config)
+    reconcile_game_access(config, refresh_es=False)
+    assert (Path(config.local_roms_path) / "snes" / LINK_NAME).is_symlink()
+    monkeypatch.setattr(
+        "romcloud.integrations.batocera.catalog.CatalogService.refresh",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("source scan")),
     )
 
-    assert result.exit_code == 1
-    assert "available only in Smart Cache mode" in result.output
+    set_operating_mode(config, OperatingMode.CACHE)
+
+    assert operating_mode(config) is OperatingMode.CACHE
+    assert cached_proxy.is_file() and uncached_proxy.is_file()
+    assert not (Path(config.local_roms_path) / "snes" / LINK_NAME).exists()
+    assert cached_path is not None and cached_path.read_bytes() == b"Cached"
+    assert Container(config).cache_repo.get(cached.id).is_pinned
 
 
-def test_state_write_failure_rolls_back_to_previous_full_presentation(
+def test_cache_to_connected_uses_catalog_systems_without_refresh(
     tmp_path: Path, monkeypatch
 ) -> None:
     config = _config(tmp_path)
-    db = Database(str(Path(config.data_path) / "catalog.db"))
-    db.initialize()
-    _cached, cached_proxy, _ = _add_game(config, db, "Cached", cached=True)
-    _uncached, uncached_proxy, _ = _add_game(config, db, "Uncached")
-    restore_owned_proxies(config)
-    assert operating_mode(config) is OperatingMode.NAS
+    (cached, cached_proxy, cached_path), (_uncached, uncached_proxy, _) = _library(config)
+    monkeypatch.setattr(
+        "romcloud.integrations.batocera.catalog.CatalogService.refresh",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("source scan")),
+    )
 
+    set_operating_mode(config, OperatingMode.CONNECTED)
+
+    assert operating_mode(config) is OperatingMode.CONNECTED
+    assert not cached_proxy.exists() and not uncached_proxy.exists()
+    assert (Path(config.local_roms_path) / "snes" / LINK_NAME).is_symlink()
+    assert cached_path is not None and cached_path.read_bytes() == b"Cached"
+    assert Container(config).cache_repo.get(cached.id).is_pinned
+
+
+def test_cache_to_offline_hides_only_source_only_managed_games(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    (_cached, cached_proxy, _), (_uncached, uncached_proxy, _) = _library(config)
+    local_rom = Path(config.local_roms_path) / "snes" / "Local Game.sfc"
+    local_rom.write_bytes(b"local")
+    foreign_proxy = Path(config.local_roms_path) / "snes" / "Foreign.romcloud"
+    foreign_proxy.write_text('{"owner":"other"}', encoding="utf-8")
+
+    set_operating_mode(config, OperatingMode.OFFLINE)
+
+    assert cached_proxy.is_file() and not uncached_proxy.exists()
+    assert local_rom.read_bytes() == b"local" and foreign_proxy.is_file()
+
+
+def test_offline_to_cache_restores_catalog_while_source_is_unavailable(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    (_cached, cached_proxy, _), (_uncached, uncached_proxy, _) = _library(config)
+    set_operating_mode(config, OperatingMode.OFFLINE)
+    Path(config.source.rom_root).rename(tmp_path / "disconnected")
+
+    set_operating_mode(config, OperatingMode.CACHE)
+
+    assert operating_mode(config) is OperatingMode.CACHE
+    assert cached_proxy.is_file() and uncached_proxy.is_file()
+
+
+def test_connected_to_offline_does_not_require_source(tmp_path: Path) -> None:
+    config = _config(tmp_path, DIRECT_NAS_MODE)
+    (_cached, cached_proxy, _), (_uncached, uncached_proxy, _) = _library(config)
+    reconcile_game_access(config, refresh_es=False)
+    Path(config.source.rom_root).rename(tmp_path / "disconnected")
+
+    set_operating_mode(config, OperatingMode.OFFLINE)
+
+    assert operating_mode(config) is OperatingMode.OFFLINE
+    assert cached_proxy.is_file() and not uncached_proxy.exists()
+
+
+def test_failed_connected_to_cache_restores_dangling_direct_links(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = _config(tmp_path, DIRECT_NAS_MODE)
+    (_cached, cached_proxy, _), (_uncached, uncached_proxy, _) = _library(config)
+    reconcile_game_access(config, refresh_es=False)
+    link = Path(config.local_roms_path) / "snes" / LINK_NAME
+    assert link.is_symlink()
+    Path(config.source.rom_root).rename(tmp_path / "disconnected")
+
+    def refresh(config, systems, **kwargs):
+        if OperatingMode(kwargs["mode"]) is OperatingMode.CACHE:
+            raise RuntimeError("ES update failed")
+
+    monkeypatch.setattr(
+        "romcloud.integrations.batocera.game_access._refresh_emulationstation",
+        refresh,
+    )
+
+    with pytest.raises(ModeTransitionError, match="remains in Connected Mode"):
+        set_operating_mode(config, OperatingMode.CACHE)
+
+    assert operating_mode(config) is OperatingMode.CONNECTED
+    assert link.is_symlink()
+    assert not cached_proxy.exists() and not uncached_proxy.exists()
+
+
+def test_offline_to_connected_validates_source_without_catalog_refresh(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = _config(tmp_path)
+    _library(config)
+    set_operating_mode(config, OperatingMode.OFFLINE)
+    monkeypatch.setattr(
+        "romcloud.integrations.batocera.catalog.CatalogService.refresh",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("source scan")),
+    )
+
+    set_operating_mode(config, OperatingMode.CONNECTED)
+
+    assert operating_mode(config) is OperatingMode.CONNECTED
+    assert (Path(config.local_roms_path) / "snes" / LINK_NAME).is_symlink()
+
+
+@pytest.mark.parametrize("start", [OperatingMode.CACHE, OperatingMode.CONNECTED])
+def test_source_loss_never_changes_selected_mode(tmp_path: Path, start: OperatingMode) -> None:
+    config = _config(tmp_path)
+    write_operating_mode(config, start)
+    Path(config.source.rom_root).rename(tmp_path / "disconnected")
+    assert operating_mode(config) is start
+
+
+def test_failed_connected_transition_rolls_back_presentation_and_mode(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    (_cached, cached_proxy, _), (_uncached, uncached_proxy, _) = _library(config)
+    conflict = Path(config.local_roms_path) / "snes" / LINK_NAME
+    conflict.mkdir()
+
+    with pytest.raises(ModeTransitionError, match="remains in Cache Mode"):
+        set_operating_mode(config, OperatingMode.CONNECTED)
+
+    assert operating_mode(config) is OperatingMode.CACHE
+    assert cached_proxy.is_file() and uncached_proxy.is_file() and conflict.is_dir()
+
+
+def test_connected_transition_rejects_source_overlapping_local_roms(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    _library(config)
+    overlapping = replace(
+        config,
+        source=SourceConfig("local", config.local_roms_path),
+    )
+
+    with pytest.raises(ModeTransitionError, match="remains in Cache Mode"):
+        set_operating_mode(overlapping, OperatingMode.CONNECTED)
+
+    assert operating_mode(overlapping) is OperatingMode.CACHE
+
+
+def test_state_write_failure_rolls_back_to_previous_presentation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = _config(tmp_path)
+    (_cached, cached_proxy, _), (_uncached, uncached_proxy, _) = _library(config)
+    assert operating_mode(config) is OperatingMode.CACHE
     monkeypatch.setattr(
         "romcloud.infrastructure.library_view.write_operating_mode",
         lambda config, mode: (_ for _ in ()).throw(OSError("disk full")),
     )
 
-    with pytest.raises(OSError, match="disk full"):
-        set_offline_library_mode(config, True)
+    with pytest.raises(ModeTransitionError):
+        set_operating_mode(config, OperatingMode.OFFLINE)
 
     assert cached_proxy.is_file() and uncached_proxy.is_file()
-    assert not offline_library_enabled(config)
 
 
-def test_es_refresh_runs_only_after_successful_transition(
-    tmp_path: Path, monkeypatch, _stub_es_refresh
+def test_progress_has_truthful_counts_and_indeterminate_phases(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    _library(config)
+    events: list[ProgressEvent] = []
+
+    set_operating_mode(config, OperatingMode.OFFLINE, progress=events.append)
+
+    counted = [event for event in events if event.total is not None]
+    assert counted and all(event.current is not None for event in counted)
+    assert any(
+        event.stage == "emulationstation" and event.status == "running"
+        and event.current is None and event.total is None
+        for event in events
+    )
+    assert events[-1].stage == "complete" and events[-1].status == "success"
+    assert events[-1].current is None and events[-1].total is None
+
+
+@pytest.mark.parametrize("selected", list(OperatingMode))
+def test_restart_recovery_reconciles_each_persisted_mode(
+    tmp_path: Path, selected: OperatingMode
 ) -> None:
     config = _config(tmp_path)
-    db = Database(str(Path(config.data_path) / "catalog.db"))
-    db.initialize()
-    _add_game(config, db, "Cached", cached=True)
-    restore_owned_proxies(config)
+    (_cached, cached_proxy, _), (_uncached, uncached_proxy, _) = _library(config)
+    write_operating_mode(config, selected)
 
-    set_offline_library_mode(config, True)
-    assert _stub_es_refresh == [("snes",)]
+    reconcile_game_access(config, refresh_es=False, render_library_metadata=False)
 
-    monkeypatch.setattr(
-        "romcloud.integrations.batocera.game_access.reconcile_library_presentation",
-        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("reconcile failed")),
-    )
-    with pytest.raises(ModeTransitionError, match="remains in Offline Mode"):
-        set_offline_library_mode(config, False)
-    assert _stub_es_refresh == [("snes",)]
+    link = Path(config.local_roms_path) / "snes" / LINK_NAME
+    if selected is OperatingMode.CONNECTED:
+        assert link.is_symlink() and not cached_proxy.exists() and not uncached_proxy.exists()
+    elif selected is OperatingMode.CACHE:
+        assert not link.exists() and cached_proxy.is_file() and uncached_proxy.is_file()
+    else:
+        assert not link.exists() and cached_proxy.is_file() and not uncached_proxy.exists()
 
 
-def test_returning_to_nas_refreshes_provider_before_restoring_full_library(
-    tmp_path: Path
-) -> None:
+def test_cli_exposes_three_modes(tmp_path: Path) -> None:
     config = _config(tmp_path)
-    db = Database(str(Path(config.data_path) / "catalog.db"))
-    db.initialize()
-    _cached, cached_proxy, _ = _add_game(config, db, "Cached", cached=True)
-    _uncached, uncached_proxy, _ = _add_game(config, db, "Uncached")
-    restore_owned_proxies(config)
-    set_offline_library_mode(config, True)
-    assert cached_proxy.exists() and not uncached_proxy.exists()
+    _library(config)
+    config_path = tmp_path / "config" / "romcloud.toml"
+    write_config(config, str(config_path))
+    runner = CliRunner()
 
-    set_offline_library_mode(config, False)
-
-    assert cached_proxy.exists() and uncached_proxy.exists()
-    assert operating_mode(config) is OperatingMode.NAS
-
-
-def test_failed_offline_to_nas_reconnect_keeps_cached_library_and_mode(
-    tmp_path: Path, _stub_es_refresh
-) -> None:
-    config = _config(tmp_path)
-    db = Database(str(Path(config.data_path) / "catalog.db"))
-    db.initialize()
-    _cached, cached_proxy, _ = _add_game(config, db, "Cached", cached=True)
-    _uncached, uncached_proxy, _ = _add_game(config, db, "Uncached")
-    restore_owned_proxies(config)
-    set_offline_library_mode(config, True)
-    Path(config.source.rom_root).rename(tmp_path / "disconnected-source")
-
-    with pytest.raises(ModeTransitionError, match="try NAS Mode again"):
-        set_offline_library_mode(config, False)
-
-    assert operating_mode(config) is OperatingMode.OFFLINE
-    assert cached_proxy.is_file()
-    assert not uncached_proxy.exists()
-    assert _stub_es_refresh == [("snes",)]
-
-
-def test_nas_connectivity_loss_does_not_change_authoritative_mode(tmp_path: Path) -> None:
-    config = _config(tmp_path)
-    assert operating_mode(config) is OperatingMode.NAS
-    Path(config.source.rom_root).rename(tmp_path / "disconnected-source")
-
-    assert operating_mode(config) is OperatingMode.NAS
-    assert json.loads(state_path(config).read_text()) == {
-        "version": 2,
-        "mode": "nas",
-    }
-
-
-def test_legacy_offline_state_migrates_to_explicit_operating_mode(tmp_path: Path) -> None:
-    config = _config(tmp_path)
-    path = state_path(config)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text('{"version": 1, "offline_library": true}\n', encoding="utf-8")
-
-    assert operating_mode(config) is OperatingMode.OFFLINE
-    assert json.loads(path.read_text()) == {"version": 2, "mode": "offline"}
-
-
-def test_offline_to_nas_uses_configured_mount_lifecycle(
-    tmp_path: Path, monkeypatch
-) -> None:
-    config = replace(
-        _config(tmp_path),
-        smb=SMBConfig("nas.local", "roms", "player"),
-    )
-    set_offline_library_mode(config, True)
-    calls: list[AppConfig] = []
-    monkeypatch.setattr(
-        "romcloud.services.connections.mount_connections",
-        lambda mounted_config, progress=None: calls.append(mounted_config) or {
-            "changed": True
-        },
-    )
-
-    set_offline_library_mode(config, False)
-
-    assert calls == [config]
-    assert operating_mode(config) is OperatingMode.NAS
-
-
-def test_offline_to_nas_validates_remote_data_without_optional_metadata_import(
-    tmp_path: Path
-) -> None:
-    remote_data = tmp_path / "remote-data"
-    remote_data.mkdir()
-    config = replace(
-        _config(tmp_path),
-        remote_data=RemoteDataConfig("local", str(remote_data)),
-        library_sync=LibrarySyncConfig(enabled=True),
-    )
-    db = Database(str(Path(config.data_path) / "catalog.db"))
-    db.initialize()
-    _add_game(config, db, "Cached", cached=True)
-    restore_owned_proxies(config)
-    set_offline_library_mode(config, True)
-
-    set_offline_library_mode(config, False)
-
-    assert operating_mode(config) is OperatingMode.NAS
-    assert not (remote_data / "library" / "library.json").exists()
-
-
-def test_missing_required_remote_data_aborts_nas_transition(tmp_path: Path) -> None:
-    config = replace(
-        _config(tmp_path),
-        remote_data=RemoteDataConfig("local", str(tmp_path / "missing-remote-data")),
-    )
-    db = Database(str(Path(config.data_path) / "catalog.db"))
-    db.initialize()
-    _cached, cached_proxy, _ = _add_game(config, db, "Cached", cached=True)
-    _uncached, uncached_proxy, _ = _add_game(config, db, "Uncached")
-    restore_owned_proxies(config)
-    set_offline_library_mode(config, True)
-
-    with pytest.raises(ModeTransitionError, match="remains in Offline Mode"):
-        set_offline_library_mode(config, False)
-
-    assert operating_mode(config) is OperatingMode.OFFLINE
-    assert cached_proxy.is_file()
-    assert not uncached_proxy.exists()
-
-
-def test_offline_save_change_reconciles_when_returning_to_nas(tmp_path: Path) -> None:
-    remote_data = tmp_path / "remote-data"
-    remote_data.mkdir()
-    local_saves = tmp_path / "saves"
-    local_saves.mkdir()
-    config = replace(
-        _config(tmp_path),
-        remote_data=RemoteDataConfig("local", str(remote_data)),
-        saves=SavesConfig(local_path=str(local_saves)),
-    )
-    db = Database(str(Path(config.data_path) / "catalog.db"))
-    db.initialize()
-    _add_game(config, db, "Game")
-    (Path(config.source.rom_root) / "snes/Game.sfc").write_bytes(b"rom")
-    save = local_saves / "snes/Game.srm"
-    save.parent.mkdir()
-    save.write_bytes(b"base")
-    Container(config).saves.commit_upload(Container(config).saves.preview_upload())
-    set_offline_library_mode(config, True)
-    save.write_bytes(b"offline-progress")
-
-    report = set_offline_library_mode(config, False)
-
-    assert operating_mode(config) is OperatingMode.NAS
-    assert report.save_reconcile is not None
-    assert report.save_reconcile["uploaded"] == 1
-    assert (remote_data / "saves/snes/Game.srm").read_bytes() == b"offline-progress"
-
-
-def test_offline_to_nas_preserves_two_sided_save_conflict(tmp_path: Path) -> None:
-    remote_data = tmp_path / "remote-data"
-    remote_data.mkdir()
-    local_saves = tmp_path / "saves"
-    local_saves.mkdir()
-    config = replace(
-        _config(tmp_path),
-        remote_data=RemoteDataConfig("local", str(remote_data)),
-        saves=SavesConfig(local_path=str(local_saves)),
-    )
-    db = Database(str(Path(config.data_path) / "catalog.db"))
-    db.initialize()
-    _add_game(config, db, "Game")
-    (Path(config.source.rom_root) / "snes/Game.sfc").write_bytes(b"rom")
-    local = local_saves / "snes/Game.srm"
-    local.parent.mkdir()
-    local.write_bytes(b"base")
-    saves = Container(config).saves
-    saves.commit_upload(saves.preview_upload())
-    set_offline_library_mode(config, True)
-    local.write_bytes(b"offline-version")
-    remote = remote_data / "saves/snes/Game.srm"
-    remote.write_bytes(b"nas-version")
-
-    report = set_offline_library_mode(config, False)
-
-    assert operating_mode(config) is OperatingMode.NAS
-    assert report.save_reconcile["conflicts"] == 1
-    assert local.read_bytes() == b"offline-version"
-    assert remote.read_bytes() == b"nas-version"
-
-
-def test_offline_to_nas_leaves_unmanaged_local_game_saves_untouched(
-    tmp_path: Path,
-) -> None:
-    remote_data = tmp_path / "remote-data"
-    remote_data.mkdir()
-    local_saves = tmp_path / "saves"
-    local_saves.mkdir()
-    config = replace(
-        _config(tmp_path),
-        remote_data=RemoteDataConfig("local", str(remote_data)),
-        saves=SavesConfig(local_path=str(local_saves)),
-    )
-    local = local_saves / "snes/Local Game.srm"
-    remote = remote_data / "saves/snes/Local Game.srm"
-    local.parent.mkdir()
-    remote.parent.mkdir(parents=True)
-    local.write_bytes(b"local-only-game")
-    remote.write_bytes(b"other-device-local-game")
-    set_offline_library_mode(config, True)
-
-    report = set_offline_library_mode(config, False)
-
-    assert report.save_reconcile["scope"] == "managed_games"
-    assert report.save_reconcile["uploaded"] == 0
-    assert report.save_reconcile["downloaded"] == 0
-    assert local.read_bytes() == b"local-only-game"
-    assert remote.read_bytes() == b"other-device-local-game"
-
-
-def test_local_rom_with_same_save_basename_prevents_automatic_attribution(
-    tmp_path: Path,
-) -> None:
-    remote_data = tmp_path / "remote-data"
-    remote_data.mkdir()
-    local_saves = tmp_path / "saves"
-    local_saves.mkdir()
-    config = replace(
-        _config(tmp_path),
-        remote_data=RemoteDataConfig("local", str(remote_data)),
-        saves=SavesConfig(local_path=str(local_saves)),
-    )
-    db = Database(str(Path(config.data_path) / "catalog.db"))
-    db.initialize()
-    _add_game(config, db, "Same Name")
-    # A user-owned ROM with the same emulator basename makes the save owner
-    # unknowable even though the catalog also contains a managed game.
-    (Path(config.local_roms_path) / "snes/Same Name.zip").write_bytes(b"local-rom")
-    save = local_saves / "snes/Same Name.srm"
-    save.parent.mkdir()
-    save.write_bytes(b"ambiguous")
-
-    plan = Container(config).saves.preview_reconciliation()
-
-    assert plan.entries == ()
-    assert plan.excluded_files == 1
+    for command, expected in (
+        ("offline", "Offline Mode"),
+        ("cache", "Cache Mode"),
+        ("connected", "Connected Mode"),
+    ):
+        result = runner.invoke(cli, ["--config", str(config_path), "library", command])
+        assert result.exit_code == 0, result.output
+        assert expected in result.output

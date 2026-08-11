@@ -20,7 +20,7 @@ def _fmt_bytes(n: int) -> str:
 @click.option(
     "--override",
     is_flag=True,
-    help="Allow this cache command while Direct/NAS mode is configured.",
+    help="Allow this cache command while Connected Mode is active.",
 )
 @click.pass_context
 def cache_group(ctx: click.Context, override: bool) -> None:
@@ -30,17 +30,18 @@ def cache_group(ctx: click.Context, override: bool) -> None:
 
 
 def _require_cache_mode(ctx: click.Context) -> None:
-    from romcloud.infrastructure.config import DIRECT_NAS_MODE
+    from romcloud.core.capabilities import OperatingMode
+    from romcloud.infrastructure.capabilities import capability_policy
 
     container = get_container(ctx)
     if (
-        container.config.game_access_mode == DIRECT_NAS_MODE
+        capability_policy(container.config).effective_mode is OperatingMode.CONNECTED
         and not ctx.obj.get("cache_override", False)
     ):
         raise click.ClickException(
-            "Cache commands are unavailable in Direct/NAS mode because games are "
-            "played from the remote source. Re-run this one command with "
-            "`romcloud cache --override ...` to proceed without changing the configured mode."
+            "Cache commands are unavailable in Connected Mode because games are "
+            "played from the configured source. Re-run this one command with "
+            "`romcloud cache --override ...` to proceed without changing modes."
         )
 
 

@@ -422,7 +422,7 @@ def _parse(data: dict, path: Path) -> AppConfig:  # noqa: C901
         Path(source.rom_root), Path(local_roms_path)
     ):
         raise ConfigurationError(
-            f"{path}: Direct/NAS source.rom_root must not overlap local_roms.path."
+            f"{path}: Connected Mode source.rom_root must not overlap local_roms.path."
         )
 
     validate_remote_data_boundary(
@@ -467,7 +467,7 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
         Path(config.source.rom_root), Path(config.local_roms_path)
     ):
         raise ConfigurationError(
-            f"{path}: Direct/NAS source.rom_root must not overlap local_roms.path."
+            f"{path}: Connected Mode source.rom_root must not overlap local_roms.path."
         )
     if config.library_sync.enabled and config.remote_data is None:
         raise ConfigurationError(
@@ -516,7 +516,7 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
         "\n",
         "[local_roms]\n",
         "# Directory where Batocera stores local ROM directories.\n",
-        "# Smart Cache creates proxies; Direct/NAS creates verified system symlinks.\n",
+        "# Cache Mode creates proxies; Connected Mode creates verified system symlinks.\n",
         "# ROMCloud never modifies existing user ROMs or owns system directories.\n",
         f'path = "{config.local_roms_path}"\n',
         "\n",

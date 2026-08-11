@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -143,7 +144,16 @@ class GameRepository:
             rows = conn.execute(
                 "SELECT * FROM games ORDER BY system, title"
             ).fetchall()
-            return [self._row_to_game(conn, r) for r in rows]
+            asset_rows = conn.execute(
+                "SELECT * FROM game_assets ORDER BY game_id, is_primary DESC, filename"
+            ).fetchall()
+            assets_by_game: dict[str, list] = defaultdict(list)
+            for asset in asset_rows:
+                assets_by_game[asset["game_id"]].append(asset)
+            return [
+                self._game_from_rows(row, assets_by_game[row["id"]])
+                for row in rows
+            ]
 
     def list_systems(self) -> list[str]:
         """Return the distinct systems that currently have at least one
@@ -165,6 +175,10 @@ class GameRepository:
             "SELECT * FROM game_assets WHERE game_id = ? ORDER BY is_primary DESC, filename",
             (row["id"],),
         ).fetchall()
+        return self._game_from_rows(row, asset_rows)
+
+    @staticmethod
+    def _game_from_rows(row, asset_rows) -> Game:  # type: ignore[no-untyped-def]
         assets = [
             GameAsset(
                 filename=a["filename"],

@@ -4,10 +4,9 @@
 the device.**
 
 ROMCloud makes ROMs stored on a NAS, another PC, or external storage appear in
-Batocera's normal EmulationStation library. **Smart Cache** downloads games on
-first launch and keeps frequently used games locally. **Direct/NAS** exposes
-the read-only remote system folders directly and requires the source to remain
-reachable while browsing and playing.
+Batocera's normal EmulationStation library. **Cache Mode** downloads games on
+first launch and keeps frequently used games locally. **Connected Mode** uses
+the configured primary source directly and requires it to remain available.
 
 ## Why use ROMCloud?
 
@@ -24,7 +23,7 @@ reachable while browsing and playing.
   downloads, verifies staged data, and commits a whole dataset transactionally.
 - **Optionally sync library metadata.** Library Sync imports scraped metadata
   and media into ROMCloud-owned canonical records, then renders the correct
-  local paths for Smart Cache or Direct/NAS without modifying source XML.
+  local paths for Cache or Connected Mode without modifying source XML.
 - **Use familiar storage.** The current beta supports SMB shares and local or
   externally mounted directories. A NAS or PC can expose an SMB share; USB and
   other mounted storage work through the local-filesystem path.
@@ -39,8 +38,8 @@ reachable while browsing and playing.
   purge workflows distinguish replaceable runtime files from user data.
 
 > [!IMPORTANT]
-> The ROM-source SMB mount remains read-only in both modes. Direct/NAS does not
-> provide downloads, pinning, eviction, cache cleanup, or offline games.
+> The ROM-source SMB mount remains read-only in every operating mode. Connected
+> Mode does not use cache-backed proxies for normal launches.
 > SaveSync and Library Sync, when enabled, use a separate explicitly writable
 > data location.
 
@@ -97,7 +96,7 @@ Batocera EmulationStation library
         Batocera emulatorlauncher
 ```
 
-In Direct/NAS mode ROMCloud creates only a verified, manifest-owned `ROMCloud`
+In Connected Mode ROMCloud creates only a verified, manifest-owned `ROMCloud`
 directory symlink inside each existing `/userdata/roms/<system>/` directory.
 Local ROMs remain alongside it. ROMCloud never owns the system directory and
 uninstall/reconfigure unlinks only symlinks whose recorded path and target still
@@ -105,8 +104,8 @@ match. An existing foreign file, directory, or symlink at that reserved path is
 reported as a conflict and left untouched.
 
 ROMCloud does not replace EmulationStation, Batocera's emulator configuration,
-or `emulatorlauncher`. Smart Cache's launch wrapper changes only the ROM path
-for a `.romcloud` game. Ordinary local and Direct/NAS ROM launches use
+or `emulatorlauncher`. Cache Mode's launch wrapper changes only the ROM path
+for a `.romcloud` game. Ordinary local and Connected Mode ROM launches use
 Batocera's normal path.
 
 ## Storage support
@@ -350,8 +349,8 @@ Canonical records live at:
 The device working copy is `data/library/library.json`. Record identity is a
 SHA-256 key derived from the Batocera system and normalized primary source-ROM
 path; mount paths, local `.romcloud` paths, and access mode are excluded.
-Smart Cache renders `./Game.romcloud` and local content-addressed media copies.
-Direct/NAS renders `./ROMCloud/Game.chd` and prefers source-hosted media such as
+Cache Mode renders `./Game.romcloud` and local content-addressed media copies.
+Connected Mode renders `./ROMCloud/Game.chd` and prefers source-hosted media such as
 `./ROMCloud/images/Game.png`. Switching modes regenerates presentation without
 changing canonical records.
 
@@ -391,58 +390,65 @@ remote store. `remove-local` removes only marked local entries and preserves
 canonical/source data and media. Catalog refresh does not start this optional
 import. Library Sync push, pull, and
 sync are blocked in Offline Mode; the canonical remote library is left
-untouched and locally scraped metadata remains available for a later NAS Mode
-sync. Local rendering never recreates absent NAS-only proxies.
+untouched and locally scraped metadata remains available for a later connected
+sync. Local rendering never recreates absent source-only proxies.
 
-## Local cache and offline use
+## Operating modes, local cache, and offline use
 
-This section applies to Smart Cache. Direct/NAS hides these controls in the
-graphical interface. Explicit CLI maintenance remains possible for diagnostics
-with `romcloud cache --override ...`; the override applies to that invocation
-only and does not change the configured mode.
+ROMCloud persists exactly one authoritative operating state in
+`/userdata/system/romcloud/data/library-view.json`: `connected`, `cache`, or
+`offline`. Source reachability is status, not mode. ROMCloud never silently
+changes the selected mode when a source is disconnected or restored. Legacy
+version-2 `nas` state migrates once to `connected`.
 
-### NAS and Offline modes
+- **Connected Mode:** use the configured primary source directly. The source
+  may be an SMB-mounted library, an external drive, or another supported local
+  provider. The persisted catalog remains the managed-library identity, while
+  verified `ROMCloud` directory links expose its known systems. The source is
+  required; cache files and pins are preserved but are not the normal launch
+  path.
+- **Cache Mode:** recreate the known `.romcloud` library from catalog and proxy
+  ownership records. Cached games launch locally. An uncached launch uses the
+  existing transfer, verification, LRU eviction, and pinning path; if the
+  source is unavailable only that cache miss fails. Entering this mode does not
+  scan the source.
+- **Offline Mode:** expose only managed games whose complete cached assets are
+  valid. Remote-only titles are hidden, cache misses are blocked, and ordinary
+  local Batocera games remain untouched.
 
-Smart Cache has one authoritative operating state, shown as two opposite
-choices on the graphical main menu. **Offline Mode** shows only ROMCloud games
-whose complete cached assets are currently valid and disables remote-dependent
-work. **NAS Mode** is the full-library state. The CLI is:
+The graphical main menu presents these as three mutually exclusive choices.
+The equivalent CLI is:
 
 ```bash
+romcloud library connected
+romcloud library cache
 romcloud library offline
 romcloud library status
-romcloud library nas
 ```
 
 Offline Mode allows cached launches, cache status/pin/unpin/removal/eviction,
 local settings and diagnostics, and connection recovery bookkeeping. It
 blocks cache misses/downloads, provider/catalog refresh, Library Sync remote
 operations, SaveSync upload/download, and update network operations before
-they contact remote storage. It never enters or leaves automatically when
-connectivity changes. If storage becomes unreachable while NAS Mode is active,
-ROMCloud remains in NAS Mode and reports a connectivity failure.
+they contact remote storage. Connected Mode source loss remains a connection
+failure; Cache Mode source loss keeps cache hits playable and fails uncached
+launches clearly; neither changes the authoritative mode.
 
-Selecting NAS Mode while Offline Mode is active is an explicit reconnect. The
-transition remounts configured storage, validates the read-only ROM source and
-any separate writable ROMCloud data location, refreshes the complete catalog,
-prepares the full proxy/gamelist presentation, and
-performs ownership-scoped, conflict-aware save/state reconciliation before refreshing
-EmulationStation and atomically committing NAS Mode. A failure at any point
-leaves Offline Mode authoritative and cached/local games visible; no partial
-full library or half-copied save tree is exposed. When no writable
-`remote_data` is configured, the transition skips save reconciliation and
-reports that centralized saves are unavailable without blocking NAS ROM access.
+Every transition is a fast representation change over the persisted database:
+it reconciles verified direct links or owned proxies, updates locally rendered
+metadata when enabled, refreshes the ROMCloud-owned EmulationStation override,
+asks Batocera to restart EmulationStation, and only then atomically commits the
+new mode. It does not run catalog discovery, Library Sync source import, or
+SaveSync reconciliation. A failed transition restores the previous
+presentation and leaves the previous state authoritative.
 
-The transition does not delete catalog rows, cached bytes, cache status, pin
-state, local saves, local ROMs, or unrelated `.romcloud` files. Offline Mode
-is unavailable in Direct/NAS mode because that access strategy fundamentally
-depends on the provider.
+Catalog refresh is deliberately separate. If source games changed while the
+device was disconnected, the known catalog may remain stale until the user
+runs **Refresh Catalog**. Mode switching never traverses the source tree just
+to change access representation.
 
-The active `nas` or `offline` state is stored atomically in
-`/userdata/system/romcloud/data/library-view.json` and remains authoritative
-across reboot, relaunch, refresh, repair, and update reconciliation. Switching
-successfully to Direct/NAS commits NAS Mode; switching back to Smart Cache
-therefore starts with the normal full-library presentation.
+Transitions do not delete catalog rows, cached bytes, cache status, LRU data,
+pin state, local saves, local ROMs, or unrelated `.romcloud` files.
 
 The default cache is:
 
@@ -495,23 +501,22 @@ games may have their own network requirements.
 
 ## SaveSync
 
-In NAS Mode, ROMCloud keeps the emulator-facing save tree local and reconciles
+ROMCloud keeps the emulator-facing save tree local and can reconcile
 eligible ROMCloud-managed game data with a canonical remote save/state dataset.
 The authoritative ownership identity is the catalog's stable `Game.id`; save
 names and emulator title IDs are used only when they can safely attribute an
 already policy-selected artifact to that catalog game. A persisted last-shared manifest
 allows ROMCloud to distinguish local-only and remote-only changes from files
-changed on both devices. One-sided changes synchronize automatically when
-entering NAS Mode; conflicting files remain untouched on both sides and are
-reported instead of being guessed or overwritten. A local game's save is not
+changed on both devices. SaveSync runs only through its explicit operations;
+operating-mode transitions do not start it. Conflicting files remain untouched
+on both sides and are reported instead of being guessed or overwritten. A local game's save is not
 automatically synchronized just because it shares a system save directory with
 a managed game.
 
 Offline Mode never polls or modifies remote saves. `/userdata/saves` remains a
-normal writable local working tree, and changes made offline are reconciled on
-the next successful manual transition to NAS Mode. If writable `remote_data`
-is not configured, NAS ROM access still works but shared save/state continuity
-is clearly reported as unavailable.
+normal writable local working tree. If writable `remote_data` is not
+configured, Connected or Cache Mode ROM access still works but shared
+save/state continuity is unavailable.
 
 The GUI also exposes deliberate **Upload All Saves** and **Download All Saves**
 operations. Unlike automatic reconciliation, these deliberately cover the
@@ -700,7 +705,7 @@ romcloud healthcheck               Source, cache, integration, and SaveSync chec
 romcloud refresh [--system NAME]   Refresh catalog and EmulationStation registration
 romcloud launch PROXY              Resolve/cache a proxy manually
 romcloud cache ...                 Status, add, remove, pin, and unpin
-romcloud library ...               Cached-only/full Smart Cache presentation
+romcloud library ...               Connected/Cache/Offline operating mode
 romcloud library-sync ...          Metadata/media status, pull, push, sync, removal
 romcloud saves ...                 SaveSync status, previews, upload/download, Xbox opt-in
 romcloud mount ...                 Install/start/stop/status/remove SMB mount service
@@ -724,7 +729,8 @@ provider = "local"
 rom_root = "/userdata/romcloud/source"
 
 [game_access]
-# Use "direct_nas" to play from the source without local game caching.
+# Legacy setup preference used to initialize a missing operating-mode state.
+# "direct_nas" initializes Connected Mode; "smart_cache" initializes Cache Mode.
 mode = "smart_cache"
 
 [cache]
@@ -784,8 +790,8 @@ Default paths:
 ├── config/romcloud.toml         Main configuration
 ├── config/credentials.toml      Passwords, mode 0600
 ├── data/catalog.db              Catalog/cache/proxy ownership database
-├── data/direct-links.json       Verified Direct/NAS symlink ownership manifest
-├── data/library-view.json       Active cached-only Smart Cache presentation
+├── data/direct-links.json       Verified Connected Mode symlink ownership manifest
+├── data/library-view.json       Authoritative connected/cache/offline state
 ├── data/library/library.json    Local canonical Library Sync working copy
 ├── data/library-sync-state.json Last Library Sync result
 ├── data/savesync-state.json     Last shared save manifest, conflicts, records, device ID
@@ -886,9 +892,9 @@ recording of the display.
 - A source game that disappears is not automatically removed from the catalog.
 - Offline launch applies only to complete cached games with intact local
   metadata and emulator dependencies.
-- SaveSync automatically reconciles safely attributable managed-game data on
-  Offline → NAS transitions and supports manual three-way reconciliation, but
-  it does not yet hook game launch/exit. Shared or opaque emulator layouts need
+- SaveSync supports deliberate three-way reconciliation, but operating-mode
+  transitions do not start it and it does not yet hook game launch/exit.
+  Shared or opaque emulator layouts need
   the local-game opt-in or an explicit whole-tree operation; true conflicts are
   reported and preserved rather than content-merged.
 - Library Sync is opt-in beta functionality. Its XML merge/render behavior and
@@ -898,8 +904,9 @@ recording of the display.
   opt-in. Some structured emulator save layouts remain unsupported until they
   are validated.
 - `.m3u` and CCD/IMG/SUB companion parsing are not implemented. BIN/CUE is.
-- EmulationStation is not automatically restarted after setup or catalog
-  refresh; update its game lists or restart it manually.
+- EmulationStation is automatically restarted after successful operating-mode
+  transitions. Setup and explicit catalog refresh still require updating game
+  lists or restarting EmulationStation manually.
 - GUI update relaunch behavior still requires confirmation across real
   Batocera/SDL environments.
 

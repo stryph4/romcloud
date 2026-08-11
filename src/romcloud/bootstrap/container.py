@@ -17,7 +17,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from romcloud.core.capabilities import CapabilityPolicy
+from romcloud.core.capabilities import CapabilityPolicy, OperatingMode
 from romcloud.core.exceptions import ConfigurationError
 from romcloud.core.models.cache import CachePolicy
 from romcloud.core.save_ownership import ManagedSaveOwnershipPolicy
@@ -185,7 +185,7 @@ class Container:
     @property
     def catalog(self) -> CatalogService:
         if self._catalog is None:
-            from romcloud.infrastructure.library_view import offline_library_enabled
+            from romcloud.infrastructure.library_view import operating_mode
 
             self._catalog = CatalogService(
                 provider=self.provider,
@@ -193,10 +193,7 @@ class Container:
                 proxy_repo=self.proxy_repo,
                 local_roms_root=self._config.local_roms_path,
                 source_root=self._config.source.rom_root,
-                write_proxies=(
-                    self._config.game_access_mode != "direct_nas"
-                    and not offline_library_enabled(self._config)
-                ),
+                write_proxies=operating_mode(self._config) is OperatingMode.CACHE,
                 capability_policy=self._policy(),
             )
         return self._catalog
@@ -305,7 +302,11 @@ class Container:
                 local_roms_root=self._config.local_roms_path,
                 data_root=self._config.data_path,
                 remote_root=str(remote_base / "library") if remote_base is not None else None,
-                game_access_mode=self._config.game_access_mode,
+                game_access_mode=(
+                    "direct_nas"
+                    if self._policy().effective_mode is OperatingMode.CONNECTED
+                    else "smart_cache"
+                ),
                 game_repo=self.game_repo,
                 proxy_repo=self.proxy_repo,
                 capability_policy=self._policy(),

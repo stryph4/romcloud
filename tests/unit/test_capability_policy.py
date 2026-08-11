@@ -55,14 +55,14 @@ def test_offline_policy_has_narrow_explicit_capabilities(offline_policy) -> None
     assert "Offline Mode" in serialized["blocked_reasons"]["save_sync"]
 
 
-def test_direct_mode_never_enters_offline_state() -> None:
+def test_configured_strategy_does_not_override_authoritative_offline_state() -> None:
     policy = CapabilityPolicy("direct_nas", PresentationIntent.OFFLINE)
-    assert not policy.offline_mode_supported
-    assert not policy.offline
-    assert not policy.allows(Capability.OFFLINE_MODE)
-    assert policy.serialize()["operating_mode"] == "nas"
-    assert policy.serialize()["presentation_intent"] == "nas"
-    assert policy.allows(Capability.CATALOG_REFRESH)
+    assert policy.offline_mode_supported
+    assert policy.offline
+    assert policy.allows(Capability.OFFLINE_MODE)
+    assert policy.serialize()["operating_mode"] == "offline"
+    assert policy.serialize()["presentation_intent"] == "offline"
+    assert not policy.allows(Capability.CATALOG_REFRESH)
 
 
 def test_catalog_guard_runs_before_provider_access(
@@ -160,7 +160,7 @@ def test_savesync_guard_precedes_connectivity_and_preserves_local_saves(
         local_root=str(local),
         remote_root=str(remote),
         state_path=tmp_path / "state.json",
-        capability_policy=CapabilityPolicy("smart_cache", PresentationIntent.ONLINE),
+        capability_policy=CapabilityPolicy("smart_cache", PresentationIntent.CACHE),
     )
     assert online.preview_upload().direction == "upload"
     assert save.read_bytes() == b"local-save"

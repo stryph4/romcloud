@@ -14,12 +14,9 @@ from romcloud.core.exceptions import CapabilityUnavailableError
 
 
 class OperatingMode(str, Enum):
-    NAS = "nas"
+    CONNECTED = "connected"
+    CACHE = "cache"
     OFFLINE = "offline"
-
-    # Compatibility for internal callers from before NAS Mode was named
-    # explicitly.  It is an enum alias for NAS, never a third state.
-    ONLINE = "nas"
 
 
 PresentationIntent = OperatingMode
@@ -62,19 +59,18 @@ class CapabilityDecision:
 @dataclass(frozen=True)
 class CapabilityPolicy:
     game_access_mode: str
-    operating_mode: OperatingMode = OperatingMode.NAS
+    operating_mode: OperatingMode = OperatingMode.CACHE
 
     @property
     def effective_mode(self) -> OperatingMode:
-        # Direct/NAS cannot provide an offline library. Configuration and
-        # startup reconciliation persist this normalized state as NAS too.
-        if not self.offline_mode_supported:
-            return OperatingMode.NAS
         return OperatingMode(self.operating_mode)
 
     @property
     def offline_mode_supported(self) -> bool:
-        return self.game_access_mode == "smart_cache"
+        # The configured access strategy is now only the migration/default
+        # preference. All configured sources participate in the same explicit
+        # Connected/Cache/Offline state model.
+        return True
 
     @property
     def offline(self) -> bool:
@@ -84,14 +80,10 @@ class CapabilityPolicy:
         )
 
     def decision(self, capability: Capability) -> CapabilityDecision:
-        if capability is Capability.OFFLINE_MODE and not self.offline_mode_supported:
-            return CapabilityDecision(
-                False, "Offline Mode is available only in Smart Cache mode."
-            )
         if self.offline and capability in _OFFLINE_BLOCKED:
             return CapabilityDecision(
                 False,
-                "Unavailable while Offline Mode is active. Switch to NAS Mode first.",
+                "Unavailable while Offline Mode is active. Switch to Cache or Connected Mode first.",
             )
         return CapabilityDecision(True)
 
@@ -109,7 +101,8 @@ class CapabilityPolicy:
             "game_access_mode": self.game_access_mode,
             "operating_mode": self.effective_mode.value,
             "presentation_intent": self.effective_mode.value,
-            "nas_mode": self.effective_mode is OperatingMode.NAS,
+            "connected_mode": self.effective_mode is OperatingMode.CONNECTED,
+            "cache_mode": self.effective_mode is OperatingMode.CACHE,
             "offline_mode": self.offline,
             "offline_mode_supported": self.offline_mode_supported,
             "capabilities": {

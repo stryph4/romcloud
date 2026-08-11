@@ -1,63 +1,61 @@
-"""Manual Smart Cache library-presentation commands."""
+"""Manual authoritative operating-mode commands."""
 
 from __future__ import annotations
 
 import click
 
 from romcloud.cli.context import get_container
-from romcloud.core.capabilities import Capability, OperatingMode
+from romcloud.core.capabilities import OperatingMode
 from romcloud.core.exceptions import ROMCloudError
-from romcloud.infrastructure.capabilities import capability_policy
 from romcloud.infrastructure.library_view import operating_mode
 from romcloud.integrations.batocera.game_access import set_operating_mode
 
 
 @click.group("library")
 def library_group() -> None:
-    """Select Smart Cache NAS or Offline operating mode."""
-
-
-def _require_smart_cache(ctx: click.Context):  # noqa: ANN202
-    container = get_container(ctx)
-    try:
-        capability_policy(container.config).require(
-            Capability.OFFLINE_MODE, "Change operating mode"
-        )
-    except ROMCloudError as exc:
-        raise click.ClickException(str(exc)) from exc
-    return container
+    """Select Connected, Cache, or Offline operating mode."""
 
 
 def _set(ctx: click.Context, mode: OperatingMode) -> None:
-    container = _require_smart_cache(ctx)
+    container = get_container(ctx)
     try:
         report = set_operating_mode(container.config, mode)
     except ROMCloudError as exc:
         raise click.ClickException(str(exc)) from exc
-    label = "Offline Mode" if mode is OperatingMode.OFFLINE else "NAS Mode"
+    label = f"{mode.value.title()} Mode"
     click.echo(
-        f"{label} is active: {report.visible} visible proxy file(s). "
-        "Update game lists or restart EmulationStation to see the change."
+        f"{label} is active: {report.visible} managed game(s) visible."
     )
 
 
 @library_group.command("status")
 @click.pass_context
 def library_status(ctx: click.Context) -> None:
-    """Show the current Smart Cache library presentation."""
+    """Show the authoritative operating mode."""
     container = get_container(ctx)
-    policy = capability_policy(container.config)
-    if not policy.offline_mode_supported:
-        click.echo("Offline Mode: unavailable (Direct/NAS mode)")
-        return
+    selected = operating_mode(container.config)
+    descriptions = {
+        OperatingMode.CONNECTED: "use the configured ROM source directly",
+        OperatingMode.CACHE: "show the managed library and cache games on demand",
+        OperatingMode.OFFLINE: "show only games playable locally",
+    }
     click.echo(
-        "Operating mode: "
-        + (
-            "Offline Mode (cached games only)"
-            if operating_mode(container.config) is OperatingMode.OFFLINE
-            else "NAS Mode (full library and remote features)"
-        )
+        f"Operating mode: {selected.value.title()} Mode ({descriptions[selected]})"
     )
+
+
+@library_group.command("connected")
+@click.pass_context
+def library_connected(ctx: click.Context) -> None:
+    """Use the configured ROM source directly."""
+    _set(ctx, OperatingMode.CONNECTED)
+
+
+@library_group.command("cache")
+@click.pass_context
+def library_cache(ctx: click.Context) -> None:
+    """Expose the managed catalog and cache games on demand."""
+    _set(ctx, OperatingMode.CACHE)
 
 
 @library_group.command("offline")
@@ -67,15 +65,8 @@ def library_offline(ctx: click.Context) -> None:
     _set(ctx, OperatingMode.OFFLINE)
 
 
-@library_group.command("nas")
-@click.pass_context
-def library_nas(ctx: click.Context) -> None:
-    """Reconnect and restore the full Smart Cache proxy library."""
-    _set(ctx, OperatingMode.NAS)
-
-
 @library_group.command("online", hidden=True)
 @click.pass_context
 def library_online_compat(ctx: click.Context) -> None:
-    """Compatibility alias for NAS Mode."""
-    _set(ctx, OperatingMode.NAS)
+    """Compatibility alias for Connected Mode."""
+    _set(ctx, OperatingMode.CONNECTED)

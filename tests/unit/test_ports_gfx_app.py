@@ -13,6 +13,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from ports_gfx.app import (
+    MENU_CATEGORIES,
     MENU_ITEMS,
     _ControllerTestScreenState,
     _apply_direction,
@@ -72,7 +73,7 @@ class TestMenuItems:
             display=SimpleNamespace(flip=lambda: None),
         )
         layout = compute_layout(800, 600, 1)
-        state = MenuState([MenuItem("NAS Mode", "nas", "Use network storage")])
+        state = MenuState([MenuItem("Connected Mode", "connected", "Use configured storage")])
 
         _render_menu(
             pygame,
@@ -121,16 +122,11 @@ class TestMenuItems:
         assert len(savesync_items) == 1
         assert savesync_items[0].label == "SaveSync"
 
-    def test_direct_mode_hides_cache_only_menu_items(self):
+    def test_all_three_modes_are_available_from_one_authoritative_state(self):
         direct = menu_categories_for_mode("direct_nas")
-        assert all(
-            item.action != "cache-status"
-            for items in direct.values()
-            for item in items
-        )
         assert any(
             item.action == "cache-status"
-            for items in menu_categories_for_mode("smart_cache").values()
+            for items in direct.values()
             for item in items
         )
         assert all(
@@ -139,16 +135,18 @@ class TestMenuItems:
             for item in items
         )
         direct_roots = root_menu_items_for_state(
-            {"game_access_mode": "direct_nas", "offline_mode_supported": False,
-             "operating_mode": "nas", "offline_mode": False, "capabilities": {}}
+            {"game_access_mode": "direct_nas", "operating_mode": "connected",
+             "offline_mode": False, "capabilities": {}}
         )
-        assert [item.label for item in direct_roots if "Mode" in item.label] == ["NAS Mode"]
-        assert next(item for item in direct_roots if item.label == "NAS Mode").active
+        assert [item.label for item in direct_roots if "Mode" in item.label] == [
+            "Connected Mode", "Cache Mode", "Offline Mode"
+        ]
+        assert next(item for item in direct_roots if item.label == "Connected Mode").active
 
-    def test_smart_cache_mode_control_is_prominent_and_not_in_library_submenu(self):
-        nas_state = {
-            "game_access_mode": "smart_cache", "operating_mode": "nas", "offline_mode": False,
-            "offline_mode_supported": True, "capabilities": {},
+    def test_mode_control_is_prominent_and_exit_is_top_level(self):
+        cache_state = {
+            "game_access_mode": "smart_cache", "operating_mode": "cache", "offline_mode": False,
+            "capabilities": {},
         }
         offline_state = {
             "game_access_mode": "smart_cache", "operating_mode": "offline", "offline_mode": True,
@@ -158,21 +156,26 @@ class TestMenuItems:
                              "remote_validation": False},
         }
 
-        nas_roots = root_menu_items_for_state(nas_state)
+        cache_roots = root_menu_items_for_state(cache_state)
         offline_roots = root_menu_items_for_state(offline_state)
-        assert [item.label for item in nas_roots[1:3]] == ["NAS Mode", "Offline Mode"]
-        assert nas_roots[1].active and not nas_roots[2].active
-        assert "valid cached games" in nas_roots[2].description
-        assert [item.label for item in offline_roots[1:3]] == ["NAS Mode", "Offline Mode"]
-        assert not offline_roots[1].active and offline_roots[2].active
-        assert "Reconnect" in offline_roots[1].description
+        assert [item.label for item in cache_roots[1:4]] == [
+            "Connected Mode", "Cache Mode", "Offline Mode"
+        ]
+        assert not cache_roots[1].active and cache_roots[2].active and not cache_roots[3].active
+        assert [item.label for item in offline_roots[1:4]] == [
+            "Connected Mode", "Cache Mode", "Offline Mode"
+        ]
+        assert not offline_roots[1].active and not offline_roots[2].active and offline_roots[3].active
         assert all(
             not item.action.startswith("library-")
             for item in menu_categories_for_state(offline_state, True)["Library"]
         )
         assert [item.label for item in offline_roots] == [
-            "Library", "NAS Mode", "Offline Mode", "Storage", "Settings"
+            "Library", "Connected Mode", "Cache Mode", "Offline Mode",
+            "Storage", "Settings", "Exit"
         ]
+        assert all(item.action != EXIT_ACTION for item in MENU_CATEGORIES["Settings"])
+        assert offline_roots[-1].action == EXIT_ACTION
         assert all(
             item.action != "setup"
             for item in menu_categories_for_state(offline_state)["Storage"]

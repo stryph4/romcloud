@@ -242,12 +242,15 @@ def _resolve_and_cache(proxy_path: str) -> str:
     from romcloud.services import cache as cache_module
 
     config = load_config()
-    if config.game_access_mode == "direct_nas":
+    from romcloud.core.capabilities import OperatingMode
+    from romcloud.infrastructure.library_view import operating_mode
+
+    if operating_mode(config) is OperatingMode.CONNECTED:
         from romcloud.core.exceptions import CacheError
 
         raise CacheError(
-            "ROMCloud proxy caching is unavailable in Direct/NAS mode; launch the "
-            "game through its Direct/NAS path."
+            "ROMCloud proxy caching is unavailable in Connected Mode; launch the "
+            "game through its direct source path."
         )
     configure_logging(
         level=config.logging.level,
@@ -293,7 +296,8 @@ def _resolve_and_cache(proxy_path: str) -> str:
     if not container.provider.is_reachable(game.source_root):
         from romcloud.core.exceptions import GameNotCachedError
         raise GameNotCachedError(
-            f"Game is not cached and source is unreachable: {game.source_root}"
+            "Game is not cached and the configured source is unavailable. "
+            f"Reconnect the source and try again: {game.source_root}"
         )
 
     path = _transfer_with_progress(container, config, game)

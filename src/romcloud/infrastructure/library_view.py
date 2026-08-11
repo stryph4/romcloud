@@ -10,7 +10,7 @@ from romcloud.infrastructure.config import AppConfig
 from romcloud.core.capabilities import OperatingMode
 
 STATE_FILENAME = "library-view.json"
-STATE_VERSION = 2
+STATE_VERSION = 3
 
 
 def state_path(config: AppConfig) -> Path:
@@ -20,10 +20,10 @@ def state_path(config: AppConfig) -> Path:
 def operating_mode(config: AppConfig) -> OperatingMode:
     """Return and, when necessary, initialize the one persisted mode.
 
-    Version 1 stored only the exceptional offline boolean.  Reading it once
-    migrates that intent to the explicit two-state schema.  Missing or
-    malformed legacy state becomes an explicit NAS state for compatibility
-    with installations that previously represented online by absence.
+    Version 1 stored only the exceptional offline boolean. Version 2 stored
+    ``nas`` versus ``offline`` while the configured access strategy still
+    selected direct links versus cache proxies. Reading either once
+    preserves that intent in the authoritative three-state schema.
     """
     path = state_path(config)
     payload = None
@@ -37,17 +37,24 @@ def operating_mode(config: AppConfig) -> OperatingMode:
             return OperatingMode(payload.get("mode"))
         except (TypeError, ValueError):
             pass
-    mode = (
-        OperatingMode.OFFLINE
-        if payload == {"version": 1, "offline_library": True}
-        else OperatingMode.NAS
-    )
+    if payload == {"version": 1, "offline_library": True} or (
+        isinstance(payload, dict)
+        and payload.get("version") == 2
+        and payload.get("mode") == "offline"
+    ):
+        mode = OperatingMode.OFFLINE
+    elif isinstance(payload, dict) and payload.get("mode") == "nas":
+        mode = OperatingMode.CONNECTED
+    elif getattr(config, "game_access_mode", "smart_cache") == "direct_nas":
+        mode = OperatingMode.CONNECTED
+    else:
+        mode = OperatingMode.CACHE
     write_operating_mode(config, mode)
     return mode
 
 
 def write_operating_mode(config: AppConfig, mode: OperatingMode | str) -> None:
-    """Atomically persist exactly one of the two valid operating modes."""
+    """Atomically persist exactly one authoritative operating mode."""
     selected = OperatingMode(mode)
     atomic_write_text(
         state_path(config),
@@ -62,7 +69,7 @@ def offline_library_enabled(config: AppConfig) -> bool:
 
 
 def write_offline_library_state(config: AppConfig, enabled: bool) -> None:
-    """Compatibility adapter; false is explicit NAS, never file absence."""
+    """Compatibility adapter; false restores Cache Mode."""
     write_operating_mode(
-        config, OperatingMode.OFFLINE if enabled else OperatingMode.NAS
+        config, OperatingMode.OFFLINE if enabled else OperatingMode.CACHE
     )

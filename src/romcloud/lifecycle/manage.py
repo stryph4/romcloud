@@ -18,6 +18,7 @@ from romcloud.infrastructure.credentials import (
     cifs_credentials_path,
     remote_data_cifs_credentials_path,
 )
+from romcloud.core.progress import ProgressSink, emit_progress
 from romcloud.integrations.batocera import es_config, mount_service, ports_gamelist_config
 from romcloud.lifecycle import install
 
@@ -68,12 +69,16 @@ def _manifest_records(config: AppConfig) -> list[tuple[str, Path]]:
     return [(str(game_id), Path(str(proxy_path))) for game_id, proxy_path in rows]
 
 
-def remove_owned_proxies(config: AppConfig) -> int:
+def remove_owned_proxies(
+    config: AppConfig, *, keep_game_ids: Optional[set[str]] = None
+) -> int:
     """Remove only manifest-owned or strictly signed ROMCloud proxy files."""
     local_root = Path(config.local_roms_path)
     removed: set[Path] = set()
 
     for game_id, path in _manifest_records(config):
+        if keep_game_ids is not None and game_id in keep_game_ids:
+            continue
         payload = _proxy_payload(path)
         if (
             payload is not None
@@ -86,7 +91,14 @@ def remove_owned_proxies(config: AppConfig) -> int:
     if local_root.is_dir():
         for path in local_root.rglob("*.romcloud"):
             payload = _proxy_payload(path)
-            if payload is not None and _is_within(path, local_root):
+            if (
+                payload is not None
+                and (
+                    keep_game_ids is None
+                    or payload["game_id"] not in keep_game_ids
+                )
+                and _is_within(path, local_root)
+            ):
                 path.unlink(missing_ok=True)
                 removed.add(path)
 
@@ -94,7 +106,10 @@ def remove_owned_proxies(config: AppConfig) -> int:
 
 
 def restore_owned_proxies(
-    config: AppConfig, *, game_ids: Optional[set[str]] = None
+    config: AppConfig,
+    *,
+    game_ids: Optional[set[str]] = None,
+    progress: ProgressSink = None,
 ) -> int:
     """Recreate selected missing proxies from retained catalog games.
 
@@ -103,34 +118,70 @@ def restore_owned_proxies(
     """
     container = Container(config)
     restored = 0
-    for record in container.proxy_repo.list_all():
-        if game_ids is not None and record.game_id not in game_ids:
-            continue
+    records = [
+        record
+        for record in container.proxy_repo.list_all()
+        if game_ids is None or record.game_id in game_ids
+    ]
+    games = {game.id: game for game in container.game_repo.list_all()}
+    total = len(records)
+    emit_progress(
+        progress,
+        "operating_mode",
+        "managed_entries",
+        "running",
+        "Restoring ROMCloud entries",
+        current=0,
+        total=total,
+    )
+    interval = max(1, total // 100) if total else 1
+    for index, record in enumerate(records, start=1):
         path = Path(record.proxy_path)
-        if path.exists() or not _is_within(path, Path(config.local_roms_path)):
-            continue
-        game = container.game_repo.get(record.game_id)
-        if game is None:
-            continue
-        payload = {
-            "romcloud_version": "1",
-            "game_id": game.id,
-            "title": game.title,
-            "system": game.system,
-            "source_provider": game.source_provider,
-            "source_root": game.source_root,
-            "assets": [
-                {
-                    "filename": asset.filename,
-                    "relative_path": asset.relative_path,
-                    "is_primary": asset.is_primary,
+        if not path.exists() and _is_within(path, Path(config.local_roms_path)):
+            game = games.get(record.game_id)
+            if game is not None:
+                payload = {
+                    "romcloud_version": "1",
+                    "game_id": game.id,
+                    "title": game.title,
+                    "system": game.system,
+                    "source_provider": game.source_provider,
+                    "source_root": game.source_root,
+                    "assets": [
+                        {
+                            "filename": asset.filename,
+                            "relative_path": asset.relative_path,
+                            "is_primary": asset.is_primary,
+                        }
+                        for asset in game.assets
+                    ],
                 }
-                for asset in game.assets
-            ],
-        }
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-        restored += 1
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+                )
+                restored += 1
+        if index == total or index % interval == 0:
+            emit_progress(
+                progress,
+                "operating_mode",
+                "managed_entries",
+                "running",
+                f"Restoring ROMCloud entries: {index:,} / {total:,} games",
+                current=index,
+                total=total,
+                metadata={"restored": restored},
+            )
+    emit_progress(
+        progress,
+        "operating_mode",
+        "managed_entries",
+        "success",
+        "ROMCloud entries restored",
+        current=total,
+        total=total,
+        metadata={"restored": restored},
+    )
     return restored
 
 
