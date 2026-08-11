@@ -564,6 +564,7 @@ Default paths:
 ├── logs/romcloud.log            Rotating application log
 ├── logs/mount-worker.log        Detached SMB worker output
 ├── logs/gui-relaunch.log        Automatic GUI relaunch failures
+├── logs/gui-display.log         Ports-to-Pygame display handoff timings
 ├── run/mount-worker.status.json Last mount-worker status
 ├── ports-gfx/                   Installed graphical payload
 └── venv/                        Isolated backend Python environment
@@ -625,6 +626,24 @@ does not treat temporary source absence as permission to delete catalog data.
 Review `logs/gui-relaunch.log`, then reopen **Ports → ROMCloud** manually. The
 update may still have completed successfully even though starting the
 replacement GUI failed.
+
+### The display flickers before ROMCloud appears
+
+Review `logs/gui-display.log`. It records monotonic timestamps for the Ports
+entry, launcher wrapper, Python/Pygame initialization, display probing and
+creation, selected display path, SDL driver, and relevant X11/Wayland
+environment. Compare a fresh **Ports → ROMCloud** launch with an update-driven
+restart, then preserve these Batocera logs from the same run:
+
+```text
+/userdata/system/logs/es_launch_stdout.log
+/userdata/system/logs/es_launch_stderr.log
+/userdata/system/logs/display.log
+```
+
+The GUI trace includes both UTC and monotonic time once Python starts, allowing
+the shell events and Batocera log entries to be aligned with a slow-motion
+recording of the display.
 
 ## Known limitations
 

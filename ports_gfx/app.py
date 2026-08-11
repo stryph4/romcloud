@@ -29,6 +29,7 @@ their curses render loops untested — they need a real display/terminal).
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -37,6 +38,7 @@ from ports_gfx.actions import ACTION_DIRECTIONS, Action
 from ports_gfx.activity import ActivityLog
 from ports_gfx.catalog_progress import CatalogRefreshProgress
 from ports_gfx.client import BackendResult, call_backend, operation_result
+from ports_gfx.display_diagnostics import DisplayDiagnostics
 from ports_gfx.input_debug import InputDebugLogger
 from ports_gfx.input_manager import InputEvent, InputManager
 from ports_gfx.layout import (
@@ -334,66 +336,210 @@ def run_app(
     is caught here and reported to stderr with a non-zero exit code —
     Batocera's Ports launcher must always get control back cleanly.
     """
+    diagnostics = DisplayDiagnostics(romcloud_bin)
+    diagnostics.record("python_run_app_start", environment=diagnostics.environment())
+    diagnostics.record("pygame_import_before")
     try:
         import pygame
     except ImportError as exc:
+        diagnostics.record("pygame_import_failed", error=str(exc))
         print(
             f"error: pygame is not available under this Python interpreter: {exc}",
             file=sys.stderr,
         )
         return 1
+    try:
+        sdl_version = pygame.get_sdl_version()
+    except Exception:  # noqa: BLE001 - version reporting is diagnostic only
+        sdl_version = "unknown"
+    diagnostics.record(
+        "pygame_import_after",
+        pygame_version=getattr(getattr(pygame, "version", None), "ver", "unknown"),
+        sdl_version=sdl_version,
+    )
 
     try:
         relaunch = GuiRelaunchCoordinator(romcloud_bin)
-        exit_code = _run(pygame, romcloud_bin, relaunch)
+        exit_code = _run(pygame, romcloud_bin, relaunch, diagnostics)
+        diagnostics.record(
+            "pygame_run_returned",
+            exit_code=exit_code,
+            relaunch_pending=relaunch.relaunch_pending,
+        )
         if not relaunch.relaunch_pending:
             return exit_code
         kwargs = {"failure_log_path": relaunch_failure_log}
         if relaunch_popen is not None:
             kwargs["popen"] = relaunch_popen
+        diagnostics.record("replacement_launch_before", launcher=str(relaunch.launcher))
         result = relaunch.launch_once(**kwargs)
+        diagnostics.record(
+            "replacement_launch_after",
+            attempted=result.attempted,
+            launched=result.launched,
+            error=result.error,
+        )
         if result.launched:
             return 0
         print(relaunch_failure_message(result), file=sys.stderr)
         return 1
     except Exception as exc:  # noqa: BLE001 — must never crash Batocera's Ports flow
+        diagnostics.record("python_run_app_failed", error=str(exc))
         print(f"error: ports UI crashed: {exc}", file=sys.stderr)
         return 1
 
 
-def _detect_screen_size(pygame) -> tuple[int, int]:  # noqa: ANN001
+def _detect_screen_size(  # noqa: ANN001
+    pygame,
+    diagnostics: DisplayDiagnostics | None = None,
+) -> tuple[int, int]:
     """Current display resolution, defensively clamped.
 
     Some drivers (e.g. a headless/dummy SDL video driver) can report a
     zero or nonsensical size; fall back to a safe default rather than
     ever computing a layout against a degenerate (0, 0) screen.
     """
+    if diagnostics is not None:
+        diagnostics.record("display_info_before")
     try:
         info = pygame.display.Info()
         w, h = info.current_w, info.current_h
-    except Exception:  # noqa: BLE001
+        if diagnostics is not None:
+            diagnostics.record("display_info_after", width=w, height=h)
+    except Exception as exc:  # noqa: BLE001
         w, h = _FALLBACK_SIZE
+        if diagnostics is not None:
+            diagnostics.record(
+                "display_info_failed",
+                error=str(exc),
+                fallback_width=w,
+                fallback_height=h,
+            )
 
     if w < _MIN_SANE_DIMENSION or h < _MIN_SANE_DIMENSION:
+        if diagnostics is not None:
+            diagnostics.record(
+                "display_info_rejected",
+                width=w,
+                height=h,
+                fallback_width=_FALLBACK_SIZE[0],
+                fallback_height=_FALLBACK_SIZE[1],
+            )
         return _FALLBACK_SIZE
     return w, h
 
 
-def _open_display(pygame, screen_w: int, screen_h: int):  # noqa: ANN001
-    """Open a full-screen window at *(screen_w, screen_h)*, falling back
-    to a windowed surface of the same size if full-screen mode itself
-    fails to initialize (e.g. an unusual/unsupported SDL video driver)."""
+def _open_display(  # noqa: ANN001
+    pygame,
+    screen_w: int,
+    screen_h: int,
+    diagnostics: DisplayDiagnostics | None = None,
+):
+    """Open a desktop-sized borderless window without changing video mode.
+
+    Exclusive fullscreen remains the first fallback for drivers that cannot
+    create a borderless window, followed by the historical windowed fallback.
+    """
+    requested = (screen_w, screen_h)
+    os.environ.setdefault("SDL_VIDEO_WINDOW_POS", "0,0")
+    driver = "unknown"
     try:
-        return pygame.display.set_mode((screen_w, screen_h), pygame.FULLSCREEN)
+        driver = pygame.display.get_driver()
+    except Exception:  # noqa: BLE001 - diagnostic only
+        pass
+
+    if diagnostics is not None:
+        diagnostics.record(
+            "display_open_before",
+            requested_size=list(requested),
+            preferred_path="borderless-desktop",
+            video_driver=driver,
+            environment=diagnostics.environment(),
+        )
+    try:
+        screen = pygame.display.set_mode(requested, pygame.NOFRAME)
     except Exception as exc:  # noqa: BLE001
         try:
             _LOGGER.warning(
-                "Fullscreen display initialization failed; falling back to windowed mode: %s",
+                "Borderless display initialization failed; falling back to exclusive fullscreen: %s",
                 exc,
             )
         except Exception:  # noqa: BLE001 - diagnostics must not break fallback
             pass
-        return pygame.display.set_mode((screen_w, screen_h))
+        if diagnostics is not None:
+            diagnostics.record("display_borderless_failed", error=str(exc))
+    else:
+        _record_display_opened(
+            pygame,
+            screen,
+            "borderless-desktop",
+            pygame.NOFRAME,
+            diagnostics,
+        )
+        return screen
+
+    try:
+        screen = pygame.display.set_mode(requested, pygame.FULLSCREEN)
+    except Exception as exc:  # noqa: BLE001
+        try:
+            _LOGGER.warning(
+                "Exclusive fullscreen initialization failed; falling back to windowed mode: %s",
+                exc,
+            )
+        except Exception:  # noqa: BLE001 - diagnostics must not break fallback
+            pass
+        if diagnostics is not None:
+            diagnostics.record("display_exclusive_failed", error=str(exc))
+        screen = pygame.display.set_mode(requested)
+        selected_path = "windowed-fallback"
+        selected_flags = 0
+    else:
+        selected_path = "exclusive-fullscreen-fallback"
+        selected_flags = pygame.FULLSCREEN
+
+    _record_display_opened(
+        pygame,
+        screen,
+        selected_path,
+        selected_flags,
+        diagnostics,
+    )
+    return screen
+
+
+def _record_display_opened(  # noqa: ANN001
+    pygame,
+    screen,
+    selected_path: str,
+    selected_flags: int,
+    diagnostics: DisplayDiagnostics | None,
+) -> None:
+    """Record the selected path and SDL's post-creation display dimensions."""
+    surface_size = list(screen.get_size())
+    try:
+        _LOGGER.info(
+            "Display path selected: %s (%sx%s)",
+            selected_path,
+            surface_size[0],
+            surface_size[1],
+        )
+    except Exception:  # noqa: BLE001 - diagnostics must not break startup
+        pass
+
+    if diagnostics is None:
+        return
+
+    fields: dict[str, object] = {
+        "selected_path": selected_path,
+        "selected_flags": selected_flags,
+        "surface_size": surface_size,
+    }
+    try:
+        info = pygame.display.Info()
+        fields["display_info_size"] = [info.current_w, info.current_h]
+    except Exception as exc:  # noqa: BLE001 - diagnostic only
+        fields["display_info_error"] = str(exc)
+    diagnostics.record("display_open_after", **fields)
 
 
 def _load_startup_backend_state(  # noqa: ANN001
@@ -449,8 +595,18 @@ def _run(  # noqa: ANN001
     pygame,
     romcloud_bin: str,
     relaunch: GuiRelaunchCoordinator,
+    diagnostics: DisplayDiagnostics,
 ) -> int:
+    diagnostics.record("pygame_init_before")
     pygame.init()
+    try:
+        video_initialized: bool | str = bool(pygame.display.get_init())
+    except Exception:  # noqa: BLE001 - state reporting is diagnostic only
+        video_initialized = "unknown"
+    diagnostics.record(
+        "pygame_init_after",
+        video_initialized=video_initialized,
+    )
     # Best-effort: joystick/controller subsystem init failures (e.g. no
     # input backend on a minimal SDL build) must never prevent the rest of
     # the UI from working — keyboard/touch remain fully usable regardless.
@@ -468,8 +624,10 @@ def _run(  # noqa: ANN001
     input_debug: InputDebugLogger | None = None
 
     try:
-        screen_w, screen_h = _detect_screen_size(pygame)
-        screen = _open_display(pygame, screen_w, screen_h)
+        screen_w, screen_h = _detect_screen_size(pygame, diagnostics)
+        screen = _open_display(pygame, screen_w, screen_h, diagnostics)
+        screen_w, screen_h = screen.get_size()
+        diagnostics.record("layout_dimensions_selected", width=screen_w, height=screen_h)
         pygame.display.set_caption("ROMCloud")
         splash = SplashRenderer(pygame, screen)
 
@@ -783,7 +941,9 @@ def _run(  # noqa: ANN001
                 input_debug.close()
             except Exception:  # noqa: BLE001
                 pass
+        diagnostics.record("pygame_quit_before")
         pygame.quit()
+        diagnostics.record("pygame_quit_after")
 
 
 def _apply_direction(

@@ -145,7 +145,84 @@ class TestStartupSplash:
         assert order.index(source_frame) < order.index(("backend", "connection-status"))
 
 
-def test_fullscreen_failure_is_logged_before_windowed_fallback(caplog):
+class _DisplaySurface:
+    def __init__(self, size=(1280, 720)) -> None:
+        self._size = size
+
+    def get_size(self):
+        return self._size
+
+
+class _DisplayDiagnostics:
+    def __init__(self) -> None:
+        self.events = []
+
+    def environment(self):
+        return {"SDL_VIDEODRIVER": "x11", "DISPLAY": ":0"}
+
+    def record(self, event, **fields):
+        self.events.append((event, fields))
+
+
+def test_borderless_desktop_is_selected_without_exclusive_fullscreen():
+    class Display:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def set_mode(self, size, flags=None):
+            self.calls.append((size, flags))
+            return _DisplaySurface(size)
+
+        def Info(self):  # noqa: N802 - pygame API spelling
+            return type("Info", (), {"current_w": 1280, "current_h": 720})()
+
+    pygame = type(
+        "Pygame",
+        (),
+        {"NOFRAME": 2, "FULLSCREEN": 1, "display": Display()},
+    )()
+
+    diagnostics = _DisplayDiagnostics()
+    surface = _open_display(pygame, 1280, 720, diagnostics)
+
+    assert surface.get_size() == (1280, 720)
+    assert pygame.display.calls == [((1280, 720), pygame.NOFRAME)]
+    assert diagnostics.events[-1] == (
+        "display_open_after",
+        {
+            "selected_path": "borderless-desktop",
+            "selected_flags": pygame.NOFRAME,
+            "surface_size": [1280, 720],
+            "display_info_size": [1280, 720],
+        },
+    )
+
+
+def test_borderless_failure_falls_back_to_exclusive_fullscreen(caplog):
+    class Display:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def set_mode(self, size, flags=None):
+            self.calls.append((size, flags))
+            if flags == 2:
+                raise RuntimeError("borderless unavailable")
+            return _DisplaySurface(size)
+
+    pygame = type(
+        "Pygame",
+        (),
+        {"NOFRAME": 2, "FULLSCREEN": 1, "display": Display()},
+    )()
+
+    surface = _open_display(pygame, 1280, 720)
+
+    assert surface.get_size() == (1280, 720)
+    assert pygame.display.calls == [((1280, 720), 2), ((1280, 720), 1)]
+    assert "borderless unavailable" in caplog.text
+
+
+def test_exclusive_failure_is_logged_before_windowed_fallback(caplog):
     class Display:
         def __init__(self) -> None:
             self.calls = []
@@ -153,14 +230,24 @@ def test_fullscreen_failure_is_logged_before_windowed_fallback(caplog):
         def set_mode(self, size, flags=None):
             self.calls.append((size, flags))
             if flags is not None:
-                raise RuntimeError("fullscreen unavailable")
-            return "windowed"
+                raise RuntimeError(f"flags {flags} unavailable")
+            return _DisplaySurface(size)
 
-    pygame = type("Pygame", (), {"FULLSCREEN": 1, "display": Display()})()
+    pygame = type(
+        "Pygame",
+        (),
+        {"NOFRAME": 2, "FULLSCREEN": 1, "display": Display()},
+    )()
 
-    assert _open_display(pygame, 1280, 720) == "windowed"
-    assert pygame.display.calls == [((1280, 720), 1), ((1280, 720), None)]
-    assert "fullscreen unavailable" in caplog.text
+    surface = _open_display(pygame, 1280, 720)
+
+    assert surface.get_size() == (1280, 720)
+    assert pygame.display.calls == [
+        ((1280, 720), 2),
+        ((1280, 720), 1),
+        ((1280, 720), None),
+    ]
+    assert "flags 1 unavailable" in caplog.text
 
 
 class TestWizardValidationPresentation:
@@ -710,7 +797,7 @@ class TestRunAppRelaunchBoundary:
         order: list[str] = []
         monkeypatch.setitem(sys.modules, "pygame", object())
 
-        def fake_run(_pygame, _romcloud_bin, coordinator):
+        def fake_run(_pygame, _romcloud_bin, coordinator, _diagnostics):
             coordinator.mark_update_succeeded(progress_complete=True)
             order.append("gui-cleanup-complete")
             return 0
@@ -741,7 +828,7 @@ class TestRunAppRelaunchBoundary:
 
         monkeypatch.setitem(sys.modules, "pygame", object())
 
-        def fake_run(_pygame, _romcloud_bin, coordinator):
+        def fake_run(_pygame, _romcloud_bin, coordinator, _diagnostics):
             coordinator.mark_update_succeeded(progress_complete=True)
             return 0
 
@@ -769,7 +856,7 @@ class TestRunAppRelaunchBoundary:
         monkeypatch.setitem(sys.modules, "pygame", object())
         calls: list[list[str]] = []
 
-        def fake_run(_pygame, _romcloud_bin, coordinator):
+        def fake_run(_pygame, _romcloud_bin, coordinator, _diagnostics):
             coordinator.mark_update_failed()
             return 0
 

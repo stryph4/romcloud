@@ -117,13 +117,19 @@ class TestInstallPortsUi:
         assert (ports_gfx_dir / "ports_gfx" / "client.py").exists()
         assert (ports_gfx_dir / "ports_gfx" / "wizard.py").exists()
         assert result.wrapper_path == bin_dir / "romcloud-ports"
-        assert f'exec "{fake_python}" -m ports_gfx "$@"' in result.wrapper_path.read_text()
+        wrapper_content = result.wrapper_path.read_text()
+        assert f'exec "{fake_python}" -m ports_gfx "$@"' in wrapper_content
+        assert 'event="wrapper_start"' in wrapper_content
+        assert "ROMCLOUD_DISPLAY_LOG" in wrapper_content
+        assert f'mkdir -p "{bin_dir.parent / "logs"}"' in wrapper_content
         assert result.launch_progress_wrapper_path == bin_dir / "romcloud-launch-progress"
         launch_progress_content = result.launch_progress_wrapper_path.read_text()
         assert f'exec "{fake_python}" -m ports_gfx.launch_progress "$@"' in launch_progress_content
         assert "ROMCLOUD_BIN" not in launch_progress_content
         assert result.port_entry_path == ports_dir / "ROMCloud.sh"
-        assert f'exec "{result.wrapper_path}" "$@"' in result.port_entry_path.read_text()
+        port_entry_content = result.port_entry_path.read_text()
+        assert f'exec "{result.wrapper_path}" "$@"' in port_entry_content
+        assert 'event="port_entry_start"' in port_entry_content
 
     def test_no_system_python_found(self, tmp_path: Path, monkeypatch) -> None:
         project_root = tmp_path / "project"

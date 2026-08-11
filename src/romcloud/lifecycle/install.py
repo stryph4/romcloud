@@ -130,6 +130,18 @@ def _system_python_has_pygame(system_python: str) -> bool:
     return result.returncode == 0
 
 
+def _display_trace_shell(log_path: Path, event: str) -> str:
+    """Tiny best-effort shell trace correlated with Python monotonic logs."""
+    return (
+        f'export ROMCLOUD_DISPLAY_LOG="{log_path}"\n'
+        f'mkdir -p "{log_path.parent}" 2>/dev/null || true\n'
+        'IFS=" " read -r ROMCLOUD_MONOTONIC _ < /proc/uptime\n'
+        f'printf \'monotonic=%s pid=%s parent_pid=%s event="{event}"\\n\' '
+        '"$ROMCLOUD_MONOTONIC" "$$" "$PPID" '
+        '>> "$ROMCLOUD_DISPLAY_LOG" 2>/dev/null || true\n'
+    )
+
+
 @dataclass(frozen=True)
 class PortsUiResult:
     installed: bool
@@ -178,8 +190,10 @@ def install_ports_ui(
             shutil.rmtree(target)
         shutil.copytree(source, target)
 
+        display_log = romcloud_bin.parent.parent / "logs" / "gui-display.log"
         wrapper_content = (
             "#!/bin/bash\n"
+            f'{_display_trace_shell(display_log, "wrapper_start")}'
             f'export ROMCLOUD_BIN="{romcloud_bin}"\n'
             f'export PYTHONPATH="{ports_gfx_dir}${{PYTHONPATH:+:$PYTHONPATH}}"\n'
             f'exec "{resolved_python}" -m ports_gfx "$@"\n'
@@ -202,7 +216,11 @@ def install_ports_ui(
         port_entry_path = None
         port_entry_skip_reason = None
         if ports_dir.is_dir():
-            port_entry_content = f'#!/bin/bash\nexec "{wrapper_path}" "$@"\n'
+            port_entry_content = (
+                "#!/bin/bash\n"
+                f'{_display_trace_shell(display_log, "port_entry_start")}'
+                f'exec "{wrapper_path}" "$@"\n'
+            )
             port_entry_path = _write_executable(ports_dir / "ROMCloud.sh", port_entry_content)
         else:
             port_entry_skip_reason = "ports_dir_missing"
