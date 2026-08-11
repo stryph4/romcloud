@@ -307,6 +307,31 @@ graphical interface. Explicit CLI maintenance remains possible for diagnostics
 with `romcloud cache --override ...`; the override applies to that invocation
 only and does not change the configured mode.
 
+### Offline Library Mode
+
+Smart Cache can manually change EmulationStation's presentation to show only
+ROMCloud games whose complete cached assets are currently valid. Use **Show
+Cached Games Only** in the graphical Library menu, or:
+
+```bash
+romcloud library offline
+romcloud library status
+romcloud library online
+```
+
+This is a reversible proxy-view mode, not connectivity detection or cache
+maintenance. It does not delete catalog rows, cached bytes, cache status, pin
+state, local ROMs, or unrelated `.romcloud` files. It does not change eviction
+or SaveSync behavior and never enters or leaves automatically when a NAS goes
+offline. **Restore Full Library** (or `romcloud library online`) recreates the
+normal full Smart Cache proxy set from retained catalog ownership records.
+
+The active state is stored atomically in
+`/userdata/system/romcloud/data/library-view.json` and remains active across
+reboot, relaunch, refresh, repair, and update reconciliation. Switching
+successfully to Direct/NAS clears it; switching back to Smart Cache therefore
+starts with the normal full-library presentation.
+
 The default cache is:
 
 ```text
@@ -498,6 +523,7 @@ romcloud healthcheck               Source, cache, integration, and SaveSync chec
 romcloud refresh [--system NAME]   Refresh catalog and EmulationStation registration
 romcloud launch PROXY              Resolve/cache a proxy manually
 romcloud cache ...                 Status, add, remove, pin, and unpin
+romcloud library ...               Cached-only/full Smart Cache presentation
 romcloud saves ...                 SaveSync status, previews, upload/download, Xbox opt-in
 romcloud mount ...                 Install/start/stop/status/remove SMB mount service
 romcloud es ...                    Install/refresh/status/remove ES integration
@@ -576,6 +602,7 @@ Default paths:
 ├── config/credentials.toml      Passwords, mode 0600
 ├── data/catalog.db              Catalog/cache/proxy ownership database
 ├── data/direct-links.json       Verified Direct/NAS symlink ownership manifest
+├── data/library-view.json       Active cached-only Smart Cache presentation
 ├── data/savesync-state.json     Last successful SaveSync records and device ID
 ├── logs/romcloud.log            Rotating application log
 ├── logs/mount-worker.log        Detached SMB worker output

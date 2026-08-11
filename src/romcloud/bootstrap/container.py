@@ -131,13 +131,18 @@ class Container:
     @property
     def catalog(self) -> CatalogService:
         if self._catalog is None:
+            from romcloud.infrastructure.library_view import offline_library_enabled
+
             self._catalog = CatalogService(
                 provider=self.provider,
                 game_repo=self.game_repo,
                 proxy_repo=self.proxy_repo,
                 local_roms_root=self._config.local_roms_path,
                 source_root=self._config.source.rom_root,
-                write_proxies=self._config.game_access_mode != "direct_nas",
+                write_proxies=(
+                    self._config.game_access_mode != "direct_nas"
+                    and not offline_library_enabled(self._config)
+                ),
             )
         return self._catalog
 

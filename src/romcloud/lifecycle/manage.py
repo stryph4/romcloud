@@ -92,11 +92,19 @@ def remove_owned_proxies(config: AppConfig) -> int:
     return len(removed)
 
 
-def restore_owned_proxies(config: AppConfig) -> int:
-    """Recreate missing manifest-owned proxies from retained catalog games."""
+def restore_owned_proxies(
+    config: AppConfig, *, game_ids: Optional[set[str]] = None
+) -> int:
+    """Recreate selected missing proxies from retained catalog games.
+
+    ``game_ids=None`` restores the full catalog. An explicit set supports
+    cached-only presentation without changing catalog or proxy ownership rows.
+    """
     container = Container(config)
     restored = 0
     for record in container.proxy_repo.list_all():
+        if game_ids is not None and record.game_id not in game_ids:
+            continue
         path = Path(record.proxy_path)
         if path.exists() or not _is_within(path, Path(config.local_roms_path)):
             continue

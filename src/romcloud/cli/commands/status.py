@@ -7,6 +7,7 @@ import click
 from romcloud.cli.context import get_container
 from romcloud.infrastructure.source_display import source_display_summary
 from romcloud.infrastructure.config import DIRECT_NAS_MODE
+from romcloud.infrastructure.library_view import offline_library_enabled
 
 
 def _fmt_bytes(n: int) -> str:
@@ -32,6 +33,15 @@ def status_cmd(ctx: click.Context, system: str | None) -> None:
         "  Access:  "
         + ("Direct/NAS" if container.config.game_access_mode == DIRECT_NAS_MODE else "Smart Cache")
     )
+    if container.config.game_access_mode != DIRECT_NAS_MODE:
+        click.echo(
+            "  Library: "
+            + (
+                "Cached games only"
+                if offline_library_enabled(container.config)
+                else "Full Smart Cache catalog"
+            )
+        )
     # Catalog stats.
     games = container.catalog.list_games(system)
     click.echo(f"\n{'─' * 50}")

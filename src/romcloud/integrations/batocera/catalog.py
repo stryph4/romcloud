@@ -213,8 +213,7 @@ class CatalogService:
                             game.added_at = existing.added_at
                             game.last_played = existing.last_played
                             self._game_repo.save(game)
-                            if self._write_proxies_enabled:
-                                self._rewrite_owned_proxy(game)
+                            self._rewrite_owned_proxy(game)
                             updated += 1
                             log.info(
                                 "Updated asset metadata for %r [%s]", game.title, system
@@ -227,8 +226,7 @@ class CatalogService:
                         continue
 
                     self._game_repo.save(game)
-                    if self._write_proxies_enabled:
-                        self._write_proxy(game)
+                    self._write_proxy(game)
                     added += 1
                     log.info("Catalogued %r [%s]", game.title, system)
 
@@ -741,9 +739,10 @@ class CatalogService:
     # ── proxy I/O ─────────────────────────────────────────────────────────────
 
     def _write_proxy(self, game: Game) -> None:
-        """Create the .romcloud file and record it in the ownership DB."""
+        """Record proxy ownership and materialize it when presentation allows."""
         proxy_dir = self._local_roms_root / game.system
-        proxy_dir.mkdir(parents=True, exist_ok=True)
+        if self._write_proxies_enabled:
+            proxy_dir.mkdir(parents=True, exist_ok=True)
 
         safe_title = _safe_filename(game.title)
         proxy_path = proxy_dir / f"{safe_title}.romcloud"
@@ -752,7 +751,8 @@ class CatalogService:
         if proxy_path.exists() and not self._proxy_repo.owns_path(str(proxy_path)):
             proxy_path = proxy_dir / f"{safe_title}.{game.id[:8]}.romcloud"
 
-        self._write_proxy_payload(proxy_path, game)
+        if self._write_proxies_enabled:
+            self._write_proxy_payload(proxy_path, game)
 
         record = ProxyRecord.create(game_id=game.id, proxy_path=str(proxy_path))
         self._proxy_repo.save(record)
@@ -763,7 +763,8 @@ class CatalogService:
         if record is None:
             self._write_proxy(game)
             return
-        self._write_proxy_payload(Path(record.proxy_path), game)
+        if self._write_proxies_enabled:
+            self._write_proxy_payload(Path(record.proxy_path), game)
 
     def _write_proxy_payload(self, proxy_path: Path, game: Game) -> None:
         payload = {

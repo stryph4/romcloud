@@ -187,12 +187,60 @@ def uidata_status(ctx: click.Context) -> None:
             "game_access_mode": container.config.game_access_mode,
         }
         if container.config.game_access_mode != "direct_nas":
+            from romcloud.infrastructure.library_view import offline_library_enabled
+
             summary = container.cache.status_summary()
-            payload.update(cached=summary["complete"], pinned=summary["pinned"])
+            payload.update(
+                cached=summary["complete"],
+                pinned=summary["pinned"],
+                offline_library_mode=offline_library_enabled(container.config),
+            )
         payload.update(source_display_summary(container.config))
         return payload
 
     _run_action(ctx, build)
+
+
+def _run_library_mode_action(ctx: click.Context, enabled: bool) -> None:
+    def build() -> dict:
+        _load_context_config(ctx)
+        container = get_container(ctx)
+        from romcloud.integrations.batocera import es_config
+        from romcloud.integrations.batocera.game_access import set_offline_library_mode
+
+        progress = _progress_sink({"progress": True})
+        label = "cached games only" if enabled else "full library"
+        emit_progress(
+            progress, "library", "reconcile", "running", f"Showing {label}…"
+        )
+        report = set_offline_library_mode(container.config, enabled)
+        es_config.refresh(container.game_repo.list_systems())
+        emit_progress(
+            progress, "library", "reconcile", "success", f"Now showing {label}"
+        )
+        return {
+            "offline_library_mode": report.offline,
+            "visible_proxies": report.visible,
+            "removed_proxies": report.removed,
+            "restored_proxies": report.restored,
+            "es_restart_required": True,
+        }
+
+    _run_action(ctx, build)
+
+
+@uidata_group.command("library-offline")
+@click.pass_context
+def uidata_library_offline(ctx: click.Context) -> None:
+    """Switch Smart Cache presentation to valid cached games only."""
+    _run_library_mode_action(ctx, True)
+
+
+@uidata_group.command("library-online")
+@click.pass_context
+def uidata_library_online(ctx: click.Context) -> None:
+    """Restore the full Smart Cache proxy presentation."""
+    _run_library_mode_action(ctx, False)
 
 
 @uidata_group.command("refresh")

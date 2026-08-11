@@ -68,6 +68,7 @@ from romcloud.cli.commands.healthcheck import healthcheck_cmd
 from romcloud.cli.commands.launch import launch_cmd
 from romcloud.cli.commands.cache import cache_group
 from romcloud.cli.commands.saves import saves_group
+from romcloud.cli.commands.library import library_group
 from romcloud.cli.commands.update import update_cmd
 from romcloud.cli.commands.es import es_group
 from romcloud.cli.commands.mount import mount_group
@@ -82,6 +83,7 @@ cli.add_command(healthcheck_cmd, name="healthcheck")
 cli.add_command(launch_cmd, name="launch")
 cli.add_command(cache_group, name="cache")
 cli.add_command(saves_group, name="saves")
+cli.add_command(library_group, name="library")
 cli.add_command(update_cmd, name="update")
 cli.add_command(es_group, name="es")
 cli.add_command(mount_group, name="mount")

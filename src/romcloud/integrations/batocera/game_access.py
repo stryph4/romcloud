@@ -34,6 +34,14 @@ class DirectLinkReport:
     removed: int = 0
 
 
+@dataclass(frozen=True)
+class LibraryPresentationReport:
+    offline: bool
+    removed: int = 0
+    restored: int = 0
+    visible: int = 0
+
+
 def _manifest_path(config: AppConfig) -> Path:
     return Path(config.data_path) / MANIFEST_FILENAME
 
@@ -177,6 +185,10 @@ def reconcile_direct_links(config: AppConfig, systems: Iterable[str]) -> DirectL
 def reconcile_game_access(config: AppConfig) -> DirectLinkReport:
     """Apply the configured strategy to catalog-owned Batocera artifacts."""
     # Imported lazily to avoid a lifecycle/container import cycle.
+    from romcloud.infrastructure.library_view import (
+        offline_library_enabled,
+        write_offline_library_state,
+    )
     from romcloud.lifecycle.manage import remove_owned_proxies, restore_owned_proxies
 
     container = Container(config)
@@ -188,7 +200,75 @@ def reconcile_game_access(config: AppConfig) -> DirectLinkReport:
         ]
         report = reconcile_direct_links(config, systems)
         remove_owned_proxies(config)
+        # Offline Library Mode is Smart Cache-only. A successful Direct/NAS
+        # transition deliberately resets the next Smart Cache presentation.
+        write_offline_library_state(config, False)
         return report
     report = remove_direct_links(config)
-    restore_owned_proxies(config)
+    if offline_library_enabled(config):
+        reconcile_library_presentation(config, offline=True)
+    else:
+        restore_owned_proxies(config)
     return report
+
+
+def _valid_cached_game_ids(config: AppConfig) -> set[str]:
+    container = Container(config)
+    return {
+        record.game_id
+        for record in container.proxy_repo.list_all()
+        if container.cache.has_valid_cached_assets(record.game_id)
+    }
+
+
+def reconcile_library_presentation(
+    config: AppConfig, *, offline: bool
+) -> LibraryPresentationReport:
+    """Replace only owned proxies with the requested Smart Cache view."""
+    if config.game_access_mode == DIRECT_NAS_MODE:
+        raise RuntimeError(
+            "Offline Library Mode is available only in Smart Cache mode."
+        )
+    from romcloud.lifecycle.manage import remove_owned_proxies, restore_owned_proxies
+
+    visible_ids = _valid_cached_game_ids(config) if offline else None
+    removed = remove_owned_proxies(config)
+    restored = restore_owned_proxies(config, game_ids=visible_ids)
+    return LibraryPresentationReport(
+        offline=offline,
+        removed=removed,
+        restored=restored,
+        visible=len(visible_ids) if visible_ids is not None else len(
+            Container(config).proxy_repo.list_all()
+        ),
+    )
+
+
+def set_offline_library_mode(
+    config: AppConfig, enabled: bool
+) -> LibraryPresentationReport:
+    """Transactionally change persisted presentation state where practical."""
+    from romcloud.infrastructure.library_view import (
+        offline_library_enabled,
+        write_offline_library_state,
+    )
+
+    if config.game_access_mode == DIRECT_NAS_MODE:
+        raise RuntimeError(
+            "Offline Library Mode is available only in Smart Cache mode."
+        )
+    previous = offline_library_enabled(config)
+    if previous == enabled:
+        return reconcile_library_presentation(config, offline=enabled)
+    try:
+        report = reconcile_library_presentation(config, offline=enabled)
+        write_offline_library_state(config, enabled)
+        return report
+    except Exception:
+        # Best-effort rollback restores the prior usable proxy presentation.
+        try:
+            reconcile_library_presentation(config, offline=previous)
+            write_offline_library_state(config, previous)
+        except Exception:
+            pass
+        raise

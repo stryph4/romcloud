@@ -143,13 +143,22 @@ MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
 }
 
 
-def menu_categories_for_mode(mode: str) -> dict[str, tuple[MenuItem, ...]]:
-    """Hide cache-only UI entirely when games are exposed directly."""
-    if mode != "direct_nas":
-        return MENU_CATEGORIES
+def menu_categories_for_mode(
+    mode: str, offline_library_mode: bool = False
+) -> dict[str, tuple[MenuItem, ...]]:
+    """Expose presentation controls only for Smart Cache."""
+    if mode == "direct_nas":
+        return {
+            category: tuple(item for item in items if item.action != "cache-status")
+            for category, items in MENU_CATEGORIES.items()
+        }
+    action = MenuItem(
+        "Restore Full Library" if offline_library_mode else "Show Cached Games Only",
+        "library-online" if offline_library_mode else "library-offline",
+    )
     return {
-        category: tuple(item for item in items if item.action != "cache-status")
-        for category, items in MENU_CATEGORIES.items()
+        **MENU_CATEGORIES,
+        "Library": (*MENU_CATEGORIES["Library"], action),
     }
 
 # Actions dispatched through the reusable long-running operation screen
@@ -166,6 +175,12 @@ _OPERATIONS: dict[str, OperationSpec] = {
         title="Unmount", args=("uidata", "connection-unmount")
     ),
     "refresh": OperationSpec(title="Refresh Catalog", args=("uidata", "refresh-progress")),
+    "library-offline": OperationSpec(
+        title="Show Cached Games Only", args=("uidata", "library-offline")
+    ),
+    "library-online": OperationSpec(
+        title="Restore Full Library", args=("uidata", "library-online")
+    ),
     "update-check": OperationSpec(title="Check for Updates", args=("uidata", "update-check")),
     "update-install": OperationSpec(title="Update ROMCloud", args=("uidata", "update-install")),
 }
@@ -234,6 +249,8 @@ def format_result(action: str, result: BackendResult) -> str:
                 f"pinned={result.data.get('pinned', 0)}",
             ]
             body = f"{' | '.join(source_bits)} | {' '.join(stats)}" if source_prefix else " ".join(stats)
+            if result.data.get("offline_library_mode"):
+                body += " | Cached games only"
             return f"{action}: {body}"
         reachable = result.data.get("source_reachable")
         body = f"{source_prefix} | {'reachable' if reachable else 'unreachable'}" if source_prefix else (
@@ -646,7 +663,11 @@ def _run(  # noqa: ANN001
 
         setup_status, connection = _load_startup_backend_state(splash, romcloud_bin)
         access_mode = str(setup_status.data.get("game_access_mode", "smart_cache"))
-        state = NavigationState(ROOT_MENU_ITEMS, menu_categories_for_mode(access_mode))
+        offline_library_mode = bool(setup_status.data.get("offline_library_mode", False))
+        state = NavigationState(
+            ROOT_MENU_ITEMS,
+            menu_categories_for_mode(access_mode, offline_library_mode),
+        )
         wizard: WizardState | None = None
         if initial_screen_for_status(setup_status) == "wizard":
             wizard = WizardState(setup_status)
@@ -862,6 +883,24 @@ def _run(  # noqa: ANN001
                             connection = call_backend(romcloud_bin, "connection-status")
                             message = format_result("connection-status", connection)
                             message_kind = classify_message_kind("connection-status", connection)
+                        elif operation_screen.title in (
+                            "Show Cached Games Only", "Restore Full Library"
+                        ):
+                            setup_status = call_backend(romcloud_bin, "setup-status")
+                            access_mode = str(
+                                setup_status.data.get("game_access_mode", "smart_cache")
+                            )
+                            offline_library_mode = bool(
+                                setup_status.data.get("offline_library_mode", False)
+                            )
+                            state = NavigationState(
+                                ROOT_MENU_ITEMS,
+                                menu_categories_for_mode(
+                                    access_mode, offline_library_mode
+                                ),
+                            )
+                            state.open_category("Library")
+                            message, message_kind = operation_summary_message(operation_screen)
                         else:
                             message, message_kind = operation_summary_message(operation_screen)
                         operation_screen = None
@@ -894,9 +933,16 @@ def _run(  # noqa: ANN001
                     activity.ingest(line.text)
                 if wizard.finished:
                     current_screen = "menu"
-                    access_mode = wizard.game_access_mode
+                    setup_status = call_backend(romcloud_bin, "setup-status")
+                    access_mode = str(
+                        setup_status.data.get("game_access_mode", wizard.game_access_mode)
+                    )
+                    offline_library_mode = bool(
+                        setup_status.data.get("offline_library_mode", False)
+                    )
                     state = NavigationState(
-                        ROOT_MENU_ITEMS, menu_categories_for_mode(access_mode)
+                        ROOT_MENU_ITEMS,
+                        menu_categories_for_mode(access_mode, offline_library_mode),
                     )
                     wizard = None
                     message = "Setup complete"

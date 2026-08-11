@@ -92,6 +92,21 @@ class CacheService:
             return False
         return True
 
+    def has_valid_cached_assets(self, game_id: str) -> bool:
+        """Read-only validity check for cached-library presentation.
+
+        Unlike :meth:`is_cached`, this never repairs or deletes stale cache
+        records. Presentation changes must not mutate cache state.
+        """
+        entry = self._cache_repo.get(game_id)
+        if entry is None or not entry.is_complete:
+            return False
+        game = self._game_repo.get(game_id)
+        launch_path = self._launch_asset_path(entry, game)
+        if launch_path is None or not launch_path.exists() or game is None:
+            return False
+        return self._all_assets_present(entry, game)
+
     def _all_assets_present(self, entry: CacheEntry, game: Game) -> bool:
         """True if every asset of *game* is present at its final cache path
         (and size-correct, where the expected size is known)."""

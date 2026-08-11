@@ -81,6 +81,20 @@ class TestMenuItems:
             for items in menu_categories_for_mode("smart_cache").values()
             for item in items
         )
+        assert all(
+            not item.action.startswith("library-")
+            for items in direct.values()
+            for item in items
+        )
+
+    def test_smart_cache_library_action_reflects_persisted_view(self):
+        normal = menu_categories_for_mode("smart_cache", False)["Library"]
+        offline = menu_categories_for_mode("smart_cache", True)["Library"]
+
+        assert normal[-1].label == "Show Cached Games Only"
+        assert normal[-1].action == "library-offline"
+        assert offline[-1].label == "Restore Full Library"
+        assert offline[-1].action == "library-online"
 
 
 class TestInitialScreen:
@@ -334,6 +348,19 @@ class TestFormatResult:
         assert "games=12" in line
         assert "cached=3" in line
         assert "pinned=1" in line
+
+    def test_status_reports_cached_only_presentation(self):
+        result = BackendResult(
+            ok=True,
+            data={
+                "games_total": 12,
+                "cached": 3,
+                "pinned": 1,
+                "offline_library_mode": True,
+            },
+        )
+
+        assert "Cached games only" in format_result("status", result)
 
     def test_healthcheck_result_formats_source_summary(self):
         result = BackendResult(

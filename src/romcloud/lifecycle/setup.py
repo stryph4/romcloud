@@ -247,11 +247,17 @@ def setup_state(config_path: Path) -> dict[str, Any]:
         failed_step = str(saved_state.get("failed_step") or saved_state.get("step") or "setup")
         issues.append(f"Setup did not finish at: {failed_step}.")
 
+    from romcloud.infrastructure.library_view import offline_library_enabled
+
     payload: dict[str, Any] = {
         "state": "partial" if issues else "configured",
         "issues": issues,
         "source_type": "smb" if config.smb is not None else "local",
         "game_access_mode": config.game_access_mode,
+        "offline_library_mode": (
+            config.game_access_mode != DIRECT_NAS_MODE
+            and offline_library_enabled(config)
+        ),
         "rom_root": config.source.rom_root,
         "cache_root": config.cache.path,
         "max_size_gb": config.cache.max_size_gb,
