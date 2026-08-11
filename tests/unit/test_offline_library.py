@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
+from threading import Event, Thread
 
 import pytest
 from click.testing import CliRunner
@@ -34,6 +35,7 @@ from romcloud.infrastructure.repositories.game import GameRepository
 from romcloud.infrastructure.repositories.proxy import ProxyRepository
 from romcloud.integrations.batocera.game_access import (
     LINK_NAME,
+    _operating_mode_lock,
     reconcile_game_access,
     set_operating_mode,
 )
@@ -342,6 +344,27 @@ def test_progress_has_truthful_counts_and_indeterminate_phases(tmp_path: Path) -
     )
     assert events[-1].stage == "complete" and events[-1].status == "success"
     assert events[-1].current is None and events[-1].total is None
+
+
+def test_operating_mode_lock_still_serializes_backend_transitions(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    contender_started = Event()
+    contender_entered = Event()
+
+    def contend() -> None:
+        contender_started.set()
+        with _operating_mode_lock(config):
+            contender_entered.set()
+
+    with _operating_mode_lock(config):
+        thread = Thread(target=contend)
+        thread.start()
+        assert contender_started.wait(1)
+        assert not contender_entered.wait(0.1)
+
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert contender_entered.is_set()
 
 
 @pytest.mark.parametrize("selected", list(OperatingMode))

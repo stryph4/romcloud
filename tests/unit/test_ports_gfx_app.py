@@ -712,6 +712,44 @@ class TestHandleMenuEvent:
         assert screen == OPERATION_SCREEN
         assert operation is not None
 
+    def test_duplicate_mode_confirm_keeps_running_transition_without_spawning(
+        self, monkeypatch
+    ):
+        from ports_gfx import app as app_module
+        from ports_gfx.operation_screen import OperationScreenState
+
+        state = MenuState([MenuItem("Cache Mode", "library-cache")])
+        layout = self._layout(state)
+        active = OperationScreenState(
+            title="Cache Mode",
+            runner=SimpleNamespace(
+                state=OperationState.RUNNING,
+                is_finished=False,
+            ),
+        )
+        monkeypatch.setattr(
+            app_module,
+            "start_operation",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("duplicate worker spawned")
+            ),
+        )
+
+        running, screen, message, kind, operation = app_module._handle_menu_event(
+            InputEvent(action=Action.CONFIRM),
+            state,
+            layout,
+            "/opt/romcloud/bin/romcloud",
+            True,
+            None,
+            "info",
+            active,
+        )
+
+        assert running is True
+        assert screen == OPERATION_SCREEN
+        assert operation is active
+
 
 class TestHandleSavesyncEvent:
     def _screen(self, **kwargs):

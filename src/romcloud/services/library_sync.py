@@ -236,7 +236,12 @@ class LibrarySyncService:
         )
 
     def render_local(self) -> LibrarySyncReport:
-        """Regenerate only device presentation from the last local canonical copy."""
+        """Regenerate presentation from local state without fetching media.
+
+        This reconciliation path is used by operating-mode and lifecycle work.
+        Expensive canonical-media materialization belongs only to an explicit
+        Library Sync operation (``pull``, ``push``, or ``sync``).
+        """
         if not self.enabled:
             raise LibrarySyncError("Library Sync is disabled; enable it in configuration first.")
         report = LibrarySyncReport(direction="render")
@@ -245,6 +250,7 @@ class LibrarySyncService:
             _read_dataset(self._local_root / CANONICAL_FILENAME),
             report,
             media_validation=validation,
+            materialize_media=False,
         )
         self._write_media_validation(validation)
         return report
@@ -680,6 +686,7 @@ class LibrarySyncService:
         progress: ProgressSink = None,
         *,
         media_validation: Optional[dict[str, dict]] = None,
+        materialize_media: bool = True,
     ) -> int:
         media_validation = media_validation if media_validation is not None else {}
         rendered = 0
@@ -708,6 +715,7 @@ class LibrarySyncService:
                 rendered_before=rendered,
                 total=total,
                 media_validation=media_validation,
+                materialize_media=materialize_media,
             )
             emit_progress(
                 progress,
@@ -731,6 +739,7 @@ class LibrarySyncService:
         rendered_before: int = 0,
         total: int = 0,
         media_validation: Optional[dict[str, dict]] = None,
+        materialize_media: bool = True,
     ) -> int:
         media_validation = media_validation if media_validation is not None else {}
         system_root = self._local_roms_root / system
@@ -796,9 +805,15 @@ class LibrarySyncService:
                     descriptor,
                     report,
                     media_validation,
+                    materialize=materialize_media,
                 )
-                if tag in MEDIA_TAGS and rendered_media:
-                    _set_child(element, tag, rendered_media)
+                if tag in MEDIA_TAGS:
+                    if rendered_media:
+                        _set_child(element, tag, rendered_media)
+                    else:
+                        stale = element.find(tag)
+                        if stale is not None:
+                            element.remove(stale)
             _set_child(element, OWNERSHIP_TAG, library_id)
             count += 1
 
@@ -841,6 +856,8 @@ class LibrarySyncService:
         descriptor: dict,
         report: LibrarySyncReport,
         media_validation: dict[str, dict],
+        *,
+        materialize: bool = True,
     ) -> Optional[str]:
         source_path = descriptor.get("source_path")
         safe_source_path = _safe_relative(source_path) if isinstance(source_path, str) else None
@@ -861,17 +878,28 @@ class LibrarySyncService:
             or suffix not in ("", Path("x" + suffix).suffix)
             or "/" in suffix
             or "\\" in suffix
-            or self._remote_root is None
         ):
-            return None
-        source = self._remote_root / safe_blob
-        if not _within(source, self._remote_root):
             return None
         relative = PurePosixPath(LOCAL_MEDIA_DIR, digest[:2], digest + suffix)
         destination = system_root / relative
         validation_key = f"{system_root.name}/{relative.as_posix()}"
         validation = media_validation.get(validation_key)
         report.media_examined += 1
+        if not materialize:
+            # Mode/presentation reconciliation must remain local-only.  An
+            # existing ordinary file is safe to reference without opening it;
+            # a missing file is optional artwork, not a reason to reach into
+            # canonical remote storage or fail the mode transition.
+            if not destination.is_symlink() and destination.is_file():
+                report.media_skipped += 1
+                report.unchanged += 1
+                return f"./{relative.as_posix()}"
+            return None
+        if self._remote_root is None:
+            return None
+        source = self._remote_root / safe_blob
+        if not _within(source, self._remote_root):
+            return None
         if (
             isinstance(validation, dict)
             and validation.get("sha256") == digest

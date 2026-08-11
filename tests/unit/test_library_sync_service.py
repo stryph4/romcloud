@@ -20,9 +20,11 @@ from romcloud.infrastructure.config import (
     SourceConfig,
 )
 from romcloud.infrastructure.library_view import (
+    operating_mode,
     write_offline_library_state,
     write_operating_mode,
 )
+from romcloud.integrations.batocera.game_access import set_operating_mode
 from romcloud.services.library_sync import OWNERSHIP_TAG, library_id_for_game
 from romcloud.core.models.librarysync import LibrarySyncReport
 
@@ -86,6 +88,18 @@ def _media_record(config: AppConfig) -> dict:
     return record["media"]["image"]
 
 
+def _rendered_media(config: AppConfig) -> Path:
+    descriptor = _media_record(config)
+    digest = descriptor["sha256"]
+    return (
+        Path(config.local_roms_path)
+        / "ps2"
+        / ".romcloud-media"
+        / digest[:2]
+        / f"{digest}{descriptor['suffix']}"
+    )
+
+
 def _setup(tmp_path: Path, *, enabled: bool = True, mode: str = "smart_cache"):
     config = _config(tmp_path, enabled=enabled, mode=mode)
     source_xml = _source_library(config)
@@ -107,6 +121,17 @@ def _setup(tmp_path: Path, *, enabled: bool = True, mode: str = "smart_cache"):
 def _managed(local_xml: Path) -> ET.Element:
     root = ET.parse(local_xml).getroot()
     return next(item for item in root.findall("game") if item.findtext(OWNERSHIP_TAG))
+
+
+def _stub_mode_frontend(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr(
+        "romcloud.integrations.batocera.game_access._refresh_emulationstation",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "romcloud.integrations.batocera.game_access._reload_emulationstation",
+        lambda: True,
+    )
 
 
 def test_opt_in_disabled_does_no_library_work(tmp_path: Path):
@@ -519,6 +544,111 @@ def test_direct_paths_and_mode_switch_do_not_change_canonical(tmp_path: Path):
     Container(config).library_sync.sync()
     assert _managed(_local_root(config)).findtext("path") == "./Game.romcloud"
     assert _canonical(config).read_bytes() == canonical_before
+
+
+@pytest.mark.parametrize("starting_mode", [OperatingMode.CONNECTED, OperatingMode.OFFLINE])
+def test_cache_transition_is_local_only_when_remote_media_is_unavailable(
+    tmp_path: Path, monkeypatch, starting_mode: OperatingMode
+):
+    _stub_mode_frontend(monkeypatch)
+    config, container, _ = _setup(tmp_path)
+    container.library_sync.sync()
+    local_canonical = Path(config.data_path) / "library" / "library.json"
+    canonical_before = local_canonical.read_bytes()
+    media = _rendered_media(config)
+    assert media.is_file()
+
+    set_operating_mode(config, starting_mode)
+    media.unlink()
+    remote_root = Path(config.remote_data.root)
+    unavailable_root = tmp_path / "remote-disconnected"
+    remote_root.rename(unavailable_root)
+    remote_library = remote_root / "library"
+    original_open = Path.open
+
+    def guarded_open(path: Path, *args, **kwargs):  # noqa: ANN002, ANN003
+        try:
+            path.relative_to(remote_library)
+        except ValueError:
+            return original_open(path, *args, **kwargs)
+        raise AssertionError(f"mode transition opened canonical remote media: {path}")
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+    monkeypatch.setattr(
+        "romcloud.integrations.batocera.catalog.CatalogService.refresh",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("mode transition refreshed the catalog")
+        ),
+    )
+    monkeypatch.setattr(
+        "romcloud.services.library_sync.LibrarySyncService._import_gamelists",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("mode transition imported Library Sync metadata")
+        ),
+    )
+    monkeypatch.setattr(
+        "romcloud.services.library_sync._copy_verified",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("mode transition copied Library Sync media")
+        ),
+    )
+
+    set_operating_mode(config, OperatingMode.CACHE)
+
+    game = container.game_repo.list_all()[0]
+    proxy = container.proxy_repo.get(game.id)
+    assert proxy is not None and Path(proxy.proxy_path).is_file()
+    assert operating_mode(config) is OperatingMode.CACHE
+    assert local_canonical.read_bytes() == canonical_before
+    assert not media.exists()
+    managed = _managed(_local_root(config))
+    assert managed.findtext("name") == "Scraped Game"
+    assert managed.find("image") is None
+    assert (unavailable_root / "library" / "library.json").is_file()
+
+
+def test_cache_transition_reuses_existing_local_media_without_remote_reads(
+    tmp_path: Path, monkeypatch
+):
+    _stub_mode_frontend(monkeypatch)
+    config, container, _ = _setup(tmp_path)
+    container.library_sync.sync()
+    media = _rendered_media(config)
+    media_before = media.read_bytes()
+    set_operating_mode(config, OperatingMode.OFFLINE)
+    remote_root = Path(config.remote_data.root)
+    unavailable_root = tmp_path / "remote-disconnected"
+    remote_root.rename(unavailable_root)
+    remote_library = remote_root / "library"
+    original_open = Path.open
+
+    def guarded_open(path: Path, *args, **kwargs):  # noqa: ANN002, ANN003
+        try:
+            path.relative_to(remote_library)
+        except ValueError:
+            return original_open(path, *args, **kwargs)
+        raise AssertionError(f"mode transition opened canonical remote media: {path}")
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+    monkeypatch.setattr(
+        "romcloud.services.library_sync._hash_file",
+        lambda path: (_ for _ in ()).throw(
+            AssertionError(f"mode transition hashed media: {path}")
+        ),
+    )
+    monkeypatch.setattr(
+        "romcloud.services.library_sync._copy_verified",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("mode transition copied Library Sync media")
+        ),
+    )
+
+    set_operating_mode(config, OperatingMode.CACHE)
+
+    managed = _managed(_local_root(config))
+    assert managed.findtext("image").startswith("./.romcloud-media/")
+    assert media.read_bytes() == media_before
+    assert (unavailable_root / "library" / "library.json").is_file()
 
 
 def test_direct_device_references_source_media_without_local_duplication(tmp_path: Path):

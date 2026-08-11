@@ -286,6 +286,9 @@ _OPERATIONS: dict[str, OperationSpec] = {
     "update-check": OperationSpec(title="Check for Updates", args=("uidata", "update-check")),
     "update-install": OperationSpec(title="Update ROMCloud", args=("uidata", "update-install")),
 }
+_MODE_TRANSITION_ACTIONS = frozenset(
+    {"library-connected", "library-cache", "library-offline"}
+)
 
 _BG_COLOR = (18, 18, 24)
 _CARD_BG = (40, 40, 50)
@@ -926,6 +929,7 @@ def _run(  # noqa: ANN001
                     else:
                         running, current_screen, message, message_kind, new_operation = _handle_menu_event(
                             ievent, state, layout, romcloud_bin, running, message, message_kind,
+                            operation_screen,
                         )
                         if new_operation is not None:
                             operation_screen = new_operation
@@ -1159,6 +1163,7 @@ def _handle_menu_event(
     running: bool,
     message: Optional[str],
     message_kind: str,
+    active_operation: Optional[OperationScreenState] = None,
 ) -> tuple[bool, str, Optional[str], str, Optional[OperationScreenState]]:
     action = ievent.action
     next_screen = "menu"
@@ -1184,6 +1189,22 @@ def _handle_menu_event(
             message = f"{item.label} is active."
             message_kind = "success"
         elif item.action in _OPERATIONS:
+            if (
+                item.action in _MODE_TRANSITION_ACTIONS
+                and active_operation is not None
+                and not active_operation.is_finished
+            ):
+                # Keep the original runner and its progress visible.  This is
+                # a defensive debounce for queued/repeated controller,
+                # keyboard, or touch confirmations while a transition is
+                # already active; never launch another backend worker.
+                return (
+                    running,
+                    OPERATION_SCREEN,
+                    message,
+                    message_kind,
+                    active_operation,
+                )
             next_screen = OPERATION_SCREEN
             operation = start_operation(item.action, romcloud_bin)
             return running, next_screen, message, message_kind, operation
