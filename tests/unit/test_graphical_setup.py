@@ -233,6 +233,29 @@ class TestSetupState:
         state_path.write_text('{"status":"applying","step":"refresh catalog"}')
         assert graphical_setup.setup_state(config_path)["state"] == "partial"
 
+    @pytest.mark.parametrize("mode", ["connected", "cache", "offline"])
+    def test_configured_install_stays_configured_when_source_is_unreachable(
+        self, tmp_path, mode
+    ):
+        """Setup completeness must be independent from runtime source
+        availability. Real-hardware regression: a Steam Deck resuming with
+        the NAS still unavailable must reopen the normal dashboard, in
+        every persisted operating mode (including Offline), never the
+        first-run wizard."""
+        from romcloud.core.capabilities import OperatingMode
+        from romcloud.infrastructure.library_view import write_operating_mode
+
+        config_path = tmp_path / "config" / "romcloud.toml"
+        config = _config(config_path)
+        write_config(config, str(config_path))
+        write_smb_password(config.credentials_path, "secret")
+        write_operating_mode(config, OperatingMode(mode))
+
+        assert not Path(config.source.rom_root).exists()
+        result = graphical_setup.setup_state(config_path)
+
+        assert result["state"] == "configured"
+
 
 class TestDiscovery:
     def test_successful_discovery(self, monkeypatch):

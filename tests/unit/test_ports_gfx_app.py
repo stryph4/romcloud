@@ -249,9 +249,28 @@ class TestInitialScreen:
 
     def test_partial_or_broken_install_opens_repair_wizard(self):
         partial = BackendResult(ok=True, data={"state": "partial"})
-        failed = BackendResult(ok=False, error="malformed response")
         assert initial_screen_for_status(partial) == "wizard"
-        assert initial_screen_for_status(failed) == "wizard"
+
+    def test_failed_backend_call_never_opens_wizard(self):
+        """A subprocess timeout/error (e.g. the backend is still starting up
+        right after a suspend/resume) must not be treated as "unconfigured"
+        — this is the real-hardware bug: a Steam Deck resume transiently
+        failing the startup `setup-status` call must not route an already
+        configured installation into the first-run wizard."""
+        failed = BackendResult(ok=False, error="no output from romcloud (exit 1)")
+        timed_out = BackendResult(ok=False, error="Command timed out after 20 seconds")
+        assert initial_screen_for_status(failed) == "menu"
+        assert initial_screen_for_status(timed_out) == "menu"
+
+    def test_unknown_or_missing_state_field_never_opens_wizard(self):
+        """Only an explicit "fresh"/"partial" state may open the wizard —
+        an otherwise-ok response with an unexpected/missing state must not
+        default to it either."""
+        assert initial_screen_for_status(BackendResult(ok=True, data={})) == "menu"
+        assert (
+            initial_screen_for_status(BackendResult(ok=True, data={"state": "mounted"}))
+            == "menu"
+        )
 
 
 class _RecordingSplash:

@@ -459,10 +459,18 @@ def render_completed_update_relaunch(
 
 
 def initial_screen_for_status(status: BackendResult) -> str:
-    """Choose startup routing from the backend's structural setup state."""
-    if status.ok and status.data.get("state") == "configured":
-        return "menu"
-    return "wizard"
+    """Choose startup routing from the backend's structural setup state.
+
+    Routes to the first-run wizard only when the backend explicitly reports
+    a fresh or structurally incomplete installation. A failed backend call
+    (subprocess timeout/error, e.g. while the system is still finishing a
+    resume-from-suspend) is a communication failure, not evidence the
+    installation is unconfigured — it must never be treated as "fresh" and
+    silently open the setup wizard over an already-configured install.
+    """
+    if status.ok and status.data.get("state") in ("fresh", "partial"):
+        return "wizard"
+    return "menu"
 
 
 def run_app(
@@ -2271,7 +2279,7 @@ def _render_wizard(  # noqa: ANN001
         body_lines = _wizard_body_lines(wizard)
         if wizard.osk is not None:
             body_lines.extend(
-                ["", f"Current value: {wizard.osk.displayed_text}", "Tab opens the on-screen keyboard"]
+                ["", f"Current value: {wizard.osk.displayed_text}", "Start/options controller button opens the on-screen keyboard"]
             )
         for line in body_lines:
             for wrapped in wrap_lines([line], max_chars):

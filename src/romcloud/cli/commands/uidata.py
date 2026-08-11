@@ -245,11 +245,11 @@ def _run_library_mode_action(ctx: click.Context, mode: str) -> None:
         progress = _progress_sink({"progress": True})
         label = f"{mode.title()} Mode"
         emit_progress(
-            progress, "library", "reconcile", "running", f"Showing {label}…"
+            progress, "library", "reconcile", "running", f"Entering {label}…"
         )
         report = set_operating_mode(container.config, mode, progress=progress)
         emit_progress(
-            progress, "library", "reconcile", "success", f"Now showing {label}"
+            progress, "library", "reconcile", "success", f"Entered {label}"
         )
         return {
             "offline_library_mode": report.offline,

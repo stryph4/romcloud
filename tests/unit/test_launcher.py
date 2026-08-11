@@ -564,6 +564,86 @@ class TestCacheMissLaunchResolution:
         assert Path(cache.get_entry(game.id).cache_path).is_dir()
 
 
+# ── launch must never change operating mode or trigger presentation work ────
+
+
+class TestLaunchModeIsolation:
+    """Launching a game may resolve/cache/mark-launched, but must never
+    persist a mode change or reconcile global library/ES presentation —
+    that is exclusively the job of an explicit user mode-selection action
+    (`set_operating_mode`), never a side effect of a launch."""
+
+    def _build_cached_game(self, tmp_path):
+        from romcloud.core.models.cache import CacheEntry, CacheStatus
+        from romcloud.core.models.game import Game, GameAsset
+        from romcloud.infrastructure.config import AppConfig, CacheConfig, SourceConfig
+        from romcloud.infrastructure.database import Database
+        from romcloud.infrastructure.repositories.cache import CacheRepository
+        from romcloud.infrastructure.repositories.game import GameRepository
+
+        source_root = tmp_path / "source"
+        cache_root = tmp_path / "cache"
+        local_roms = tmp_path / "roms"
+        for root in (source_root / "snes", cache_root, local_roms / "snes"):
+            root.mkdir(parents=True)
+        config = AppConfig(
+            source=SourceConfig("local", str(source_root)),
+            cache=CacheConfig(str(cache_root)),
+            local_roms_path=str(local_roms),
+            data_path=str(tmp_path / "data"),
+        )
+        database = Database(str(Path(config.data_path) / "catalog.db"))
+        database.initialize()
+        game_repo = GameRepository(database)
+        cache_repo = CacheRepository(database)
+        filename = "Chrono Trigger.sfc"
+        asset = GameAsset(
+            filename=filename, relative_path=f"snes/{filename}", size_bytes=4, is_primary=True
+        )
+        game = Game.create("snes", "Chrono Trigger", "local", str(source_root), [asset])
+        game_repo.save(game)
+        cached_path = cache_root / "snes" / filename
+        cached_path.parent.mkdir(parents=True, exist_ok=True)
+        cached_path.write_bytes(b"data")
+        entry = CacheEntry.create(game.id, str(cached_path))
+        entry.status = CacheStatus.COMPLETE
+        entry.size_bytes = 4
+        cache_repo.save(entry)
+        return config, game, cached_path
+
+    def test_cached_launch_never_changes_mode_or_reconciles_presentation(
+        self, tmp_path, monkeypatch
+    ):
+        import romcloud.infrastructure.config as config_module
+        import romcloud.integrations.batocera.launcher as launcher_module
+        from romcloud.core.capabilities import OperatingMode
+        from romcloud.infrastructure.library_view import operating_mode, state_path
+        from romcloud.integrations.batocera import game_access, presentation
+        from romcloud.integrations.batocera.game_access import set_operating_mode
+
+        config, game, cached_path = self._build_cached_game(tmp_path)
+        monkeypatch.setattr(game_access, "_refresh_emulationstation", lambda *a, **k: None)
+        monkeypatch.setattr(game_access, "_reload_emulationstation", lambda: False)
+        set_operating_mode(config, OperatingMode.CACHE)
+        before_state = state_path(config).read_text()
+
+        def _fail(*args, **kwargs):
+            raise AssertionError("launch must never reconcile mode/presentation")
+
+        monkeypatch.setattr(game_access, "set_operating_mode", _fail)
+        monkeypatch.setattr(game_access, "reconcile_game_access", _fail)
+        monkeypatch.setattr(presentation, "refresh_emulationstation", _fail)
+        monkeypatch.setattr(presentation, "reload_emulationstation", _fail)
+        monkeypatch.setattr(config_module, "load_config", lambda: config)
+
+        proxy_path = str(Path(config.local_roms_path) / "snes" / "Chrono Trigger.romcloud")
+        result = launcher_module._resolve_and_cache(proxy_path)
+
+        assert result == str(cached_path)
+        assert operating_mode(config) is OperatingMode.CACHE
+        assert state_path(config).read_text() == before_state
+
+
 # ── run_launcher_wrapper: cancellation must not crash the wrapper ────────────
 
 
