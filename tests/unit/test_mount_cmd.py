@@ -395,13 +395,12 @@ class TestStartupMigrationFromMountStatus:
 
 
 class TestExistingStartBehaviorIntact:
-    def test_start_mounts_catalog_ro_and_savesync_rw(self, monkeypatch):
+    def test_start_mounts_catalog_ro_and_savesync_rw(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
             mount_cmd_module.mount_worker,
             "credentials_for_mount",
-            lambda config, target: ("hunter2", Path(f"/{target.credential_kind}-creds")),
+            lambda config, target: "hunter2",
         )
-        monkeypatch.setattr(mount_cmd_module, "write_cifs_credentials_file", lambda *a, **k: None)
         calls = []
         monkeypatch.setattr(
             mount_cmd_module.mount,
@@ -413,7 +412,9 @@ class TestExistingStartBehaviorIntact:
 
         result = _invoke(
             ["start"],
-            _fake_config(smb=_fake_smb(), saves_mount="/mnt/saves-rw"),
+            _fake_config(
+                smb=_fake_smb(), saves_mount="/mnt/saves-rw", romcloud_home=str(tmp_path)
+            ),
         )
 
         assert result.exit_code == 0, result.output
@@ -423,43 +424,45 @@ class TestExistingStartBehaviorIntact:
         assert calls[0]["read_only"] is True
         assert calls[1]["read_only"] is False
 
-    def test_start_still_blocks_and_reports_mounted(self, monkeypatch):
+    def test_start_still_blocks_and_reports_mounted(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
             mount_cmd_module.mount_worker,
             "credentials_for_mount",
-            lambda *a: ("hunter2", Path("/creds")),
+            lambda *a: "hunter2",
         )
-        monkeypatch.setattr(mount_cmd_module, "write_cifs_credentials_file", lambda *a, **k: None)
         monkeypatch.setattr(
             mount_cmd_module.mount,
             "mount_cifs_source",
             lambda **k: SimpleNamespace(mounted=True, already_mounted=False, detail="mounted"),
         )
 
-        result = _invoke(["start"], _fake_config(smb=_fake_smb()))
+        result = _invoke(
+            ["start"], _fake_config(smb=_fake_smb(), romcloud_home=str(tmp_path))
+        )
 
         assert result.exit_code == 0, result.output
         assert "Mounted." in result.output
 
-    def test_start_requires_password(self, monkeypatch):
+    def test_start_requires_password(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
             mount_cmd_module.mount_worker,
             "credentials_for_mount",
-            lambda *a: (None, Path("/creds")),
+            lambda *a: None,
         )
-        result = _invoke(["start"], _fake_config(smb=_fake_smb()))
+        result = _invoke(
+            ["start"], _fake_config(smb=_fake_smb(), romcloud_home=str(tmp_path))
+        )
         assert result.exit_code != 0
         assert "No SMB password stored" in result.output
 
     def test_start_rolls_back_only_mounts_created_before_later_failure(
-        self, monkeypatch
+        self, tmp_path, monkeypatch
     ):
         monkeypatch.setattr(
             mount_cmd_module.mount_worker,
             "credentials_for_mount",
-            lambda config, target: ("secret", Path(f"/{target.credential_kind}-creds")),
+            lambda config, target: "secret",
         )
-        monkeypatch.setattr(mount_cmd_module, "write_cifs_credentials_file", lambda *a: None)
         attempts = []
         unmounted = []
 
@@ -478,7 +481,9 @@ class TestExistingStartBehaviorIntact:
 
         result = _invoke(
             ["start"],
-            _fake_config(smb=_fake_smb(), saves_mount="/mnt/saves-rw"),
+            _fake_config(
+                smb=_fake_smb(), saves_mount="/mnt/saves-rw", romcloud_home=str(tmp_path)
+            ),
         )
 
         assert result.exit_code != 0

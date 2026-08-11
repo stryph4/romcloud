@@ -171,6 +171,29 @@ def repair(
     )
 
 
+_LEGACY_CREDENTIALS_FILENAME = "smb.credentials"
+
+
+def _remove_credential_files(config: AppConfig) -> None:
+    """Remove every persisted copy of SMB credentials on uninstall/purge.
+
+    Covers: the canonical (encrypted or, on very old installs, plaintext)
+    ``credentials.toml``; the pre-migration legacy ``smb.credentials`` file;
+    the now-retired permanent ``mount.cifs`` credential files older ROMCloud
+    versions left on disk; and any ephemeral CIFS credential temp file that
+    a crash mid-mount could have left behind (normally cleaned up in
+    ``finally`` — this is defensive, not the primary cleanup path).
+    """
+    credentials_path = config.credentials_path
+    credentials_path.unlink(missing_ok=True)
+    credentials_path.with_name(_LEGACY_CREDENTIALS_FILENAME).unlink(missing_ok=True)
+    cifs_credentials_path(credentials_path).unlink(missing_ok=True)
+    remote_data_cifs_credentials_path(credentials_path).unlink(missing_ok=True)
+    (credentials_path.parent / "setup-state.json").unlink(missing_ok=True)
+    for stale in credentials_path.parent.glob(".romcloud-cifs-*"):
+        stale.unlink(missing_ok=True)
+
+
 def uninstall(
     *,
     config: AppConfig,
@@ -204,9 +227,7 @@ def uninstall(
     )
     proxies_removed = remove_owned_proxies(config)
     mount_worker.cleanup_runtime_state(romcloud_home)
-    cifs_credentials_path(config.credentials_path).unlink(missing_ok=True)
-    remote_data_cifs_credentials_path(config.credentials_path).unlink(missing_ok=True)
-    (config.credentials_path.parent / "setup-state.json").unlink(missing_ok=True)
+    _remove_credential_files(config)
 
     for name in ("bin", "venv", "ports-gfx"):
         shutil.rmtree(romcloud_home / name, ignore_errors=True)

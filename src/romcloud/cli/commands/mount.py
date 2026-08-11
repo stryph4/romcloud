@@ -34,7 +34,6 @@ import click
 from romcloud.cli.context import get_container
 from romcloud.core.exceptions import ROMCloudError
 from romcloud.infrastructure import mount, mount_worker
-from romcloud.infrastructure.credentials import write_cifs_credentials_file
 from romcloud.integrations.batocera import mount_service
 from romcloud.services.connections import mount_connections, unmount_connections
 
@@ -105,7 +104,7 @@ def mount_start_cmd(ctx: click.Context) -> None:
     config = _require_mounts(ctx)
 
     try:
-        result = mount_connections(config, credential_writer=write_cifs_credentials_file)
+        result = mount_connections(config)
     except (ROMCloudError, OSError) as exc:
         click.echo(f"error: {exc}", err=True)
         ctx.exit(1)

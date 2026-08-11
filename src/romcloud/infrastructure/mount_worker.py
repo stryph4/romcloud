@@ -56,12 +56,13 @@ from romcloud.core.exceptions import ConfigurationError, ROMCloudError, Provider
 from romcloud.infrastructure.config import SMBConfig, paths_overlap
 from romcloud.infrastructure import mount as mountlib
 from romcloud.infrastructure import mount_endpoint_cache
+from romcloud.infrastructure import credentials
 from romcloud.infrastructure.credentials import (
     cifs_credentials_path,
+    credential_lock_state,
     load_remote_data_smb_password,
     load_smb_password,
     remote_data_cifs_credentials_path,
-    write_cifs_credentials_file,
 )
 from romcloud.infrastructure.logging import get_logger
 
@@ -145,17 +146,57 @@ def _configured_mount_is_ready(item: ConfiguredMount) -> bool:
     )
 
 
-def credentials_for_mount(config, target: ConfiguredMount) -> tuple[Optional[str], Path]:
-    """Resolve the independently stored password/helper path for a mount."""
-    if target.credential_kind == "source":
-        return (
-            load_smb_password(config.credentials_path),
-            cifs_credentials_path(config.credentials_path),
-        )
-    return (
-        load_remote_data_smb_password(config.credentials_path),
-        remote_data_cifs_credentials_path(config.credentials_path),
+def credentials_for_mount(config, target: ConfiguredMount) -> Optional[str]:
+    """Resolve the independently stored password for a mount.
+
+    Raises :class:`ConfigurationError` (never with the password itself)
+    when a credential envelope exists but cannot be decrypted on this
+    hardware — distinct from simply having no password configured, so
+    callers can surface an accurate recovery message instead of the
+    generic "no password stored" one.
+    """
+    section = "smb" if target.credential_kind == "source" else "remote_data_smb"
+    password = (
+        load_smb_password(config.credentials_path)
+        if target.credential_kind == "source"
+        else load_remote_data_smb_password(config.credentials_path)
     )
+    if password is None and credential_lock_state(config.credentials_path, section) == "locked":
+        raise ConfigurationError(
+            f"Stored network credentials for {target.label} cannot be unlocked on this "
+            "hardware. Run `romcloud configure` to re-enter the SMB password."
+        )
+    return password
+
+
+def mount_configured_target(
+    config,
+    target: ConfiguredMount,
+    password: str,
+    *,
+    mount_fn: Optional[Callable[..., "mountlib.MountOutcome"]] = None,
+    **mount_kwargs,
+) -> "mountlib.MountOutcome":
+    """Mount *target* using a short-lived CIFS credentials file that is
+    always removed afterward, regardless of outcome — see
+    :func:`romcloud.infrastructure.credentials.ephemeral_cifs_credentials_file`.
+    """
+    mount_fn = mount_fn or mountlib.mount_cifs_source
+    directory = config.credentials_path.parent
+    prefix = f".romcloud-cifs-{target.credential_kind}-"
+    with credentials.ephemeral_cifs_credentials_file(
+        directory, target.smb.username, password, prefix=prefix
+    ) as creds_path:
+        return mount_fn(
+            server=target.smb.server,
+            share=target.smb.share,
+            mount_point=target.mount_point,
+            credentials_path=creds_path,
+            read_only=target.read_only,
+            remote_path=getattr(target.smb, "remote_path", ""),
+            port=target.smb.port,
+            **mount_kwargs,
+        )
 
 
 # ── path helpers ──────────────────────────────────────────────────────────────
@@ -470,7 +511,7 @@ def _run_worker_locked(
             if _configured_mount_is_ready(target):
                 details.append(f"{target.label}: already mounted")
                 continue
-            password, creds_path = credentials_for_mount(config, target)
+            password = credentials_for_mount(config, target)
             if not password:
                 raise ConfigurationError(
                     f"No SMB password stored for {target.label}; run `romcloud configure`"
@@ -480,25 +521,29 @@ def _run_worker_locked(
                 "waiting",
                 f"waiting for {target.label} at {target.smb.server}:{target.smb.port}",
             )
-            write_cifs_credentials_file(creds_path, target.smb.username, password)
-            outcome = _mount_with_cached_endpoint_fallback(
-                romcloud_home=romcloud_home,
-                server=target.smb.server,
-                share=target.smb.share,
-                mount_point=target.mount_point,
-                credentials_path=creds_path,
-                read_only=target.read_only,
-                port=target.smb.port,
-                remote_path=getattr(target.smb, "remote_path", ""),
-                use_endpoint_cache=target.credential_kind == "source",
-                attempt_timeout=attempt_timeout,
-                attempt_interval=attempt_interval,
-                retry_timeout=retry_timeout,
-                retry_initial_delay=retry_initial_delay,
-                retry_max_delay=retry_max_delay,
-                sleep=sleep,
-                clock=clock,
-            )
+            directory = config.credentials_path.parent
+            prefix = f".romcloud-cifs-{target.credential_kind}-"
+            with credentials.ephemeral_cifs_credentials_file(
+                directory, target.smb.username, password, prefix=prefix
+            ) as creds_path:
+                outcome = _mount_with_cached_endpoint_fallback(
+                    romcloud_home=romcloud_home,
+                    server=target.smb.server,
+                    share=target.smb.share,
+                    mount_point=target.mount_point,
+                    credentials_path=creds_path,
+                    read_only=target.read_only,
+                    port=target.smb.port,
+                    remote_path=getattr(target.smb, "remote_path", ""),
+                    use_endpoint_cache=target.credential_kind == "source",
+                    attempt_timeout=attempt_timeout,
+                    attempt_interval=attempt_interval,
+                    retry_timeout=retry_timeout,
+                    retry_initial_delay=retry_initial_delay,
+                    retry_max_delay=retry_max_delay,
+                    sleep=sleep,
+                    clock=clock,
+                )
             details.append(f"{target.label}: {outcome.detail}")
         detail = "; ".join(details)
         _write_worker_status(romcloud_home, "success", detail)

@@ -95,6 +95,13 @@ def healthcheck_cmd(ctx: click.Context) -> None:
         except Exception as exc:  # noqa: BLE001 — healthcheck must never crash
             check("SMB locations mounted", False, f"error checking status: {exc}")
 
+        from romcloud.infrastructure.credentials import describe_protection
+
+        for section, label in (("smb", "ROM source"), ("remote_data_smb", "remote data")):
+            protection = describe_protection(config.credentials_path, section)
+            if protection:
+                click.echo(f"  ℹ  {label} credential storage: {protection}")
+
     click.echo("─" * 50)
     if ok:
         click.echo("  All checks passed.")

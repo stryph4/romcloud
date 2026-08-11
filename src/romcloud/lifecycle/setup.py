@@ -27,13 +27,12 @@ from romcloud.infrastructure.config import (
     write_config,
 )
 from romcloud.infrastructure.credentials import (
+    describe_protection,
     load_remote_data_smb_password,
     load_smb_password,
-    write_cifs_credentials_file,
     write_remote_data_smb_password,
     write_smb_password,
 )
-from romcloud.infrastructure.mount import mount_cifs_source
 from romcloud.infrastructure import mount_worker
 from romcloud.infrastructure.smb_discovery_client import build_default_smb_discovery_service
 from romcloud.integrations.batocera import es_config, mount_service
@@ -587,22 +586,18 @@ def apply_setup(
         emit_progress(progress, "configure", "mount", "running", "Connecting storage…")
         _write_state(state_path, {"status": "applying", "step": step})
         for target in mount_worker.configured_mounts(config):
-            password, cifs_path = mount_worker.credentials_for_mount(config, target)
+            password = mount_worker.credentials_for_mount(config, target)
             assert password is not None
-            write_cifs_credentials_file(cifs_path, target.smb.username, password)
-            outcome = mount_cifs_source(
-                target.smb.server,
-                target.smb.share,
-                target.mount_point,
-                cifs_path,
-                read_only=target.read_only,
-                port=target.smb.port,
-                remote_path=getattr(target.smb, "remote_path", ""),
-            )
+            outcome = mount_worker.mount_configured_target(config, target, password)
             if outcome is not None and not outcome.already_mounted:
                 mounted_during_setup.append(target.mount_point)
         if mount_worker.configured_mounts(config):
             emit_progress(progress, "configure", "mount", "success", "Mounted successfully")
+            protection = describe_protection(config.credentials_path, "smb")
+            if protection:
+                emit_progress(
+                    progress, "configure", "credential_protection", "success", protection
+                )
 
         container = Container(config)
         source_probe = container.provider.validate_access(config.source.rom_root)

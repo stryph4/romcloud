@@ -27,7 +27,7 @@ def test_mount_emits_connecting_then_connected_without_live_server(tmp_path, mon
     monkeypatch.setattr(
         connections.mount_worker,
         "credentials_for_mount",
-        lambda config, target: ("secret", Path("/tmp/fake-creds")),
+        lambda config, target: "secret",
     )
     monkeypatch.setattr(
         connections.mount,
@@ -41,9 +41,7 @@ def test_mount_emits_connecting_then_connected_without_live_server(tmp_path, mon
     )
     events = []
 
-    result = connections.mount_connections(
-        config, events.append, credential_writer=lambda *args: None
-    )
+    result = connections.mount_connections(config, events.append)
 
     assert result == {"state": "connected", "changed": True}
     assert [(event.status, event.stage) for event in events] == [

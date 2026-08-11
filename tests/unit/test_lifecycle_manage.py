@@ -254,6 +254,31 @@ def test_uninstall_unmounts_remote_before_source_and_removes_both_helpers(
     assert not remote_data_cifs_credentials_path(config.credentials_path).exists()
 
 
+def test_uninstall_removes_the_canonical_and_legacy_credential_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, home, _local_roms, _cache = _config(tmp_path)
+    config.credentials_path.parent.mkdir(parents=True, exist_ok=True)
+    config.credentials_path.write_text('[smb]\npassword = "hunter2"\n', encoding="utf-8")
+    config.credentials_path.chmod(0o600)
+    legacy = config.credentials_path.with_name("smb.credentials")
+    legacy.write_text("username=alice\npassword=hunter2\n", encoding="utf-8")
+    legacy.chmod(0o600)
+    setup_state = config.credentials_path.parent / "setup-state.json"
+    setup_state.write_text("{}", encoding="utf-8")
+    stale_ephemeral = config.credentials_path.parent / ".romcloud-cifs-source-abc123"
+    stale_ephemeral.write_text("username=alice\npassword=hunter2\n", encoding="utf-8")
+    stale_ephemeral.chmod(0o600)
+    _isolate_integrations(monkeypatch)
+
+    manage.uninstall(config=config, romcloud_home=home, ports_dir=tmp_path / "ports")
+
+    assert not config.credentials_path.exists()
+    assert not legacy.exists()
+    assert not setup_state.exists()
+    assert not stale_ephemeral.exists()
+
+
 def test_uninstall_stops_before_runtime_removal_if_a_mount_cannot_unmount(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

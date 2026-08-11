@@ -7,7 +7,6 @@ from pathlib import Path
 from romcloud.core.exceptions import ConfigurationError, ROMCloudError
 from romcloud.core.progress import ProgressSink, emit_progress
 from romcloud.infrastructure import mount, mount_worker
-from romcloud.infrastructure.credentials import write_cifs_credentials_file
 
 
 def connection_status(config) -> dict[str, object]:
@@ -59,11 +58,12 @@ def mount_connections(
     config,
     progress: ProgressSink = None,
     *,
-    credential_writer=write_cifs_credentials_file,
+    mount_fn=None,
 ) -> dict[str, object]:
     targets = mount_worker.configured_mounts(config)
     if not targets:
         raise ConfigurationError("This configuration uses a local folder and does not need mounting.")
+    mount_fn = mount_fn or mount.mount_cifs_source
     mounted_now: list[str] = []
     try:
         for target in targets:
@@ -74,24 +74,13 @@ def mount_connections(
                 "running",
                 f"Connecting to {target.smb.server}…",
             )
-            password, credentials_path = mount_worker.credentials_for_mount(config, target)
+            password = mount_worker.credentials_for_mount(config, target)
             if not password:
                 raise ConfigurationError(
                     f"No SMB password stored for {target.label}; open setup to update credentials."
                 )
-            credential_writer(credentials_path, target.smb.username, password)
-            mount_kwargs = {}
-            remote_path = getattr(target.smb, "remote_path", "")
-            if remote_path:
-                mount_kwargs["remote_path"] = remote_path
-            outcome = mount.mount_cifs_source(
-                server=target.smb.server,
-                share=target.smb.share,
-                mount_point=target.mount_point,
-                credentials_path=credentials_path,
-                read_only=target.read_only,
-                port=target.smb.port,
-                **mount_kwargs,
+            outcome = mount_worker.mount_configured_target(
+                config, target, password, mount_fn=mount_fn
             )
             if not outcome.already_mounted:
                 mounted_now.append(target.mount_point)

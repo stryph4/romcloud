@@ -175,11 +175,13 @@ def _patch_apply_dependencies(
     )
     monkeypatch.setattr(graphical_setup.mount_service, "install_service", lambda *args, **kwargs: None)
     if mount_error is None:
-        monkeypatch.setattr(graphical_setup, "mount_cifs_source", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            graphical_setup.mount_worker.mountlib, "mount_cifs_source", lambda **kwargs: None
+        )
     else:
-        def fail_mount(*args, **kwargs):
+        def fail_mount(**kwargs):
             raise RuntimeError(mount_error)
-        monkeypatch.setattr(graphical_setup, "mount_cifs_source", fail_mount)
+        monkeypatch.setattr(graphical_setup.mount_worker.mountlib, "mount_cifs_source", fail_mount)
     monkeypatch.setattr(
         graphical_setup,
         "Container",
@@ -609,9 +611,9 @@ class TestApply:
         _patch_apply_dependencies(monkeypatch)
         calls = []
         monkeypatch.setattr(
-            graphical_setup,
+            graphical_setup.mount_worker.mountlib,
             "mount_cifs_source",
-            lambda *args, **kwargs: calls.append((args, kwargs)),
+            lambda **kwargs: calls.append(kwargs),
         )
         payload = _payload(
             remote_data_type="smb",
@@ -624,12 +626,12 @@ class TestApply:
         graphical_setup.apply_setup(config_path, payload)
         config = graphical_setup.load_config(str(config_path))
 
-        assert [(call[0][0], call[0][1]) for call in calls] == [
+        assert [(call["server"], call["share"]) for call in calls] == [
             ("nas.local", "ROMs"),
             ("backup-nas.local", "ROMCloud"),
         ]
-        assert calls[0][1]["read_only"] is True
-        assert calls[1][1]["read_only"] is False
+        assert calls[0]["read_only"] is True
+        assert calls[1]["read_only"] is False
         assert config.remote_data == RemoteDataConfig(
             provider="smb",
             root="/userdata/romcloud/remote",
@@ -701,9 +703,9 @@ class TestApply:
         config_path = tmp_path / "config" / "romcloud.toml"
         _patch_apply_dependencies(monkeypatch, remote_reachable=False)
         monkeypatch.setattr(
-            graphical_setup,
+            graphical_setup.mount_worker.mountlib,
             "mount_cifs_source",
-            lambda *args, **kwargs: SimpleNamespace(already_mounted=False),
+            lambda **kwargs: SimpleNamespace(already_mounted=False),
         )
         unmounted = []
         monkeypatch.setattr(
@@ -759,9 +761,9 @@ class TestApply:
         config_path = tmp_path / "config" / "romcloud.toml"
         _patch_apply_dependencies(monkeypatch, remote_reachable=False)
         monkeypatch.setattr(
-            graphical_setup,
+            graphical_setup.mount_worker.mountlib,
             "mount_cifs_source",
-            lambda *args, **kwargs: SimpleNamespace(already_mounted=False),
+            lambda **kwargs: SimpleNamespace(already_mounted=False),
         )
 
         def cleanup(path):

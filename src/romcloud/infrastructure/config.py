@@ -30,7 +30,10 @@ else:
 
 from romcloud.core.exceptions import ConfigurationError, ConfigurationNotFoundError
 from romcloud.infrastructure.atomic_file import atomic_write_text
-from romcloud.infrastructure.credentials import migrate_legacy_smb_credentials
+from romcloud.infrastructure.credentials import (
+    migrate_legacy_smb_credentials,
+    migrate_plaintext_credentials,
+)
 
 # ── defaults ──────────────────────────────────────────────────────────────────
 
@@ -193,6 +196,7 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
 
     config = _parse(data, path)
     migrate_legacy_smb_credentials(config.credentials_path)
+    migrate_plaintext_credentials(config.credentials_path)
     return config
 
 
