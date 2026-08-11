@@ -381,6 +381,51 @@ def test_reconnect_readiness_recovery_never_restarts_es(tmp_path: Path, _stub_es
     assert operating_mode(config) is OperatingMode.CACHE
 
 
+@pytest.mark.parametrize(
+    "start,requested",
+    [
+        (OperatingMode.CACHE, OperatingMode.CONNECTED),
+        (OperatingMode.CONNECTED, OperatingMode.CACHE),
+        (OperatingMode.CACHE, OperatingMode.OFFLINE),
+        (OperatingMode.OFFLINE, OperatingMode.CACHE),
+        (OperatingMode.CONNECTED, OperatingMode.OFFLINE),
+        (OperatingMode.OFFLINE, OperatingMode.CONNECTED),
+    ],
+)
+def test_genuine_transition_reports_es_restarted(
+    tmp_path: Path, _stub_es, start: OperatingMode, requested: OperatingMode
+) -> None:
+    """Real-hardware regression: `batocera-es-swissknife --restart` is
+    fire-and-forget, so a genuine mode transition must surface a
+    deterministic signal that ES was actually asked to restart — never
+    silently claim the new presentation is already launch-ready."""
+    config = _config(tmp_path)
+    _library(config)
+    write_operating_mode(config, start)
+
+    report = set_operating_mode(config, requested)
+
+    assert report.es_restarted is True
+
+
+@pytest.mark.parametrize(
+    "mode", [OperatingMode.CACHE, OperatingMode.CONNECTED, OperatingMode.OFFLINE]
+)
+def test_same_mode_reentry_reports_es_not_restarted(
+    tmp_path: Path, _stub_es, mode: OperatingMode
+) -> None:
+    """Same-mode invariant: re-entering the already-active mode never
+    restarts ES, so the report must say so explicitly (no manual-refresh
+    reminder is warranted when nothing about the presentation changed)."""
+    config = _config(tmp_path)
+    _library(config)
+    write_operating_mode(config, mode)
+
+    report = set_operating_mode(config, mode)
+
+    assert report.es_restarted is False
+
+
 def test_operating_mode_lock_still_serializes_backend_transitions(tmp_path: Path) -> None:
     config = _config(tmp_path)
     contender_started = Event()

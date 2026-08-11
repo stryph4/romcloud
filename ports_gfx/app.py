@@ -285,7 +285,9 @@ _OPERATIONS: dict[str, OperationSpec] = {
         title="Connected Mode", args=("uidata", "library-connected")
     ),
     "update-check": OperationSpec(title="Check for Updates", args=("uidata", "update-check")),
-    "update-install": OperationSpec(title="Update ROMCloud", args=("uidata", "update-install")),
+    "update-install": OperationSpec(
+        title="Update ROMCloud", args=("uidata", "update-install"), arms_gui_relaunch=True
+    ),
 }
 _MODE_TRANSITION_ACTIONS = frozenset(
     {"library-connected", "library-cache", "library-offline"}
@@ -411,7 +413,9 @@ def start_operation(action: str, romcloud_bin: str, *, popen=None) -> OperationS
     argv = [romcloud_bin, *spec.args]
     runner = OperationRunner(argv) if popen is None else OperationRunner(argv, popen=popen)
     runner.start()
-    return OperationScreenState(title=spec.title, runner=runner)
+    return OperationScreenState(
+        title=spec.title, runner=runner, arms_gui_relaunch=spec.arms_gui_relaunch
+    )
 
 
 def operation_summary_message(operation: OperationScreenState) -> tuple[str, str]:
@@ -428,12 +432,34 @@ def operation_summary_message(operation: OperationScreenState) -> tuple[str, str
     return f"{operation.title}: failed{suffix}", "error"
 
 
+def mode_transition_summary_message(
+    operation: OperationScreenState, result: BackendResult
+) -> tuple[str, str]:
+    """Dashboard message for a finished Connected/Cache/Offline Mode switch.
+
+    ``batocera-es-swissknife --restart`` is fire-and-forget — ROMCloud has
+    no way to confirm EmulationStation has actually finished reloading
+    before control returns here. Rather than silently trust stale ES
+    state, a genuine transition (``manual_refresh_recommended`` true) gets
+    an explicit, deterministic reminder instead of a bare "succeeded"
+    message. Same-mode re-entry (nothing changed, ES was never restarted)
+    keeps the plain summary.
+    """
+    if operation.succeeded and result.ok and result.data.get("manual_refresh_recommended"):
+        return (
+            f"{operation.title} is active. If a game doesn't launch immediately, "
+            "use Batocera's Refresh Games List.",
+            "warning",
+        )
+    return operation_summary_message(operation)
+
+
 def request_relaunch_for_completed_update(
     operation: OperationScreenState,
     relaunch: GuiRelaunchCoordinator,
 ) -> bool:
     """Enter the terminal relaunch state for one confirmed update success."""
-    if operation.title != "Update ROMCloud" or not operation.is_finished:
+    if not operation.arms_gui_relaunch or not operation.is_finished:
         return False
     if not operation.succeeded:
         relaunch.mark_update_failed()
@@ -1032,7 +1058,9 @@ def _run(  # noqa: ANN001
                             )
                             if bool(operating_state.get("offline_mode", False)):
                                 update_check.update_available = False
-                            message, message_kind = operation_summary_message(operation_screen)
+                            message, message_kind = mode_transition_summary_message(
+                                operation_screen, operation_result(operation_screen.runner)
+                            )
                         else:
                             message, message_kind = operation_summary_message(operation_screen)
                         operation_screen = None
@@ -1049,7 +1077,7 @@ def _run(  # noqa: ANN001
                     event = activity.ingest(line.text)
                     if event is not None:
                         catalog_progress.ingest(event)
-                if operation_screen.title == "Update ROMCloud" and operation_screen.is_finished:
+                if operation_screen.arms_gui_relaunch and operation_screen.is_finished:
                     if render_completed_update_relaunch(
                         operation_screen, relaunch, splash
                     ):

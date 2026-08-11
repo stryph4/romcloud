@@ -179,6 +179,46 @@ class TestRefresh:
         assert payload["es_restart_required"] is True
 
 
+class TestLibraryModeAction:
+    """`romcloud uidata library-cache|library-connected|library-offline` —
+    the GUI's manual-refresh reminder is driven entirely by whether
+    `set_operating_mode` actually restarted ES, never a hardcoded value."""
+
+    def test_genuine_transition_recommends_manual_refresh(self, tmp_path, monkeypatch):
+        from romcloud.integrations.batocera.game_access import LibraryPresentationReport
+
+        monkeypatch.setattr(
+            "romcloud.integrations.batocera.game_access.set_operating_mode",
+            lambda config, mode, progress=None: LibraryPresentationReport(
+                offline=False, es_restarted=True
+            ),
+        )
+
+        result = _write_and_invoke(tmp_path, ["library-cache"])
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output.strip().splitlines()[-1])
+        assert payload["ok"] is True
+        assert payload["manual_refresh_recommended"] is True
+
+    def test_same_mode_reentry_does_not_recommend_manual_refresh(self, tmp_path, monkeypatch):
+        from romcloud.integrations.batocera.game_access import LibraryPresentationReport
+
+        monkeypatch.setattr(
+            "romcloud.integrations.batocera.game_access.set_operating_mode",
+            lambda config, mode, progress=None: LibraryPresentationReport(
+                offline=False, es_restarted=False
+            ),
+        )
+
+        result = _write_and_invoke(tmp_path, ["library-cache"])
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output.strip().splitlines()[-1])
+        assert payload["ok"] is True
+        assert payload["manual_refresh_recommended"] is False
+
+
 class TestLibrarySyncBridge:
     def test_preview_returns_lightweight_import_counts(self, monkeypatch):
         import romcloud.cli.commands.uidata as uidata_module

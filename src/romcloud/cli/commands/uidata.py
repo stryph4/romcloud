@@ -259,7 +259,13 @@ def _run_library_mode_action(ctx: click.Context, mode: str) -> None:
             "restored_proxies": report.restored,
             "save_sync_available": report.save_sync_available,
             "save_reconcile": report.save_reconcile,
-            "es_restart_required": False,
+            # `batocera-es-swissknife --restart` is fire-and-forget — a
+            # requested restart is not proof ES has finished reloading yet,
+            # so a genuine mode change always asks for a deterministic,
+            # visible manual-refresh reminder rather than silently trusting
+            # stale ES state. Same-mode re-entry never restarts ES, so
+            # nothing changed and no reminder is needed.
+            "manual_refresh_recommended": report.es_restarted,
         }
 
     _run_action(ctx, build)

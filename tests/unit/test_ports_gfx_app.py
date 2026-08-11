@@ -30,6 +30,7 @@ from ports_gfx.app import (
     menu_categories_for_mode,
     menu_categories_for_state,
     root_menu_items_for_state,
+    mode_transition_summary_message,
     operation_summary_message,
     request_relaunch_for_completed_update,
     render_completed_update_relaunch,
@@ -981,7 +982,9 @@ class TestUpdateRelaunchRequest:
         from ports_gfx.operation_screen import OperationScreenState
 
         runner = _FakeUpdateRunner(state, lines, finished=finished)
-        return OperationScreenState(title="Update ROMCloud", runner=runner)
+        return OperationScreenState(
+            title="Update ROMCloud", runner=runner, arms_gui_relaunch=True
+        )
 
     def test_successful_final_result_enters_terminal_relaunch_state(self):
         coordinator = GuiRelaunchCoordinator("/opt/romcloud/bin/romcloud")
@@ -1060,6 +1063,36 @@ class TestUpdateRelaunchRequest:
             operation, coordinator, _RecordingSplash(frames)
         ) is False
         assert frames == []
+        assert coordinator.relaunch_pending is False
+
+    def test_only_update_install_spec_arms_gui_relaunch(self):
+        """Explicit-ownership regression: every non-self-update operation
+        (mode transitions, catalog refresh, mount/reconnect, update-check)
+        must never be able to arm the terminal GUI-relaunch handoff."""
+        from ports_gfx.app import _OPERATIONS
+
+        armed = {action for action, spec in _OPERATIONS.items() if spec.arms_gui_relaunch}
+        assert armed == {"update-install"}
+
+    def test_finished_succeeded_non_update_operation_never_arms_relaunch(self):
+        """Real-hardware regression: a completed Cache/Connected/Offline
+        Mode transition (or any other operation) must never relaunch the
+        GUI, even though it is finished and succeeded — only the explicit
+        ``arms_gui_relaunch`` flag may authorize that, never the title or
+        the fact that the operation succeeded."""
+        from ports_gfx.operation_screen import OperationScreenState
+
+        coordinator = GuiRelaunchCoordinator("/opt/romcloud/bin/romcloud")
+        for title in ("Cache Mode", "Connected Mode", "Offline Mode", "Refresh Catalog"):
+            runner = _FakeUpdateRunner(
+                OperationState.SUCCEEDED,
+                [OperationLine("stdout", '{"ok":true}')],
+            )
+            operation = OperationScreenState(
+                title=title, runner=runner, arms_gui_relaunch=False
+            )
+            assert request_relaunch_for_completed_update(operation, coordinator) is False
+        assert coordinator.terminal is False
         assert coordinator.relaunch_pending is False
 
 
@@ -1168,4 +1201,47 @@ class TestOperationSummaryMessage:
         operation = self._operation(state=OperationState.FAILED, error="")
         message, kind = operation_summary_message(operation)
         assert message == "Refresh Catalog: failed"
+        assert kind == "error"
+
+
+class TestModeTransitionSummaryMessage:
+    """`batocera-es-swissknife --restart` is fire-and-forget — real-hardware
+    regression: control must never silently claim ES is ready to launch the
+    new presentation. A genuine mode transition surfaces an explicit,
+    deterministic manual-refresh reminder instead of a bare success line;
+    same-mode re-entry (nothing restarted) does not."""
+
+    def _operation(self, *, state: OperationState, title: str = "Cache Mode"):
+        from ports_gfx.operation_screen import OperationScreenState
+
+        return OperationScreenState(title=title, runner=_FakeFinishedRunner(state, ""))
+
+    def test_genuine_transition_recommends_manual_refresh(self):
+        operation = self._operation(state=OperationState.SUCCEEDED)
+        result = BackendResult(ok=True, data={"manual_refresh_recommended": True})
+
+        message, kind = mode_transition_summary_message(operation, result)
+
+        assert message == (
+            "Cache Mode is active. If a game doesn't launch immediately, "
+            "use Batocera's Refresh Games List."
+        )
+        assert kind == "warning"
+
+    def test_same_mode_reentry_reports_plain_success(self):
+        operation = self._operation(state=OperationState.SUCCEEDED)
+        result = BackendResult(ok=True, data={"manual_refresh_recommended": False})
+
+        message, kind = mode_transition_summary_message(operation, result)
+
+        assert message == "Cache Mode: succeeded"
+        assert kind == "success"
+
+    def test_failed_transition_never_recommends_refresh(self):
+        operation = self._operation(state=OperationState.FAILED)
+        result = BackendResult(ok=False, error="boom")
+
+        message, kind = mode_transition_summary_message(operation, result)
+
+        assert message == "Cache Mode: failed"
         assert kind == "error"

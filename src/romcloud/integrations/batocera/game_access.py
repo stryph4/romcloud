@@ -12,7 +12,7 @@ import fcntl
 import json
 import os
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable
 
@@ -59,6 +59,12 @@ class LibraryPresentationReport:
     visible: int = 0
     save_sync_available: bool = False
     save_reconcile: dict | None = None
+    # True only when this transition actually asked Batocera to restart ES
+    # (a real mode change, never a same-mode re-entry). `--restart` is a
+    # fire-and-forget external tool with no readiness signal ROMCloud can
+    # poll, so callers must treat this as "a restart was requested" rather
+    # than "ES has already finished reloading and is launch-ready".
+    es_restarted: bool = False
 
 
 def _manifest_path(config: AppConfig) -> Path:
@@ -647,9 +653,11 @@ def set_operating_mode(
             report, container = _apply_mode_presentation(
                 config, requested, progress=progress
             )
+            restart_requested = requested is not previous
             _update_emulationstation(
-                config, container, requested, progress, restart=requested is not previous
+                config, container, requested, progress, restart=restart_requested
             )
+            report = replace(report, es_restarted=restart_requested)
             if previous is not requested:
                 emit_progress(
                     progress,
