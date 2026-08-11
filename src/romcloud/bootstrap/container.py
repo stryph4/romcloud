@@ -15,8 +15,9 @@ from __future__ import annotations
 
 from typing import Optional
 
-from romcloud.core.models.cache import CachePolicy
+from romcloud.core.capabilities import CapabilityPolicy
 from romcloud.core.exceptions import ConfigurationError
+from romcloud.core.models.cache import CachePolicy
 from romcloud.core.storage import StorageProvider
 from romcloud.infrastructure.config import AppConfig, validate_remote_data_boundary
 from romcloud.infrastructure.capabilities import capability_policy
@@ -39,8 +40,14 @@ from romcloud.services.transfer import TransferService
 class Container:
     """Wires together all application dependencies."""
 
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        *,
+        operating_policy: Optional[CapabilityPolicy] = None,
+    ) -> None:
         self._config = config
+        self._operating_policy = operating_policy
         self._db: Optional[Database] = None
         self._provider: Optional[StorageProvider] = None
         self._game_repo: Optional[GameRepository] = None
@@ -51,6 +58,10 @@ class Container:
         self._catalog: Optional[CatalogService] = None
         self._saves: Optional[SaveSyncService] = None
         self._library_sync: Optional[LibrarySyncService] = None
+
+    def _policy(self) -> CapabilityPolicy:
+        """Resolve mode policy only for services that actually consume it."""
+        return self._operating_policy or capability_policy(self._config)
 
     @property
     def config(self) -> AppConfig:
@@ -128,7 +139,7 @@ class Container:
                 transfer_service=self.transfer,
                 cache_root=self._config.cache.path,
                 policy=policy,
-                capability_policy=capability_policy(self._config),
+                capability_policy=self._policy(),
             )
         return self._cache
 
@@ -147,7 +158,7 @@ class Container:
                     self._config.game_access_mode != "direct_nas"
                     and not offline_library_enabled(self._config)
                 ),
-                capability_policy=capability_policy(self._config),
+                capability_policy=self._policy(),
             )
         return self._catalog
 
@@ -185,7 +196,7 @@ class Container:
                 remote_root=str(remote_base / "saves") if remote_base is not None else None,
                 state_path=Path(self._config.data_path) / "savesync-state.json",
                 xbox_enabled=self._config.saves.xbox_enabled,
-                capability_policy=capability_policy(self._config),
+                capability_policy=self._policy(),
             )
         return self._saves
 
@@ -227,7 +238,7 @@ class Container:
                 game_access_mode=self._config.game_access_mode,
                 game_repo=self.game_repo,
                 proxy_repo=self.proxy_repo,
-                capability_policy=capability_policy(self._config),
+                capability_policy=self._policy(),
             )
         return self._library_sync
 

@@ -135,20 +135,24 @@ MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
 }
 
 
-def _fallback_operating_state(mode: str, offline: bool) -> dict[str, object]:
+ACTIVE_MODE_ACTION = "operating-mode-active"
+
+
+def _fallback_operating_state(mode: str) -> dict[str, object]:
     """Compatibility fallback for older backends; current backends serialize policy."""
-    blocked = offline and mode == "smart_cache"
     return {
         "game_access_mode": mode,
-        "presentation_intent": "offline" if blocked else "online",
-        "offline_mode": blocked,
+        "operating_mode": "nas",
+        "presentation_intent": "nas",
+        "nas_mode": True,
+        "offline_mode": False,
         "offline_mode_supported": mode == "smart_cache",
         "capabilities": {
-            "catalog_refresh": not blocked,
-            "library_sync": not blocked,
-            "save_sync": not blocked,
-            "update_network": not blocked,
-            "remote_validation": not blocked,
+            "catalog_refresh": True,
+            "library_sync": True,
+            "save_sync": True,
+            "update_network": True,
+            "remote_validation": True,
         },
     }
 
@@ -157,33 +161,31 @@ def operating_state_from_status(data: dict) -> dict[str, object]:
     state = data.get("operating_state")
     if isinstance(state, dict):
         return state
-    return _fallback_operating_state(
-        str(data.get("game_access_mode", "smart_cache")),
-        bool(data.get("offline_library_mode", False)),
-    )
+    return _fallback_operating_state(str(data.get("game_access_mode", "smart_cache")))
 
 
 def root_menu_items_for_state(state: dict[str, object]) -> tuple[MenuItem, ...]:
     capabilities = state.get("capabilities", {})
     capabilities = capabilities if isinstance(capabilities, dict) else {}
     items = [MenuItem("Library", f"{CATEGORY_ACTION_PREFIX}Library")]
+    active_mode = str(state.get("operating_mode", "nas"))
+    items.append(
+        MenuItem(
+            "NAS Mode",
+            ACTIVE_MODE_ACTION if active_mode == "nas" else "library-nas",
+            "Active" if active_mode == "nas" else "Reconnect and restore the full library.",
+            active=active_mode == "nas",
+        )
+    )
     if bool(state.get("offline_mode_supported", False)):
-        if bool(state.get("offline_mode", False)):
-            items.append(
-                MenuItem(
-                    "Online Mode",
-                    "library-online",
-                    "Restore the full library and re-enable network features.",
-                )
+        items.append(
+            MenuItem(
+                "Offline Mode",
+                ACTIVE_MODE_ACTION if active_mode == "offline" else "library-offline",
+                "Active" if active_mode == "offline" else "Use only valid cached games.",
+                active=active_mode == "offline",
             )
-        else:
-            items.append(
-                MenuItem(
-                    "Offline Mode",
-                    "library-offline",
-                    "Show cached games only and disable network features.",
-                )
-            )
+        )
     items.append(MenuItem("Storage", f"{CATEGORY_ACTION_PREFIX}Storage"))
     if capabilities.get("save_sync", True):
         items.append(MenuItem("SaveSync", SAVESYNC_ACTION))
@@ -219,11 +221,17 @@ def menu_categories_for_mode(
 ) -> dict[str, tuple[MenuItem, ...]]:
     """Compatibility wrapper around the serialized-policy menu builder."""
     return menu_categories_for_state(
-        _fallback_operating_state(mode, offline_library_mode), library_sync_enabled
+        {
+            **_fallback_operating_state(mode),
+            "operating_mode": "offline" if offline_library_mode else "nas",
+            "nas_mode": not offline_library_mode,
+            "offline_mode": offline_library_mode,
+        },
+        library_sync_enabled,
     )
 
 
-ROOT_MENU_ITEMS = root_menu_items_for_state(_fallback_operating_state("smart_cache", False))
+ROOT_MENU_ITEMS = root_menu_items_for_state(_fallback_operating_state("smart_cache"))
 
 # Actions dispatched through the reusable long-running operation screen
 # (see operation_screen.py) instead of a quick blocking uidata JSON call.
@@ -242,8 +250,8 @@ _OPERATIONS: dict[str, OperationSpec] = {
     "library-offline": OperationSpec(
         title="Offline Mode", args=("uidata", "library-offline")
     ),
-    "library-online": OperationSpec(
-        title="Online Mode", args=("uidata", "library-online")
+    "library-nas": OperationSpec(
+        title="NAS Mode", args=("uidata", "library-nas")
     ),
     "library-sync": OperationSpec(
         title="Sync Library Metadata", args=("uidata", "library-sync")
@@ -952,7 +960,7 @@ def _run(  # noqa: ANN001
                             connection = call_backend(romcloud_bin, "connection-status")
                             message = format_result("connection-status", connection)
                             message_kind = classify_message_kind("connection-status", connection)
-                        elif operation_screen.title in ("Offline Mode", "Online Mode"):
+                        elif operation_screen.title in ("Offline Mode", "NAS Mode"):
                             setup_status = call_backend(romcloud_bin, "setup-status")
                             operating_state = operating_state_from_status(setup_status.data)
                             library_sync_enabled = bool(
@@ -1115,6 +1123,9 @@ def _handle_menu_event(
             running = False
         elif item.action == CONTROLLER_TEST_ACTION:
             next_screen = "controller_test"
+        elif item.action == ACTIVE_MODE_ACTION:
+            message = f"{item.label} is active."
+            message_kind = "success"
         elif item.action in _OPERATIONS:
             next_screen = OPERATION_SCREEN
             operation = start_operation(item.action, romcloud_bin)
@@ -1246,8 +1257,22 @@ def _render_menu(  # noqa: ANN001
         screen.blit(banner, banner_rect)
 
     for i, (item, rect) in enumerate(zip(state.items, layout.card_rects)):
-        color = _SELECTED_BG if i == state.selected_index else _CARD_BG
+        color = (
+            _SELECTED_BG
+            if i == state.selected_index
+            else (45, 75, 55)
+            if item.active
+            else _CARD_BG
+        )
         pygame.draw.rect(screen, color, (rect.x, rect.y, rect.w, rect.h), border_radius=6)
+        if item.active:
+            pygame.draw.rect(
+                screen,
+                _SUCCESS_COLOR,
+                (rect.x, rect.y, rect.w, rect.h),
+                width=3,
+                border_radius=6,
+            )
         label = fonts["body"].render(item.label, True, _FG_COLOR)
         label_center_y = rect.centery - (layout.fonts.hint // 2 if item.description else 0)
         label_rect = label.get_rect(center=(rect.centerx, label_center_y))

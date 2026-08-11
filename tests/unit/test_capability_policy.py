@@ -60,7 +60,8 @@ def test_direct_mode_never_enters_offline_state() -> None:
     assert not policy.offline_mode_supported
     assert not policy.offline
     assert not policy.allows(Capability.OFFLINE_MODE)
-    assert policy.serialize()["presentation_intent"] == "online"
+    assert policy.serialize()["operating_mode"] == "nas"
+    assert policy.serialize()["presentation_intent"] == "nas"
     assert policy.allows(Capability.CATALOG_REFRESH)
 
 

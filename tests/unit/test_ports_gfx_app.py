@@ -90,35 +90,38 @@ class TestMenuItems:
         )
         direct_roots = root_menu_items_for_state(
             {"game_access_mode": "direct_nas", "offline_mode_supported": False,
-             "offline_mode": False, "capabilities": {}}
+             "operating_mode": "nas", "offline_mode": False, "capabilities": {}}
         )
-        assert all(item.action not in ("library-offline", "library-online") for item in direct_roots)
+        assert [item.label for item in direct_roots if "Mode" in item.label] == ["NAS Mode"]
+        assert next(item for item in direct_roots if item.label == "NAS Mode").active
 
     def test_smart_cache_mode_control_is_prominent_and_not_in_library_submenu(self):
-        online_state = {
-            "game_access_mode": "smart_cache", "offline_mode": False,
+        nas_state = {
+            "game_access_mode": "smart_cache", "operating_mode": "nas", "offline_mode": False,
             "offline_mode_supported": True, "capabilities": {},
         }
         offline_state = {
-            "game_access_mode": "smart_cache", "offline_mode": True,
+            "game_access_mode": "smart_cache", "operating_mode": "offline", "offline_mode": True,
             "offline_mode_supported": True,
             "capabilities": {"catalog_refresh": False, "library_sync": False,
                              "save_sync": False, "update_network": False,
                              "remote_validation": False},
         }
 
-        online_roots = root_menu_items_for_state(online_state)
+        nas_roots = root_menu_items_for_state(nas_state)
         offline_roots = root_menu_items_for_state(offline_state)
-        assert online_roots[1].label == "Offline Mode"
-        assert "cached games only" in online_roots[1].description
-        assert offline_roots[1].label == "Online Mode"
-        assert "re-enable network" in offline_roots[1].description
+        assert [item.label for item in nas_roots[1:3]] == ["NAS Mode", "Offline Mode"]
+        assert nas_roots[1].active and not nas_roots[2].active
+        assert "valid cached games" in nas_roots[2].description
+        assert [item.label for item in offline_roots[1:3]] == ["NAS Mode", "Offline Mode"]
+        assert not offline_roots[1].active and offline_roots[2].active
+        assert "Reconnect" in offline_roots[1].description
         assert all(
             not item.action.startswith("library-")
             for item in menu_categories_for_state(offline_state, True)["Library"]
         )
         assert [item.label for item in offline_roots] == [
-            "Library", "Online Mode", "Storage", "Settings"
+            "Library", "NAS Mode", "Offline Mode", "Storage", "Settings"
         ]
         assert all(
             item.action != "setup"

@@ -5,16 +5,16 @@ from __future__ import annotations
 import click
 
 from romcloud.cli.context import get_container
-from romcloud.core.capabilities import Capability
+from romcloud.core.capabilities import Capability, OperatingMode
 from romcloud.core.exceptions import ROMCloudError
 from romcloud.infrastructure.capabilities import capability_policy
-from romcloud.infrastructure.library_view import offline_library_enabled
-from romcloud.integrations.batocera.game_access import set_offline_library_mode
+from romcloud.infrastructure.library_view import operating_mode
+from romcloud.integrations.batocera.game_access import set_operating_mode
 
 
 @click.group("library")
 def library_group() -> None:
-    """Select Smart Cache Online or Offline operating mode."""
+    """Select Smart Cache NAS or Offline operating mode."""
 
 
 def _require_smart_cache(ctx: click.Context):  # noqa: ANN202
@@ -28,13 +28,13 @@ def _require_smart_cache(ctx: click.Context):  # noqa: ANN202
     return container
 
 
-def _set(ctx: click.Context, enabled: bool) -> None:
+def _set(ctx: click.Context, mode: OperatingMode) -> None:
     container = _require_smart_cache(ctx)
     try:
-        report = set_offline_library_mode(container.config, enabled)
+        report = set_operating_mode(container.config, mode)
     except ROMCloudError as exc:
         raise click.ClickException(str(exc)) from exc
-    label = "Offline Mode" if enabled else "Online Mode"
+    label = "Offline Mode" if mode is OperatingMode.OFFLINE else "NAS Mode"
     click.echo(
         f"{label} is active: {report.visible} visible proxy file(s). "
         "Update game lists or restart EmulationStation to see the change."
@@ -54,8 +54,8 @@ def library_status(ctx: click.Context) -> None:
         "Operating mode: "
         + (
             "Offline Mode (cached games only)"
-            if offline_library_enabled(container.config)
-            else "Online Mode (full library and network features)"
+            if operating_mode(container.config) is OperatingMode.OFFLINE
+            else "NAS Mode (full library and remote features)"
         )
     )
 
@@ -64,11 +64,18 @@ def library_status(ctx: click.Context) -> None:
 @click.pass_context
 def library_offline(ctx: click.Context) -> None:
     """Show only ROMCloud games with valid local cached assets."""
-    _set(ctx, True)
+    _set(ctx, OperatingMode.OFFLINE)
 
 
-@library_group.command("online")
+@library_group.command("nas")
 @click.pass_context
-def library_online(ctx: click.Context) -> None:
-    """Restore the full Smart Cache proxy library."""
-    _set(ctx, False)
+def library_nas(ctx: click.Context) -> None:
+    """Reconnect and restore the full Smart Cache proxy library."""
+    _set(ctx, OperatingMode.NAS)
+
+
+@library_group.command("online", hidden=True)
+@click.pass_context
+def library_online_compat(ctx: click.Context) -> None:
+    """Compatibility alias for NAS Mode."""
+    _set(ctx, OperatingMode.NAS)

@@ -8,13 +8,18 @@ user-owned.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 from romcloud.bootstrap.container import Container
+from romcloud.core.capabilities import Capability, CapabilityPolicy, OperatingMode
+from romcloud.core.exceptions import ModeTransitionError, ProviderNotReachableError
+from romcloud.core.progress import ProgressSink, emit_progress
 from romcloud.infrastructure.atomic_file import atomic_write_text
 from romcloud.infrastructure.config import AppConfig, DIRECT_NAS_MODE
 from romcloud.integrations.batocera.systems import BATOCERA_SYSTEMS
@@ -195,10 +200,7 @@ def reconcile_game_access(
 ) -> GameAccessReport:
     """Apply the configured strategy to catalog-owned Batocera artifacts."""
     # Imported lazily to avoid a lifecycle/container import cycle.
-    from romcloud.infrastructure.library_view import (
-        offline_library_enabled,
-        write_offline_library_state,
-    )
+    from romcloud.infrastructure.library_view import operating_mode, write_operating_mode
     from romcloud.lifecycle.manage import remove_owned_proxies, restore_owned_proxies
 
     container = Container(config)
@@ -210,16 +212,16 @@ def reconcile_game_access(
         ]
         report = reconcile_direct_links(config, systems)
         remove_owned_proxies(config)
-        # Offline Library Mode is Smart Cache-only. A successful Direct/NAS
-        # transition deliberately resets the next Smart Cache presentation.
-        write_offline_library_state(config, False)
         if getattr(getattr(config, "library_sync", None), "enabled", False):
             container.library_sync.render_local()
         if refresh_es:
             _refresh_emulationstation(config, container.game_repo.list_systems())
+        # Direct/NAS cannot support Offline Mode. Commit the normalized state
+        # only after every required access artifact has been reconciled.
+        write_operating_mode(config, OperatingMode.NAS)
         return GameAccessReport(created=report.created, removed=report.removed)
     report = remove_direct_links(config)
-    if offline_library_enabled(config):
+    if operating_mode(config) is OperatingMode.OFFLINE:
         reconcile_library_presentation(config, offline=True)
     else:
         restore_owned_proxies(config)
@@ -279,43 +281,144 @@ def reconcile_library_presentation(
 
 
 def set_offline_library_mode(
-    config: AppConfig, enabled: bool
+    config: AppConfig, enabled: bool, progress: ProgressSink = None
 ) -> LibraryPresentationReport:
-    """Transactionally change persisted presentation state where practical."""
-    from romcloud.infrastructure.library_view import (
-        offline_library_enabled,
-        write_offline_library_state,
+    """Compatibility adapter for the explicit two-state transition API."""
+    return set_operating_mode(
+        config,
+        OperatingMode.OFFLINE if enabled else OperatingMode.NAS,
+        progress=progress,
     )
 
-    from romcloud.core.capabilities import Capability
+
+@contextmanager
+def _operating_mode_lock(config: AppConfig):  # noqa: ANN202
+    path = Path(config.data_path) / ".operating-mode.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _render_library_metadata(config: AppConfig, container: Container) -> None:
+    if getattr(getattr(config, "library_sync", None), "enabled", False):
+        container.library_sync.render_local()
+
+
+def _prepare_nas_library(
+    config: AppConfig, progress: ProgressSink
+) -> Container:
+    """Reconnect and refresh remotely backed state without exposing proxies."""
+    from romcloud.infrastructure import mount_worker
+    from romcloud.services.connections import mount_connections
+
+    emit_progress(
+        progress, "operating_mode", "connect", "running", "Reconnecting ROMCloud storage…"
+    )
+    if mount_worker.configured_mounts(config):
+        mount_connections(config, progress=progress)
+
+    transition_policy = CapabilityPolicy(config.game_access_mode, OperatingMode.NAS)
+    container = Container(config, operating_policy=transition_policy)
+    validate_source = getattr(container.provider, "validate_access", None)
+    if validate_source is not None:
+        source_probe = validate_source(config.source.rom_root)
+        if not source_probe.ok:
+            raise ProviderNotReachableError(
+                source_probe.detail or "The configured ROM source is unavailable."
+            )
+    elif not container.provider.is_reachable(config.source.rom_root):
+        raise ProviderNotReachableError("The configured ROM source is unavailable.")
+
+    if config.remote_data is not None:
+        remote_probe = container.saves.validate_remote_storage()
+        if not remote_probe.ok:
+            raise ProviderNotReachableError(
+                remote_probe.detail or "ROMCloud remote data storage is unavailable."
+            )
+    emit_progress(
+        progress, "operating_mode", "connect", "success", "ROMCloud storage connected"
+    )
+
+    emit_progress(
+        progress, "operating_mode", "catalog", "running", "Restoring the full library…"
+    )
+    refresh = container.catalog.refresh(progress=progress)
+    if refresh.errors:
+        details = "; ".join(f"{system}: {message}" for system, message in refresh.errors)
+        raise ProviderNotReachableError(details)
+    if config.library_sync.enabled:
+        container.library_sync.sync()
+    emit_progress(
+        progress, "operating_mode", "catalog", "success", "Full library restored"
+    )
+    return container
+
+
+def _restore_mode_presentation(
+    config: AppConfig,
+    mode: OperatingMode,
+    *,
+    refresh_es: bool,
+) -> LibraryPresentationReport:
+    report = reconcile_library_presentation(
+        config, offline=mode is OperatingMode.OFFLINE
+    )
+    container = Container(config)
+    _render_library_metadata(config, container)
+    if refresh_es:
+        _refresh_emulationstation(config, container.game_repo.list_systems())
+    return report
+
+
+def set_operating_mode(
+    config: AppConfig,
+    mode: OperatingMode | str,
+    *,
+    progress: ProgressSink = None,
+) -> LibraryPresentationReport:
+    """Transactionally switch between authoritative NAS and Offline modes."""
     from romcloud.infrastructure.capabilities import capability_policy
+    from romcloud.infrastructure.library_view import operating_mode, write_operating_mode
 
     capability_policy(config).require(Capability.OFFLINE_MODE, "Change operating mode")
-    previous = offline_library_enabled(config)
-    if previous == enabled:
-        report = reconcile_library_presentation(config, offline=enabled)
-        container = Container(config)
-        if getattr(getattr(config, "library_sync", None), "enabled", False):
-            container.library_sync.render_local()
-        _refresh_emulationstation(config, container.game_repo.list_systems())
-        return report
-    try:
-        report = reconcile_library_presentation(config, offline=enabled)
-        write_offline_library_state(config, enabled)
-        container = Container(config)
-        if getattr(getattr(config, "library_sync", None), "enabled", False):
-            container.library_sync.render_local()
-        _refresh_emulationstation(config, container.game_repo.list_systems())
-        return report
-    except Exception:
-        # Best-effort rollback restores the prior usable proxy presentation.
+    requested = OperatingMode(mode)
+    with _operating_mode_lock(config):
+        previous = operating_mode(config)
+        if previous is requested:
+            return _restore_mode_presentation(config, requested, refresh_es=True)
+
+        presentation_changed = False
         try:
-            reconcile_library_presentation(config, offline=previous)
-            write_offline_library_state(config, previous)
-            container = Container(config)
-            if getattr(getattr(config, "library_sync", None), "enabled", False):
-                container.library_sync.render_local()
+            if requested is OperatingMode.NAS:
+                container = _prepare_nas_library(config, progress)
+                report = reconcile_library_presentation(config, offline=False)
+                presentation_changed = True
+                _render_library_metadata(config, container)
+            else:
+                report = reconcile_library_presentation(config, offline=True)
+                presentation_changed = True
+                container = Container(config)
+                _render_library_metadata(config, container)
+
             _refresh_emulationstation(config, container.game_repo.list_systems())
-        except Exception:
-            pass
-        raise
+            # This atomic write is the commit point and deliberately the last
+            # fallible transition step. Until now every reader still saw the
+            # previous authoritative mode.
+            write_operating_mode(config, requested)
+            return report
+        except Exception as exc:
+            if presentation_changed:
+                try:
+                    _restore_mode_presentation(config, previous, refresh_es=True)
+                except Exception:
+                    pass
+            if requested is OperatingMode.NAS:
+                raise ModeTransitionError(
+                    "ROMCloud could not reconnect and remains in Offline Mode. "
+                    "Check the NAS connection and try NAS Mode again."
+                ) from exc
+            raise

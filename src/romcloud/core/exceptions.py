@@ -13,6 +13,10 @@ class CapabilityUnavailableError(ROMCloudError):
     """The current operating state intentionally disables a capability."""
 
 
+class ModeTransitionError(ROMCloudError):
+    """A requested operating-mode transition failed without being committed."""
+
+
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 

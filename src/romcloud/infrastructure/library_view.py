@@ -1,4 +1,4 @@
-"""Persisted Smart Cache library-presentation state."""
+"""Authoritative persisted ROMCloud operating mode."""
 
 from __future__ import annotations
 
@@ -7,37 +7,62 @@ from pathlib import Path
 
 from romcloud.infrastructure.atomic_file import atomic_write_text
 from romcloud.infrastructure.config import AppConfig
+from romcloud.core.capabilities import OperatingMode
 
 STATE_FILENAME = "library-view.json"
-STATE_VERSION = 1
+STATE_VERSION = 2
 
 
 def state_path(config: AppConfig) -> Path:
     return Path(config.data_path) / STATE_FILENAME
 
 
-def offline_library_enabled(config: AppConfig) -> bool:
-    """Return persisted cached-only presentation state; malformed state is off."""
+def operating_mode(config: AppConfig) -> OperatingMode:
+    """Return and, when necessary, initialize the one persisted mode.
+
+    Version 1 stored only the exceptional offline boolean.  Reading it once
+    migrates that intent to the explicit two-state schema.  Missing or
+    malformed legacy state becomes an explicit NAS state for compatibility
+    with installations that previously represented online by absence.
+    """
     path = state_path(config)
-    if not path.is_file() or path.is_symlink():
-        return False
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    return payload == {"version": STATE_VERSION, "offline_library": True}
+    payload = None
+    if path.is_file() and not path.is_symlink():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = None
+    if isinstance(payload, dict) and payload.get("version") == STATE_VERSION:
+        try:
+            return OperatingMode(payload.get("mode"))
+        except (TypeError, ValueError):
+            pass
+    mode = (
+        OperatingMode.OFFLINE
+        if payload == {"version": 1, "offline_library": True}
+        else OperatingMode.NAS
+    )
+    write_operating_mode(config, mode)
+    return mode
+
+
+def write_operating_mode(config: AppConfig, mode: OperatingMode | str) -> None:
+    """Atomically persist exactly one of the two valid operating modes."""
+    selected = OperatingMode(mode)
+    atomic_write_text(
+        state_path(config),
+        json.dumps({"version": STATE_VERSION, "mode": selected.value}, indent=2)
+        + "\n",
+    )
+
+
+def offline_library_enabled(config: AppConfig) -> bool:
+    """Compatibility adapter for cached-only presentation consumers."""
+    return operating_mode(config) is OperatingMode.OFFLINE
 
 
 def write_offline_library_state(config: AppConfig, enabled: bool) -> None:
-    """Persist enabled state atomically; online is represented by no state file."""
-    path = state_path(config)
-    if not enabled:
-        path.unlink(missing_ok=True)
-        return
-    atomic_write_text(
-        path,
-        json.dumps(
-            {"version": STATE_VERSION, "offline_library": True}, indent=2
-        )
-        + "\n",
+    """Compatibility adapter; false is explicit NAS, never file absence."""
+    write_operating_mode(
+        config, OperatingMode.OFFLINE if enabled else OperatingMode.NAS
     )

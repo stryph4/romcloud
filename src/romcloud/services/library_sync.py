@@ -558,7 +558,7 @@ class LibrarySyncService:
             rel = path.relative_to(self._local_roms_root / game.system).as_posix()
         except ValueError:
             return None
-        # A normal refresh while offline deliberately leaves online-only
+        # A normal refresh while offline deliberately leaves NAS-only
         # proxies absent; never recreate them here.
         if not path.is_file():
             return None
@@ -620,7 +620,11 @@ def offline_library_enabled_for_roots(data_root: Path) -> bool:
     if not path.is_file() or path.is_symlink():
         return False
     try:
-        return json.loads(path.read_text(encoding="utf-8")) == {"version": 1, "offline_library": True}
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload in (
+            {"version": 1, "offline_library": True},
+            {"version": 2, "mode": "offline"},
+        )
     except (OSError, ValueError):
         return False
 

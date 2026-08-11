@@ -37,9 +37,9 @@ def status_cmd(ctx: click.Context, system: str | None) -> None:
         click.echo(
             "  Library: "
             + (
-                "Cached games only"
+                "Offline Mode (cached games only)"
                 if offline_library_enabled(container.config)
-                else "Full Smart Cache catalog"
+                else "NAS Mode (full Smart Cache catalog)"
             )
         )
     # Catalog stats.

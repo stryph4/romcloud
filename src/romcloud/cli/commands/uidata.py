@@ -237,23 +237,24 @@ def uidata_status(ctx: click.Context) -> None:
     _run_action(ctx, build)
 
 
-def _run_library_mode_action(ctx: click.Context, enabled: bool) -> None:
+def _run_library_mode_action(ctx: click.Context, mode: str) -> None:
     def build() -> dict:
         _load_context_config(ctx)
         container = get_container(ctx)
-        from romcloud.integrations.batocera.game_access import set_offline_library_mode
+        from romcloud.integrations.batocera.game_access import set_operating_mode
 
         progress = _progress_sink({"progress": True})
-        label = "Offline Mode" if enabled else "Online Mode"
+        label = "Offline Mode" if mode == "offline" else "NAS Mode"
         emit_progress(
             progress, "library", "reconcile", "running", f"Showing {label}…"
         )
-        report = set_offline_library_mode(container.config, enabled)
+        report = set_operating_mode(container.config, mode, progress=progress)
         emit_progress(
             progress, "library", "reconcile", "success", f"Now showing {label}"
         )
         return {
             "offline_library_mode": report.offline,
+            "operating_mode": "offline" if report.offline else "nas",
             "visible_proxies": report.visible,
             "removed_proxies": report.removed,
             "restored_proxies": report.restored,
@@ -267,14 +268,21 @@ def _run_library_mode_action(ctx: click.Context, enabled: bool) -> None:
 @click.pass_context
 def uidata_library_offline(ctx: click.Context) -> None:
     """Switch Smart Cache presentation to valid cached games only."""
-    _run_library_mode_action(ctx, True)
+    _run_library_mode_action(ctx, "offline")
 
 
-@uidata_group.command("library-online")
+@uidata_group.command("library-nas")
 @click.pass_context
-def uidata_library_online(ctx: click.Context) -> None:
-    """Restore the full Smart Cache proxy presentation."""
-    _run_library_mode_action(ctx, False)
+def uidata_library_nas(ctx: click.Context) -> None:
+    """Reconnect and restore the complete Smart Cache NAS presentation."""
+    _run_library_mode_action(ctx, "nas")
+
+
+@uidata_group.command("library-online", hidden=True)
+@click.pass_context
+def uidata_library_online_compat(ctx: click.Context) -> None:
+    """Compatibility alias for pre-NAS-mode graphical clients."""
+    _run_library_mode_action(ctx, "nas")
 
 
 @uidata_group.command("refresh")

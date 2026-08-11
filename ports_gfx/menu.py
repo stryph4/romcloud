@@ -25,6 +25,7 @@ class MenuItem:
     label: str
     action: str
     description: str = ""
+    active: bool = False
 
 
 EXIT_ACTION = "exit"

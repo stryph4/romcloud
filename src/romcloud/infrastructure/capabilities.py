@@ -1,16 +1,15 @@
 """Configuration adapter for the central capability policy."""
 
-from romcloud.core.capabilities import CapabilityPolicy, PresentationIntent
+from romcloud.core.capabilities import CapabilityPolicy, OperatingMode
 from romcloud.infrastructure.config import AppConfig
-from romcloud.infrastructure.library_view import offline_library_enabled
+from romcloud.infrastructure.library_view import operating_mode
 
 
 def capability_policy(config: AppConfig) -> CapabilityPolicy:
     try:
-        offline = offline_library_enabled(config)
+        mode = operating_mode(config)
     except (AttributeError, TypeError):
         # Lightweight command/test contexts created before the persisted
-        # presentation feature have no data_path and therefore imply online.
-        offline = False
-    intent = PresentationIntent.OFFLINE if offline else PresentationIntent.ONLINE
-    return CapabilityPolicy(config.game_access_mode, intent)
+        # operating-state feature have no data_path and therefore imply NAS.
+        mode = OperatingMode.NAS
+    return CapabilityPolicy(config.game_access_mode, mode)

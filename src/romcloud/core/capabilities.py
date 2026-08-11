@@ -1,7 +1,7 @@
 """Central capability policy for ROMCloud operating states.
 
 The policy is deliberately pure: callers provide the configured game-access
-mode and persisted presentation intent, then both backend guards and the GUI
+strategy and persisted operating mode, then both backend guards and the GUI
 consume the same decisions.
 """
 
@@ -13,9 +13,16 @@ from enum import Enum
 from romcloud.core.exceptions import CapabilityUnavailableError
 
 
-class PresentationIntent(str, Enum):
-    ONLINE = "online"
+class OperatingMode(str, Enum):
+    NAS = "nas"
     OFFLINE = "offline"
+
+    # Compatibility for internal callers from before NAS Mode was named
+    # explicitly.  It is an enum alias for NAS, never a third state.
+    ONLINE = "nas"
+
+
+PresentationIntent = OperatingMode
 
 
 class Capability(str, Enum):
@@ -55,7 +62,15 @@ class CapabilityDecision:
 @dataclass(frozen=True)
 class CapabilityPolicy:
     game_access_mode: str
-    presentation_intent: PresentationIntent = PresentationIntent.ONLINE
+    operating_mode: OperatingMode = OperatingMode.NAS
+
+    @property
+    def effective_mode(self) -> OperatingMode:
+        # Direct/NAS cannot provide an offline library. Configuration and
+        # startup reconciliation persist this normalized state as NAS too.
+        if not self.offline_mode_supported:
+            return OperatingMode.NAS
+        return OperatingMode(self.operating_mode)
 
     @property
     def offline_mode_supported(self) -> bool:
@@ -65,7 +80,7 @@ class CapabilityPolicy:
     def offline(self) -> bool:
         return (
             self.offline_mode_supported
-            and self.presentation_intent is PresentationIntent.OFFLINE
+            and self.effective_mode is OperatingMode.OFFLINE
         )
 
     def decision(self, capability: Capability) -> CapabilityDecision:
@@ -76,7 +91,7 @@ class CapabilityPolicy:
         if self.offline and capability in _OFFLINE_BLOCKED:
             return CapabilityDecision(
                 False,
-                "Unavailable while Offline Mode is active. Switch to Online Mode first.",
+                "Unavailable while Offline Mode is active. Switch to NAS Mode first.",
             )
         return CapabilityDecision(True)
 
@@ -92,11 +107,9 @@ class CapabilityPolicy:
         decisions = {cap.value: self.decision(cap) for cap in Capability}
         return {
             "game_access_mode": self.game_access_mode,
-            "presentation_intent": (
-                PresentationIntent.OFFLINE.value
-                if self.offline
-                else PresentationIntent.ONLINE.value
-            ),
+            "operating_mode": self.effective_mode.value,
+            "presentation_intent": self.effective_mode.value,
+            "nas_mode": self.effective_mode is OperatingMode.NAS,
             "offline_mode": self.offline,
             "offline_mode_supported": self.offline_mode_supported,
             "capabilities": {

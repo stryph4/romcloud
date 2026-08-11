@@ -358,10 +358,10 @@ romcloud library-sync remove-local
 canonical document. `push` and `sync` add local/source improvements to the
 remote store. `remove-local` removes only marked local entries and preserves
 canonical/source data and media. Catalog refresh runs Library Sync only while
-the opt-in is enabled and Online Mode is active. Library Sync push, pull, and
+the opt-in is enabled and NAS Mode is active. Library Sync push, pull, and
 sync are blocked in Offline Mode; the canonical remote library is left
-untouched and locally scraped metadata remains available for a later online
-sync. Local rendering never recreates absent online-only proxies.
+untouched and locally scraped metadata remains available for a later NAS Mode
+sync. Local rendering never recreates absent NAS-only proxies.
 
 ## Local cache and offline use
 
@@ -370,17 +370,17 @@ graphical interface. Explicit CLI maintenance remains possible for diagnostics
 with `romcloud cache --override ...`; the override applies to that invocation
 only and does not change the configured mode.
 
-### Offline and Online modes
+### NAS and Offline modes
 
-Smart Cache has an explicit operating-state control on the graphical main
-menu. **Offline Mode** shows only ROMCloud games whose complete cached assets
-are currently valid and disables provider-dependent work. **Online Mode**
-restores the full proxy library and re-enables those features. The CLI remains:
+Smart Cache has one authoritative operating state, shown as two opposite
+choices on the graphical main menu. **Offline Mode** shows only ROMCloud games
+whose complete cached assets are currently valid and disables remote-dependent
+work. **NAS Mode** is the full-library state. The CLI is:
 
 ```bash
 romcloud library offline
 romcloud library status
-romcloud library online
+romcloud library nas
 ```
 
 Offline Mode allows cached launches, cache status/pin/unpin/removal/eviction,
@@ -388,20 +388,28 @@ local settings and diagnostics, and connection recovery bookkeeping. It
 blocks cache misses/downloads, provider/catalog refresh, Library Sync remote
 operations, SaveSync upload/download, and update network operations before
 they contact remote storage. It never enters or leaves automatically when
-connectivity changes. Returning online recreates the normal full Smart Cache
-proxy set from retained local catalog ownership records without refreshing the
-provider, and it does not automatically run SaveSync or Library Sync.
+connectivity changes. If storage becomes unreachable while NAS Mode is active,
+ROMCloud remains in NAS Mode and reports a connectivity failure.
+
+Selecting NAS Mode while Offline Mode is active is an explicit reconnect. The
+transition remounts configured storage, validates the read-only ROM source and
+any separate writable ROMCloud data location, refreshes the complete catalog,
+runs enabled Library Sync, prepares the full proxy/gamelist presentation, and
+refreshes EmulationStation before atomically committing NAS Mode. A failure at
+any point leaves Offline Mode authoritative and cached/local games visible; no
+partial full library is exposed. SaveSync data is validated but never uploaded
+or downloaded merely by changing modes.
 
 The transition does not delete catalog rows, cached bytes, cache status, pin
 state, local saves, local ROMs, or unrelated `.romcloud` files. Offline Mode
 is unavailable in Direct/NAS mode because that access strategy fundamentally
 depends on the provider.
 
-The active state is stored atomically in
-`/userdata/system/romcloud/data/library-view.json` and remains active across
-reboot, relaunch, refresh, repair, and update reconciliation. Switching
-successfully to Direct/NAS clears it; switching back to Smart Cache therefore
-starts with the normal full-library presentation.
+The active `nas` or `offline` state is stored atomically in
+`/userdata/system/romcloud/data/library-view.json` and remains authoritative
+across reboot, relaunch, refresh, repair, and update reconciliation. Switching
+successfully to Direct/NAS commits NAS Mode; switching back to Smart Cache
+therefore starts with the normal full-library presentation.
 
 The default cache is:
 
