@@ -26,7 +26,8 @@ def test_successful_refresh_registers_only_cataloged_systems(monkeypatch) -> Non
         game_repo=SimpleNamespace(list_systems=lambda: ["ps2", "snes"]),
     )
     monkeypatch.setattr(refresh_module, "get_container", lambda ctx: container)
-    def reconcile(config):
+    def reconcile(config, **kwargs):
+        assert kwargs == {"render_library_metadata": False}
         calls.append(container.game_repo.list_systems())
         return SimpleNamespace(
             created=0, removed=0,
@@ -54,7 +55,7 @@ def test_es_registration_failure_makes_incomplete_refresh_nonzero(monkeypatch) -
     monkeypatch.setattr(refresh_module, "get_container", lambda ctx: container)
     monkeypatch.setattr(
         "romcloud.integrations.batocera.game_access.reconcile_game_access",
-        lambda config: (_ for _ in ()).throw(
+        lambda config, **kwargs: (_ for _ in ()).throw(
             es_config.ESConfigError("stock file missing")
         ),
     )

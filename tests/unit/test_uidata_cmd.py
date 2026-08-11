@@ -179,6 +179,78 @@ class TestRefresh:
         assert payload["es_restart_required"] is True
 
 
+class TestLibrarySyncBridge:
+    def test_preview_returns_lightweight_import_counts(self, monkeypatch):
+        import romcloud.cli.commands.uidata as uidata_module
+
+        preview = type(
+            "Preview",
+            (),
+            {"as_dict": lambda self: {"games_eligible": 10, "video_references": 2}},
+        )()
+        container = type(
+            "Container", (), {"library_sync": type("Service", (), {"preview_source_import": lambda self: preview})()}
+        )()
+        monkeypatch.setattr(uidata_module, "_load_context_config", lambda ctx: None)
+        monkeypatch.setattr(uidata_module, "get_container", lambda ctx: container)
+
+        result = CliRunner().invoke(
+            uidata_module.uidata_group,
+            ["library-sync-preview"],
+            obj={"config_path": "unused"},
+        )
+
+        assert result.exit_code == 0
+        assert json.loads(result.stdout)["games_eligible"] == 10
+
+    def test_import_forwards_structured_progress(self, monkeypatch):
+        import romcloud.cli.commands.uidata as uidata_module
+        from romcloud.core.models.librarysync import LibrarySyncReport
+        from romcloud.core.progress import emit_progress
+
+        class Service:
+            def sync(self, progress=None):
+                emit_progress(
+                    progress,
+                    "library_sync",
+                    "media",
+                    "running",
+                    "ps2: media file 1 / 2",
+                    current=1,
+                    total=2,
+                )
+                return LibrarySyncReport(direction="sync", rendered=1)
+
+        container = type(
+            "Container",
+            (),
+            {
+                "library_sync": Service(),
+                "config": object(),
+                "game_repo": type("Repo", (), {"list_systems": lambda self: ["ps2"]})(),
+            },
+        )()
+        monkeypatch.setattr(uidata_module, "_load_context_config", lambda ctx: None)
+        monkeypatch.setattr(uidata_module, "get_container", lambda ctx: container)
+        monkeypatch.setattr(
+            "romcloud.integrations.batocera.presentation.refresh_emulationstation",
+            lambda config, systems: None,
+        )
+
+        result = CliRunner().invoke(
+            uidata_module.uidata_group,
+            ["library-sync"],
+            obj={"config_path": "unused"},
+        )
+
+        assert result.exit_code == 0
+        assert "@romcloud-progress" in result.output
+        payload_line = next(
+            line for line in reversed(result.output.splitlines()) if line.startswith("{")
+        )
+        assert json.loads(payload_line)["rendered"] == 1
+
+
 class TestUpdateBridge:
     def test_check_uses_shared_updater_without_network(self, tmp_path, monkeypatch):
         from romcloud.lifecycle import update as update_module

@@ -45,23 +45,12 @@ def refresh_cmd(ctx: click.Context, system: str | None, dry_run: bool) -> None:
         result = container.catalog.refresh()
         click.echo(str(result))
 
-        if getattr(getattr(container.config, "library_sync", None), "enabled", False):
-            library_report = container.library_sync.sync()
-            click.echo(
-                "Library Sync: "
-                f"{library_report.metadata_added} added, "
-                f"{library_report.metadata_updated} updated, "
-                f"{library_report.media_transferred} media transferred, "
-                f"{len(library_report.conflicts)} conflicts, "
-                f"{len(library_report.failures)} failures."
-            )
-            for failure in library_report.failures:
-                click.echo(f"warning: {failure}", err=True)
-
         try:
             from romcloud.integrations.batocera.game_access import reconcile_game_access
 
-            access_result = reconcile_game_access(container.config)
+            access_result = reconcile_game_access(
+                container.config, render_library_metadata=False
+            )
         except ROMCloudError as exc:
             click.echo(f"error: could not update EmulationStation integration — {exc}", err=True)
             ctx.exit(1)

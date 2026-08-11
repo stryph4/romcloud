@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from ports_gfx.actions import Action
+from ports_gfx.activity import ActivityEvent
 from ports_gfx.client import BackendResult
 from ports_gfx.input_manager import InputEvent
 from ports_gfx.layout import Rect
 from ports_gfx.osk import MASK_CHAR
-from ports_gfx.wizard import WizardState, WizardStep
+from ports_gfx.wizard import STEP_CONTEXT, STEPS, WizardState, WizardStep
 
 
 RECTS = [Rect(0, index * 20, 100, 18) for index in range(8)]
@@ -33,6 +34,66 @@ def test_fresh_and_partial_welcome_states():
     assert fresh.options == ["Start Setup"]
     assert partial.options == ["Resume / Repair Setup"]
     assert partial.issues == ["credentials missing"]
+
+
+def test_every_wizard_step_has_short_user_facing_context():
+    assert set(STEP_CONTEXT) == set(STEPS)
+    for step in STEPS:
+        wizard = WizardState()
+        wizard.step = step
+        primary, secondary = wizard.context_lines
+        assert primary
+        assert secondary
+        combined = f"{primary} {secondary}".lower()
+        assert "provider abstraction" not in combined
+        assert "mount worker" not in combined
+        assert "sqlite" not in combined
+
+
+def test_local_folder_context_matches_the_folder_purpose():
+    wizard = WizardState()
+    wizard.step = WizardStep.LOCAL_BROWSE
+
+    wizard.local_browse_purpose = "source"
+    assert "system folders" in wizard.context_lines[0]
+    wizard.local_browse_purpose = "cache"
+    assert "local game copies" in wizard.context_lines[0]
+    wizard.local_browse_purpose = "remote_data"
+    assert "synchronized saves" in wizard.context_lines[0]
+
+
+def test_running_wizard_progress_is_indeterminate_until_a_total_is_reported():
+    wizard = WizardState()
+    wizard.step = WizardStep.APPLY
+    wizard.runner = _Runner(finished=False)
+
+    assert wizard.progress is not None
+    assert wizard.progress.fraction is None
+    assert wizard.progress.message == "Saving configuration…"
+
+
+def test_wizard_progress_tracks_phase_totals_without_finishing_early():
+    wizard = WizardState()
+    wizard.step = WizardStep.APPLY
+    wizard.runner = _Runner(finished=False)
+    wizard._progress_event = ActivityEvent(  # noqa: SLF001 - pure progress model
+        "", "catalog_refresh", "system_progress", "running", "Scanning games", current=8, total=10
+    )
+
+    assert wizard.progress is not None
+    assert wizard.progress.label == "Scanning games — 8 / 10"
+    assert wizard.progress.fraction == 0.8
+
+    wizard._progress_event = ActivityEvent(  # noqa: SLF001
+        "", "catalog_refresh", "overall_progress", "running", "Finishing scan", current=10, total=10
+    )
+    assert wizard.progress.fraction == 0.99
+
+    wizard._progress_event = ActivityEvent(  # noqa: SLF001
+        "", "catalog_refresh", "refresh_completed", "success", "Library scan complete", current=10, total=10
+    )
+    assert wizard.progress.fraction == 1.0
+    assert wizard.progress.message == "Library scan complete"
 
 
 def test_controller_keyboard_and_touch_use_the_same_next_back_actions():
@@ -92,7 +153,8 @@ def test_share_discovery_success_and_failure(monkeypatch):
     )
     wizard.poll()
     assert wizard.step == WizardStep.DISCOVER
-    assert wizard.error == "authentication failed"
+    assert wizard.error == "Could not connect. Check the ROM server and account, then retry."
+    assert wizard.technical_error == "authentication failed"
     assert wizard.options == ["Retry"]
 
 
@@ -246,6 +308,11 @@ def test_apply_failure_retries_and_success_clears_password(monkeypatch):
     )
     wizard.poll()
     assert wizard.options == ["Retry"]
+    assert wizard.runner is None
+    assert wizard.progress is None
+    assert "review details and retry" in wizard.error
+    assert wizard.technical_error == "refresh catalog failed"
+    assert wizard.activity.events[-1].detail == "refresh catalog failed"
     assert wizard.password == "secret"
 
     wizard.runner = _Runner()
@@ -255,6 +322,7 @@ def test_apply_failure_retries_and_success_clears_password(monkeypatch):
     )
     wizard.poll()
     assert wizard.step == WizardStep.DONE
+    assert wizard.notice == "ROMCloud setup is complete."
     assert wizard.password == ""
     assert wizard.remote_password == ""
 

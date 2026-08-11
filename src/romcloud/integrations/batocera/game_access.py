@@ -198,7 +198,10 @@ def reconcile_direct_links(config: AppConfig, systems: Iterable[str]) -> DirectL
 
 
 def reconcile_game_access(
-    config: AppConfig, *, refresh_es: bool = True
+    config: AppConfig,
+    *,
+    refresh_es: bool = True,
+    render_library_metadata: bool = True,
 ) -> GameAccessReport:
     """Apply the configured strategy to catalog-owned Batocera artifacts."""
     # Imported lazily to avoid a lifecycle/container import cycle.
@@ -214,7 +217,10 @@ def reconcile_game_access(
         ]
         report = reconcile_direct_links(config, systems)
         remove_owned_proxies(config)
-        if getattr(getattr(config, "library_sync", None), "enabled", False):
+        if (
+            render_library_metadata
+            and getattr(getattr(config, "library_sync", None), "enabled", False)
+        ):
             container.library_sync.render_local()
         if refresh_es:
             _refresh_emulationstation(config, container.game_repo.list_systems())
@@ -227,7 +233,10 @@ def reconcile_game_access(
         reconcile_library_presentation(config, offline=True)
     else:
         restore_owned_proxies(config)
-    if getattr(getattr(config, "library_sync", None), "enabled", False):
+    if (
+        render_library_metadata
+        and getattr(getattr(config, "library_sync", None), "enabled", False)
+    ):
         container.library_sync.render_local()
     es_result = (
         _refresh_emulationstation(config, container.game_repo.list_systems())
@@ -352,8 +361,6 @@ def _prepare_nas_library(
     if refresh.errors:
         details = "; ".join(f"{system}: {message}" for system, message in refresh.errors)
         raise ProviderNotReachableError(details)
-    if config.library_sync.enabled:
-        container.library_sync.sync()
     emit_progress(
         progress, "operating_mode", "catalog", "success", "Full library restored"
     )

@@ -312,12 +312,9 @@ def _run_catalog_refresh(ctx: click.Context, progress) -> None:  # noqa: ANN001
         from romcloud.integrations.batocera.game_access import reconcile_game_access
         from romcloud.infrastructure.config import DIRECT_NAS_MODE
 
-        library_report = (
-            container.library_sync.sync()
-            if container.config.library_sync.enabled
-            else None
+        access_result = reconcile_game_access(
+            container.config, render_library_metadata=False
         )
-        access_result = reconcile_game_access(container.config)
         if container.config.game_access_mode == DIRECT_NAS_MODE:
             es_systems: list[str] = []
             es_missing: list[str] = []
@@ -344,7 +341,7 @@ def _run_catalog_refresh(ctx: click.Context, progress) -> None:  # noqa: ANN001
             "es_systems": es_systems,
             "es_missing_systems": es_missing,
             "es_restart_required": True,
-            "library_sync": library_report.as_dict() if library_report else None,
+            "library_sync": None,
         }
 
     _run_action(ctx, build)
@@ -364,15 +361,27 @@ def uidata_library_sync_status(ctx: click.Context) -> None:
 @uidata_group.command("library-sync")
 @click.pass_context
 def uidata_library_sync(ctx: click.Context) -> None:
-    """Run the shared additive bidirectional Library Sync service."""
+    """Deliberately import source metadata after graphical confirmation."""
     def build() -> dict:
         _load_context_config(ctx)
         container = get_container(ctx)
-        report = container.library_sync.sync()
+        progress = _progress_sink({"progress": True})
+        report = container.library_sync.sync(progress=progress)
         from romcloud.integrations.batocera.presentation import refresh_emulationstation
 
         refresh_emulationstation(container.config, container.game_repo.list_systems())
         return report.as_dict()
+
+    _run_action(ctx, build)
+
+
+@uidata_group.command("library-sync-preview")
+@click.pass_context
+def uidata_library_sync_preview(ctx: click.Context) -> None:
+    """Return a lightweight source-metadata import preflight."""
+    def build() -> dict:
+        _load_context_config(ctx)
+        return get_container(ctx).library_sync.preview_source_import().as_dict()
 
     _run_action(ctx, build)
 

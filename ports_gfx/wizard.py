@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from typing import Any, Sequence
 
 from ports_gfx.actions import ACTION_DIRECTIONS, Action
-from ports_gfx.activity import ActivityLog
+from ports_gfx.activity import ActivityEvent, ActivityLog
 from ports_gfx.client import BackendResult, operation_result, start_backend_operation
 from ports_gfx.input_manager import InputEvent
 from ports_gfx.layout import Rect
@@ -61,6 +63,191 @@ TEXT_STEPS = (
 CACHE_FIELDS = ("cache_root", "cache_root_manual", "max_size_gb", "min_free_gb")
 
 
+@dataclass(frozen=True)
+class WizardStepContext:
+    primary: str
+    secondary: str
+
+
+@dataclass(frozen=True)
+class WizardProgressState:
+    message: str
+    status: str = "running"
+    stage: str = ""
+    current: int | None = None
+    total: int | None = None
+
+    @property
+    def determinate(self) -> bool:
+        return self.current is not None and self.total is not None and self.total > 0
+
+    @property
+    def fraction(self) -> float | None:
+        if not self.determinate:
+            return None
+        assert self.current is not None and self.total is not None
+        fraction = max(0.0, min(1.0, self.current / self.total))
+        # A running phase must not look complete merely because its final item
+        # was reported before the phase's terminal event reached the UI.
+        if fraction >= 1.0 and not (
+            self.status == "success"
+            and self.stage in {"refresh_completed", "complete"}
+        ):
+            return 0.99
+        return fraction
+
+    @property
+    def label(self) -> str:
+        if not self.determinate:
+            return self.message
+        assert self.current is not None and self.total is not None
+        return f"{self.message} — {self.current:,} / {self.total:,}"
+
+
+STEP_CONTEXT: dict[WizardStep, WizardStepContext] = {
+    WizardStep.WELCOME: WizardStepContext(
+        "ROMCloud will guide you through your ROM library, game access, and shared data settings.",
+        "You can review each choice before ROMCloud changes this device.",
+    ),
+    WizardStep.SOURCE: WizardStepContext(
+        "Choose where your ROM collection is stored.",
+        "ROMCloud can use a NAS or a supported local or external folder.",
+    ),
+    WizardStep.LOCAL_BROWSE: WizardStepContext(
+        "Choose a folder on this device or attached storage.",
+        "Open folders to browse, then select the folder you want ROMCloud to use.",
+    ),
+    WizardStep.SERVER: WizardStepContext(
+        "Enter the network name or address of the server holding your ROMs.",
+        "Next, ROMCloud will ask for the connection port and account.",
+    ),
+    WizardStep.PORT: WizardStepContext(
+        "Enter the network port used by your ROM share.",
+        "Most SMB servers use port 445.",
+    ),
+    WizardStep.USERNAME: WizardStepContext(
+        "Enter an account that can read your ROM library.",
+        "ROMCloud keeps ROM-library access read-only.",
+    ),
+    WizardStep.PASSWORD: WizardStepContext(
+        "Enter the password for your ROM-library account.",
+        "ROMCloud will connect and show the shares this account can access.",
+    ),
+    WizardStep.DISCOVER: WizardStepContext(
+        "ROMCloud is connecting to your ROM server.",
+        "It will authenticate and find the shares available to your account.",
+    ),
+    WizardStep.SHARE: WizardStepContext(
+        "Choose the share that contains your ROM collection.",
+        "Next, you can select the specific ROM folder inside it.",
+    ),
+    WizardStep.SOURCE_BROWSE: WizardStepContext(
+        "Choose the folder that contains your Batocera system folders.",
+        "ROMCloud reads this library without modifying your source games.",
+    ),
+    WizardStep.DETECT: WizardStepContext(
+        "ROMCloud is testing access to the selected ROM folder.",
+        "It will identify the Batocera systems available there.",
+    ),
+    WizardStep.SYSTEMS: WizardStepContext(
+        "Review the systems ROMCloud found in your library.",
+        "Continue to choose how games should be opened on this device.",
+    ),
+    WizardStep.GAME_ACCESS: WizardStepContext(
+        "Choose how ROMCloud should open games.",
+        "Smart Cache keeps played games locally; Direct/NAS uses the source while playing.",
+    ),
+    WizardStep.REMOTE_DATA: WizardStepContext(
+        "Choose where ROMCloud should store shared data such as synchronized saves.",
+        "This location must be writable and separate from the read-only ROM share.",
+    ),
+    WizardStep.REMOTE_LOCAL: WizardStepContext(
+        "Enter a writable local or external folder for shared ROMCloud data.",
+        "Next, choose whether to enable shared library metadata.",
+    ),
+    WizardStep.REMOTE_AUTH: WizardStepContext(
+        "Choose how ROMCloud should connect to the writable data share.",
+        "It may use the same account prompts or a different server and account.",
+    ),
+    WizardStep.REMOTE_SERVER: WizardStepContext(
+        "Enter the server that will hold shared ROMCloud data.",
+        "This may be the ROM server or another supported server.",
+    ),
+    WizardStep.REMOTE_PORT: WizardStepContext(
+        "Enter the network port used by the writable data share.",
+        "Most SMB servers use port 445.",
+    ),
+    WizardStep.REMOTE_USERNAME: WizardStepContext(
+        "Enter an account that can write shared ROMCloud data.",
+        "ROMCloud will verify write and cleanup access before setup completes.",
+    ),
+    WizardStep.REMOTE_PASSWORD: WizardStepContext(
+        "Enter the password for the writable-data account.",
+        "ROMCloud will connect and show the shares this account can access.",
+    ),
+    WizardStep.REMOTE_DISCOVER: WizardStepContext(
+        "ROMCloud is connecting to the shared-data server.",
+        "It will authenticate and find the shares available to your account.",
+    ),
+    WizardStep.REMOTE_SHARE: WizardStepContext(
+        "Choose the share where ROMCloud should keep synchronized data.",
+        "Next, you can choose a folder inside that share.",
+    ),
+    WizardStep.REMOTE_BROWSE: WizardStepContext(
+        "Choose the folder for shared ROMCloud data.",
+        "ROMCloud will test this location before saving the configuration.",
+    ),
+    WizardStep.REMOTE_VALIDATE: WizardStepContext(
+        "ROMCloud is checking access to the shared-data folder.",
+        "A full write and cleanup test will run when setup is applied.",
+    ),
+    WizardStep.LIBRARY_SYNC: WizardStepContext(
+        "Choose whether ROMCloud should share game descriptions and media between devices.",
+        "Setup only enables it; import starts later from Library after a preview and long press.",
+    ),
+    WizardStep.CACHE: WizardStepContext(
+        "Choose how much local space ROMCloud may use for games you play.",
+        "Cached and pinned games can launch faster and remain available in Offline Mode.",
+    ),
+    WizardStep.REVIEW: WizardStepContext(
+        "Review your choices before ROMCloud configures this device.",
+        "Continue to test storage, scan your games, and prepare EmulationStation.",
+    ),
+    WizardStep.APPLY: WizardStepContext(
+        "ROMCloud is configuring and testing this device.",
+        "Keep this window open while it scans the library and prepares EmulationStation.",
+    ),
+    WizardStep.DONE: WizardStepContext(
+        "ROMCloud setup is complete.",
+        "Return to EmulationStation and refresh its game list to show ROMCloud games.",
+    ),
+}
+
+
+_RUNNING_MESSAGES = {
+    WizardStep.LOCAL_BROWSE: "Opening the selected folder…",
+    WizardStep.DISCOVER: "Connecting to your ROM library…",
+    WizardStep.SOURCE_BROWSE: "Opening the ROM share…",
+    WizardStep.DETECT: "Testing access to your ROM library…",
+    WizardStep.REMOTE_DISCOVER: "Connecting to shared data storage…",
+    WizardStep.REMOTE_BROWSE: "Opening the shared-data folder…",
+    WizardStep.REMOTE_VALIDATE: "Testing access to shared data storage…",
+    WizardStep.APPLY: "Saving configuration…",
+}
+
+
+_FAILURE_MESSAGES = {
+    WizardStep.LOCAL_BROWSE: "Could not open that folder. Check that it is available, then retry.",
+    WizardStep.DISCOVER: "Could not connect. Check the ROM server and account, then retry.",
+    WizardStep.SOURCE_BROWSE: "Could not open the ROM share. Check access, then retry.",
+    WizardStep.DETECT: "Could not read that ROM folder. Check the folder and permissions, then retry.",
+    WizardStep.REMOTE_DISCOVER: "Could not connect. Check the shared-data server and account, then retry.",
+    WizardStep.REMOTE_BROWSE: "Could not open the shared-data share. Check access, then retry.",
+    WizardStep.REMOTE_VALIDATE: "Could not verify that data folder. Check access, then retry.",
+    WizardStep.APPLY: "Setup could not finish. Your earlier settings were preserved when possible; review details and retry.",
+}
+
+
 class WizardState:
     """Device-agnostic setup state. Secrets live only in this process."""
 
@@ -110,6 +297,9 @@ class WizardState:
         self.library_sync_enabled = bool(data.get("library_sync_enabled", False))
         self.activity = ActivityLog()
         self.show_details = False
+        self.notice = ""
+        self.technical_error = ""
+        self._progress_event: ActivityEvent | None = None
 
     @property
     def step_number(self) -> int:
@@ -155,6 +345,43 @@ class WizardState:
             WizardStep.DONE: "Setup Complete",
         }
         return titles[self.step]
+
+    @property
+    def context_lines(self) -> tuple[str, str]:
+        context = STEP_CONTEXT[self.step]
+        if self.step == WizardStep.LOCAL_BROWSE:
+            context = {
+                "source": WizardStepContext(
+                    "Choose the local folder that contains your Batocera system folders.",
+                    "ROMCloud reads your games in place and does not move the source files.",
+                ),
+                "remote_data": WizardStepContext(
+                    "Choose a writable folder for synchronized saves and other shared data.",
+                    "This folder stays separate from your ROM library and game cache.",
+                ),
+                "cache": WizardStepContext(
+                    "Choose where ROMCloud should keep local game copies.",
+                    "Next, you can set the maximum cache size and reserved free space.",
+                ),
+            }.get(self.local_browse_purpose, context)
+        return context.primary, context.secondary
+
+    @property
+    def progress(self) -> WizardProgressState | None:
+        if self.runner is None:
+            return None
+        event = self._progress_event
+        if event is None:
+            return WizardProgressState(
+                _RUNNING_MESSAGES.get(self.step, "ROMCloud is working…")
+            )
+        return WizardProgressState(
+            event.message,
+            status=event.status,
+            stage=event.stage,
+            current=event.current,
+            total=event.total,
+        )
 
     @property
     def options(self) -> list[str]:
@@ -443,6 +670,8 @@ class WizardState:
 
     def _confirm(self, romcloud_bin: str, *, show_osk: bool = True) -> None:
         self.error = ""
+        self.technical_error = ""
+        self.notice = ""
         if self.step == WizardStep.WELCOME:
             self.step = WizardStep.SOURCE
         elif self.step == WizardStep.SOURCE:
@@ -603,6 +832,8 @@ class WizardState:
             self.step = previous
             self.selected_index = 0
             self.error = ""
+            self.technical_error = ""
+            self.notice = ""
 
     def select(self, index: int) -> None:
         count = max(1, len(self.options))
@@ -626,13 +857,30 @@ class WizardState:
             return []
         drained = self.runner.poll()
         for line in drained:
-            self.activity.ingest(line.text)
+            event = self.activity.ingest(line.text)
+            if event is not None:
+                self._progress_event = event
         if not self.runner.is_finished:
             return drained
         result = operation_result(self.runner)
         self.runner = None
         if not result.ok:
-            self.error = result.error
+            self.technical_error = result.error
+            self.error = _FAILURE_MESSAGES.get(
+                self.step,
+                "ROMCloud could not complete this step. Review details and retry.",
+            )
+            if self._progress_event is None or self._progress_event.status != "error":
+                self.activity.append(
+                    ActivityEvent(
+                        datetime.now().strftime("%H:%M:%S"),
+                        "setup",
+                        self.step.value,
+                        "error",
+                        self.error,
+                        detail=self.technical_error,
+                    )
+                )
             return drained
 
         if self.step == WizardStep.DISCOVER:
@@ -642,11 +890,21 @@ class WizardState:
                 return drained
             self.step = WizardStep.SHARE
             self.selected_index = 0
+            count = len(self.shares)
+            self.notice = (
+                f"Connection successful — {count:,} "
+                f"share{'s' if count != 1 else ''} found."
+            )
         elif self.step == WizardStep.DETECT:
             self.systems = [str(system) for system in result.data.get("systems", [])]
             self.source_validation = dict(result.data.get("validation", {}))
             self.step = WizardStep.SYSTEMS
             self.selected_index = 0
+            count = len(self.systems)
+            self.notice = (
+                f"Library check complete — {count:,} "
+                f"system{'s' if count != 1 else ''} found."
+            )
         elif self.step in (
             WizardStep.SOURCE_BROWSE,
             WizardStep.REMOTE_BROWSE,
@@ -657,6 +915,7 @@ class WizardState:
                 dict(entry) for entry in result.data.get("entries", [])
             ]
             self.selected_index = 0
+            self.notice = "Folder loaded. Choose this folder or open another folder."
         elif self.step == WizardStep.REMOTE_DISCOVER:
             self.remote_shares = [dict(item) for item in result.data.get("shares", [])]
             if not self.remote_shares:
@@ -664,16 +923,23 @@ class WizardState:
                 return drained
             self.step = WizardStep.REMOTE_SHARE
             self.selected_index = 0
+            count = len(self.remote_shares)
+            self.notice = (
+                f"Connection successful — {count:,} "
+                f"share{'s' if count != 1 else ''} found."
+            )
         elif self.step == WizardStep.REMOTE_VALIDATE:
             self.remote_validation = dict(result.data.get("validation", {}))
             self.step = self._post_storage_step()
             self.selected_index = 0
+            self.notice = "Shared-data folder is accessible. A write test will run when setup is applied."
         elif self.step == WizardStep.APPLY:
             self.applied_summary = dict(result.data)
             self.password = ""
             self.remote_password = ""
             self.step = WizardStep.DONE
             self.selected_index = 0
+            self.notice = "ROMCloud setup is complete."
         return drained
 
     def request_payload(self) -> dict[str, Any]:
@@ -716,6 +982,9 @@ class WizardState:
     def _start_operation(self, step: WizardStep, action: str, romcloud_bin: str) -> None:
         self.step = step
         self.error = ""
+        self.technical_error = ""
+        self.notice = ""
+        self._progress_event = None
         self.runner = start_backend_operation(romcloud_bin, action, self.request_payload())
 
     def _start_local_browse(self, purpose: str, path: str, romcloud_bin: str) -> None:
@@ -724,6 +993,9 @@ class WizardState:
         self.browser_entries = []
         self.step = WizardStep.LOCAL_BROWSE
         self.error = ""
+        self.technical_error = ""
+        self.notice = ""
+        self._progress_event = None
         self.runner = start_backend_operation(
             romcloud_bin,
             "setup-browse-local",
@@ -741,6 +1013,10 @@ class WizardState:
             if action == "setup-browse-local"
             else self.request_payload()
         )
+        self.error = ""
+        self.technical_error = ""
+        self.notice = ""
+        self._progress_event = None
         self.runner = start_backend_operation(romcloud_bin, action, payload)
 
     def _confirm_browser(self, romcloud_bin: str) -> None:

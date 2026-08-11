@@ -49,6 +49,14 @@ from ports_gfx.layout import (
     compute_wizard_regions,
     find_next_focus_index,
 )
+from ports_gfx.library_sync_screen import (
+    CONFIRMING as LIBRARY_CONFIRMING,
+    IMPORTING as LIBRARY_IMPORTING,
+    PREFLIGHT as LIBRARY_PREFLIGHT,
+    PREFLIGHTING as LIBRARY_PREFLIGHTING,
+    RESULT as LIBRARY_RESULT,
+    LibrarySyncScreenState,
+)
 from ports_gfx.menu import (
     BACK_ACTION,
     CATEGORY_ACTION_PREFIX,
@@ -99,6 +107,7 @@ SAVESYNC_ACTION = "savesync"
 rather than dispatching to the backend — SaveSync is a first-class
 top-level menu entry, not a Settings submenu."""
 SETUP_ACTION = "setup"
+LIBRARY_SYNC_ACTION = "library-sync"
 
 MENU_ITEMS: tuple[MenuItem, ...] = (
     MenuItem("Storage Setup", SETUP_ACTION),
@@ -211,7 +220,7 @@ def menu_categories_for_state(
     if mode != "direct_nas":
         library.append(MenuItem("Cache Status", "cache-status"))
     if library_sync_enabled and capabilities.get("library_sync", True):
-        library.append(MenuItem("Sync Library Metadata", "library-sync"))
+        library.append(MenuItem("Import Source Metadata", LIBRARY_SYNC_ACTION))
     storage = MENU_CATEGORIES["Storage"]
     if not capabilities.get("remote_validation", True):
         storage = tuple(item for item in storage if item.action != SETUP_ACTION)
@@ -256,9 +265,6 @@ _OPERATIONS: dict[str, OperationSpec] = {
     ),
     "library-nas": OperationSpec(
         title="NAS Mode", args=("uidata", "library-nas")
-    ),
-    "library-sync": OperationSpec(
-        title="Sync Library Metadata", args=("uidata", "library-sync")
     ),
     "update-check": OperationSpec(title="Check for Updates", args=("uidata", "update-check")),
     "update-install": OperationSpec(title="Update ROMCloud", args=("uidata", "update-install")),
@@ -773,6 +779,7 @@ def _run(  # noqa: ANN001
         controller_test = _ControllerTestScreenState()
         operation_screen: Optional[OperationScreenState] = None
         savesync_screen: Optional[SaveSyncScreenState] = None
+        library_sync_screen: Optional[LibrarySyncScreenState] = None
         activity = ActivityLog(max_events=250)
         catalog_progress = CatalogRefreshProgress()
         update_check = UpdateCheckState()
@@ -835,6 +842,8 @@ def _run(  # noqa: ANN001
                     rects = (layout.safe_area,)
                 elif current_screen == "savesync":
                     rects = (layout.safe_area,)
+                elif current_screen == "library_sync":
+                    rects = (layout.safe_area,)
                 else:
                     rects = ()
                 ievent = input_manager.handle_event(
@@ -885,6 +894,10 @@ def _run(  # noqa: ANN001
                         savesync_screen = SaveSyncScreenState(romcloud_bin=romcloud_bin)
                         savesync_screen.refresh_status()
                         current_screen = "savesync"
+                    elif ievent.action == Action.CONFIRM and item.action == LIBRARY_SYNC_ACTION:
+                        library_sync_screen = LibrarySyncScreenState(romcloud_bin=romcloud_bin)
+                        library_sync_screen.start_preview()
+                        current_screen = "library_sync"
                     elif ievent.action == Action.CONFIRM and item.action == SETUP_ACTION:
                         wizard = WizardState(call_backend(romcloud_bin, "setup-status"))
                         current_screen = "wizard"
@@ -899,6 +912,12 @@ def _run(  # noqa: ANN001
                     current_screen = _handle_savesync_event(ievent, savesync_screen)
                     if current_screen == "menu":
                         savesync_screen = None
+                elif current_screen == "library_sync" and library_sync_screen is not None:
+                    current_screen = _handle_library_sync_event(
+                        ievent, library_sync_screen
+                    )
+                    if current_screen == "menu":
+                        library_sync_screen = None
                 elif current_screen == "wizard" and wizard is not None:
                     if ievent.action == Action.BACK and wizard.step == WizardStep.WELCOME:
                         running = False
@@ -1004,6 +1023,10 @@ def _run(  # noqa: ANN001
                 for line in savesync_screen.poll():
                     activity.ingest(line.text)
                 savesync_screen.update_confirm(dt)
+            elif current_screen == "library_sync" and library_sync_screen is not None:
+                for line in library_sync_screen.poll():
+                    activity.ingest(line.text)
+                library_sync_screen.update_confirm(dt)
             elif current_screen == "wizard" and wizard is not None:
                 for line in wizard.poll():
                     activity.ingest(line.text)
@@ -1070,8 +1093,14 @@ def _run(  # noqa: ANN001
                 _render_savesync(
                     pygame, screen, fonts, layout, savesync_screen, activity
                 )
+            elif current_screen == "library_sync" and library_sync_screen is not None:
+                _render_library_sync(
+                    pygame, screen, fonts, layout, library_sync_screen, activity
+                )
             elif current_screen == "wizard" and wizard is not None:
-                _render_wizard(pygame, screen, fonts, layout, wizard, activity)
+                _render_wizard(
+                    pygame, screen, fonts, layout, wizard, wizard.activity
+                )
         return 0
     finally:
         if input_debug is not None:
@@ -1195,7 +1224,6 @@ def _handle_savesync_event(ievent: InputEvent, savesync_screen: SaveSyncScreenSt
             _, dy = ACTION_DIRECTIONS[ievent.action]
             if dy:
                 savesync_screen.select(savesync_screen.selected_index + dy)
-            return "savesync"
         if ievent.action == Action.CONFIRM:
             return "menu" if savesync_screen.confirm_dashboard_selection() == "back" else "savesync"
         if ievent.action == Action.BACK:
@@ -1250,6 +1278,29 @@ def _handle_savesync_event(ievent: InputEvent, savesync_screen: SaveSyncScreenSt
     return "savesync"  # PREVIEWING / COMMITTING / APPLYING_SETTINGS: wait
 
 
+def _handle_library_sync_event(
+    ievent: InputEvent, screen: LibrarySyncScreenState
+) -> str:
+    """Drive the deliberate preview -> hold -> import workflow."""
+    if screen.step == LIBRARY_PREFLIGHT:
+        if ievent.action == Action.CONFIRM:
+            screen.begin_confirm()
+            screen.handle_confirm_event(ievent)
+        elif ievent.action == Action.BACK:
+            return "menu"
+    elif screen.step == LIBRARY_CONFIRMING:
+        screen.handle_confirm_event(ievent)
+    elif screen.step == LIBRARY_IMPORTING:
+        if ievent.action == Action.BACK:
+            screen.cancel_import()
+    elif screen.step == LIBRARY_RESULT:
+        if ievent.action == Action.CONFIRM and screen.error:
+            screen.retry()
+        elif ievent.action in (Action.CONFIRM, Action.BACK):
+            return "menu"
+    return "library_sync"
+
+
 def _render_menu(  # noqa: ANN001
     pygame,
     screen,
@@ -1299,8 +1350,9 @@ def _render_menu(  # noqa: ANN001
                 border_radius=6,
             )
         label = fonts["body"].render(item.label, True, _FG_COLOR)
-        label_center_y = rect.centery - (layout.fonts.hint // 2 if item.description else 0)
-        label_rect = label.get_rect(center=(rect.centerx, label_center_y))
+        center_x, center_y = rect.center
+        label_center_y = center_y - (layout.fonts.hint // 2 if item.description else 0)
+        label_rect = label.get_rect(center=(center_x, label_center_y))
         screen.blit(label, label_rect)
         if item.description:
             max_chars = max(12, rect.w // max(6, layout.fonts.hint // 2))
@@ -1308,7 +1360,7 @@ def _render_menu(  # noqa: ANN001
                 item.description[:max_chars], True, _HINT_COLOR
             )
             description_rect = description.get_rect(
-                center=(rect.centerx, label_rect.bottom + layout.fonts.hint)
+                center=(center_x, label_rect.bottom + layout.fonts.hint)
             )
             screen.blit(description, description_rect)
 
@@ -1520,13 +1572,20 @@ def _draw_progress_bar(  # noqa: ANN001
 ) -> None:
     pygame.draw.rect(screen, _CARD_BG, (rect.x, rect.y, rect.w, rect.h), border_radius=4)
     if fraction is None:
-        # A short fixed segment communicates indeterminate work without
-        # claiming a fabricated percentage.
+        # Animate a short segment for work whose duration cannot be measured,
+        # without claiming a fabricated percentage.
         segment_w = max(8, rect.w // 5)
+        ticks = 0
+        pygame_time = getattr(pygame, "time", None)
+        get_ticks = getattr(pygame_time, "get_ticks", None)
+        if callable(get_ticks):
+            ticks = int(get_ticks())
+        travel = max(1, rect.w - segment_w)
+        offset = int((ticks / 900.0 % 1.0) * travel)
         pygame.draw.rect(
             screen,
             _WARNING_COLOR,
-            (rect.x, rect.y, segment_w, rect.h),
+            (rect.x + offset, rect.y, segment_w, rect.h),
             border_radius=4,
         )
         return
@@ -1699,6 +1758,114 @@ def _save_size(num_bytes: int) -> str:
     return f"{value:.1f} TB"
 
 
+def _library_sync_body_lines(screen: LibrarySyncScreenState) -> list[str]:
+    if screen.step == LIBRARY_PREFLIGHTING:
+        return ["Inspecting source game lists…", "No media is being hashed or copied yet."]
+    if screen.step == LIBRARY_PREFLIGHT:
+        preview = screen.preview
+        systems = preview.get("systems", [])
+        systems_text = ", ".join(str(item) for item in systems) or "none"
+        return [
+            f"Eligible catalog games: {int(preview.get('games_eligible', 0)):,}",
+            f"Systems ({len(systems)}): {systems_text}",
+            (
+                f"Game lists: {int(preview.get('gamelist_files', 0)):,} "
+                f"({_save_size(int(preview.get('gamelist_bytes', 0)))})"
+            ),
+            f"Artwork references: {int(preview.get('artwork_references', 0)):,}",
+            f"Video references: {int(preview.get('video_references', 0)):,}",
+            f"Other media references: {int(preview.get('other_media_references', 0)):,}",
+            "Transfer bytes: counted only as files are copied",
+            str(preview.get("duration_note", "Duration depends on library size and storage speed.")),
+            "",
+            "Source game lists and source media will not be modified.",
+            "Press Confirm, then hold for 3 seconds to start. Back cancels.",
+        ]
+    if screen.step == LIBRARY_CONFIRMING:
+        return [
+            "Hold to Start Import",
+            "Keep holding Confirm for 3 seconds. Release or press Back to cancel.",
+        ]
+    if screen.step == LIBRARY_IMPORTING:
+        event = screen.latest_progress
+        lines = ["Importing source metadata and referenced media…"]
+        if event is not None:
+            lines.append(event.message)
+            if event.detail:
+                lines.append(event.detail)
+        lines.extend(["", "Back cancels safely; the operation can be retried."])
+        return lines
+    if screen.step == LIBRARY_RESULT:
+        if screen.error:
+            return [
+                ("Canceled: " if screen.cancelled else "Failed: ") + screen.error,
+                "Press Confirm to retry the preflight, or Back to return.",
+            ]
+        return [
+            "Source metadata import complete.",
+            f"Metadata added: {int(screen.result.get('metadata_added', 0)):,}",
+            f"Metadata updated: {int(screen.result.get('metadata_updated', 0)):,}",
+            f"Media examined: {int(screen.result.get('media_examined', 0)):,}",
+            f"Media skipped unchanged: {int(screen.result.get('media_skipped', 0)):,}",
+            f"Full-file hashes: {int(screen.result.get('media_hashed', 0)):,}",
+            f"Bytes fully hashed: {_save_size(int(screen.result.get('media_bytes_hashed', 0)))}",
+            f"Media copied: {int(screen.result.get('media_transferred', 0)):,}",
+            f"Actual bytes transferred: {_save_size(int(screen.result.get('media_bytes_transferred', 0)))}",
+            f"Games rendered: {int(screen.result.get('rendered', 0)):,}",
+            "Press Confirm or Back to return.",
+        ]
+    return []
+
+
+def _render_library_sync(  # noqa: ANN001
+    pygame,
+    screen_surface,
+    fonts: dict,
+    layout: Layout,
+    state: LibrarySyncScreenState,
+    activity: ActivityLog,
+) -> None:
+    screen_surface.fill(_BG_COLOR)
+    title = fonts["title"].render("Import Source Metadata", True, _FG_COLOR)
+    screen_surface.blit(title, (layout.header_rect.x, layout.header_rect.y))
+
+    y = layout.navigation_rect.y
+    line_h = layout.fonts.body + 6
+    max_chars = max(20, layout.navigation_rect.w // 11)
+    for line in wrap_lines(_library_sync_body_lines(state), max_chars):
+        text = fonts["body"].render(
+            line,
+            True,
+            _ERROR_COLOR if state.step == LIBRARY_RESULT and state.error else _FG_COLOR,
+        )
+        screen_surface.blit(text, (layout.navigation_rect.x, y))
+        y += line_h
+
+    if state.step == LIBRARY_CONFIRMING:
+        bar = Rect(
+            layout.navigation_rect.x,
+            y + line_h // 2,
+            min(layout.navigation_rect.w, 560),
+            max(8, layout.fonts.body // 2),
+        )
+        _draw_progress_bar(pygame, screen_surface, bar, state.confirm.progress)
+    elif state.step in (LIBRARY_PREFLIGHTING, LIBRARY_IMPORTING):
+        bar = Rect(
+            layout.navigation_rect.x,
+            y + line_h // 2,
+            min(layout.navigation_rect.w, 560),
+            max(8, layout.fonts.body // 2),
+        )
+        _draw_progress_bar(
+            pygame, screen_surface, bar, state.progress_fraction
+        )
+
+    _render_activity_panel(pygame, screen_surface, fonts, layout, activity)
+    hint = fonts["hint"].render(_HINT_TEXT, True, _HINT_COLOR)
+    screen_surface.blit(hint, (layout.hint_rect.x, layout.hint_rect.y))
+    pygame.display.flip()
+
+
 def _render_savesync(  # noqa: ANN001
     pygame,
     screen,
@@ -1819,12 +1986,11 @@ def _wizard_rects(layout: Layout, wizard: WizardState) -> list[Rect]:
 
 
 def _wizard_body_lines(wizard: WizardState) -> list[str]:
+    context = [*wizard.context_lines]
+    if wizard.notice:
+        context.append(wizard.notice)
     if wizard.step == WizardStep.WELCOME:
-        return wizard.issues or [
-            "This setup wizard helps you choose where your ROM library, cache, and SaveSync data will be stored. Press 'Continue' to begin."
-        ]
-    if wizard.step == WizardStep.SOURCE:
-        return ["Select where your ROM library is stored."]
+        return [*context, *wizard.issues]
     if wizard.step in (
         WizardStep.SOURCE_BROWSE,
         WizardStep.REMOTE_BROWSE,
@@ -1836,16 +2002,12 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
             for entry in wizard.browser_entries
             if not entry.get("is_directory")
         ]
-        lines = [f"Current folder: {location}"]
+        lines = [*context, f"Current folder: {location}"]
         if files:
             preview = ", ".join(files[:4])
             suffix = "…" if len(files) > 4 else ""
             lines.append(f"Files here: {preview}{suffix}")
         return lines
-    if wizard.step == WizardStep.DISCOVER:
-        return ["Connecting and finding accessible shares..."] if wizard.runner else []
-    if wizard.step == WizardStep.DETECT:
-        return [f"Checking //{wizard.server}/{wizard.share}..."] if wizard.runner else []
     if wizard.step == WizardStep.SYSTEMS:
         validation = []
         if wizard.source_validation.get("connected"):
@@ -1857,37 +2019,20 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
             if not wizard.systems
             else [f"{len(wizard.systems)} systems: {', '.join(wizard.systems)}"]
         )
-        return [*validation, *systems]
+        return [*context, *validation, *systems]
     if wizard.step == WizardStep.GAME_ACCESS:
         return [
-            "Smart Cache downloads games on first launch and supports offline play.",
-            "Direct/NAS plays from storage and requires the source while playing.",
+            *context,
             "Direct/NAS has no local downloads, cache management, pinning, eviction, or offline games.",
-        ]
-    if wizard.step == WizardStep.REMOTE_DATA:
-        return [
-            "Choose separate writable storage for synchronized ROMCloud data.",
-            "SaveSync and Library Sync are unavailable if this step is skipped.",
         ]
     if wizard.step == WizardStep.LIBRARY_SYNC:
         return [
-            "Library Sync is opt-in.",
+            *context,
             "Existing source/NAS gamelist.xml files may be read to initialize metadata.",
-            "ROMCloud will not modify source files and manages only local Batocera metadata.",
         ]
-    if wizard.step == WizardStep.REMOTE_AUTH:
-        return [
-            "Reuse only affects setup prompts.",
-            "ROM and writable-data credentials remain independently stored.",
-        ]
-    if wizard.step == WizardStep.REMOTE_DISCOVER:
-        return ["Connecting and finding writable-data shares..."] if wizard.runner else []
-    if wizard.step == WizardStep.REMOTE_VALIDATE:
-        return [
-            f"Checking //{wizard.remote_server}/{wizard.remote_share}..."
-        ] if wizard.runner else []
     if wizard.step == WizardStep.REVIEW:
         lines = [
+            *context,
             (
                 f"ROM library: //{wizard.server}/{wizard.share}"
                 f"{f'/{wizard.source_remote_path}' if wizard.source_remote_path else ''} [Read only]"
@@ -1916,13 +2061,9 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
             lines.insert(-1, "\u2713 Connected  \u2713 Read access verified")
             lines.insert(-1, "Write and cleanup will be verified before setup completes.")
         return lines
-    if wizard.step == WizardStep.APPLY:
-        return [
-            "Mounting source/data storage, validating writes, refreshing the catalog, "
-            "and updating EmulationStation..."
-        ] if wizard.runner else []
     if wizard.step == WizardStep.DONE:
         lines = [
+            *context,
             (
                 f"ROM library: //{wizard.applied_summary.get('server', wizard.server)}/{wizard.applied_summary.get('share', wizard.share)} [Read only]"
                 if wizard.source_type == "smb"
@@ -1956,9 +2097,37 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
             )
         else:
             lines.append("Direct/NAS: the source must remain reachable while playing.")
-        lines.append("ROMCloud is ready. Return to EmulationStation and restart or rescan it to show new games.")
+        if wizard.library_sync_enabled:
+            lines.append(
+                "Optional metadata was not imported. Use Library > Import Source Metadata when ready."
+            )
         return lines
-    return []
+    return context
+
+
+def _render_wizard_progress(  # noqa: ANN001
+    pygame,
+    screen,
+    fonts: dict,
+    layout: Layout,
+    wizard: WizardState,
+) -> None:
+    progress = wizard.progress
+    if progress is None:
+        return
+    area = layout.message_rect
+    max_chars = max(1, area.w // max(7, layout.fonts.hint // 2))
+    label = fonts["hint"].render(progress.label[:max_chars], True, _FG_COLOR)
+    screen.blit(label, (area.x, area.y))
+    bar_h = max(8, fonts["hint"].get_height() // 2)
+    bar = Rect(area.x, area.y + fonts["hint"].get_height() + 5, area.w, bar_h)
+    _draw_progress_bar(
+        pygame,
+        screen,
+        bar,
+        progress.fraction,
+        failed=progress.status == "error",
+    )
 
 
 def _render_wizard(  # noqa: ANN001
@@ -2029,7 +2198,9 @@ def _render_wizard(  # noqa: ANN001
         details=wizard.show_details,
     )
 
-    if wizard.error:
+    _render_wizard_progress(pygame, screen, fonts, layout, wizard)
+
+    if wizard.error and wizard.progress is None:
         max_chars = max(1, layout.message_rect.w // max(8, layout.fonts.body // 2))
         error = fonts["body"].render(wizard.error[:max_chars], True, _ERROR_COLOR)
         screen.blit(error, (layout.message_rect.x, layout.message_rect.y))

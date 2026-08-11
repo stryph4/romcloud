@@ -31,6 +31,7 @@ from romcloud.infrastructure.credentials import (
     write_smb_password,
 )
 from romcloud.infrastructure.providers.local import StorageAccessResult
+from romcloud.core.progress import emit_progress
 
 
 def _payload(**overrides):
@@ -119,7 +120,28 @@ class _Container:
                 detail="" if source_reachable else "read access denied",
             )
         )
-        self.catalog = SimpleNamespace(refresh=lambda: SimpleNamespace(errors=errors))
+        def refresh(progress=None):
+            emit_progress(
+                progress,
+                "catalog_refresh",
+                "system_progress",
+                "running",
+                "Scanning games",
+                current=1,
+                total=2,
+            )
+            emit_progress(
+                progress,
+                "catalog_refresh",
+                "refresh_completed",
+                "success" if not errors else "error",
+                "Library scan complete",
+                current=2,
+                total=2,
+            )
+            return SimpleNamespace(errors=errors)
+
+        self.catalog = SimpleNamespace(refresh=refresh)
         self.game_repo = SimpleNamespace(list_systems=lambda: ["psx", "snes"])
         self.saves = SimpleNamespace(
             is_remote_reachable=lambda: remote_reachable,
@@ -146,7 +168,10 @@ def _patch_apply_dependencies(
     monkeypatch.setattr(
         graphical_setup,
         "validate_share",
-        lambda payload: {"systems": ["psx", "snes"], "count": 2},
+        lambda payload, progress=None: {
+            "systems": ["psx", "snes"],
+            "count": 2,
+        },
     )
     monkeypatch.setattr(graphical_setup.mount_service, "install_service", lambda *args, **kwargs: None)
     if mount_error is None:
@@ -445,6 +470,56 @@ class TestApply:
         assert graphical_setup.setup_state(config_path)["state"] == "configured"
         assert not (config_path.parent / graphical_setup.SETUP_STATE_FILENAME).exists()
 
+    def test_setup_streams_phase_and_catalog_progress_to_the_gui(
+        self, tmp_path, monkeypatch
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        _patch_apply_dependencies(monkeypatch)
+        events = []
+
+        graphical_setup.apply_setup(config_path, _payload(), progress=events.append)
+
+        assert any(
+            event.stage == "system_progress"
+            and event.current == 1
+            and event.total == 2
+            for event in events
+        )
+        phases = [(event.stage, event.status) for event in events]
+        assert ("mount", "running") in phases
+        assert ("emulationstation", "running") in phases
+        assert ("emulationstation", "success") in phases
+        assert phases[-1] == ("complete", "success")
+
+    def test_enabled_library_sync_does_not_import_optional_enrichment(
+        self, tmp_path, monkeypatch
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        remote_root = tmp_path / "remote-data"
+        _patch_apply_dependencies(monkeypatch)
+        calls = []
+
+        def reconcile(config, **kwargs):
+            calls.append(kwargs)
+
+        monkeypatch.setattr(
+            "romcloud.integrations.batocera.game_access.reconcile_game_access",
+            reconcile,
+        )
+        events = []
+        graphical_setup.apply_setup(
+            config_path,
+            _payload(
+                remote_data_type="local",
+                remote_data_root=str(remote_root),
+                library_sync_enabled=True,
+            ),
+            progress=events.append,
+        )
+
+        assert calls == [{"render_library_metadata": False}]
+        assert all(event.stage != "library_sync" for event in events)
+
     def test_local_source_from_graphical_setup_persists_without_smb(
         self, tmp_path, monkeypatch
     ):
@@ -455,7 +530,7 @@ class TestApply:
         monkeypatch.setattr(
             graphical_setup,
             "validate_local_source",
-            lambda payload: {
+            lambda payload, progress=None: {
                 "systems": ["psx"],
                 "count": 1,
                 "validation": {"connected": True, "read_verified": True},

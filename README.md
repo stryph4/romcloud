@@ -187,6 +187,13 @@ SaveSync. It then applies the configuration, mounts configured SMB targets,
 performs the initial catalog refresh, creates proxies, and reconciles the
 EmulationStation integration.
 
+Every wizard step includes a short explanation of the choice and what follows.
+Connection, authentication, mount, validation, and
+EmulationStation phases use an animated activity indicator because those calls
+do not expose reliable totals. Catalog scanning shows real per-system game
+counts and progress. All of this work runs through the existing non-blocking
+operation runner so controller, keyboard, and touch input remain responsive.
+
 Setup is retryable. A failed fresh setup retains credential-free failure state;
 a failed repair of an existing valid setup restores the previous configuration
 and credentials. EmulationStation still needs a game-list refresh or restart to
@@ -216,7 +223,7 @@ processes communicate through credential-safe JSON subprocess requests;
 The current category-based interface provides:
 
 - **Library:** catalog status/refresh, cache and offline-presentation controls,
-  and Library Sync when enabled;
+  and a preflighted, hold-to-start source metadata import when Library Sync is enabled;
 - **Storage:** setup/reconfiguration, connection status, mount/reconnect, and
   unmount;
 - **SaveSync:** status, upload/download preview, hold-to-confirm commit, and the
@@ -316,6 +323,16 @@ romcloud library-sync enable
 romcloud library-sync sync
 ```
 
+Enabling Library Sync during setup does not import source metadata or media.
+Setup completes as soon as the source, catalog, game-access strategy, and
+EmulationStation integration are usable. Start the optional enrichment later
+from **Library > Import Source Metadata**. The graphical flow first counts
+catalog games, systems, game-list files/bytes, artwork references, videos, and
+other media references without hashing or copying media. It then requires a
+three-second hold. Exact transfer bytes are not guessed in advance; they are
+counted only as changed files are copied. The UI says duration depends on
+library size and storage/network speed rather than inventing an ETA.
+
 When enabled, ROMCloud may read a `gamelist.xml` under each source system to
 initialize names, descriptions, ratings, dates, developer/publisher/genre,
 players, and supported media. Source/NAS XML is never written. Local system
@@ -341,8 +358,22 @@ changing canonical records.
 The beta merge policy is non-destructive and additive. Missing fields/media
 are filled; blank local values never delete canonical data. If two non-empty
 values differ, the existing canonical value wins deterministically and a
-conflict is reported. Media are SHA-256 addressed and copied only when missing
-or changed. No operation recursively deletes media trees.
+conflict is reported. A media file changed at the same persisted source path
+is treated as a new content-addressed revision; competing media origins still
+retain the canonical value and report a conflict. Media are SHA-256 addressed
+and copied only when missing or changed. No operation recursively deletes
+media trees.
+
+After a media file has been fully hashed and a destination copy has been
+verified, ROMCloud persists separate source, remote-blob, and device-local
+validation fingerprints. A fingerprint combines size, nanosecond modification
+and change times, and bounded beginning/middle/end content samples; timestamps
+alone are never accepted. A matching fingerprint avoids rereading the full
+file on later imports. Missing or mismatched fingerprint data falls back to a
+full SHA-256, and every newly copied file is still fully verified before its
+atomic replacement. Runtime progress reports media examined, cheaply skipped,
+fully hashed, copied, and actual bytes transferred rather than presenting the
+whole referenced library as transfer volume.
 
 Explicit operations are:
 
@@ -357,8 +388,8 @@ romcloud library-sync remove-local
 `pull` updates local canonical/presentation state without writing the remote
 canonical document. `push` and `sync` add local/source improvements to the
 remote store. `remove-local` removes only marked local entries and preserves
-canonical/source data and media. Catalog refresh runs Library Sync only while
-the opt-in is enabled and NAS Mode is active. Library Sync push, pull, and
+canonical/source data and media. Catalog refresh does not start this optional
+import. Library Sync push, pull, and
 sync are blocked in Offline Mode; the canonical remote library is left
 untouched and locally scraped metadata remains available for a later NAS Mode
 sync. Local rendering never recreates absent NAS-only proxies.
@@ -394,7 +425,7 @@ ROMCloud remains in NAS Mode and reports a connectivity failure.
 Selecting NAS Mode while Offline Mode is active is an explicit reconnect. The
 transition remounts configured storage, validates the read-only ROM source and
 any separate writable ROMCloud data location, refreshes the complete catalog,
-runs enabled Library Sync, prepares the full proxy/gamelist presentation, and
+prepares the full proxy/gamelist presentation, and
 performs ownership-scoped, conflict-aware save/state reconciliation before refreshing
 EmulationStation and atomically committing NAS Mode. A failure at any point
 leaves Offline Mode authoritative and cached/local games visible; no partial

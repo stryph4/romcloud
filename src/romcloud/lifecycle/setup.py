@@ -356,6 +356,13 @@ def discover_shares(
             _redact(result.detail, password)
             or str(result.error_kind or "No shares found.")
         )
+    emit_progress(
+        progress,
+        "configure",
+        "shares",
+        "success",
+        f"Connection successful — {len(result.shares)} share{'s' if len(result.shares) != 1 else ''} found",
+    )
     return {
         "shares": [
             {"name": share.name, "comment": share.comment}
@@ -406,6 +413,13 @@ def validate_share(
             "validation": {"connected": True, "read_verified": True},
         }
     detection = discovery.detect_systems(validation)
+    emit_progress(
+        progress,
+        "configure",
+        "systems",
+        "success",
+        f"Library check complete — {detection.count} system{'s' if detection.count != 1 else ''} found",
+    )
     return {
         "systems": list(detection.detected_systems),
         "count": detection.count,
@@ -497,10 +511,25 @@ def validate_local_source(
     provider = LocalFilesystemProvider()
     validation = provider.validate_access(root)
     if not validation.ok:
+        emit_progress(
+            progress,
+            "configure",
+            "directory",
+            "error",
+            "Could not access the selected ROM folder.",
+            detail=validation.detail,
+        )
         raise ValueError(validation.detail or "Could not access the selected folder.")
     emit_progress(progress, "configure", "directory", "success", "Directory accessible")
     emit_progress(progress, "configure", "read", "success", "Read access verified")
     systems = provider.list_systems(root)
+    emit_progress(
+        progress,
+        "configure",
+        "systems",
+        "success",
+        f"Library check complete — {len(systems)} system{'s' if len(systems) != 1 else ''} found",
+    )
     return {
         "systems": systems,
         "count": len(systems),
@@ -516,12 +545,12 @@ def apply_setup(
         payload, validate_cache=requested_mode != DIRECT_NAS_MODE
     )
     validation_result = (
-        validate_share(payload)
+        validate_share(payload, progress)
         if request.source_type == "smb"
-        else validate_local_source(payload)
+        else validate_local_source(payload, progress)
     )
     if request.remote_data_type == "smb":
-        validate_share({**payload, "purpose": "remote_data"})
+        validate_share({**payload, "purpose": "remote_data"}, progress)
     state_path = config_path.parent / SETUP_STATE_FILENAME
     existing = _existing_config(config_path)
     existing_was_valid = existing is not None and not _structural_issues(existing)
@@ -600,30 +629,33 @@ def apply_setup(
         step = "refresh catalog"
         emit_progress(progress, "configure", "catalog", "running", "Refreshing the game catalog…")
         _write_state(state_path, {"status": "applying", "step": step})
-        refresh_result = container.catalog.refresh()
+        refresh_result = container.catalog.refresh(progress=progress)
         if refresh_result.errors:
             details = "; ".join(f"{system}: {message}" for system, message in refresh_result.errors)
             raise RuntimeError(details)
         emit_progress(progress, "configure", "catalog", "success", "Catalog refreshed")
 
-        if config.library_sync.enabled:
-            step = "initialize Library Sync"
-            _write_state(state_path, {"status": "applying", "step": step})
-            emit_progress(
-                progress, "configure", "library_sync", "running",
-                "Importing source metadata without modifying source gamelists…",
-            )
-            container.library_sync.sync()
-            emit_progress(
-                progress, "configure", "library_sync", "success",
-                "Library metadata synchronized",
-            )
-
         step = "update EmulationStation integration"
         _write_state(state_path, {"status": "applying", "step": step})
         from romcloud.integrations.batocera.game_access import reconcile_game_access
 
-        reconcile_game_access(config)
+        emit_progress(
+            progress,
+            "configure",
+            "emulationstation",
+            "running",
+            "Preparing games for EmulationStation…",
+        )
+        # Optional metadata/media enrichment is a deliberate post-setup
+        # Library action. Setup needs only catalog-owned launch entries.
+        reconcile_game_access(config, render_library_metadata=False)
+        emit_progress(
+            progress,
+            "configure",
+            "emulationstation",
+            "success",
+            "EmulationStation entries prepared",
+        )
         emit_progress(progress, "configure", "complete", "success", "ROMCloud setup complete")
     except Exception as exc:
         from romcloud.infrastructure.mount import unmount_cifs_source

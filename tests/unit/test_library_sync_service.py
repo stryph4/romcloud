@@ -77,6 +77,11 @@ def _canonical(config: AppConfig) -> Path:
     return Path(config.remote_data.root) / "library" / "library.json"
 
 
+def _media_record(config: AppConfig) -> dict:
+    record = next(iter(json.loads(_canonical(config).read_text())["records"].values()))
+    return record["media"]["image"]
+
+
 def _setup(tmp_path: Path, *, enabled: bool = True, mode: str = "smart_cache"):
     config = _config(tmp_path, enabled=enabled, mode=mode)
     source_xml = _source_library(config)
@@ -108,6 +113,49 @@ def test_opt_in_disabled_does_no_library_work(tmp_path: Path):
 
     assert not _canonical(config).exists()
     assert _local_root(config).read_text().count("<game>") == 1
+
+
+def test_source_import_preflight_is_lightweight_and_reports_media_types(
+    tmp_path: Path, monkeypatch
+):
+    config, container, _ = _setup(tmp_path)
+    monkeypatch.setattr(
+        "romcloud.services.library_sync._hash_file",
+        lambda path: (_ for _ in ()).throw(AssertionError("preflight must not hash media")),
+    )
+
+    preview = container.library_sync.preview_source_import().as_dict()
+
+    assert preview["games_eligible"] == 1
+    assert preview["systems"] == ["ps2"]
+    assert preview["gamelist_files"] == 2
+    assert preview["gamelist_bytes"] > 0
+    assert preview["artwork_references"] == 1
+    assert preview["video_references"] == 0
+    assert preview["other_media_references"] == 1
+    assert preview["estimated_bytes"] is None
+    assert preview["duration_estimate"] is None
+    assert "storage/network speed" in preview["duration_note"]
+
+
+def test_source_import_emits_real_entry_file_byte_and_render_progress(tmp_path: Path):
+    _config_value, container, _ = _setup(tmp_path)
+    events = []
+
+    report = container.library_sync.sync(progress=events.append)
+
+    assert report.rendered == 1
+    metadata = [event for event in events if event.stage == "metadata"]
+    assert metadata[-1].current is not None and metadata[-1].current >= 1
+    media = [event for event in events if event.stage == "media"]
+    assert media[-1].current == media[-1].total == 1
+    assert media[-1].metadata["media_examined"] == 1
+    assert media[-1].metadata["media_copied"] == 1
+    assert media[-1].metadata["bytes_transferred"] > 0
+    rendered = [event for event in events if event.stage == "render"]
+    assert rendered[-1].current == rendered[-1].total == 1
+    assert events[-1].stage == "complete"
+    assert events[-1].status == "success"
 
 
 def test_offline_mode_blocks_remote_sync_without_changing_canonical(tmp_path: Path):
@@ -193,6 +241,170 @@ def test_import_sync_and_smart_cache_render_are_safe_and_idempotent(tmp_path: Pa
     assert second.conflicts == []
     assert _canonical(config).read_bytes() == canonical_before
     assert source_xml.read_bytes() == source_before
+
+
+def test_second_unchanged_import_uses_fingerprints_without_full_file_hashes(
+    tmp_path: Path, monkeypatch
+):
+    config, container, _ = _setup(tmp_path)
+    image = Path(config.source.rom_root) / "ps2" / "images" / "Game.png"
+    image.write_bytes(b"large-media" * 100_000)
+    assert image.stat().st_size > 3 * 64 * 1024
+    first = container.library_sync.sync()
+    descriptor = _media_record(config)
+    state = json.loads(
+        (Path(config.data_path) / "library-sync-state.json").read_text()
+    )
+
+    assert descriptor["source_fingerprint"]["sample_sha256"]
+    assert descriptor["blob_fingerprint"]["sample_sha256"]
+    assert state["media_validation"]
+    assert first.media_bytes_transferred == image.stat().st_size * 2
+
+    monkeypatch.setattr(
+        "romcloud.services.library_sync._hash_file",
+        lambda path: (_ for _ in ()).throw(
+            AssertionError(f"unchanged media was fully hashed: {path}")
+        ),
+    )
+    second = container.library_sync.sync()
+
+    assert second.media_transferred == 0
+    assert second.media_bytes_transferred == 0
+    assert second.media_hashed == 0
+    assert second.media_examined == 2  # source/blob plus local rendered copy
+    assert second.media_skipped == 2
+
+
+def test_changed_source_media_is_rehashed_copied_and_fully_verified(tmp_path: Path):
+    config, container, _ = _setup(tmp_path)
+    image = Path(config.source.rom_root) / "ps2" / "images" / "Game.png"
+    container.library_sync.sync()
+    before = _media_record(config)
+    old_blob = Path(config.remote_data.root) / "library" / before["blob"]
+    replacement = b"new-media"
+    assert len(replacement) == image.stat().st_size
+
+    image.write_bytes(replacement)
+    report = container.library_sync.sync()
+    after = _media_record(config)
+    new_blob = Path(config.remote_data.root) / "library" / after["blob"]
+
+    assert after["sha256"] != before["sha256"]
+    assert new_blob.read_bytes() == replacement
+    assert old_blob.is_file()  # content-addressed history is never deleted
+    assert report.media_hashed >= 3  # source plus both verified copies
+    assert report.media_transferred == 2
+    assert report.media_bytes_transferred == len(replacement) * 2
+
+
+def test_changed_media_copy_verification_failure_preserves_canonical(
+    tmp_path: Path, monkeypatch
+):
+    import romcloud.services.library_sync as library_sync_module
+
+    config, container, _ = _setup(tmp_path)
+    image = Path(config.source.rom_root) / "ps2" / "images" / "Game.png"
+    container.library_sync.sync()
+    canonical_before = _canonical(config).read_bytes()
+    image.write_bytes(b"new-media")
+
+    def corrupt_copy(source: Path, destination: Path):
+        destination.write_bytes(b"x" * source.stat().st_size)
+
+    monkeypatch.setattr(library_sync_module.shutil, "copyfile", corrupt_copy)
+
+    with pytest.raises(LibrarySyncError, match="verification failed"):
+        container.library_sync.sync()
+
+    assert _canonical(config).read_bytes() == canonical_before
+    assert not list(
+        (Path(config.remote_data.root) / "library" / "media").rglob("*.partial")
+    )
+
+
+def test_missing_remote_blob_is_rebuilt_without_rehashing_unchanged_source(
+    tmp_path: Path, monkeypatch
+):
+    import romcloud.services.library_sync as library_sync_module
+
+    config, container, _ = _setup(tmp_path)
+    image = Path(config.source.rom_root) / "ps2" / "images" / "Game.png"
+    expected = image.read_bytes()
+    container.library_sync.sync()
+    descriptor = _media_record(config)
+    blob = Path(config.remote_data.root) / "library" / descriptor["blob"]
+    blob.unlink()
+    real_hash = library_sync_module._hash_file
+    hashed: list[Path] = []
+
+    def recording_hash(path: Path):
+        hashed.append(path)
+        return real_hash(path)
+
+    monkeypatch.setattr(library_sync_module, "_hash_file", recording_hash)
+    report = container.library_sync.sync()
+
+    assert blob.read_bytes() == expected
+    assert image not in hashed
+    assert report.media_transferred == 1
+    assert report.media_bytes_transferred == len(expected)
+
+
+def test_source_fingerprint_mismatch_falls_back_to_full_sha256(
+    tmp_path: Path, monkeypatch
+):
+    import romcloud.services.library_sync as library_sync_module
+
+    config, container, _ = _setup(tmp_path)
+    image = Path(config.source.rom_root) / "ps2" / "images" / "Game.png"
+    container.library_sync.sync()
+    payload = json.loads(_canonical(config).read_text())
+    descriptor = next(iter(payload["records"].values()))["media"]["image"]
+    descriptor["source_fingerprint"]["mtime_ns"] = -1
+    _canonical(config).write_text(json.dumps(payload), encoding="utf-8")
+    real_hash = library_sync_module._hash_file
+    hashed: list[Path] = []
+
+    def recording_hash(path: Path):
+        hashed.append(path)
+        return real_hash(path)
+
+    monkeypatch.setattr(library_sync_module, "_hash_file", recording_hash)
+    report = container.library_sync.sync()
+
+    assert image in hashed
+    assert report.media_hashed == 1
+    assert report.media_transferred == 0
+
+
+def test_corrupt_same_size_remote_blob_is_detected_and_rebuilt(
+    tmp_path: Path, monkeypatch
+):
+    import romcloud.services.library_sync as library_sync_module
+
+    config, container, _ = _setup(tmp_path)
+    image = Path(config.source.rom_root) / "ps2" / "images" / "Game.png"
+    expected = image.read_bytes()
+    container.library_sync.sync()
+    descriptor = _media_record(config)
+    blob = Path(config.remote_data.root) / "library" / descriptor["blob"]
+    blob.write_bytes(b"x" * len(expected))
+    real_hash = library_sync_module._hash_file
+    hashed: list[Path] = []
+
+    def recording_hash(path: Path):
+        hashed.append(path)
+        return real_hash(path)
+
+    monkeypatch.setattr(library_sync_module, "_hash_file", recording_hash)
+    report = container.library_sync.sync()
+
+    assert image not in hashed
+    assert blob in hashed
+    assert blob.read_bytes() == expected
+    assert report.media_transferred == 1
+    assert report.media_hashed >= 2  # corrupt blob plus verified temporary
 
 
 def test_local_gamelist_generation_uses_atomic_writer(tmp_path: Path, monkeypatch):

@@ -10,14 +10,18 @@ render loops untested.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from ports_gfx.app import (
     MENU_ITEMS,
     _ControllerTestScreenState,
     _apply_direction,
     _handle_controller_test_event,
+    _library_sync_body_lines,
     _handle_menu_event,
     _load_startup_backend_state,
     _open_display,
+    _render_menu,
     _wizard_body_lines,
     classify_message_kind,
     format_result,
@@ -31,17 +35,63 @@ from ports_gfx.app import (
     start_operation,
 )
 from ports_gfx.actions import Action
+from ports_gfx.activity import ActivityLog
 from ports_gfx.client import BackendResult
 from ports_gfx.input_manager import InputEvent
 from ports_gfx.layout import compute_layout
-from ports_gfx.menu import CONTROLLER_TEST_ACTION, EXIT_ACTION, MenuState
+from ports_gfx.library_sync_screen import PREFLIGHT, LibrarySyncScreenState
+from ports_gfx.menu import CONTROLLER_TEST_ACTION, EXIT_ACTION, MenuItem, MenuState
 from ports_gfx.operation import OperationLine, OperationState
 from ports_gfx.operation_screen import OPERATION_SCREEN
 from ports_gfx.relaunch import GuiRelaunchCoordinator
+from ports_gfx.update_state import UpdateCheckState
 from ports_gfx.wizard import WizardState, WizardStep
 
 
 class TestMenuItems:
+    def test_render_uses_layout_rect_center_for_described_item(self):
+        class RenderedText:
+            def __init__(self) -> None:
+                self.centers: list[tuple[float, float]] = []
+
+            def get_rect(self, *, center):  # noqa: ANN001
+                self.centers.append(center)
+                return SimpleNamespace(bottom=center[1] + 10)
+
+        rendered: list[RenderedText] = []
+
+        class Font:
+            def render(self, *_args):  # noqa: ANN002
+                text = RenderedText()
+                rendered.append(text)
+                return text
+
+        screen = SimpleNamespace(fill=lambda _color: None, blit=lambda *_args: None)
+        pygame = SimpleNamespace(
+            draw=SimpleNamespace(rect=lambda *_args, **_kwargs: None),
+            display=SimpleNamespace(flip=lambda: None),
+        )
+        layout = compute_layout(800, 600, 1)
+        state = MenuState([MenuItem("NAS Mode", "nas", "Use network storage")])
+
+        _render_menu(
+            pygame,
+            screen,
+            {"title": Font(), "body": Font(), "hint": Font()},
+            layout,
+            state,
+            None,
+            "info",
+            ActivityLog(),
+            UpdateCheckState(),
+        )
+
+        center_x, center_y = layout.card_rects[0].center
+        assert rendered[1].centers == [
+            (center_x, center_y - layout.fonts.hint // 2)
+        ]
+        assert rendered[2].centers[0][0] == center_x
+
     def test_contains_expected_actions_in_order(self):
         from ports_gfx import app as app_module
 
@@ -134,6 +184,55 @@ class TestMenuItems:
 
         assert all(item.action != "library-sync" for item in disabled)
         assert enabled[-1].action == "library-sync"
+        assert enabled[-1].label == "Import Source Metadata"
+
+    def test_metadata_import_preflight_copy_shows_cost_without_fake_estimate(self):
+        screen = LibrarySyncScreenState(
+            "romcloud",
+            step=PREFLIGHT,
+            preview={
+                "games_eligible": 18200,
+                "systems": ["ps2", "snes"],
+                "gamelist_files": 2,
+                "gamelist_bytes": 4096,
+                "artwork_references": 8241,
+                "video_references": 240,
+                "other_media_references": 10,
+                "duration_note": "Duration depends on library size and storage/network speed.",
+            },
+        )
+
+        lines = _library_sync_body_lines(screen)
+
+        assert "Eligible catalog games: 18,200" in lines
+        assert "Artwork references: 8,241" in lines
+        assert "Video references: 240" in lines
+        assert "Transfer bytes: counted only as files are copied" in lines
+        assert any("storage/network speed" in line for line in lines)
+        assert any("hold for 3 seconds" in line for line in lines)
+
+    def test_metadata_import_result_distinguishes_skip_hash_copy_and_bytes(self):
+        screen = LibrarySyncScreenState(
+            "romcloud",
+            step="result",
+            result={
+                "media_examined": 20,
+                "media_skipped": 18,
+                "media_hashed": 3,
+                "media_bytes_hashed": 2048,
+                "media_transferred": 1,
+                "media_bytes_transferred": 1024,
+            },
+        )
+
+        lines = _library_sync_body_lines(screen)
+
+        assert "Media examined: 20" in lines
+        assert "Media skipped unchanged: 18" in lines
+        assert "Full-file hashes: 3" in lines
+        assert "Bytes fully hashed: 2.0 KB" in lines
+        assert "Media copied: 1" in lines
+        assert "Actual bytes transferred: 1.0 KB" in lines
 
 
 class TestInitialScreen:
@@ -318,6 +417,15 @@ def test_exclusive_failure_is_logged_before_windowed_fallback(caplog):
 
 
 class TestWizardValidationPresentation:
+    def test_every_step_renders_its_primary_and_secondary_context(self):
+        wizard = WizardState()
+        for step in WizardStep:
+            wizard.step = step
+            lines = _wizard_body_lines(wizard)
+            primary, secondary = wizard.context_lines
+            assert primary in lines
+            assert secondary in lines
+
     def test_review_labels_source_read_only_and_remote_read_write(self):
         wizard = WizardState()
         wizard.step = WizardStep.REVIEW

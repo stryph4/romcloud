@@ -380,7 +380,7 @@ def test_offline_to_nas_uses_configured_mount_lifecycle(
     assert operating_mode(config) is OperatingMode.NAS
 
 
-def test_offline_to_nas_validates_remote_data_and_runs_enabled_library_sync(
+def test_offline_to_nas_validates_remote_data_without_optional_metadata_import(
     tmp_path: Path
 ) -> None:
     remote_data = tmp_path / "remote-data"
@@ -399,7 +399,7 @@ def test_offline_to_nas_validates_remote_data_and_runs_enabled_library_sync(
     set_offline_library_mode(config, False)
 
     assert operating_mode(config) is OperatingMode.NAS
-    assert (remote_data / "library" / "library.json").is_file()
+    assert not (remote_data / "library" / "library.json").exists()
 
 
 def test_missing_required_remote_data_aborts_nas_transition(tmp_path: Path) -> None:
