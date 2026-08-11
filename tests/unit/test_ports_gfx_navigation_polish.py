@@ -6,17 +6,24 @@ from ports_gfx.actions import Action
 from ports_gfx.app import MENU_CATEGORIES, MENU_ITEMS, ROOT_MENU_ITEMS, _wizard_option_rows
 from ports_gfx.input_manager import InputEvent
 from ports_gfx.layout import compute_layout, compute_wizard_regions
-from ports_gfx.menu import BACK_ACTION, NavigationState
+from ports_gfx.menu import BACK_ACTION, CATEGORY_ACTION_PREFIX, NavigationState
 from ports_gfx.wizard import WizardState, WizardStep
 
 
-def test_root_categories_are_the_requested_compact_hierarchy():
+def test_root_items_preserve_the_requested_compact_order_and_actions():
     assert [item.label for item in ROOT_MENU_ITEMS] == [
         "Library",
         "Storage",
         "SaveSync",
         "Maintenance",
         "Settings",
+    ]
+    assert [item.action for item in ROOT_MENU_ITEMS] == [
+        "category:Library",
+        "category:Storage",
+        "savesync",
+        "category:Maintenance",
+        "category:Settings",
     ]
 
 
@@ -28,11 +35,28 @@ def test_every_preexisting_action_is_mapped_once_without_renaming():
         for item in items
         if item.action != "update-install"
     ]
+    mapped.extend(
+        (item.action, item.label)
+        for item in ROOT_MENU_ITEMS
+        if not item.action.startswith(CATEGORY_ACTION_PREFIX)
+    )
     assert set(mapped) == old
     assert len(mapped) == len(set(mapped))
     assert ("refresh", "Refresh Catalog") in mapped
     assert ("connection-mount", "Mount / Reconnect") in mapped
     assert ("connection-unmount", "Unmount") in mapped
+
+
+def test_savesync_root_item_bypasses_the_category_level():
+    nav = NavigationState(ROOT_MENU_ITEMS, MENU_CATEGORIES)
+    nav.select(2)
+
+    assert nav.selected_item.label == "SaveSync"
+    assert nav.selected_item.action == "savesync"
+    assert not nav.enter_selected_category()
+    assert nav.level == "root"
+    assert nav.selected_index == 2
+    assert "SaveSync" not in MENU_CATEGORIES
 
 
 def test_submenu_replaces_root_and_back_restores_root_focus():

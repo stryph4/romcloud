@@ -108,7 +108,10 @@ MENU_ITEMS: tuple[MenuItem, ...] = (
 )
 
 ROOT_MENU_ITEMS: tuple[MenuItem, ...] = tuple(
-    MenuItem(label, f"{CATEGORY_ACTION_PREFIX}{label}")
+    MenuItem(
+        label,
+        SAVESYNC_ACTION if label == "SaveSync" else f"{CATEGORY_ACTION_PREFIX}{label}",
+    )
     for label in ("Library", "Storage", "SaveSync", "Maintenance", "Settings")
 )
 
@@ -124,7 +127,6 @@ MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
         MenuItem("Mount / Reconnect", "connection-mount"),
         MenuItem("Unmount", "connection-unmount"),
     ),
-    "SaveSync": (MenuItem("SaveSync", SAVESYNC_ACTION),),
     "Maintenance": (
         MenuItem("Check for Updates", "update-check"),
         MenuItem("Update ROMCloud", "update-install"),
