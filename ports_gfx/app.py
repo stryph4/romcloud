@@ -29,6 +29,7 @@ their curses render loops untested — they need a real display/terminal).
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from typing import Optional
 
 from ports_gfx.actions import ACTION_DIRECTIONS, Action
@@ -65,6 +66,11 @@ from ports_gfx.operation_screen import (
     wrap_lines,
 )
 from ports_gfx.osk import compute_osk_layout, compute_osk_text_rect
+from ports_gfx.relaunch import (
+    RELAUNCH_FAILURE_LOG,
+    GuiRelaunchCoordinator,
+    relaunch_failure_message,
+)
 from ports_gfx.savesync_screen import (
     APPLYING_SETTINGS,
     COMMITTING,
@@ -273,6 +279,24 @@ def operation_summary_message(operation: OperationScreenState) -> tuple[str, str
     return f"{operation.title}: failed{suffix}", "error"
 
 
+def request_relaunch_for_completed_update(
+    operation: OperationScreenState,
+    relaunch: GuiRelaunchCoordinator,
+) -> bool:
+    """Enter the terminal relaunch state for one confirmed update success."""
+    if operation.title != "Update ROMCloud" or not operation.is_finished:
+        return False
+    if not operation.succeeded:
+        relaunch.mark_update_failed()
+        return False
+    result = operation_result(operation.runner)
+    # The final successful JSON is written only after perform_update has
+    # returned, so the updater's install/reconciliation/post-update work is
+    # committed before this process is allowed to enter its terminal state.
+    progress_complete = result.ok
+    return relaunch.mark_update_succeeded(progress_complete=progress_complete)
+
+
 def initial_screen_for_status(status: BackendResult) -> str:
     """Choose startup routing from the backend's structural setup state."""
     if status.ok and status.data.get("state") == "configured":
@@ -280,7 +304,12 @@ def initial_screen_for_status(status: BackendResult) -> str:
     return "wizard"
 
 
-def run_app(romcloud_bin: str) -> int:
+def run_app(
+    romcloud_bin: str,
+    *,
+    relaunch_popen=None,  # noqa: ANN001 - injectable process factory for tests
+    relaunch_failure_log: Path = RELAUNCH_FAILURE_LOG,
+) -> int:
     """Entry point. Returns a process exit code; never raises.
 
     Any failure (pygame missing, display init failure, unexpected crash)
@@ -297,7 +326,18 @@ def run_app(romcloud_bin: str) -> int:
         return 1
 
     try:
-        return _run(pygame, romcloud_bin)
+        relaunch = GuiRelaunchCoordinator(romcloud_bin)
+        exit_code = _run(pygame, romcloud_bin, relaunch)
+        if not relaunch.relaunch_pending:
+            return exit_code
+        kwargs = {"failure_log_path": relaunch_failure_log}
+        if relaunch_popen is not None:
+            kwargs["popen"] = relaunch_popen
+        result = relaunch.launch_once(**kwargs)
+        if result.launched:
+            return 0
+        print(relaunch_failure_message(result), file=sys.stderr)
+        return 1
     except Exception as exc:  # noqa: BLE001 — must never crash Batocera's Ports flow
         print(f"error: ports UI crashed: {exc}", file=sys.stderr)
         return 1
@@ -362,7 +402,11 @@ class _ControllerTestScreenState:
         self.selected_index = max(0, min(index, len(_REMAPPABLE_ACTIONS) - 1))
 
 
-def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module, imported lazily
+def _run(  # noqa: ANN001
+    pygame,
+    romcloud_bin: str,
+    relaunch: GuiRelaunchCoordinator,
+) -> int:
     pygame.init()
     # Best-effort: joystick/controller subsystem init failures (e.g. no
     # input backend on a minimal SDL build) must never prevent the rest of
@@ -564,13 +608,23 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
                         ievent, controller_test, input_manager,
                     )
                 elif current_screen == OPERATION_SCREEN and operation_screen is not None:
-                    if operation_screen.title == "Refresh Catalog":
+                    if request_relaunch_for_completed_update(
+                        operation_screen, relaunch
+                    ):
+                        # Ignore this and all remaining queued application
+                        # input.  The old process may render the final state,
+                        # but it must never return to normal controls.
+                        update_check.update_available = False
+                        current_screen = "restarting"
+                        running = False
+                    elif operation_screen.title == "Refresh Catalog":
                         if ievent.action == Action.UP:
                             catalog_progress.scroll(-1, 6)
                         elif ievent.action == Action.DOWN:
                             catalog_progress.scroll(1, 6)
-                    current_screen = handle_operation_event(ievent, operation_screen)
-                    if current_screen == "menu":
+                    if not relaunch.terminal:
+                        current_screen = handle_operation_event(ievent, operation_screen)
+                    if current_screen == "menu" and not relaunch.terminal:
                         if operation_screen.title == "Check for Updates":
                             update_check = UpdateCheckState.completed(
                                 operation_result(operation_screen.runner)
@@ -586,10 +640,6 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
                                 "warning" if update_check.update_available else
                                 "success" if update_check.status == "current" else "error"
                             )
-                        elif operation_screen.title == "Update ROMCloud" and operation_screen.succeeded:
-                            update_check.update_available = False
-                            message = "ROMCloud updated. Restart ROMCloud to load the new GUI."
-                            message_kind = "success"
                         elif operation_screen.title in ("Mount / Reconnect", "Unmount"):
                             connection = call_backend(romcloud_bin, "connection-status")
                             message = format_result("connection-status", connection)
@@ -610,6 +660,13 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
                     event = activity.ingest(line.text)
                     if event is not None:
                         catalog_progress.ingest(event)
+                if operation_screen.title == "Update ROMCloud" and operation_screen.is_finished:
+                    if request_relaunch_for_completed_update(
+                        operation_screen, relaunch
+                    ):
+                        update_check.update_available = False
+                        current_screen = "restarting"
+                        running = False
             elif current_screen == "savesync" and savesync_screen is not None:
                 for line in savesync_screen.poll():
                     activity.ingest(line.text)
@@ -673,6 +730,8 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
                 )
             elif current_screen == "wizard" and wizard is not None:
                 _render_wizard(pygame, screen, fonts, layout, wizard, activity)
+            elif current_screen == "restarting":
+                _render_restarting(pygame, screen, fonts, layout, activity)
 
         return 0
     finally:
@@ -682,6 +741,24 @@ def _run(pygame, romcloud_bin: str) -> int:  # noqa: ANN001 — `pygame` module,
             except Exception:  # noqa: BLE001
                 pass
         pygame.quit()
+
+
+def _render_restarting(  # noqa: ANN001
+    pygame,
+    screen,
+    fonts: dict,
+    layout: Layout,
+    activity: ActivityLog,
+) -> None:
+    screen.fill(_BG_COLOR)
+    title = fonts["title"].render("ROMCloud", True, _FG_COLOR)
+    screen.blit(title, (layout.header_rect.x, layout.header_rect.y))
+    message = fonts["body"].render(
+        "ROMCloud updated successfully. Restarting…", True, _SUCCESS_COLOR
+    )
+    screen.blit(message, (layout.navigation_rect.x, layout.navigation_rect.y))
+    _render_activity_panel(pygame, screen, fonts, layout, activity)
+    pygame.display.flip()
 
 
 def _apply_direction(

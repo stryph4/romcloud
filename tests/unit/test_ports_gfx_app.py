@@ -21,6 +21,7 @@ from ports_gfx.app import (
     format_result,
     initial_screen_for_status,
     operation_summary_message,
+    request_relaunch_for_completed_update,
     start_operation,
 )
 from ports_gfx.actions import Action
@@ -28,8 +29,9 @@ from ports_gfx.client import BackendResult
 from ports_gfx.input_manager import InputEvent
 from ports_gfx.layout import compute_layout
 from ports_gfx.menu import CONTROLLER_TEST_ACTION, EXIT_ACTION, MenuState
-from ports_gfx.operation import OperationState
+from ports_gfx.operation import OperationLine, OperationState
 from ports_gfx.operation_screen import OPERATION_SCREEN
+from ports_gfx.relaunch import GuiRelaunchCoordinator
 from ports_gfx.wizard import WizardState, WizardStep
 
 
@@ -508,6 +510,170 @@ class _FakeFinishedRunner:
     def __init__(self, state: OperationState, error: str = "") -> None:
         self.state = state
         self.error = error
+
+
+class _FakeUpdateRunner:
+    def __init__(
+        self,
+        state: OperationState,
+        lines: list[OperationLine],
+        *,
+        finished: bool = True,
+        error: str = "",
+    ) -> None:
+        self.state = state
+        self.lines = lines
+        self.is_finished = finished
+        self.error = error
+
+
+class TestUpdateRelaunchRequest:
+    def _operation(
+        self,
+        state: OperationState,
+        lines: list[OperationLine],
+        *,
+        finished: bool = True,
+    ):
+        from ports_gfx.operation_screen import OperationScreenState
+
+        runner = _FakeUpdateRunner(state, lines, finished=finished)
+        return OperationScreenState(title="Update ROMCloud", runner=runner)
+
+    def test_successful_final_result_enters_terminal_relaunch_state(self):
+        coordinator = GuiRelaunchCoordinator("/opt/romcloud/bin/romcloud")
+        operation = self._operation(
+            OperationState.SUCCEEDED,
+            [
+                OperationLine(
+                    "stderr",
+                    '@romcloud-progress {"stage":"completed","status":"success"}',
+                ),
+                OperationLine("stdout", '{"ok":true,"restart_required":true}'),
+            ],
+        )
+
+        requested = request_relaunch_for_completed_update(operation, coordinator)
+
+        assert requested is True
+        assert coordinator.progress_complete is True
+        assert coordinator.terminal is True
+        assert coordinator.relaunch_pending is True
+
+    def test_running_update_does_not_relaunch_even_with_partial_output(self):
+        coordinator = GuiRelaunchCoordinator("/opt/romcloud/bin/romcloud")
+        operation = self._operation(
+            OperationState.RUNNING,
+            [OperationLine("stdout", '{"ok":true}')],
+            finished=False,
+        )
+
+        assert request_relaunch_for_completed_update(operation, coordinator) is False
+        assert coordinator.terminal is False
+
+    def test_failed_update_does_not_relaunch(self):
+        coordinator = GuiRelaunchCoordinator("/opt/romcloud/bin/romcloud")
+        operation = self._operation(
+            OperationState.FAILED,
+            [OperationLine("stdout", '{"ok":false,"error":"install failed"}')],
+        )
+
+        assert request_relaunch_for_completed_update(operation, coordinator) is False
+        assert coordinator.terminal is False
+        assert coordinator.relaunch_pending is False
+
+    def test_zero_exit_without_success_json_does_not_relaunch(self):
+        coordinator = GuiRelaunchCoordinator("/opt/romcloud/bin/romcloud")
+        operation = self._operation(
+            OperationState.SUCCEEDED,
+            [OperationLine("stdout", "not json")],
+        )
+
+        assert request_relaunch_for_completed_update(operation, coordinator) is False
+        assert coordinator.terminal is False
+
+
+class TestRunAppRelaunchBoundary:
+    def test_launcher_runs_only_after_old_gui_returns_from_cleanup(self, monkeypatch):
+        import sys
+
+        from ports_gfx import app as app_module
+
+        order: list[str] = []
+        monkeypatch.setitem(sys.modules, "pygame", object())
+
+        def fake_run(_pygame, _romcloud_bin, coordinator):
+            coordinator.mark_update_succeeded(progress_complete=True)
+            order.append("gui-cleanup-complete")
+            return 0
+
+        def fake_popen(argv, **_kwargs):
+            order.append(f"launch:{argv[0]}")
+            return object()
+
+        monkeypatch.setattr(app_module, "_run", fake_run)
+
+        result = app_module.run_app(
+            "/userdata/system/romcloud/bin/romcloud",
+            relaunch_popen=fake_popen,
+        )
+
+        assert result == 0
+        assert order == [
+            "gui-cleanup-complete",
+            "launch:/userdata/system/romcloud/bin/romcloud-ports",
+        ]
+
+    def test_relaunch_failure_exits_old_gui_and_reports_manual_fallback(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        import sys
+
+        from ports_gfx import app as app_module
+
+        monkeypatch.setitem(sys.modules, "pygame", object())
+
+        def fake_run(_pygame, _romcloud_bin, coordinator):
+            coordinator.mark_update_succeeded(progress_complete=True)
+            return 0
+
+        def fail_popen(_argv, **_kwargs):
+            raise OSError("launcher unavailable")
+
+        monkeypatch.setattr(app_module, "_run", fake_run)
+        log_path = tmp_path / "gui-relaunch.log"
+
+        result = app_module.run_app(
+            "/opt/romcloud/bin/romcloud",
+            relaunch_popen=fail_popen,
+            relaunch_failure_log=log_path,
+        )
+
+        assert result == 1
+        assert "updated successfully" in capsys.readouterr().err
+        assert "Reopen ROMCloud" in log_path.read_text()
+
+    def test_failed_update_return_does_not_launch(self, monkeypatch):
+        import sys
+
+        from ports_gfx import app as app_module
+
+        monkeypatch.setitem(sys.modules, "pygame", object())
+        calls: list[list[str]] = []
+
+        def fake_run(_pygame, _romcloud_bin, coordinator):
+            coordinator.mark_update_failed()
+            return 0
+
+        monkeypatch.setattr(app_module, "_run", fake_run)
+
+        result = app_module.run_app(
+            "/opt/romcloud/bin/romcloud",
+            relaunch_popen=lambda argv, **_kwargs: calls.append(argv),
+        )
+
+        assert result == 0
+        assert calls == []
 
 
 class TestOperationSummaryMessage:
