@@ -601,7 +601,7 @@ class LibrarySyncService:
                 digest, size = _hash_file(origin)
                 _record_media_hash(report, size)
                 after = _stat_fields(origin)
-                if before != after or after["size"] != size:
+                if not _stat_unchanged(before, after) or after["size"] != size:
                     raise LibrarySyncError(f"Media changed while it was being read: {origin}")
 
             suffix = origin.suffix.lower() if len(origin.suffix) <= 12 else ""
@@ -810,20 +810,31 @@ class LibrarySyncService:
                 if tag in METADATA_TAGS and str(value).strip():
                     _set_child(element, tag, str(value))
             for tag, descriptor in record.get("media", {}).items():
-                rendered_media = self._render_media(
-                    system_root,
-                    descriptor,
-                    report,
-                    media_validation,
-                    materialize=materialize_media,
-                )
-                if tag in MEDIA_TAGS:
-                    if rendered_media:
-                        _set_child(element, tag, rendered_media)
-                    else:
-                        stale = element.find(tag)
-                        if stale is not None:
-                            element.remove(stale)
+                if tag not in MEDIA_TAGS:
+                    continue
+                try:
+                    rendered_media = self._render_media(
+                        system_root,
+                        descriptor,
+                        report,
+                        media_validation,
+                        materialize=materialize_media,
+                    )
+                except (LibrarySyncError, OSError) as exc:
+                    # One unreadable/corrupt/missing remote blob must never
+                    # abort rendering for every other game and system — and
+                    # must never remove an already-correct existing tag just
+                    # because this particular attempt to refresh it failed.
+                    report.failures.append(
+                        f"{system}/{game.title} {tag}: could not render media: {exc}"
+                    )
+                    continue
+                if rendered_media:
+                    _set_child(element, tag, rendered_media)
+                else:
+                    stale = element.find(tag)
+                    if stale is not None:
+                        element.remove(stale)
             _set_child(element, OWNERSHIP_TAG, library_id)
             count += 1
 
@@ -1055,6 +1066,20 @@ def _stat_fields(path: Path) -> dict[str, int]:
     }
 
 
+# Fields compared to decide "has this file observably changed". ``ctime_ns``
+# is intentionally excluded: on CIFS/SMB mounts the reported change time is
+# not stable across independent stat() calls for a file whose content and
+# mtime have not changed (server-side attribute synthesis/caching differs
+# from local filesystems), so gating on it makes every fingerprint
+# spuriously "miss" and forces a full re-hash of unchanged media on every
+# sync. It is still recorded in ``_stat_fields``/fingerprints for diagnostics.
+_STABLE_STAT_KEYS = ("size", "mtime_ns")
+
+
+def _stat_unchanged(before: dict[str, int], after: dict[str, int]) -> bool:
+    return all(before.get(key) == after.get(key) for key in _STABLE_STAT_KEYS)
+
+
 def _sample_file_hash(path: Path, size: int) -> str:
     """Hash bounded samples so timestamps are never the sole cache proof."""
     sample = min(FINGERPRINT_SAMPLE_BYTES, size)
@@ -1079,7 +1104,7 @@ def _capture_fingerprint(path: Path, *, expected_size: int) -> dict[str, object]
         raise LibrarySyncError(f"Media size changed while it was being processed: {path}")
     sample_sha256 = _sample_file_hash(path, expected_size)
     after = _stat_fields(path)
-    if before != after:
+    if not _stat_unchanged(before, after):
         raise LibrarySyncError(f"Media changed while it was being sampled: {path}")
     return {
         "version": FINGERPRINT_VERSION,
@@ -1099,20 +1124,14 @@ def _fingerprint_matches(
         return False
     if persisted.get("size") != expected_size:
         return False
-    if not isinstance(persisted.get("mtime_ns"), int) or not isinstance(
-        persisted.get("ctime_ns"), int
-    ):
+    if not isinstance(persisted.get("mtime_ns"), int):
         return False
     try:
         before = _stat_fields(path)
     except OSError:
         return False
-    expected = {
-        "size": expected_size,
-        "mtime_ns": persisted.get("mtime_ns"),
-        "ctime_ns": persisted.get("ctime_ns"),
-    }
-    if before != expected:
+    expected = {"size": expected_size, "mtime_ns": persisted.get("mtime_ns")}
+    if not _stat_unchanged(before, expected):
         return False
     try:
         sample_sha256 = _sample_file_hash(path, expected_size)
@@ -1120,7 +1139,7 @@ def _fingerprint_matches(
     except OSError:
         return False
     return (
-        before == after
+        _stat_unchanged(before, after)
         and sample_sha256 == persisted.get("sample_sha256")
     )
 

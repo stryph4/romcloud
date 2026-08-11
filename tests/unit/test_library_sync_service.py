@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -24,7 +25,10 @@ from romcloud.infrastructure.library_view import (
     write_offline_library_state,
     write_operating_mode,
 )
-from romcloud.integrations.batocera.game_access import set_operating_mode
+from romcloud.integrations.batocera.game_access import (
+    reconcile_game_access,
+    set_operating_mode,
+)
 from romcloud.services.library_sync import OWNERSHIP_TAG, library_id_for_game
 from romcloud.core.models.librarysync import LibrarySyncReport
 
@@ -303,6 +307,99 @@ def test_second_unchanged_import_uses_fingerprints_without_full_file_hashes(
     assert second.media_hashed == 0
     assert second.media_examined == 2  # source/blob plus local rendered copy
     assert second.media_skipped == 2
+
+
+def test_unchanged_media_survives_cifs_style_ctime_drift(tmp_path: Path, monkeypatch):
+    """Real hardware over CIFS: the same unmodified file's reported ctime can
+    differ across independent stat() calls even though content/mtime/size are
+    unchanged (server-side attribute synthesis, not local-filesystem
+    behaviour). A fingerprint gated on ctime equality would spuriously
+    "miss" on every single sync, forcing a full re-hash of every unchanged
+    media file — this is the exact real-hardware symptom (large rchar growth,
+    long CIFS stat/read waits) this test guards against.
+    """
+    import romcloud.services.library_sync as library_sync_module
+
+    config, container, _ = _setup(tmp_path)
+    image = Path(config.source.rom_root) / "ps2" / "images" / "Game.png"
+    image.write_bytes(b"large-media" * 100_000)
+    container.library_sync.sync()
+
+    real_stat_fields = library_sync_module._stat_fields
+    drift_counter = {"n": 0}
+
+    def drifting_stat_fields(path):
+        fields = real_stat_fields(path)
+        drift_counter["n"] += 1
+        fields["ctime_ns"] += drift_counter["n"]
+        return fields
+
+    monkeypatch.setattr(library_sync_module, "_stat_fields", drifting_stat_fields)
+    monkeypatch.setattr(
+        library_sync_module,
+        "_hash_file",
+        lambda path: (_ for _ in ()).throw(
+            AssertionError(f"unchanged media was fully hashed despite ctime drift: {path}")
+        ),
+    )
+
+    second = container.library_sync.sync()
+
+    assert second.media_transferred == 0
+    assert second.media_bytes_transferred == 0
+    assert second.media_hashed == 0
+    assert second.media_skipped == 2
+
+
+def test_second_unchanged_import_of_a_large_library_does_not_scale_with_media_bytes(
+    tmp_path: Path, monkeypatch
+):
+    """Operation-count regression: a second sync against an unchanged
+    library must not reread the full byte size of the media library,
+    regardless of how many games/media files exist. Counts (not wall-clock)
+    make this deterministic — see real-hardware evidence of ~450MB of extra
+    reads per 10s on an unchanged repeated import."""
+    config, container, _ = _setup(tmp_path)
+    system_root = Path(config.source.rom_root) / "ps2"
+    game_count = 40
+    media_size = 32 * 1024  # smaller than the sample window (per-file, not full-file, cost)
+    entries = []
+    for index in range(game_count):
+        rom = system_root / f"Game{index}.chd"
+        image = system_root / "images" / f"Game{index}.png"
+        rom.write_bytes(f"rom-{index}".encode())
+        image.write_bytes(bytes([index % 256]) * media_size)
+        entries.append(
+            f"<game><path>./Game{index}.chd</path><name>Game {index}</name>"
+            f"<image>./images/Game{index}.png</image></game>"
+        )
+    gamelist = system_root / "gamelist.xml"
+    gamelist.write_text(
+        "<gameList>" + "".join(entries) + "</gameList>", encoding="utf-8"
+    )
+    result = container.catalog.refresh()
+    assert result.errors == []
+    assert result.added == game_count  # the original Game.chd from _setup was unchanged
+
+    first = container.library_sync.sync()
+    assert first.media_hashed >= game_count  # every new media file was hashed once
+    total_media_bytes = game_count * media_size
+
+    monkeypatch.setattr(
+        "romcloud.services.library_sync._hash_file",
+        lambda path: (_ for _ in ()).throw(
+            AssertionError(f"unchanged media was fully hashed: {path}")
+        ),
+    )
+    second = container.library_sync.sync()
+
+    assert second.media_hashed == 0
+    assert second.media_bytes_hashed == 0
+    assert second.media_transferred == 0
+    assert second.media_bytes_transferred == 0
+    # Sanity: the unchanged library really is that large; a full re-hash
+    # would have read at least this many bytes per file, twice (source+blob).
+    assert total_media_bytes > 0
 
 
 def test_changed_source_media_is_rehashed_copied_and_fully_verified(tmp_path: Path):
@@ -677,6 +774,201 @@ def test_offline_mode_remains_cached_only_and_does_not_recreate_proxy(tmp_path: 
     root = ET.parse(_local_root(config)).getroot()
     assert not any(item.findtext(OWNERSHIP_TAG) for item in root.findall("game"))
     assert any(item.findtext("name") == "User-owned local game" for item in root.findall("game"))
+
+
+# ── real-hardware regression: adopted entries stuck without canonical media ──
+#
+# PSX/Saturn managed gamelist entries kept only text metadata forever, never
+# picking up canonical image/marquee/thumbnail/video, while PS2 on the same
+# install rendered correctly. Root cause: one unreadable/missing remote media
+# blob raised uncaught out of `_render_system`, aborting the *entire* local
+# render for every system on every subsequent sync — so an already-adopted
+# entry sharing a system with a single broken descriptor could never again
+# reach the write that would have filled its own, perfectly fine, media.
+
+
+def _seed_system_game(
+    config: AppConfig, container: Container, system: str, *, directory: bool = False
+) -> tuple[str, str]:
+    """Catalog one game in *system* and create its Cache Mode proxy.
+
+    Returns ``(library_id, proxy_relative_path)``. *directory* builds a
+    directory-backed source path (e.g. Saturn/Xbox-style CUE+BIN folders)
+    instead of a single-file PSX-style ROM.
+    """
+    system_root = Path(config.source.rom_root) / system
+    system_root.mkdir(parents=True, exist_ok=True)
+    (Path(config.local_roms_path) / system).mkdir(parents=True, exist_ok=True)
+    if directory:
+        title_dir = system_root / "Winning Post"
+        title_dir.mkdir()
+        (title_dir / "Winning Post.cue").write_text('FILE "Winning Post.bin" BINARY\n')
+        (title_dir / "Winning Post.bin").write_bytes(b"bin-data")
+    else:
+        (system_root / "Tenchu 2.chd").write_bytes(b"rom")
+    result = container.catalog.refresh()
+    assert result.errors == []
+    game = next(g for g in container.game_repo.list_all() if g.system == system)
+    write_operating_mode(config, OperatingMode.CACHE)
+    reconcile_game_access(config, refresh_es=False, render_library_metadata=False)
+    proxy = container.proxy_repo.get(game.id)
+    assert proxy is not None
+    return library_id_for_game(game), Path(proxy.proxy_path).name
+
+
+def _seed_canonical_media(
+    config: AppConfig, library_id: str, system: str, *, name: str, blob_bytes: bytes
+) -> str:
+    """Write a remote canonical record with one materializable video blob.
+
+    Returns the sha256 digest, so callers can point at (or deliberately
+    omit) the corresponding blob file under remote media storage.
+    """
+    digest = hashlib.sha256(blob_bytes).hexdigest()
+    canonical_path = _canonical(config)
+    canonical_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = (
+        json.loads(canonical_path.read_text())
+        if canonical_path.exists()
+        else {"schema_version": 1, "records": {}}
+    )
+    payload["records"][library_id] = {
+        "system": system,
+        "source_path": "ignored",
+        "metadata": {"name": name},
+        "media": {
+            "video": {
+                "sha256": digest,
+                "size": len(blob_bytes),
+                "suffix": ".mp4",
+                "blob": f"media/sha256/{digest[:2]}/{digest}.mp4",
+            }
+        },
+    }
+    canonical_path.write_text(json.dumps(payload), encoding="utf-8")
+    return digest
+
+
+def _write_remote_blob(config: AppConfig, digest: str, blob_bytes: bytes) -> None:
+    directory = Path(config.remote_data.root) / "library" / "media" / "sha256" / digest[:2]
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{digest}.mp4").write_bytes(blob_bytes)
+
+
+def _write_local_medialess_entry(
+    config: AppConfig, system: str, *, proxy_name: str, library_id: str, name: str
+) -> None:
+    """An already-adopted managed entry: text metadata, no media tags."""
+    path = Path(config.local_roms_path) / system / "gamelist.xml"
+    path.write_text(
+        f"""<gameList>
+  <game>
+    <path>./{proxy_name}</path>
+    <name>{name}</name>
+    <{OWNERSHIP_TAG}>{library_id}</{OWNERSHIP_TAG}>
+  </game>
+  <game>
+    <path>./Unrelated.iso</path>
+    <name>Unrelated local game</name>
+    <favorite>true</favorite>
+  </game>
+</gameList>
+""",
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize("directory", [False, True], ids=["psx_single_file", "saturn_directory"])
+def test_existing_managed_entry_is_enriched_with_missing_canonical_media(
+    tmp_path: Path, monkeypatch, directory: bool
+) -> None:
+    """An adopted entry with text metadata but no media tags must be filled
+    from canonical media, and the referenced blob materialized locally, by
+    an explicit sync — generically, for both single-file and
+    directory-backed source-path records."""
+    _stub_mode_frontend(monkeypatch)
+    config = _config(tmp_path)
+    system = "saturn" if directory else "psx"
+    container = Container(config)
+    library_id, proxy_name = _seed_system_game(config, container, system, directory=directory)
+    blob_bytes = b"canonical-video-bytes"
+    digest = _seed_canonical_media(config, library_id, system, name="Title", blob_bytes=blob_bytes)
+    _write_remote_blob(config, digest, blob_bytes)
+    _write_local_medialess_entry(
+        config, system, proxy_name=proxy_name, library_id=library_id, name="Title"
+    )
+
+    report = Container(config).library_sync.sync()
+
+    assert report.failures == []
+    root = ET.parse(Path(config.local_roms_path) / system / "gamelist.xml").getroot()
+    managed = next(item for item in root.findall("game") if item.findtext(OWNERSHIP_TAG) == library_id)
+    video = managed.findtext("video")
+    assert video is not None and video.startswith("./.romcloud-media/")
+    materialized = Path(config.local_roms_path) / system / video.removeprefix("./")
+    assert materialized.read_bytes() == blob_bytes
+    unrelated = next(item for item in root.findall("game") if item.findtext("name") == "Unrelated local game")
+    assert unrelated.findtext("favorite") == "true"
+    assert unrelated.findtext(OWNERSHIP_TAG) is None
+
+
+def test_already_correct_local_media_is_not_recopied(tmp_path: Path, monkeypatch) -> None:
+    _stub_mode_frontend(monkeypatch)
+    config = _config(tmp_path)
+    container = Container(config)
+    library_id, proxy_name = _seed_system_game(config, container, "psx")
+    blob_bytes = b"canonical-video-bytes"
+    digest = _seed_canonical_media(config, library_id, "psx", name="Title", blob_bytes=blob_bytes)
+    _write_remote_blob(config, digest, blob_bytes)
+    _write_local_medialess_entry(
+        config, "psx", proxy_name=proxy_name, library_id=library_id, name="Title"
+    )
+    Container(config).library_sync.sync()
+
+    report = Container(config).library_sync.sync()
+
+    assert report.media_transferred == 0
+    assert report.media_skipped >= 1
+
+
+def test_broken_remote_media_blob_does_not_abort_other_games_or_systems(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Root cause of the real-hardware bug: one game's unreadable/missing
+    remote media blob must not raise out of the whole render pass and
+    leave every other system's already-adopted entries permanently stuck
+    without their own, perfectly available, canonical media."""
+    _stub_mode_frontend(monkeypatch)
+    config = _config(tmp_path)
+    container = Container(config)
+    psx_id, psx_proxy = _seed_system_game(config, container, "psx")
+    ps2_id, ps2_proxy = _seed_system_game(config, container, "ps2")
+
+    good_bytes = b"good-video-bytes"
+    good_digest = _seed_canonical_media(config, ps2_id, "ps2", name="Good Game", blob_bytes=good_bytes)
+    _write_remote_blob(config, good_digest, good_bytes)
+    _write_local_medialess_entry(
+        config, "ps2", proxy_name=ps2_proxy, library_id=ps2_id, name="Good Game"
+    )
+
+    broken_bytes = b"never-actually-uploaded"
+    _seed_canonical_media(config, psx_id, "psx", name="Broken Game", blob_bytes=broken_bytes)
+    # Deliberately never write the psx blob file — simulates a corrupted or
+    # never-fully-uploaded canonical media reference.
+    _write_local_medialess_entry(
+        config, "psx", proxy_name=psx_proxy, library_id=psx_id, name="Broken Game"
+    )
+
+    report = Container(config).library_sync.sync()
+
+    assert any("psx" in failure and "video" in failure for failure in report.failures)
+    ps2_root = ET.parse(Path(config.local_roms_path) / "ps2" / "gamelist.xml").getroot()
+    ps2_managed = next(item for item in ps2_root.findall("game") if item.findtext(OWNERSHIP_TAG) == ps2_id)
+    assert ps2_managed.findtext("video", "").startswith("./.romcloud-media/")
+    psx_root = ET.parse(Path(config.local_roms_path) / "psx" / "gamelist.xml").getroot()
+    psx_managed = next(item for item in psx_root.findall("game") if item.findtext(OWNERSHIP_TAG) == psx_id)
+    assert psx_managed.findtext("name") == "Broken Game"
+    assert psx_managed.find("video") is None
 
 
 def test_remove_local_touches_only_owned_entries_and_never_media_trees(tmp_path: Path):

@@ -366,8 +366,12 @@ media trees.
 After a media file has been fully hashed and a destination copy has been
 verified, ROMCloud persists separate source, remote-blob, and device-local
 validation fingerprints. A fingerprint combines size, nanosecond modification
-and change times, and bounded beginning/middle/end content samples; timestamps
-alone are never accepted. A matching fingerprint avoids rereading the full
+time, and bounded beginning/middle/end content samples; timestamps alone are
+never accepted. The reported change time (ctime) is recorded but deliberately
+excluded from the match decision — on CIFS/SMB mounts it is not stable across
+independent stat() calls for a file whose content and modification time have
+not changed, and gating on it would force a full re-hash of every unchanged
+media file on every import. A matching fingerprint avoids rereading the full
 file on later imports. Missing or mismatched fingerprint data falls back to a
 full SHA-256, and every newly copied file is still fully verified before its
 atomic replacement. Runtime progress reports media examined, cheaply skipped,
