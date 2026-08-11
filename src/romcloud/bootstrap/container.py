@@ -115,6 +115,9 @@ class Container:
             db_path = str(Path(self._config.data_path) / "catalog.db")
             self._db = Database(db_path)
             self._db.initialize()
+            CacheRepository(self._db).reconcile_legacy_cache_paths(
+                self._config.cache.path
+            )
         return self._db
 
     # ── repositories ─────────────────────────────────────────────────────────

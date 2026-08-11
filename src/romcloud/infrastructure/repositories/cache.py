@@ -2,11 +2,25 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from pathlib import Path
+from typing import Iterable, Optional
 
 from romcloud.core.models.cache import CacheEntry, CacheStatus
 from romcloud.infrastructure.database import Database
+
+
+# Exact historical default shipped before ROMCloud's runtime paths were grouped
+# below /userdata/romcloud.  Do not add guessed locations here: reconciliation
+# is intentionally limited to roots known to have been persisted by ROMCloud.
+LEGACY_CACHE_ROOTS: tuple[Path, ...] = (Path("/userdata/romcloud-cache"),)
+
+
+@dataclass(frozen=True)
+class CachePathReconciliation:
+    migrated: int = 0
+    missing: int = 0
 
 
 def _parse_dt(value: Optional[str]) -> Optional[datetime]:
@@ -60,6 +74,55 @@ class CacheRepository:
                 "UPDATE cache_entries SET cache_path = ? WHERE game_id = ?",
                 (cache_path, game_id),
             )
+
+    def reconcile_legacy_cache_paths(
+        self,
+        cache_root: Path | str,
+        *,
+        legacy_roots: Iterable[Path | str] = LEGACY_CACHE_ROOTS,
+    ) -> CachePathReconciliation:
+        """Rebase verified legacy absolute paths into *cache_root*.
+
+        Only ``cache_path`` is updated, and only when the corresponding path
+        already exists below the configured cache root. Cache bytes and all
+        other persisted entry state are deliberately untouched.
+        """
+        configured_root = Path(cache_root)
+        roots = tuple(Path(root) for root in legacy_roots)
+        migrated = 0
+        missing = 0
+
+        with self._db.connect() as conn:
+            rows = conn.execute(
+                "SELECT game_id, cache_path FROM cache_entries"
+            ).fetchall()
+            updates: list[tuple[str, str, str]] = []
+            for row in rows:
+                recorded = Path(row["cache_path"])
+                if _is_within(recorded, configured_root):
+                    continue
+
+                relative = _relative_to_legacy_root(recorded, roots)
+                if relative is None:
+                    continue
+                rebased = configured_root / relative
+                if not rebased.exists():
+                    missing += 1
+                    continue
+                updates.append((str(rebased), row["game_id"], row["cache_path"]))
+
+            if updates:
+                before = conn.total_changes
+                conn.executemany(
+                    """
+                    UPDATE cache_entries SET cache_path = ?
+                    WHERE game_id = ? AND cache_path = ?
+                    """,
+                    updates,
+                )
+                migrated = conn.total_changes - before
+
+        return CachePathReconciliation(migrated=migrated, missing=missing)
 
     def update_size(self, game_id: str, size_bytes: int) -> None:
         with self._db.connect() as conn:
@@ -152,3 +215,24 @@ class CacheRepository:
             size_bytes=row["size_bytes"],
             is_pinned=bool(row["is_pinned"]),
         )
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _relative_to_legacy_root(
+    path: Path, legacy_roots: tuple[Path, ...]
+) -> Optional[Path]:
+    for root in legacy_roots:
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            continue
+        if relative.parts and ".." not in relative.parts:
+            return relative
+    return None
