@@ -582,7 +582,16 @@ def _update_emulationstation(
     container: Container,
     mode: OperatingMode,
     progress: ProgressSink,
+    *,
+    restart: bool = True,
 ) -> None:
+    """Regenerate the owned ES override, restarting ES only when *restart*.
+
+    A restart is a visible, disruptive interruption — it must only happen
+    when the managed presentation actually changed (a real mode
+    transition, or a rollback reverting one), never for an idempotent
+    re-entry into the mode that is already active.
+    """
     emit_progress(
         progress,
         "operating_mode",
@@ -595,7 +604,8 @@ def _update_emulationstation(
         container.game_repo.list_systems(),
         mode=mode,
     )
-    _reload_emulationstation()
+    if restart:
+        _reload_emulationstation()
     emit_progress(
         progress,
         "operating_mode",
@@ -637,7 +647,9 @@ def set_operating_mode(
             report, container = _apply_mode_presentation(
                 config, requested, progress=progress
             )
-            _update_emulationstation(config, container, requested, progress)
+            _update_emulationstation(
+                config, container, requested, progress, restart=requested is not previous
+            )
             if previous is not requested:
                 emit_progress(
                     progress,

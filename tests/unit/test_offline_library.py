@@ -346,6 +346,41 @@ def test_progress_has_truthful_counts_and_indeterminate_phases(tmp_path: Path) -
     assert events[-1].current is None and events[-1].total is None
 
 
+def test_reentering_the_active_mode_does_not_restart_es(tmp_path: Path, _stub_es) -> None:
+    """Real-hardware regression: re-selecting the mode that is already
+    active (e.g. an idempotent repair, or readiness recovery calling the
+    same mode again) must not restart EmulationStation — only an actual
+    mode transition may."""
+    refreshes, reloads = _stub_es
+    config = _config(tmp_path)
+    _library(config)
+    set_operating_mode(config, OperatingMode.CACHE)
+    reloads.clear()
+
+    set_operating_mode(config, OperatingMode.CACHE)
+
+    assert reloads == []
+    assert operating_mode(config) is OperatingMode.CACHE
+
+
+def test_reconnect_readiness_recovery_never_restarts_es(tmp_path: Path, _stub_es) -> None:
+    """`reconcile_game_access` is the reconnect/readiness/repair path run
+    after mount success, catalog refresh, or startup recovery — it must
+    never restart ES merely because it ran again while the source was
+    temporarily unavailable and the authoritative mode stayed Cache."""
+    refreshes, reloads = _stub_es
+    config = _config(tmp_path)
+    _library(config)
+    set_operating_mode(config, OperatingMode.CACHE)
+    reloads.clear()
+    Path(config.source.rom_root).rename(tmp_path / "disconnected")
+
+    reconcile_game_access(config, render_library_metadata=False)
+
+    assert reloads == []
+    assert operating_mode(config) is OperatingMode.CACHE
+
+
 def test_operating_mode_lock_still_serializes_backend_transitions(tmp_path: Path) -> None:
     config = _config(tmp_path)
     contender_started = Event()
