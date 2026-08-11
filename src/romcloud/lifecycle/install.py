@@ -280,6 +280,9 @@ def reconcile_es_override(config_path: Path) -> Optional[bool]:
         from romcloud.infrastructure.config import load_config
 
         config = load_config(str(config_path))
+        if config.game_access_mode == "direct_nas":
+            es_config.remove(override_path=override_path)
+            return True
         container = Container(config)
         managed = container.game_repo.list_systems()
         if not managed and not override_path.exists():
@@ -394,9 +397,13 @@ def reconcile_install(
     if config_path.exists():
         try:
             from romcloud.infrastructure.config import load_config
-            from romcloud.lifecycle.manage import restore_owned_proxies
+            from romcloud.integrations.batocera.game_access import reconcile_game_access
 
-            proxies_restored = restore_owned_proxies(load_config(str(config_path)))
+            configured = load_config(str(config_path))
+            before = len(list(Path(configured.local_roms_path).glob("*/*.romcloud")))
+            reconcile_game_access(configured)
+            after = len(list(Path(configured.local_roms_path).glob("*/*.romcloud")))
+            proxies_restored = max(0, after - before)
         except Exception:  # noqa: BLE001 — optional recovery, never breaks runtime repair
             log.warning("Failed to restore missing ROMCloud proxy files", exc_info=True)
 

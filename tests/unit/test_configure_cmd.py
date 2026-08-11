@@ -175,7 +175,7 @@ class TestConfigureDelegatesToReusableSmbService:
             configure_cmd,
             ["--source-type", "smb", "--rom-root", "/userdata/romcloud/source"],
             obj={"config_path": str(cfg_path)},
-            input="n\n/userdata/romcloud/cache\n50\n5\n",
+            input="\nn\n/userdata/romcloud/cache\n50\n5\n",
         )
 
         assert result.exit_code == 0, result.output
@@ -224,7 +224,7 @@ class TestConfigureDelegatesToReusableSmbService:
             configure_cmd,
             ["--source-type", "smb"],
             obj={"config_path": str(cfg_path)},
-            input="\ny\n\nn\n\n50\n5\n",
+            input="\n\ny\n\nn\n\n50\n5\n",
         )
 
         assert result.exit_code == 0, result.output
@@ -271,7 +271,7 @@ class TestConfigureDelegatesToReusableSmbService:
             configure_cmd,
             ["--source-type", "smb"],
             obj={"config_path": str(cfg_path)},
-            input="\ny\n\n\n\n50\n5\n",
+            input="\n\ny\n\n\n\n50\n5\n",
         )
 
         assert result.exit_code == 0, result.output
@@ -305,7 +305,7 @@ class TestConfigureDelegatesToReusableSmbService:
             configure_cmd,
             ["--source-type", "smb", "--rom-root", "/userdata/romcloud/source"],
             obj={"config_path": str(cfg_path)},
-            input="n\n/userdata/romcloud/cache\n50\n5\n",
+            input="\nn\n/userdata/romcloud/cache\n50\n5\n",
         )
 
         assert received["discovery"] is sentinel
@@ -373,7 +373,7 @@ class TestConfigureTransactionalPersistence:
             configure_cmd,
             ["--source-type", "smb", "--rom-root", "/userdata/romcloud/source"],
             obj={"config_path": str(cfg_path)},
-            input="n\n/userdata/romcloud/cache\n50\n5\n",
+            input="\nn\n/userdata/romcloud/cache\n50\n5\n",
         )
 
         assert result.exit_code != 0
@@ -403,7 +403,7 @@ class TestConfigureTransactionalPersistence:
             configure_cmd,
             ["--source-type", "smb", "--rom-root", "/userdata/romcloud/source"],
             obj={"config_path": str(cfg_path)},
-            input="n\n/userdata/romcloud/cache\n50\n5\n",
+            input="\nn\n/userdata/romcloud/cache\n50\n5\n",
         )
 
         assert order == ["config", "credentials"]

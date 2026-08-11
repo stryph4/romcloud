@@ -21,11 +21,15 @@ class _RefreshResult:
 def test_successful_refresh_registers_only_cataloged_systems(monkeypatch) -> None:
     calls = []
     container = SimpleNamespace(
-        config=SimpleNamespace(source=SimpleNamespace(rom_root="/source")),
+        config=SimpleNamespace(source=SimpleNamespace(rom_root="/source"), game_access_mode="smart_cache"),
         catalog=SimpleNamespace(refresh=lambda: _RefreshResult()),
         game_repo=SimpleNamespace(list_systems=lambda: ["ps2", "snes"]),
     )
     monkeypatch.setattr(refresh_module, "get_container", lambda ctx: container)
+    monkeypatch.setattr(
+        "romcloud.integrations.batocera.game_access.reconcile_game_access",
+        lambda config: SimpleNamespace(created=0, removed=0),
+    )
     monkeypatch.setattr(
         es_config,
         "refresh",
@@ -43,11 +47,15 @@ def test_successful_refresh_registers_only_cataloged_systems(monkeypatch) -> Non
 
 def test_es_registration_failure_makes_incomplete_refresh_nonzero(monkeypatch) -> None:
     container = SimpleNamespace(
-        config=SimpleNamespace(source=SimpleNamespace(rom_root="/source")),
+        config=SimpleNamespace(source=SimpleNamespace(rom_root="/source"), game_access_mode="smart_cache"),
         catalog=SimpleNamespace(refresh=lambda: _RefreshResult()),
         game_repo=SimpleNamespace(list_systems=lambda: ["snes"]),
     )
     monkeypatch.setattr(refresh_module, "get_container", lambda ctx: container)
+    monkeypatch.setattr(
+        "romcloud.integrations.batocera.game_access.reconcile_game_access",
+        lambda config: SimpleNamespace(created=0, removed=0),
+    )
     monkeypatch.setattr(
         es_config,
         "refresh",

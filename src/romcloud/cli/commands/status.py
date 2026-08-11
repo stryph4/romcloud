@@ -6,6 +6,7 @@ import click
 
 from romcloud.cli.context import get_container
 from romcloud.infrastructure.source_display import source_display_summary
+from romcloud.infrastructure.config import DIRECT_NAS_MODE
 
 
 def _fmt_bytes(n: int) -> str:
@@ -27,6 +28,10 @@ def status_cmd(ctx: click.Context, system: str | None) -> None:
     source = source_display_summary(container.config)
 
     click.echo(f"\n  Source:  {source['source_type']}" + (f" ({source['source_description']})" if source.get("source_description") else ""))
+    click.echo(
+        "  Access:  "
+        + ("Direct/NAS" if container.config.game_access_mode == DIRECT_NAS_MODE else "Smart Cache")
+    )
     # Catalog stats.
     games = container.catalog.list_games(system)
     click.echo(f"\n{'─' * 50}")
@@ -40,7 +45,7 @@ def status_cmd(ctx: click.Context, system: str | None) -> None:
             # `container.cache.is_cached` (not just `entry.is_complete`) is
             # the single source of truth — it also verifies every required
             # asset (e.g. cue companions) is actually present on disk.
-            if entry and container.cache.is_cached(game.id):
+            if container.config.game_access_mode != DIRECT_NAS_MODE and entry and container.cache.is_cached(game.id):
                 cached = " [cached" + (" pinned" if entry.is_pinned else "") + "]"
             click.echo(f"  {game.title}{cached}")
     elif not system:
@@ -48,6 +53,10 @@ def status_cmd(ctx: click.Context, system: str | None) -> None:
         by_system: Counter = Counter(g.system for g in games)
         for sys_, count in sorted(by_system.items()):
             click.echo(f"  {sys_:<20} {count:>5} games")
+
+    if container.config.game_access_mode == DIRECT_NAS_MODE:
+        click.echo("\n  Games are exposed directly; local cache/offline features are inactive.\n")
+        return
 
     # Cache stats.
     summary = container.cache.status_summary()

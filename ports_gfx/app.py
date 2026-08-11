@@ -142,6 +142,16 @@ MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
     ),
 }
 
+
+def menu_categories_for_mode(mode: str) -> dict[str, tuple[MenuItem, ...]]:
+    """Hide cache-only UI entirely when games are exposed directly."""
+    if mode != "direct_nas":
+        return MENU_CATEGORIES
+    return {
+        category: tuple(item for item in items if item.action != "cache-status")
+        for category, items in MENU_CATEGORIES.items()
+    }
+
 # Actions dispatched through the reusable long-running operation screen
 # (see operation_screen.py) instead of a quick blocking uidata JSON call.
 # Reusing this screen for a later action (update, repair, diagnostics,
@@ -215,6 +225,9 @@ def format_result(action: str, result: BackendResult) -> str:
         source_bits = [bit for bit in (source_type, source_description) if bit]
         source_prefix = " | ".join(source_bits)
         if action == "status":
+            if result.data.get("game_access_mode") == "direct_nas":
+                body = f"{source_prefix} | games={result.data.get('games_total', 0)} | Direct/NAS"
+                return f"{action}: {body}"
             stats = [
                 f"games={result.data.get('games_total', 0)}",
                 f"cached={result.data.get('cached', 0)}",
@@ -632,7 +645,8 @@ def _run(  # noqa: ANN001
         splash = SplashRenderer(pygame, screen)
 
         setup_status, connection = _load_startup_backend_state(splash, romcloud_bin)
-        state = NavigationState(ROOT_MENU_ITEMS, MENU_CATEGORIES)
+        access_mode = str(setup_status.data.get("game_access_mode", "smart_cache"))
+        state = NavigationState(ROOT_MENU_ITEMS, menu_categories_for_mode(access_mode))
         wizard: WizardState | None = None
         if initial_screen_for_status(setup_status) == "wizard":
             wizard = WizardState(setup_status)
@@ -880,6 +894,10 @@ def _run(  # noqa: ANN001
                     activity.ingest(line.text)
                 if wizard.finished:
                     current_screen = "menu"
+                    access_mode = wizard.game_access_mode
+                    state = NavigationState(
+                        ROOT_MENU_ITEMS, menu_categories_for_mode(access_mode)
+                    )
                     wizard = None
                     message = "Setup complete"
                     message_kind = "success"
@@ -1615,6 +1633,12 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
             else [f"{len(wizard.systems)} systems: {', '.join(wizard.systems)}"]
         )
         return [*validation, *systems]
+    if wizard.step == WizardStep.GAME_ACCESS:
+        return [
+            "Smart Cache downloads games on first launch and supports offline play.",
+            "Direct/NAS plays from storage and requires the source while playing.",
+            "Direct/NAS has no local downloads, cache management, pinning, eviction, or offline games.",
+        ]
     if wizard.step == WizardStep.REMOTE_DATA:
         return [
             "Choose separate writable storage for synchronized ROMCloud data.",
@@ -1641,6 +1665,11 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
             ),
             "\u2713 Connected  \u2713 Read access verified",
             f"Systems: {len(wizard.systems)}",
+            "Game access: " + (
+                "Direct / NAS (source required while playing)"
+                if wizard.game_access_mode == "direct_nas"
+                else "Smart Cache"
+            ),
             (
                 f"ROMCloud data: //{wizard.remote_server}/{wizard.remote_share} [Read/write]"
                 if wizard.remote_data_type == "smb"
@@ -1648,8 +1677,9 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
                 if wizard.remote_data_type == "local"
                 else "ROMCloud data: not configured (SaveSync unavailable)"
             ),
-            f"Cache: {wizard.cache_root} ({wizard.max_size_gb:g} GB max)",
         ]
+        if wizard.game_access_mode == "smart_cache":
+            lines.append(f"Cache: {wizard.cache_root} ({wizard.max_size_gb:g} GB max)")
         if wizard.remote_data_type == "smb" and wizard.remote_validation:
             lines.insert(-1, "\u2713 Connected  \u2713 Read access verified")
             lines.insert(-1, "Write and cleanup will be verified before setup completes.")
@@ -1688,12 +1718,13 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
                     "\u2713 Cleanup verified",
                 ]
             )
-        lines.extend(
-            [
-                f"Cache size: {wizard.applied_summary.get('max_size_gb', wizard.max_size_gb):g} GB",
-                "ROMCloud is ready. Return to EmulationStation and restart or rescan it to show new games.",
-            ]
-        )
+        if wizard.game_access_mode == "smart_cache":
+            lines.append(
+                f"Cache size: {wizard.applied_summary.get('max_size_gb', wizard.max_size_gb):g} GB"
+            )
+        else:
+            lines.append("Direct/NAS: the source must remain reachable while playing.")
+        lines.append("ROMCloud is ready. Return to EmulationStation and restart or rescan it to show new games.")
         return lines
     return []
 

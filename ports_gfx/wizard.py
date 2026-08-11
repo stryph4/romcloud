@@ -27,6 +27,7 @@ class WizardStep(Enum):
     SOURCE_BROWSE = "source_browse"
     DETECT = "detect"
     SYSTEMS = "systems"
+    GAME_ACCESS = "game_access"
     REMOTE_DATA = "remote_data"
     REMOTE_LOCAL = "remote_local"
     REMOTE_AUTH = "remote_auth"
@@ -77,6 +78,7 @@ class WizardState:
         self.rom_root = str(data.get("rom_root", "/userdata/romcloud/source"))
         self.shares: list[dict[str, str]] = []
         self.systems: list[str] = []
+        self.game_access_mode = str(data.get("game_access_mode", "smart_cache"))
         self.remote_data_type = str(data.get("remote_data_type", "none"))
         self.remote_data_root = str(data.get("remote_data_root", ""))
         self.remote_server = str(data.get("remote_server", ""))
@@ -132,6 +134,7 @@ class WizardState:
             WizardStep.SOURCE_BROWSE: "Choose the ROM Folder",
             WizardStep.DETECT: "Detect Systems",
             WizardStep.SYSTEMS: "Detected Systems",
+            WizardStep.GAME_ACCESS: "Choose Game Access",
             WizardStep.REMOTE_DATA: "ROMCloud Data Storage",
             WizardStep.REMOTE_LOCAL: "Local Data Directory",
             WizardStep.REMOTE_AUTH: "Data SMB Credentials",
@@ -170,6 +173,8 @@ class WizardState:
                 "Local / external directory",
                 "Skip (SaveSync unavailable)",
             ]
+        if self.step == WizardStep.GAME_ACCESS:
+            return ["Smart Cache", "Direct / NAS"]
         if self.step == WizardStep.REMOTE_AUTH:
             return [
                 "Use same server and credentials",
@@ -375,7 +380,7 @@ class WizardState:
             self.remote_data_root = value
             self.osk = None
             self.osk_visible = False
-            self.step = WizardStep.CACHE
+            self.step = self._post_storage_step()
             self.selected_index = 0
         elif current == WizardStep.REMOTE_SERVER:
             self.remote_server = value
@@ -453,6 +458,10 @@ class WizardState:
         elif self.step == WizardStep.DETECT:
             self._start_operation(WizardStep.DETECT, "setup-validate", romcloud_bin)
         elif self.step == WizardStep.SYSTEMS:
+            self.step = WizardStep.GAME_ACCESS
+            self.selected_index = 0 if self.game_access_mode == "smart_cache" else 1
+        elif self.step == WizardStep.GAME_ACCESS:
+            self.game_access_mode = "smart_cache" if self.selected_index == 0 else "direct_nas"
             self.step = WizardStep.REMOTE_DATA
             self.selected_index = 0
         elif self.step == WizardStep.REMOTE_DATA:
@@ -464,7 +473,11 @@ class WizardState:
                 self._start_local_browse("remote_data", self.remote_data_root or "/userdata", romcloud_bin)
             else:
                 self.remote_data_type = "none"
-                self.step = WizardStep.CACHE
+                self.step = (
+                    WizardStep.CACHE
+                    if self.game_access_mode == "smart_cache"
+                    else WizardStep.REVIEW
+                )
                 self.selected_index = 0
         elif self.step == WizardStep.REMOTE_AUTH:
             if self.selected_index == 0:
@@ -539,7 +552,8 @@ class WizardState:
             WizardStep.SOURCE_BROWSE: WizardStep.SHARE,
             WizardStep.DETECT: WizardStep.SHARE,
             WizardStep.SYSTEMS: WizardStep.SHARE,
-            WizardStep.REMOTE_DATA: WizardStep.SYSTEMS,
+            WizardStep.GAME_ACCESS: WizardStep.SYSTEMS,
+            WizardStep.REMOTE_DATA: WizardStep.GAME_ACCESS,
             WizardStep.REMOTE_AUTH: WizardStep.REMOTE_DATA,
             WizardStep.REMOTE_DISCOVER: (
                 WizardStep.REMOTE_AUTH
@@ -554,7 +568,11 @@ class WizardState:
             WizardStep.REMOTE_BROWSE: WizardStep.REMOTE_SHARE,
             WizardStep.REMOTE_VALIDATE: WizardStep.REMOTE_SHARE,
             WizardStep.CACHE: WizardStep.REMOTE_DATA,
-            WizardStep.REVIEW: WizardStep.CACHE,
+            WizardStep.REVIEW: (
+                WizardStep.CACHE
+                if self.game_access_mode == "smart_cache"
+                else WizardStep.REMOTE_DATA
+            ),
             WizardStep.APPLY: WizardStep.REVIEW,
             WizardStep.DONE: WizardStep.REVIEW,
         }.get(self.step)
@@ -627,7 +645,7 @@ class WizardState:
             self.selected_index = 0
         elif self.step == WizardStep.REMOTE_VALIDATE:
             self.remote_validation = dict(result.data.get("validation", {}))
-            self.step = WizardStep.CACHE
+            self.step = self._post_storage_step()
             self.selected_index = 0
         elif self.step == WizardStep.APPLY:
             self.applied_summary = dict(result.data)
@@ -641,6 +659,7 @@ class WizardState:
         return {
             "progress": True,
             "source_type": self.source_type,
+            "game_access_mode": self.game_access_mode,
             "server": self.server,
             "share": self.share,
             "source_remote_path": self.source_remote_path,
@@ -720,7 +739,7 @@ class WizardState:
             elif self.local_browse_purpose == "remote_data":
                 self.remote_data_type = "local"
                 self.remote_data_root = self.browser_path
-                self.step = WizardStep.CACHE
+                self.step = self._post_storage_step()
                 self.selected_index = 0
             else:
                 self.cache_root = self.browser_path
@@ -760,3 +779,10 @@ class WizardState:
             else:
                 self.remote_remote_path = self.browser_path
         self._start_current_browser_operation(romcloud_bin)
+
+    def _post_storage_step(self) -> WizardStep:
+        return (
+            WizardStep.CACHE
+            if self.game_access_mode == "smart_cache"
+            else WizardStep.REVIEW
+        )

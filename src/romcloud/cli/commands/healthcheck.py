@@ -9,6 +9,7 @@ import click
 
 from romcloud.cli.context import get_container
 from romcloud.infrastructure.source_display import source_display_summary
+from romcloud.infrastructure.config import DIRECT_NAS_MODE
 
 
 def _fmt_bytes(n: int) -> str:
@@ -54,24 +55,20 @@ def healthcheck_cmd(ctx: click.Context) -> None:
         str(local_roms),
     )
 
-    # Cache directory.
-    cache_path = Path(config.cache.path)
-    cache_exists = cache_path.is_dir() or (
-        cache_path.parent.exists() and not cache_path.exists()
-    )
-    check("Cache path writable", _can_write(cache_path), str(cache_path))
-
-    # Free space.
-    if cache_path.exists() or cache_path.parent.exists():
-        check_path = cache_path if cache_path.exists() else cache_path.parent
-        stat = shutil.disk_usage(str(check_path))
-        free_gb = stat.free / 1024**3
-        min_free_gb = config.cache.min_free_gb
-        check(
-            f"Free disk space ≥ {min_free_gb:.0f} GB",
-            free_gb >= min_free_gb,
-            f"{free_gb:.1f} GB available",
-        )
+    if config.game_access_mode != DIRECT_NAS_MODE:
+        # Cache directory and reserve apply only to Smart Cache.
+        cache_path = Path(config.cache.path)
+        check("Cache path writable", _can_write(cache_path), str(cache_path))
+        if cache_path.exists() or cache_path.parent.exists():
+            check_path = cache_path if cache_path.exists() else cache_path.parent
+            stat = shutil.disk_usage(str(check_path))
+            free_gb = stat.free / 1024**3
+            min_free_gb = config.cache.min_free_gb
+            check(
+                f"Free disk space ≥ {min_free_gb:.0f} GB",
+                free_gb >= min_free_gb,
+                f"{free_gb:.1f} GB available",
+            )
 
     # Data directory.
     data_path = Path(config.data_path)

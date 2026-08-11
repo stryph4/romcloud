@@ -137,6 +137,7 @@ class Container:
                 proxy_repo=self.proxy_repo,
                 local_roms_root=self._config.local_roms_path,
                 source_root=self._config.source.rom_root,
+                write_proxies=self._config.game_access_mode != "direct_nas",
             )
         return self._catalog
 

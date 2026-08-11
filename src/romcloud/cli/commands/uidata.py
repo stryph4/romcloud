@@ -182,12 +182,13 @@ def uidata_status(ctx: click.Context) -> None:
         _load_context_config(ctx)
         container = get_container(ctx)
         games = container.catalog.list_games()
-        summary = container.cache.status_summary()
         payload = {
             "games_total": len(games),
-            "cached": summary["complete"],
-            "pinned": summary["pinned"],
+            "game_access_mode": container.config.game_access_mode,
         }
+        if container.config.game_access_mode != "direct_nas":
+            summary = container.cache.status_summary()
+            payload.update(cached=summary["complete"], pinned=summary["pinned"])
         payload.update(source_display_summary(container.config))
         return payload
 
@@ -217,8 +218,18 @@ def _run_catalog_refresh(ctx: click.Context, progress) -> None:  # noqa: ANN001
         container = get_container(ctx)
         result = container.catalog.refresh(progress=progress)
         from romcloud.integrations.batocera import es_config
+        from romcloud.integrations.batocera.game_access import reconcile_game_access
+        from romcloud.infrastructure.config import DIRECT_NAS_MODE
 
-        es_result = es_config.refresh(container.game_repo.list_systems())
+        access_result = reconcile_game_access(container.config)
+        if container.config.game_access_mode == DIRECT_NAS_MODE:
+            es_config.remove()
+            es_systems: list[str] = []
+            es_missing: list[str] = []
+        else:
+            es_result = es_config.refresh(container.game_repo.list_systems())
+            es_systems = es_result.included_systems
+            es_missing = es_result.missing_systems
         errors = [f"{system}: {message}" for system, message in result.errors]
         return {
             "ok": not errors,
@@ -233,8 +244,11 @@ def _run_catalog_refresh(ctx: click.Context, progress) -> None:  # noqa: ANN001
             "removed": result.removed,
             "errors": errors,
             "warnings": result.warnings,
-            "es_systems": es_result.included_systems,
-            "es_missing_systems": es_result.missing_systems,
+            "game_access_mode": container.config.game_access_mode,
+            "direct_links_created": access_result.created,
+            "direct_links_removed": access_result.removed,
+            "es_systems": es_systems,
+            "es_missing_systems": es_missing,
             "es_restart_required": True,
         }
 
@@ -332,13 +346,19 @@ def uidata_healthcheck(ctx: click.Context) -> None:
 
 
 @uidata_group.command("cache-status")
+@click.option("--override", is_flag=True, help="Allow this request in Direct/NAS mode.")
 @click.pass_context
-def uidata_cache_status(ctx: click.Context) -> None:
+def uidata_cache_status(ctx: click.Context, override: bool) -> None:
     """Cache summary as JSON."""
 
     def build() -> dict:
         _load_context_config(ctx)
         container = get_container(ctx)
+        if container.config.game_access_mode == "direct_nas" and not override:
+            raise ValueError(
+                "Cache status is unavailable in Direct/NAS mode; pass --override "
+                "for this request only."
+            )
         summary = container.cache.status_summary()
         return {
             "complete": summary["complete"],

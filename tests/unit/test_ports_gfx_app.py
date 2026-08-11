@@ -22,6 +22,7 @@ from ports_gfx.app import (
     classify_message_kind,
     format_result,
     initial_screen_for_status,
+    menu_categories_for_mode,
     operation_summary_message,
     request_relaunch_for_completed_update,
     render_completed_update_relaunch,
@@ -67,6 +68,19 @@ class TestMenuItems:
         savesync_items = [item for item in MENU_ITEMS if item.action == app_module.SAVESYNC_ACTION]
         assert len(savesync_items) == 1
         assert savesync_items[0].label == "SaveSync"
+
+    def test_direct_mode_hides_cache_only_menu_items(self):
+        direct = menu_categories_for_mode("direct_nas")
+        assert all(
+            item.action != "cache-status"
+            for items in direct.values()
+            for item in items
+        )
+        assert any(
+            item.action == "cache-status"
+            for items in menu_categories_for_mode("smart_cache").values()
+            for item in items
+        )
 
 
 class TestInitialScreen:

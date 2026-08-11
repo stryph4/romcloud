@@ -18,6 +18,8 @@ from romcloud.infrastructure.config import (
     SavesConfig,
     SMBConfig,
     SourceConfig,
+    SMART_CACHE_MODE,
+    DIRECT_NAS_MODE,
     paths_overlap,
     default_config_path,
     load_config,
@@ -29,9 +31,16 @@ from romcloud.infrastructure.credentials import (
 )
 from romcloud.infrastructure.providers.local import WritableLocalFilesystemProvider
 from romcloud.infrastructure.smb_discovery_client import build_default_smb_discovery_service
+from romcloud.infrastructure.atomic_file import atomic_write_text
 
 
 @click.command("configure")
+@click.option(
+    "--game-access-mode",
+    default=None,
+    type=click.Choice([SMART_CACHE_MODE, DIRECT_NAS_MODE], case_sensitive=False),
+    help="Game access strategy: smart_cache or direct_nas.",
+)
 @click.option(
     "--rom-root",
     default=None,
@@ -72,6 +81,7 @@ def configure_cmd(
     ctx: click.Context,
     rom_root: str | None,
     cache_root: str | None,
+    game_access_mode: str | None,
     remote_data_type: str | None,
     remote_data_root: str | None,
     source_type: str | None,
@@ -108,6 +118,22 @@ def configure_cmd(
             default="local",
         )
     source_type = (source_type or "local").lower()
+
+    if game_access_mode is None and not non_interactive:
+        click.echo("\nHow should Batocera access remote games?")
+        click.echo("  smart_cache  Download on first launch; supports local/offline play")
+        click.echo("  direct_nas   Play from storage; source must remain reachable")
+        game_access_mode = click.prompt(
+            "Game access mode",
+            type=click.Choice([SMART_CACHE_MODE, DIRECT_NAS_MODE], case_sensitive=False),
+            default=existing.game_access_mode if existing else SMART_CACHE_MODE,
+        )
+        if game_access_mode.lower() == DIRECT_NAS_MODE:
+            click.echo("Direct/NAS disables local cache, downloads, pinning, eviction, and offline games.")
+    game_access_mode = (
+        game_access_mode
+        or (existing.game_access_mode if existing else SMART_CACHE_MODE)
+    ).lower()
 
     # ── ROM root ──────────────────────────────────────────────────────────────
     if rom_root is None and not non_interactive:
@@ -254,16 +280,16 @@ def configure_cmd(
             remote_password = remote_result.password
 
     # ── cache ─────────────────────────────────────────────────────────────────
-    if cache_root is None and not non_interactive:
+    if game_access_mode == SMART_CACHE_MODE and cache_root is None and not non_interactive:
         cache_root = click.prompt(
             "Cache directory",
             default="/userdata/romcloud/cache",
         )
     cache_root = cache_root or "/userdata/romcloud/cache"
 
-    max_gb: float = 50.0
-    min_free_gb: float = 5.0
-    if not non_interactive:
+    max_gb = existing.cache.max_size_gb if existing else 50.0
+    min_free_gb = existing.cache.min_free_gb if existing else 5.0
+    if game_access_mode == SMART_CACHE_MODE and not non_interactive:
         max_gb = click.prompt("Max cache size (GB)", default=50.0, type=float)
         min_free_gb = click.prompt("Min free disk space (GB)", default=5.0, type=float)
 
@@ -313,10 +339,28 @@ def configure_cmd(
         smb=smb_cfg,
         remote_data=remote_data,
         saves=existing.saves if existing else SavesConfig(),
+        game_access_mode=game_access_mode,
     )
 
+    previous_config_text = (
+        config_path.read_text(encoding="utf-8") if config_path.exists() else None
+    )
     written = write_config(config, str(config_path))
     click.echo(f"\nConfiguration written to {written}")
+
+    # Reconfiguration switches only ROMCloud-owned access artifacts. A fresh
+    # configuration has no catalog yet, so this is naturally a no-op.
+    if existing is not None:
+        from romcloud.integrations.batocera.game_access import reconcile_game_access
+
+        try:
+            reconcile_game_access(config)
+        except RuntimeError as exc:
+            if previous_config_text is not None:
+                atomic_write_text(config_path, previous_config_text)
+            else:
+                config_path.unlink(missing_ok=True)
+            raise click.ClickException(str(exc)) from exc
 
     if smb_password:
         creds_path = config_path.parent / "credentials.toml"

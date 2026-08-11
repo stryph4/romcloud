@@ -26,6 +26,7 @@ from romcloud.lifecycle import install
 class LifecycleReport:
     proxies_removed: int = 0
     proxies_restored: int = 0
+    direct_links_removed: int = 0
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -184,6 +185,9 @@ def uninstall(
     mount_service.remove_service()
     es_config.remove()
     ports_gamelist_config.remove(ports_dir=resolved_ports_dir)
+    from romcloud.integrations.batocera.game_access import remove_direct_links
+
+    direct_links_removed = remove_direct_links(config).removed
     proxies_removed = remove_owned_proxies(config)
     mount_worker.cleanup_runtime_state(romcloud_home)
     cifs_credentials_path(config.credentials_path).unlink(missing_ok=True)
@@ -198,7 +202,10 @@ def uninstall(
         run_dir.rmdir()
     except OSError:
         pass
-    return LifecycleReport(proxies_removed=proxies_removed)
+    return LifecycleReport(
+        proxies_removed=proxies_removed,
+        direct_links_removed=direct_links_removed,
+    )
 
 
 def _validate_owned_tree(path: Path, *, protected: tuple[Path, ...]) -> None:

@@ -78,6 +78,7 @@ class CatalogService:
         local_roms_root: str,
         source_root: str,
         known_systems: Optional[frozenset[str]] = None,
+        write_proxies: bool = True,
     ) -> None:
         self._provider = provider
         self._game_repo = game_repo
@@ -85,6 +86,7 @@ class CatalogService:
         self._local_roms_root = Path(local_roms_root)
         self._source_root = source_root
         self._known_systems = known_systems or BATOCERA_SYSTEMS
+        self._write_proxies_enabled = write_proxies
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -211,7 +213,8 @@ class CatalogService:
                             game.added_at = existing.added_at
                             game.last_played = existing.last_played
                             self._game_repo.save(game)
-                            self._rewrite_owned_proxy(game)
+                            if self._write_proxies_enabled:
+                                self._rewrite_owned_proxy(game)
                             updated += 1
                             log.info(
                                 "Updated asset metadata for %r [%s]", game.title, system
@@ -224,7 +227,8 @@ class CatalogService:
                         continue
 
                     self._game_repo.save(game)
-                    self._write_proxy(game)
+                    if self._write_proxies_enabled:
+                        self._write_proxy(game)
                     added += 1
                     log.info("Catalogued %r [%s]", game.title, system)
 

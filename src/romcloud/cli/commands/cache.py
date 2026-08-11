@@ -17,8 +17,31 @@ def _fmt_bytes(n: int) -> str:
 
 
 @click.group("cache")
-def cache_group() -> None:
+@click.option(
+    "--override",
+    is_flag=True,
+    help="Allow this cache command while Direct/NAS mode is configured.",
+)
+@click.pass_context
+def cache_group(ctx: click.Context, override: bool) -> None:
     """Manage the local ROM cache."""
+    ctx.ensure_object(dict)
+    ctx.obj["cache_override"] = override
+
+
+def _require_cache_mode(ctx: click.Context) -> None:
+    from romcloud.infrastructure.config import DIRECT_NAS_MODE
+
+    container = get_container(ctx)
+    if (
+        container.config.game_access_mode == DIRECT_NAS_MODE
+        and not ctx.obj.get("cache_override", False)
+    ):
+        raise click.ClickException(
+            "Cache commands are unavailable in Direct/NAS mode because games are "
+            "played from the remote source. Re-run this one command with "
+            "`romcloud cache --override ...` to proceed without changing the configured mode."
+        )
 
 
 @cache_group.command("status")
@@ -26,6 +49,7 @@ def cache_group() -> None:
 @click.pass_context
 def cache_status(ctx: click.Context, game_id: str | None) -> None:
     """List cached games (or show detail for GAME_ID)."""
+    _require_cache_mode(ctx)
     container = get_container(ctx)
 
     if game_id:
@@ -65,6 +89,7 @@ def cache_status(ctx: click.Context, game_id: str | None) -> None:
 @click.pass_context
 def cache_add(ctx: click.Context, game_id: str) -> None:
     """Pre-cache a game (download from source now)."""
+    _require_cache_mode(ctx)
     container = get_container(ctx)
 
     game = container.game_repo.get(game_id)
@@ -93,6 +118,7 @@ def cache_add(ctx: click.Context, game_id: str) -> None:
 @click.pass_context
 def cache_remove(ctx: click.Context, game_id: str, force: bool) -> None:
     """Remove the cached copy of GAME_ID."""
+    _require_cache_mode(ctx)
     container = get_container(ctx)
 
     game = container.game_repo.get(game_id)
@@ -114,6 +140,7 @@ def cache_remove(ctx: click.Context, game_id: str, force: bool) -> None:
 @click.pass_context
 def cache_pin(ctx: click.Context, game_id: str) -> None:
     """Pin GAME_ID so it is never auto-evicted."""
+    _require_cache_mode(ctx)
     container = get_container(ctx)
     try:
         container.cache.pin(game_id)
@@ -130,6 +157,7 @@ def cache_pin(ctx: click.Context, game_id: str) -> None:
 @click.pass_context
 def cache_unpin(ctx: click.Context, game_id: str) -> None:
     """Unpin GAME_ID (cached copy is kept; becomes eviction-eligible)."""
+    _require_cache_mode(ctx)
     container = get_container(ctx)
     container.cache.unpin(game_id)
     game = container.game_repo.get(game_id)

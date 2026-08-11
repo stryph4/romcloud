@@ -4,10 +4,10 @@
 the device.**
 
 ROMCloud makes ROMs stored on a NAS, another PC, or external storage appear in
-Batocera's normal EmulationStation library. When you launch a game, ROMCloud
-copies it into a managed local cache and then starts it through Batocera's
-normal launcher. Frequently used games stay local; the rest remain on the
-source until needed.
+Batocera's normal EmulationStation library. **Smart Cache** downloads games on
+first launch and keeps frequently used games locally. **Direct/NAS** exposes
+the read-only remote system folders directly and requires the source to remain
+reachable while browsing and playing.
 
 ## Why use ROMCloud?
 
@@ -36,11 +36,9 @@ source until needed.
   purge workflows distinguish replaceable runtime files from user data.
 
 > [!IMPORTANT]
-> ROMCloud is more than a network mount. The source is the complete library;
-> EmulationStation browses local proxy entries; ROMCloud maintains a smaller
-> cache containing the games actually used. The ROM-source SMB mount remains
-> read-only. SaveSync, when enabled, uses a separate explicitly writable data
-> location.
+> The ROM-source SMB mount remains read-only in both modes. Direct/NAS does not
+> provide downloads, pinning, eviction, cache cleanup, or offline games.
+> SaveSync, when enabled, uses a separate explicitly writable data location.
 
 ## Public beta status
 
@@ -95,9 +93,17 @@ Batocera EmulationStation library
         Batocera emulatorlauncher
 ```
 
+In Direct/NAS mode ROMCloud creates only a verified, manifest-owned `ROMCloud`
+directory symlink inside each existing `/userdata/roms/<system>/` directory.
+Local ROMs remain alongside it. ROMCloud never owns the system directory and
+uninstall/reconfigure unlinks only symlinks whose recorded path and target still
+match. An existing foreign file, directory, or symlink at that reserved path is
+reported as a conflict and left untouched.
+
 ROMCloud does not replace EmulationStation, Batocera's emulator configuration,
-or `emulatorlauncher`. Its launch wrapper changes only the ROM path for a
-`.romcloud` game. Ordinary local ROM launches pass through unchanged.
+or `emulatorlauncher`. Smart Cache's launch wrapper changes only the ROM path
+for a `.romcloud` game. Ordinary local and Direct/NAS ROM launches use
+Batocera's normal path.
 
 ## Storage support
 
@@ -295,6 +301,11 @@ Refresh does not restart EmulationStation. Update game lists or restart
 EmulationStation after catalog changes.
 
 ## Local cache and offline use
+
+This section applies to Smart Cache. Direct/NAS hides these controls in the
+graphical interface. Explicit CLI maintenance remains possible for diagnostics
+with `romcloud cache --override ...`; the override applies to that invocation
+only and does not change the configured mode.
 
 The default cache is:
 
@@ -508,6 +519,10 @@ source plus independent SMB SaveSync target looks like:
 provider = "local"
 rom_root = "/userdata/romcloud/source"
 
+[game_access]
+# Use "direct_nas" to play from the source without local game caching.
+mode = "smart_cache"
+
 [cache]
 path = "/userdata/romcloud/cache"
 max_size_gb = 50.0
@@ -560,6 +575,7 @@ Default paths:
 ├── config/romcloud.toml         Main configuration
 ├── config/credentials.toml      Passwords, mode 0600
 ├── data/catalog.db              Catalog/cache/proxy ownership database
+├── data/direct-links.json       Verified Direct/NAS symlink ownership manifest
 ├── data/savesync-state.json     Last successful SaveSync records and device ID
 ├── logs/romcloud.log            Rotating application log
 ├── logs/mount-worker.log        Detached SMB worker output

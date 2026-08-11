@@ -45,6 +45,10 @@ _LEGACY_SOURCE_ROOT = "/userdata/romcloud-source"
 _LEGACY_CACHE_ROOT = "/userdata/romcloud-cache"
 _LEGACY_SAVES_KEYS = frozenset({"remote_mount_path", "remote_subdir"})
 
+SMART_CACHE_MODE = "smart_cache"
+DIRECT_NAS_MODE = "direct_nas"
+GAME_ACCESS_MODES = frozenset({SMART_CACHE_MODE, DIRECT_NAS_MODE})
+
 
 def _validated_smb_remote_path(value: object, context: object = "configuration") -> str:
     """Validate the persisted share-relative mount path without I/O."""
@@ -145,6 +149,7 @@ class AppConfig:
     smb: Optional[SMBConfig] = None
     remote_data: Optional[RemoteDataConfig] = None
     saves: SavesConfig = field(default_factory=SavesConfig)
+    game_access_mode: str = SMART_CACHE_MODE
 
     @property
     def credentials_path(self) -> Path:
@@ -379,6 +384,20 @@ def _parse(data: dict, path: Path) -> AppConfig:  # noqa: C901
         xbox_enabled=bool(saves_raw.get("xbox_enabled", False)),
     )
 
+    game_access_mode = str(
+        data.get("game_access", {}).get("mode", SMART_CACHE_MODE)
+    ).strip().lower()
+    if game_access_mode not in GAME_ACCESS_MODES:
+        raise ConfigurationError(
+            f"{path}: game_access.mode must be \"smart_cache\" or \"direct_nas\"."
+        )
+    if game_access_mode == DIRECT_NAS_MODE and paths_overlap(
+        Path(source.rom_root), Path(local_roms_path)
+    ):
+        raise ConfigurationError(
+            f"{path}: Direct/NAS source.rom_root must not overlap local_roms.path."
+        )
+
     validate_remote_data_boundary(
         source=source,
         source_smb=smb,
@@ -398,6 +417,7 @@ def _parse(data: dict, path: Path) -> AppConfig:  # noqa: C901
         smb=smb,
         remote_data=remote_data,
         saves=saves,
+        game_access_mode=game_access_mode,
     )
 
 
@@ -411,6 +431,16 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
     fully written.
     """
     path = Path(config_path) if config_path else default_config_path()
+    if config.game_access_mode not in GAME_ACCESS_MODES:
+        raise ConfigurationError(
+            f"{path}: game_access_mode must be smart_cache or direct_nas."
+        )
+    if config.game_access_mode == DIRECT_NAS_MODE and paths_overlap(
+        Path(config.source.rom_root), Path(config.local_roms_path)
+    ):
+        raise ConfigurationError(
+            f"{path}: Direct/NAS source.rom_root must not overlap local_roms.path."
+        )
     validate_remote_data_boundary(
         source=config.source,
         source_smb=config.smb,
@@ -429,6 +459,10 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
         "[source]\n",
         f'provider = "{config.source.provider}"\n',
         f'rom_root = "{config.source.rom_root}"\n',
+        "\n",
+        "[game_access]\n",
+        "# smart_cache downloads games on demand; direct_nas plays from the source.\n",
+        f'mode = "{config.game_access_mode}"\n',
         "\n",
         "[cache]\n",
         f'path = "{config.cache.path}"\n',
@@ -450,7 +484,8 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
         "\n",
         "[local_roms]\n",
         "# Directory where Batocera stores local ROM directories.\n",
-        "# ROMCloud creates .romcloud proxy files here; never modifies existing ROMs.\n",
+        "# Smart Cache creates proxies; Direct/NAS creates verified system symlinks.\n",
+        "# ROMCloud never modifies existing user ROMs or owns system directories.\n",
         f'path = "{config.local_roms_path}"\n',
         "\n",
         "[data]\n",

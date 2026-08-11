@@ -242,6 +242,13 @@ def _resolve_and_cache(proxy_path: str) -> str:
     from romcloud.services import cache as cache_module
 
     config = load_config()
+    if config.game_access_mode == "direct_nas":
+        from romcloud.core.exceptions import CacheError
+
+        raise CacheError(
+            "ROMCloud proxy caching is unavailable in Direct/NAS mode; launch the "
+            "game through its Direct/NAS path."
+        )
     configure_logging(
         level=config.logging.level,
         log_dir=config.logging.path,

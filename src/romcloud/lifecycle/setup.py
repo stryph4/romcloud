@@ -19,6 +19,8 @@ from romcloud.infrastructure.config import (
     SavesConfig,
     SMBConfig,
     SourceConfig,
+    SMART_CACHE_MODE,
+    DIRECT_NAS_MODE,
     paths_overlap,
     load_config,
     write_config,
@@ -71,6 +73,7 @@ class SetupRequest:
     remote_port: int = 445
     remote_reuse_source_credentials: bool = False
     remote_remote_path: str = ""
+    game_access_mode: str = SMART_CACHE_MODE
 
     @classmethod
     def from_payload(
@@ -116,6 +119,7 @@ class SetupRequest:
             remote_remote_path=normalize_remote_directory(
                 str(payload.get("remote_remote_path", ""))
             ),
+            game_access_mode=str(payload.get("game_access_mode", SMART_CACHE_MODE)).strip().lower(),
         )
         request.validate(require_share=require_share, validate_cache=validate_cache)
         return request
@@ -123,6 +127,8 @@ class SetupRequest:
     def validate(self, *, require_share: bool = True, validate_cache: bool = True) -> None:
         if self.source_type not in {"local", "smb"}:
             raise ValueError("ROM source type must be local or smb.")
+        if self.game_access_mode not in {SMART_CACHE_MODE, DIRECT_NAS_MODE}:
+            raise ValueError("Game access mode must be smart_cache or direct_nas.")
         if self.source_type == "smb":
             if not self.server:
                 raise ValueError("SMB server is required.")
@@ -178,6 +184,12 @@ class SetupRequest:
             raise ValueError("ROM and cache paths must be absolute.")
         if validate_cache and (cache_root == rom_root or rom_root in cache_root.parents):
             raise ValueError("Cache location cannot be inside the mounted ROM source.")
+        if self.game_access_mode == DIRECT_NAS_MODE and paths_overlap(
+            rom_root, Path("/userdata/roms")
+        ):
+            raise ValueError(
+                "Direct/NAS ROM source must be separate from /userdata/roms."
+            )
         if self.remote_data_type != "none":
             remote_root = (
                 Path(self.remote_data_root)
@@ -239,6 +251,7 @@ def setup_state(config_path: Path) -> dict[str, Any]:
         "state": "partial" if issues else "configured",
         "issues": issues,
         "source_type": "smb" if config.smb is not None else "local",
+        "game_access_mode": config.game_access_mode,
         "rom_root": config.source.rom_root,
         "cache_root": config.cache.path,
         "max_size_gb": config.cache.max_size_gb,
@@ -484,7 +497,10 @@ def validate_local_source(
 def apply_setup(
     config_path: Path, payload: dict[str, Any], progress: ProgressSink = None
 ) -> dict[str, Any]:
-    request = SetupRequest.from_payload(payload)
+    requested_mode = str(payload.get("game_access_mode", SMART_CACHE_MODE)).lower()
+    request = SetupRequest.from_payload(
+        payload, validate_cache=requested_mode != DIRECT_NAS_MODE
+    )
     validation_result = (
         validate_share(payload)
         if request.source_type == "smb"
@@ -579,7 +595,13 @@ def apply_setup(
         step = "update EmulationStation integration"
         _write_state(state_path, {"status": "applying", "step": step})
         managed_systems = container.game_repo.list_systems()
-        es_config.install(managed_systems)
+        from romcloud.integrations.batocera.game_access import reconcile_game_access
+
+        if config.game_access_mode == DIRECT_NAS_MODE:
+            es_config.remove()
+        else:
+            es_config.install(managed_systems)
+        reconcile_game_access(config)
         emit_progress(progress, "configure", "complete", "success", "ROMCloud setup complete")
     except Exception as exc:
         from romcloud.infrastructure.mount import unmount_cifs_source
@@ -626,6 +648,7 @@ def apply_setup(
     state_path.unlink(missing_ok=True)
     return {
         "source_type": request.source_type,
+        "game_access_mode": request.game_access_mode,
         "server": request.server,
         "share": request.share,
         "systems": validation_result["systems"],
@@ -686,6 +709,7 @@ def _build_config(config_path: Path, request: SetupRequest, existing: AppConfig 
         ),
         remote_data=remote_data,
         saves=existing.saves if existing else SavesConfig(),
+        game_access_mode=request.game_access_mode,
     )
 
 

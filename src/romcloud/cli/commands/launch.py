@@ -29,14 +29,24 @@ from romcloud.cli.context import get_container
     is_flag=True,
     help="Suppress the progress UI (useful for scripting).",
 )
+@click.option(
+    "--override",
+    is_flag=True,
+    help="Allow this one cache-backed launch while Direct/NAS mode is configured.",
+)
 @click.pass_context
-def launch_cmd(ctx: click.Context, proxy_path: str, no_ui: bool) -> None:
+def launch_cmd(ctx: click.Context, proxy_path: str, no_ui: bool, override: bool) -> None:
     """Resolve and cache PROXY_PATH; print the resulting local ROM path.
 
     Does not invoke emulatorlauncher.  Use ``romcloud-run`` as the
     EmulationStation ``<command>`` wrapper for actual Batocera launch.
     """
     container = get_container(ctx)
+    if container.config.game_access_mode == "direct_nas" and not override:
+        raise click.ClickException(
+            "Proxy caching is unavailable in Direct/NAS mode. Batocera should launch "
+            "the exposed remote game directly; pass --override only for this command."
+        )
 
     try:
         game = container.catalog.resolve_proxy(proxy_path)

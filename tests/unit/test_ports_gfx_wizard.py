@@ -111,11 +111,16 @@ def test_multiple_or_no_detected_systems_are_reviewable(monkeypatch):
         assert wizard.options == ["Continue"]
 
 
-def test_detected_systems_lead_to_explicit_remote_data_choice():
+def test_detected_systems_lead_to_explicit_game_access_and_remote_data_choices():
     wizard = WizardState()
     wizard.step = WizardStep.SYSTEMS
 
     wizard._confirm("romcloud")  # noqa: SLF001 - pure navigation test
+
+    assert wizard.step == WizardStep.GAME_ACCESS
+    assert wizard.options == ["Smart Cache", "Direct / NAS"]
+
+    wizard._confirm("romcloud")  # Smart Cache
 
     assert wizard.step == WizardStep.REMOTE_DATA
     assert wizard.options == [
@@ -134,6 +139,19 @@ def test_skipping_remote_data_makes_choice_explicit():
 
     assert wizard.remote_data_type == "none"
     assert wizard.step == WizardStep.CACHE
+
+
+def test_direct_mode_skips_cache_settings_and_explains_source_requirement():
+    wizard = WizardState()
+    wizard.step = WizardStep.GAME_ACCESS
+    wizard.selected_index = 1
+    wizard._confirm("romcloud")  # noqa: SLF001
+    wizard.selected_index = 2
+    wizard._confirm("romcloud")  # noqa: SLF001
+
+    assert wizard.game_access_mode == "direct_nas"
+    assert wizard.step == WizardStep.REVIEW
+    assert "game_access_mode" in wizard.request_payload()
 
 
 def test_remote_smb_can_reuse_source_credentials_without_second_password(monkeypatch):

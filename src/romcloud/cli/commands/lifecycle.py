@@ -82,7 +82,10 @@ def uninstall_cmd(ctx: click.Context, yes: bool) -> None:
         report = manage.uninstall(config=config, romcloud_home=romcloud_home)
     except Exception as exc:  # noqa: BLE001
         raise click.ClickException(str(exc)) from exc
-    click.echo(f"ROMCloud uninstalled. Removed proxies: {report.proxies_removed}")
+    click.echo(
+        f"ROMCloud uninstalled. Removed proxies: {report.proxies_removed}; "
+        f"Direct/NAS links: {report.direct_links_removed}"
+    )
 
 
 @click.command("purge")

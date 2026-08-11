@@ -7,6 +7,7 @@ import click
 from romcloud.core.exceptions import ProviderNotReachableError, ROMCloudError
 from romcloud.cli.context import get_container
 from romcloud.integrations.batocera import es_config
+from romcloud.infrastructure.config import DIRECT_NAS_MODE
 
 
 @click.command("refresh")
@@ -39,17 +40,32 @@ def refresh_cmd(ctx: click.Context, system: str | None, dry_run: bool) -> None:
 
         managed = container.game_repo.list_systems()
         try:
-            es_result = es_config.refresh(managed)
+            from romcloud.integrations.batocera.game_access import reconcile_game_access
+
+            access_result = reconcile_game_access(container.config)
+            es_result = (
+                None
+                if container.config.game_access_mode == DIRECT_NAS_MODE
+                else es_config.refresh(managed)
+            )
+            if es_result is None:
+                es_config.remove()
         except es_config.ESConfigError as exc:
             click.echo(f"error: could not update EmulationStation integration — {exc}", err=True)
             ctx.exit(1)
             return
 
-        click.echo(
-            "Updated EmulationStation registration for "
-            f"{len(es_result.included_systems)} system(s)."
-        )
-        if es_result.missing_systems:
+        if es_result is not None:
+            click.echo(
+                "Updated EmulationStation registration for "
+                f"{len(es_result.included_systems)} system(s)."
+            )
+        else:
+            click.echo(
+                "Updated Direct/NAS exposure "
+                f"({access_result.created} link(s) created, {access_result.removed} removed)."
+            )
+        if es_result is not None and es_result.missing_systems:
             click.echo(
                 "warning: no Batocera system definition found for: "
                 + ", ".join(es_result.missing_systems),
@@ -63,6 +79,6 @@ def refresh_cmd(ctx: click.Context, system: str | None, dry_run: bool) -> None:
     except ProviderNotReachableError as exc:
         click.echo(f"error: Source not reachable — {exc}", err=True)
         ctx.exit(1)
-    except ROMCloudError as exc:
+    except (ROMCloudError, RuntimeError) as exc:
         click.echo(f"error: {exc}", err=True)
         ctx.exit(1)
