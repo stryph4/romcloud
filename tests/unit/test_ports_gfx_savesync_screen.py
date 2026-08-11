@@ -15,9 +15,12 @@ from ports_gfx.savesync_screen import (
     COMMITTING,
     CONFIRMING,
     DASHBOARD,
+    LOCAL_GAMES_WARNING,
     PREVIEW,
     PREVIEWING,
     RESULT,
+    RPCS3_CONFIRMING,
+    RPCS3_WARNING,
     SETTINGS,
     SaveSyncScreenState,
 )
@@ -230,6 +233,51 @@ class TestSettings:
 
         assert state.step == SETTINGS
         assert state.status["xbox_enabled"] is True
+
+    def test_rpc3_opt_in_requires_warning_and_long_hold(self):
+        state = SaveSyncScreenState(
+            romcloud_bin="romcloud",
+            step=SETTINGS,
+            settings_selected_index=1,
+            status={"rpcs3_installed_games_enabled": False},
+        )
+        state.popen = _fake_popen_returning(
+            {"ok": True, "rpcs3_installed_games_enabled": True}
+        )
+
+        state.confirm_settings_selection()
+        assert state.step == RPCS3_WARNING
+        state.begin_rpcs3_confirm()
+        state.handle_confirm_event(InputEvent(action=Action.CONFIRM))
+        state.update_confirm(3.0)
+
+        assert state.step == APPLYING_SETTINGS
+        _drain(state)
+        assert state.status["rpcs3_installed_games_enabled"] is True
+
+    def test_rpc3_hold_release_returns_to_warning_without_enabling(self):
+        state = SaveSyncScreenState(romcloud_bin="romcloud", step=RPCS3_WARNING)
+        state.begin_rpcs3_confirm()
+        assert state.step == RPCS3_CONFIRMING
+        state.handle_confirm_event(InputEvent(action=Action.CONFIRM))
+        state.update_confirm(1.0)
+        state.handle_confirm_event(InputEvent(action=Action.BACK))
+        state.update_confirm(0.1)
+
+        assert state.step == RPCS3_WARNING
+        assert state._runner is None  # noqa: SLF001
+
+    def test_local_game_opt_in_has_an_explanatory_warning(self):
+        state = SaveSyncScreenState(
+            romcloud_bin="romcloud",
+            step=SETTINGS,
+            settings_selected_index=2,
+            status={"include_local_games": False},
+        )
+
+        state.confirm_settings_selection()
+
+        assert state.step == LOCAL_GAMES_WARNING
 
     def test_return_to_dashboard_resets_selection(self):
         state = SaveSyncScreenState(romcloud_bin="romcloud", step=SETTINGS, selected_index=2)

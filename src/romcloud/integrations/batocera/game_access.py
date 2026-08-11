@@ -53,6 +53,8 @@ class LibraryPresentationReport:
     removed: int = 0
     restored: int = 0
     visible: int = 0
+    save_sync_available: bool = False
+    save_reconcile: dict | None = None
 
 
 def _manifest_path(config: AppConfig) -> Path:
@@ -310,7 +312,7 @@ def _render_library_metadata(config: AppConfig, container: Container) -> None:
 
 def _prepare_nas_library(
     config: AppConfig, progress: ProgressSink
-) -> Container:
+) -> tuple[Container, dict | None]:
     """Reconnect and refresh remotely backed state without exposing proxies."""
     from romcloud.infrastructure import mount_worker
     from romcloud.services.connections import mount_connections
@@ -355,7 +357,19 @@ def _prepare_nas_library(
     emit_progress(
         progress, "operating_mode", "catalog", "success", "Full library restored"
     )
-    return container
+
+    save_reconcile = None
+    if config.remote_data is None:
+        emit_progress(
+            progress,
+            "savesync",
+            "unavailable",
+            "warning",
+            "NAS Mode is ready; shared saves are unavailable until writable ROMCloud data storage is configured",
+        )
+    else:
+        save_reconcile = container.saves.reconcile(progress=progress).to_dict()
+    return container, save_reconcile
 
 
 def _restore_mode_presentation(
@@ -394,8 +408,16 @@ def set_operating_mode(
         presentation_changed = False
         try:
             if requested is OperatingMode.NAS:
-                container = _prepare_nas_library(config, progress)
+                container, save_reconcile = _prepare_nas_library(config, progress)
                 report = reconcile_library_presentation(config, offline=False)
+                report = LibraryPresentationReport(
+                    offline=report.offline,
+                    removed=report.removed,
+                    restored=report.restored,
+                    visible=report.visible,
+                    save_sync_available=config.remote_data is not None,
+                    save_reconcile=save_reconcile,
+                )
                 presentation_changed = True
                 _render_library_metadata(config, container)
             else:

@@ -39,6 +39,8 @@ class TestSavesConfigDefaults:
 
         assert loaded.saves.local_path == "/userdata/saves"
         assert loaded.saves.xbox_enabled is False
+        assert loaded.saves.rpcs3_installed_games_enabled is False
+        assert loaded.saves.include_local_games is False
         assert loaded.remote_data is None
         assert loaded.library_sync.enabled is False
 
@@ -135,6 +137,33 @@ class TestSavesConfigRoundTrip:
         loaded = load_config(str(config_path))
 
         assert loaded.remote_data == RemoteDataConfig("local", "/mnt/cloud-data")
+
+    def test_rpcs3_installed_games_opt_in_round_trips_and_defaults_off(
+        self, tmp_path: Path
+    ):
+        config = _base_config()
+        config = replace(
+            config,
+            saves=replace(config.saves, rpcs3_installed_games_enabled=True),
+        )
+        path = tmp_path / "romcloud.toml"
+
+        write_config(config, str(path))
+        loaded = load_config(str(path))
+
+        assert loaded.saves.rpcs3_installed_games_enabled is True
+
+    def test_local_game_save_opt_in_round_trips(self, tmp_path: Path):
+        config = _base_config()
+        config = replace(
+            config,
+            saves=replace(config.saves, include_local_games=True),
+        )
+        path = tmp_path / "romcloud.toml"
+
+        write_config(config, str(path))
+
+        assert load_config(str(path)).saves.include_local_games is True
 
     def test_independent_smb_remote_data_round_trip(self, tmp_path: Path):
         config_path = tmp_path / "romcloud.toml"

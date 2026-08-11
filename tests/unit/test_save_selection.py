@@ -9,6 +9,7 @@ from romcloud.core.save_selection import (
     YUZU_ACCOUNT_SAVE_GLOB,
     SaveSelectionPolicy,
     SaveSystemRule,
+    RPCS3_INSTALLED_GAMES_GROUP,
 )
 
 
@@ -28,6 +29,8 @@ class TestKnownSystems:
             "xbox360",
             "yuzu",
             "xbox",
+            "ps2",
+            "ps3",
         ):
             assert policy.is_known_system(system) is True
 
@@ -75,11 +78,11 @@ class TestRetroArchNativeSaves:
         ):
             assert policy.is_included("snes", relative_path) is False
 
-    def test_savestate_and_non_progress_formats_excluded(self):
+    def test_savestate_included_but_non_progress_formats_excluded(self):
         policy = DEFAULT_SAVE_SELECTION_POLICY
+        assert policy.is_included("snes", "Game.state") is True
+        assert policy.is_included("snes", "Game.state.auto") is True
         for relative_path in (
-            "Game.state",
-            "Game.state.auto",
             "Game.cfg",
             "retroarch.log",
         ):
@@ -108,11 +111,11 @@ class TestN64Native:
         for filename in ("Game.ndr", "Game.d6r", "Game.ram"):
             assert policy.is_included("n64dd", filename) is True
 
-    def test_savestates_and_nested_artifacts_excluded(self):
+    def test_savestates_included_and_nested_artifacts_excluded(self):
         policy = DEFAULT_SAVE_SELECTION_POLICY
+        assert policy.is_included("n64", "Dr. Mario 64 (USA).state") is True
+        assert policy.is_included("n64", "Dr. Mario 64 (USA).st0") is True
         for relative_path in (
-            "Dr. Mario 64 (USA).state",
-            "Dr. Mario 64 (USA).st0",
             "savestates/Dr. Mario 64 (USA).srm",
             "shaders/Dr. Mario 64 (USA).srm",
             "config/Dr. Mario 64 (USA).srm",
@@ -128,12 +131,12 @@ class TestNDSNative:
         assert policy.is_included("nds", "Game.sav") is True
         assert policy.is_included("nds", "Game.srm") is True
 
-    def test_shared_images_and_savestates_excluded(self):
+    def test_savestate_included_but_shared_images_excluded(self):
         policy = DEFAULT_SAVE_SELECTION_POLICY
+        assert policy.is_included("nds", "Game.mln") is True
         for relative_path in (
             "dldi.bin",
             "dsisd.bin",
-            "Game.mln",
             "states/Game.sav",
         ):
             assert policy.is_included("nds", relative_path) is False
@@ -147,10 +150,10 @@ class TestMAMENative:
 
     def test_non_progress_mame_trees_excluded(self):
         policy = DEFAULT_SAVE_SELECTION_POLICY
+        assert policy.is_included("mame", "state/pacman/auto.sta") is True
         for relative_path in (
             "cfg/pacman.cfg",
             "input/pacman.inp",
-            "state/pacman/auto.sta",
             "diff/disk.chd",
             "comments/pacman.xml",
             "plugins/hiscore.dat",
@@ -177,9 +180,15 @@ class TestPCSX2:
         policy = DEFAULT_SAVE_SELECTION_POLICY
         assert policy.is_included("pcsx2", "Mcd001.ps2") is True
 
-    def test_sstates_excluded(self):
+    def test_sstates_included(self):
         policy = DEFAULT_SAVE_SELECTION_POLICY
-        assert policy.is_included("pcsx2", "sstates/Game.p2s") is False
+        assert policy.is_included("pcsx2", "sstates/Game.p2s") is True
+
+    def test_batocera_v43_nested_memory_cards_and_states_included(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        assert policy.is_included("ps2", "pcsx2/Mcd001.ps2") is True
+        assert policy.is_included("ps2", "pcsx2/sstates/Game.p2s") is True
+        assert policy.is_included("ps2", "pcsx2/videos/Game.mp4") is False
 
     def test_videos_excluded(self):
         policy = DEFAULT_SAVE_SELECTION_POLICY
@@ -191,9 +200,47 @@ class TestPPSSPP:
         policy = DEFAULT_SAVE_SELECTION_POLICY
         assert policy.is_included("ppsspp", "PSP/SAVEDATA/ULUS12345/save.bin") is True
 
-    def test_state_excluded(self):
+    def test_state_included(self):
         policy = DEFAULT_SAVE_SELECTION_POLICY
-        assert policy.is_included("ppsspp", "PPSSPP_STATE/ULUS12345_1.ppst") is False
+        assert policy.is_included("ppsspp", "PPSSPP_STATE/ULUS12345_1.ppst") is True
+
+
+class TestRPCS3:
+    def test_progress_and_savestate_paths_are_default_content(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        for path in (
+            "rpcs3/dev_hdd0/home/00000001/savedata/BLUS12345/SAVE.DAT",
+            "rpcs3/dev_hdd0/home/00000001/trophy/NPWR00001_00/TROPUSR.DAT",
+            "rpcs3/dev_hdd0/savedata/vmc/MemoryCard.VM1",
+            "BLUS12345/BLUS12345_2026-08-10_120000.SAVESTAT",
+            "BLUS12345/BLUS12345_2026-08-10_120000.SAVESTAT.zst",
+        ):
+            assert policy.is_included("ps3", path) is True
+
+    def test_installed_games_are_a_disabled_optional_group(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        path = "rpcs3/dev_hdd0/game/NPUA12345/USRDIR/EBOOT.BIN"
+        decision = policy.classify("ps3", path)
+        assert decision.included is False
+        assert decision.optional_group == RPCS3_INSTALLED_GAMES_GROUP
+        assert policy.is_included(
+            "ps3",
+            path,
+            enabled_optional_groups=frozenset({RPCS3_INSTALLED_GAMES_GROUP}),
+        ) is True
+
+    def test_generated_and_ambiguous_rpcs3_content_stays_excluded(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        enabled = frozenset({RPCS3_INSTALLED_GAMES_GROUP})
+        for path in (
+            "rpcs3/dev_hdd0/game/_GDATA_12345/USRDIR/partial.bin",
+            "rpcs3/dev_hdd0/tmp/runtime.bin",
+            "rpcs3/cache/shaders/cache.bin",
+            "rpcs3/dev_hdd0/home/00000001/exdata/license.rap",
+        ):
+            assert policy.is_included(
+                "ps3", path, enabled_optional_groups=enabled
+            ) is False
 
 
 class TestXbox360:

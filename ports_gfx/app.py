@@ -80,10 +80,14 @@ from ports_gfx.savesync_screen import (
     CONFIRMING,
     DASHBOARD,
     DASHBOARD_ITEMS,
+    LOCAL_GAMES_WARNING,
     PREVIEW,
     PREVIEWING,
+    RPCS3_CONFIRMING,
+    RPCS3_WARNING,
     RESULT,
     SETTINGS,
+    SETTINGS_ITEMS,
     SaveSyncScreenState,
 )
 from ports_gfx.splash import SplashRenderer
@@ -1206,8 +1210,23 @@ def _handle_savesync_event(ievent: InputEvent, savesync_screen: SaveSyncScreenSt
             savesync_screen.return_to_dashboard()
         return "savesync"
 
-    if step == CONFIRMING:
+    if step in (CONFIRMING, RPCS3_CONFIRMING):
         savesync_screen.handle_confirm_event(ievent)
+        return "savesync"
+
+    if step == RPCS3_WARNING:
+        if ievent.action == Action.CONFIRM:
+            savesync_screen.begin_rpcs3_confirm()
+            savesync_screen.handle_confirm_event(ievent)
+        elif ievent.action == Action.BACK:
+            savesync_screen.step = SETTINGS
+        return "savesync"
+
+    if step == LOCAL_GAMES_WARNING:
+        if ievent.action == Action.CONFIRM:
+            savesync_screen.set_include_local_games(True)
+        elif ievent.action == Action.BACK:
+            savesync_screen.step = SETTINGS
         return "savesync"
 
     if step == RESULT:
@@ -1216,8 +1235,14 @@ def _handle_savesync_event(ievent: InputEvent, savesync_screen: SaveSyncScreenSt
         return "savesync"
 
     if step == SETTINGS:
-        if ievent.action == Action.CONFIRM:
-            savesync_screen.set_xbox_enabled(not savesync_screen.status.get("xbox_enabled", False))
+        if ievent.action in ACTION_DIRECTIONS:
+            _, dy = ACTION_DIRECTIONS[ievent.action]
+            if dy:
+                savesync_screen.select_setting(
+                    savesync_screen.settings_selected_index + dy
+                )
+        elif ievent.action == Action.CONFIRM:
+            savesync_screen.confirm_settings_selection()
         elif ievent.action == Action.BACK:
             savesync_screen.return_to_dashboard()
         return "savesync"
@@ -1573,11 +1598,21 @@ def _savesync_body_lines(savesync_screen: SaveSyncScreenState) -> list[str]:
             ]
         reachable = status.get("remote_reachable")
         xbox_enabled = status.get("xbox_enabled", False)
+        rpcs3_enabled = status.get("rpcs3_installed_games_enabled", False)
+        local_games = status.get("include_local_games", False)
         last_upload = status.get("last_upload")
         last_download = status.get("last_download")
+        reconcile = status.get("last_reconcile")
         return [
             f"Remote: {'reachable' if reachable else 'unreachable'}",
             f"Original Xbox: {'enabled' if xbox_enabled else 'disabled'}",
+            f"RPCS3 installed games: {'included' if rpcs3_enabled else 'excluded (safe default)'}",
+            f"Automatic scope: {'all eligible games' if local_games else 'ROMCloud-managed games'}",
+            (
+                f"Last NAS sync: {reconcile.get('conflicts', 0)} conflict(s) preserved"
+                if reconcile
+                else "Last NAS sync: never"
+            ),
             f"Last upload: {last_upload['timestamp'] if last_upload else 'never'}",
             f"Last download: {last_download['timestamp'] if last_download else 'never'}",
             "",
@@ -1588,11 +1623,20 @@ def _savesync_body_lines(savesync_screen: SaveSyncScreenState) -> list[str]:
     if step == PREVIEW:
         summary = savesync_screen.preview_summary
         return [
+            "AUTHORITATIVE REPLACEMENT",
             f"Added:     {summary.get('added', 0)}",
             f"Changed:   {summary.get('changed', 0)}",
             f"Removed:   {summary.get('removed', 0)}",
+            f"Conflicts: {summary.get('conflicts', 0)}",
             f"Unchanged: {summary.get('unchanged', 0)}",
+            f"Excluded:  {summary.get('excluded_files', 0)}",
+            f"Transfer:  {_save_size(summary.get('transfer_bytes', 0))}",
             "",
+            (
+                "Remote eligible data will be replaced by this device."
+                if savesync_screen.direction == "upload"
+                else "This device's eligible data will be replaced by remote data."
+            ),
             "Press Confirm and hold for 3 seconds to apply, Back to cancel.",
         ]
     if step == CONFIRMING:
@@ -1609,17 +1653,50 @@ def _savesync_body_lines(savesync_screen: SaveSyncScreenState) -> list[str]:
         ]
     if step == SETTINGS:
         xbox_enabled = status.get("xbox_enabled", False)
+        rpcs3_enabled = status.get("rpcs3_installed_games_enabled", False)
+        local_games = status.get("include_local_games", False)
         return [
-            "xemu stores Original Xbox saves inside its virtual hard drive,",
-            "so ROMCloud must transfer the entire virtual drive to preserve",
-            "them safely.",
+            f"Original Xbox: {'enabled' if xbox_enabled else 'disabled'}",
+            f"RPCS3 installed games: {'enabled' if rpcs3_enabled else 'disabled'}",
+            f"Local games: {'included' if local_games else 'not automatically synced'}",
             "",
-            f"Original Xbox save sync: {'enabled' if xbox_enabled else 'disabled'}",
-            "Press Confirm to toggle, Back to return.",
+            *SETTINGS_ITEMS,
+        ]
+    if step == RPCS3_WARNING:
+        files = int(status.get("rpcs3_installed_games_files", 0))
+        size_bytes = int(status.get("rpcs3_installed_games_size_bytes", 0))
+        return [
+            "WARNING: RPCS3 installed games are not ordinary saves.",
+            "This may transfer tens or hundreds of gigabytes and take hours.",
+            f"Current local estimate: {files} file(s), {_save_size(size_bytes)}.",
+            "",
+            "Press Confirm, then hold for 3 seconds to enable. Back cancels.",
+        ]
+    if step == RPCS3_CONFIRMING:
+        return [
+            "Keep holding Confirm to include RPCS3 installed games.",
+            "Release to cancel.",
+        ]
+    if step == LOCAL_GAMES_WARNING:
+        return [
+            "Include Local Games in Save Sync",
+            "ROMCloud will automatically reconcile eligible save/state data",
+            "for games that are installed locally and are not ROMCloud-managed.",
+            "",
+            "Press Confirm to enable. Back cancels.",
         ]
     if step == APPLYING_SETTINGS:
         return ["Applying setting..."]
     return []
+
+
+def _save_size(num_bytes: int) -> str:
+    value = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{int(value)} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TB"
 
 
 def _render_savesync(  # noqa: ANN001
@@ -1643,12 +1720,17 @@ def _render_savesync(  # noqa: ANN001
             and line in DASHBOARD_ITEMS
             and DASHBOARD_ITEMS.index(line) == savesync_screen.selected_index
         )
+        is_selected_item = is_selected_item or (
+            savesync_screen.step == SETTINGS
+            and line in SETTINGS_ITEMS
+            and SETTINGS_ITEMS.index(line) == savesync_screen.settings_selected_index
+        )
         color = _SELECTED_BG if is_selected_item else _FG_COLOR
         text = fonts["body"].render(line, True, color)
         screen.blit(text, (layout.navigation_rect.x, y))
         y += line_h
 
-    if savesync_screen.step == CONFIRMING:
+    if savesync_screen.step in (CONFIRMING, RPCS3_CONFIRMING):
         bar_x = layout.navigation_rect.x
         bar_y = y + line_h // 2
         bar_w = max(1, min(layout.navigation_rect.w, 560))

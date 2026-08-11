@@ -113,28 +113,47 @@ class TestScanTree:
 
         assert set(result) == {selected}
 
-    def test_real_n64_tree_selects_dr_mario_but_not_states_or_runtime_artifacts(
+    def test_real_n64_tree_selects_progress_and_states_but_not_runtime_artifacts(
         self, tmp_path: Path
     ):
         root = tmp_path / "saves"
         selected = "n64/Dr. Mario 64 (USA).srm"
-        excluded = (
+        states = (
             "n64/Dr. Mario 64 (USA).state",
             "n64/Dr. Mario 64 (USA).st0",
+        )
+        excluded = (
             "n64/savestates/Dr. Mario 64 (USA).srm",
             "n64/shaders/Dr. Mario 64 (USA).srm",
             "n64/config/Dr. Mario 64 (USA).srm",
             "n64/cache/Dr. Mario 64 (USA).srm",
             "n64/logs/Dr. Mario 64 (USA).srm",
         )
-        for relative_path in (selected, *excluded):
+        for relative_path in (selected, *states, *excluded):
             path = root / relative_path
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"data")
 
         result = save_tree.scan_tree(root, DEFAULT_SAVE_SELECTION_POLICY)
 
-        assert set(result) == {selected}
+        assert set(result) == {selected, *states}
+
+    def test_rpc3_optional_group_is_measured_without_hashing_it_into_selection(
+        self, tmp_path: Path
+    ):
+        root = tmp_path / "saves"
+        save = root / "ps3/rpcs3/dev_hdd0/home/00000001/savedata/BLUS1/SAVE.DAT"
+        game = root / "ps3/rpcs3/dev_hdd0/game/BLUS1/USRDIR/EBOOT.BIN"
+        for path, content in ((save, b"save"), (game, b"large-game")):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+
+        report = save_tree.scan_tree_report(root, DEFAULT_SAVE_SELECTION_POLICY)
+
+        assert set(report.artifacts) == {
+            "ps3/rpcs3/dev_hdd0/home/00000001/savedata/BLUS1/SAVE.DAT"
+        }
+        assert report.optional_groups == (("rpcs3_installed_games", 1, 10),)
 
 
 class TestMaterialize:
@@ -243,7 +262,7 @@ class TestAtomicReplaceDir:
             save_tree.atomic_replace_dir(new_dir, target)
 
         assert not target.exists()
-        assert len(list(tmp_path.glob("target.previous-*"))) == 1
+        assert (tmp_path / "target.previous").is_dir()
 
 
 class TestRecoverInterruptedCommit:
@@ -286,3 +305,31 @@ class TestRecoverInterruptedCommit:
             save_tree.recover_interrupted_commit(target)
 
         assert len(list(tmp_path.glob("remote-saves.previous-*"))) == 2
+
+    def test_stable_previous_generation_is_restored_when_live_tree_is_absent(
+        self, tmp_path: Path
+    ):
+        target = tmp_path / "remote-saves"
+        previous = tmp_path / "remote-saves.previous"
+        previous.mkdir()
+        (previous / "known-good.srm").write_bytes(b"known-good")
+
+        save_tree.recover_interrupted_commit(target)
+
+        assert (target / "known-good.srm").read_bytes() == b"known-good"
+        assert not previous.exists()
+
+    def test_stable_previous_generation_is_retained_when_live_tree_exists(
+        self, tmp_path: Path
+    ):
+        target = tmp_path / "remote-saves"
+        previous = tmp_path / "remote-saves.previous"
+        target.mkdir()
+        previous.mkdir()
+        (target / "live.srm").write_bytes(b"live")
+        (previous / "known-good.srm").write_bytes(b"known-good")
+
+        save_tree.recover_interrupted_commit(target)
+
+        assert (target / "live.srm").read_bytes() == b"live"
+        assert (previous / "known-good.srm").read_bytes() == b"known-good"

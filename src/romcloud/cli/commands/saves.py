@@ -1,10 +1,8 @@
-"""romcloud saves — SaveSync v1.
+"""``romcloud saves`` — shared save/state continuity and force operations.
 
-Manual, directional, whole-dataset synchronization of game-progress save
-data. No automatic sync, no launch/exit hooks, no bidirectional
-reconciliation. Upload/download are symmetric: preview a full diff first,
-then (after confirmation) the destination becomes an exact copy of the
-source selection. Both this CLI and the graphical UI
+NAS mode uses safe three-way reconciliation. Upload/download are explicit
+power-user overrides: preview first, then (after confirmation) the destination
+eligible selection becomes an exact copy of the source selection. Both this CLI and the graphical UI
 (``romcloud uidata savesync-*``) call the same
 :class:`~romcloud.services.saves.SaveSyncService` — neither duplicates
 selection, diffing, or commit logic.
@@ -37,7 +35,14 @@ def _print_diff(diff: SaveDiff) -> None:
     click.echo(f"  Changed:   {len(diff.changed)}")
     click.echo(f"  Removed:   {len(diff.removed)}")
     click.echo(f"  Unchanged: {len(diff.unchanged)}")
+    click.echo(f"  Conflicts: {len(diff.conflicts)}")
+    click.echo(f"  Excluded by policy: {diff.excluded_files}")
     click.echo(f"  Transfer size: {_human_size(diff.transfer_bytes)}")
+    for group, files, size_bytes in diff.optional_groups:
+        click.echo(
+            f"  Optional group disabled ({group}): {files} file(s), "
+            f"{_human_size(size_bytes)}"
+        )
     for entry in diff.entries:
         if entry.change.value != "unchanged":
             click.echo(f"    [{entry.change.value}] {entry.relative_path}")
@@ -45,7 +50,7 @@ def _print_diff(diff: SaveDiff) -> None:
 
 @click.group("saves")
 def saves_group() -> None:
-    """SaveSync v1 — upload/download game-progress save data."""
+    """Shared Batocera save/state continuity."""
 
 
 @saves_group.command("status")
@@ -64,6 +69,19 @@ def saves_status(ctx: click.Context) -> None:
     xbox_size = saves.xbox_hdd_size()
     if xbox_size is not None:
         click.echo(f"  xbox_hdd.qcow2 size: {_human_size(xbox_size)}")
+    rpcs3_files, rpcs3_bytes = saves.rpcs3_installed_games_size()
+    click.echo(
+        "RPCS3 installed games (very large, opt-in): "
+        f"{'enabled' if saves.rpcs3_installed_games_enabled else 'disabled'}"
+    )
+    if rpcs3_files:
+        click.echo(
+            f"  Installed-title data: {rpcs3_files} file(s), {_human_size(rpcs3_bytes)}"
+        )
+    click.echo(
+        "Automatic local-game saves: "
+        f"{'included' if saves.include_local_games else 'excluded (managed games only)'}"
+    )
 
     state = saves.get_state()
     for label, record in (("Last upload", state.last_upload), ("Last download", state.last_download)):
@@ -74,6 +92,14 @@ def saves_status(ctx: click.Context) -> None:
                 f"{label}: {record.timestamp} "
                 f"({record.artifact_count} artifact(s), {_human_size(record.total_bytes)})"
             )
+    if state.last_reconcile is not None:
+        click.echo(
+            "Last NAS reconciliation: "
+            f"{state.last_reconcile.timestamp} "
+            f"({state.last_reconcile.uploaded} uploaded, "
+            f"{state.last_reconcile.downloaded} downloaded, "
+            f"{state.last_reconcile.conflicts} conflict(s))"
+        )
 
 
 @saves_group.command("preview-upload")
@@ -117,7 +143,14 @@ def _run_commit(ctx: click.Context, *, direction: str, yes: bool) -> None:
         return
 
     destination, source = ("remote", "local") if direction == "upload" else ("local", "remote")
-    click.echo(f"\nThis will make the {destination} save data an exact copy of the {source} selection above.")
+    click.echo(
+        f"\nWARNING: this will replace the {destination} eligible save/state "
+        f"library with the {source} selection above. Policy-excluded content is preserved."
+    )
+    if diff.conflicts:
+        click.echo(
+            f"WARNING: {len(diff.conflicts)} conflict(s) will be resolved in favor of the {source} side."
+        )
     if not yes and not click.confirm(f"{direction.capitalize()} saves now?"):
         click.echo("Cancelled.")
         return
@@ -153,6 +186,46 @@ def saves_download(ctx: click.Context, yes: bool) -> None:
     _run_commit(ctx, direction="download", yes=yes)
 
 
+@saves_group.command("upload-all")
+@click.option("--yes", is_flag=True, help="Upload without prompting.")
+@click.pass_context
+def saves_upload_all(ctx: click.Context, yes: bool) -> None:
+    """Replace remote eligible save/state data with this device's data."""
+    _run_commit(ctx, direction="upload", yes=yes)
+
+
+@saves_group.command("download-all")
+@click.option("--yes", is_flag=True, help="Download without prompting.")
+@click.pass_context
+def saves_download_all(ctx: click.Context, yes: bool) -> None:
+    """Replace local eligible save/state data with the remote data."""
+    _run_commit(ctx, direction="download", yes=yes)
+
+
+@saves_group.command("reconcile")
+@click.pass_context
+def saves_reconcile(ctx: click.Context) -> None:
+    """Apply non-conflicting local/remote changes and preserve conflicts."""
+    saves = get_container(ctx).saves
+    try:
+        plan = saves.preview_reconciliation()
+        click.echo(
+            f"Preflight: {len(plan.uploads)} upload, {len(plan.downloads)} download, "
+            f"{len(plan.conflicts)} conflict(s), {plan.excluded_files} excluded."
+        )
+        if plan.conflicts:
+            click.echo("Conflicting local and remote versions will both remain untouched.")
+        report = saves.reconcile()
+    except ROMCloudError as exc:
+        click.echo(f"error: {exc}", err=True)
+        ctx.exit(1)
+        return
+    click.echo(
+        f"Done. {report.uploaded} uploaded, {report.downloaded} downloaded, "
+        f"{report.conflicts} conflict(s) preserved."
+    )
+
+
 def _set_xbox_enabled(ctx: click.Context, enabled: bool) -> None:
     config = get_container(ctx).config
     write_config(replace(config, saves=replace(config.saves, xbox_enabled=enabled)), ctx.obj["config_path"])
@@ -186,3 +259,78 @@ def saves_xbox_disable(ctx: click.Context) -> None:
     """Disable Original Xbox save sync (the default)."""
     _set_xbox_enabled(ctx, False)
     click.echo("Original Xbox save sync disabled.")
+
+
+def _set_rpcs3_installed_games_enabled(ctx: click.Context, enabled: bool) -> None:
+    config = get_container(ctx).config
+    write_config(
+        replace(
+            config,
+            saves=replace(config.saves, rpcs3_installed_games_enabled=enabled),
+        ),
+        ctx.obj["config_path"],
+    )
+
+
+@saves_group.command("rpcs3-installed-games-enable")
+@click.option("--yes", is_flag=True, help="Enable without prompting.")
+@click.pass_context
+def saves_rpcs3_installed_games_enable(ctx: click.Context, yes: bool) -> None:
+    """Include RPCS3 installed titles in future synchronization."""
+    saves = get_container(ctx).saves
+    files, size_bytes = saves.rpcs3_installed_games_size()
+    click.echo(
+        "WARNING: Include RPCS3 Installed Games can transfer tens or hundreds "
+        "of gigabytes and may take a very long time."
+    )
+    click.echo(
+        f"Current local estimate: {files} file(s), {_human_size(size_bytes)}."
+    )
+    if not yes and not click.confirm("Include RPCS3 installed games?"):
+        click.echo("Cancelled.")
+        return
+    _set_rpcs3_installed_games_enabled(ctx, True)
+    click.echo("RPCS3 installed-game synchronization enabled.")
+
+
+@saves_group.command("rpcs3-installed-games-disable")
+@click.pass_context
+def saves_rpcs3_installed_games_disable(ctx: click.Context) -> None:
+    """Exclude RPCS3 installed titles (the safe default)."""
+    _set_rpcs3_installed_games_enabled(ctx, False)
+    click.echo("RPCS3 installed-game synchronization disabled.")
+
+
+def _set_include_local_games(ctx: click.Context, enabled: bool) -> None:
+    config = get_container(ctx).config
+    write_config(
+        replace(
+            config,
+            saves=replace(config.saves, include_local_games=enabled),
+        ),
+        ctx.obj["config_path"],
+    )
+
+
+@saves_group.command("local-games-enable")
+@click.option("--yes", is_flag=True, help="Enable without prompting.")
+@click.pass_context
+def saves_local_games_enable(ctx: click.Context, yes: bool) -> None:
+    """Include eligible non-ROMCloud game saves in automatic NAS sync."""
+    click.echo(
+        "This allows automatic NAS reconciliation of eligible save/state data "
+        "for games that ROMCloud does not manage."
+    )
+    if not yes and not click.confirm("Include Local Games in Save Sync?"):
+        click.echo("Cancelled.")
+        return
+    _set_include_local_games(ctx, True)
+    click.echo("Local-game save synchronization enabled.")
+
+
+@saves_group.command("local-games-disable")
+@click.pass_context
+def saves_local_games_disable(ctx: click.Context) -> None:
+    """Return automatic sync to ROMCloud-managed games only."""
+    _set_include_local_games(ctx, False)
+    click.echo("Local-game save synchronization disabled.")

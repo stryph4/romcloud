@@ -258,6 +258,8 @@ def _run_library_mode_action(ctx: click.Context, mode: str) -> None:
             "visible_proxies": report.visible,
             "removed_proxies": report.removed,
             "restored_proxies": report.restored,
+            "save_sync_available": report.save_sync_available,
+            "save_reconcile": report.save_reconcile,
             "es_restart_required": True,
         }
 
@@ -534,7 +536,7 @@ def uidata_connection_unmount(ctx: click.Context) -> None:
     _run_action(ctx, build)
 
 
-# ── SaveSync v1 ────────────────────────────────────────────────────────────
+# ── Shared save/state continuity ───────────────────────────────────────────
 #
 # The graphical UI never re-implements selection/diffing/commit logic — it
 # only calls the same romcloud.services.saves.SaveSyncService the CLI
@@ -565,13 +567,21 @@ def uidata_savesync_status(ctx: click.Context) -> None:
         _load_context_config(ctx)
         saves = get_container(ctx).saves
         state = saves.get_state()
+        rpcs3_files, rpcs3_bytes = saves.rpcs3_installed_games_size()
         return {
             "remote_configured": saves.is_remote_configured,
             "remote_reachable": saves.is_remote_reachable(),
             "xbox_enabled": saves.xbox_enabled,
             "xbox_hdd_size_bytes": saves.xbox_hdd_size(),
+            "rpcs3_installed_games_enabled": saves.rpcs3_installed_games_enabled,
+            "rpcs3_installed_games_files": rpcs3_files,
+            "rpcs3_installed_games_size_bytes": rpcs3_bytes,
+            "include_local_games": saves.include_local_games,
             "last_upload": _record_dict(state.last_upload),
             "last_download": _record_dict(state.last_download),
+            "last_reconcile": (
+                state.last_reconcile.to_dict() if state.last_reconcile else None
+            ),
         }
 
     _run_action(ctx, build)
@@ -609,6 +619,7 @@ def uidata_savesync_preview(ctx: click.Context) -> None:
                 "added": len(diff.added),
                 "changed": len(diff.changed),
                 "removed": len(diff.removed),
+                "conflicts": len(diff.conflicts),
             },
         )
         return {
@@ -617,7 +628,14 @@ def uidata_savesync_preview(ctx: click.Context) -> None:
             "changed": len(diff.changed),
             "removed": len(diff.removed),
             "unchanged": len(diff.unchanged),
+            "conflicts": len(diff.conflicts),
             "transfer_bytes": diff.transfer_bytes,
+            "excluded_files": diff.excluded_files,
+            "excluded_bytes": diff.excluded_bytes,
+            "optional_groups": [
+                {"group": group, "files": files, "bytes": size_bytes}
+                for group, files, size_bytes in diff.optional_groups
+            ],
         }
 
     _run_action(ctx, build)
@@ -642,6 +660,8 @@ def uidata_savesync_commit(ctx: click.Context) -> None:
         if direction not in ("upload", "download"):
             raise ValueError("direction must be 'upload' or 'download'")
         diff = SaveDiff.from_dict(request["diff"])
+        if diff.direction != direction:
+            raise ValueError("diff direction does not match requested direction")
         _load_context_config(ctx)
         saves = get_container(ctx).saves
         emit_progress(
@@ -651,7 +671,11 @@ def uidata_savesync_commit(ctx: click.Context) -> None:
             "running",
             f"Applying SaveSync {direction}",
         )
-        record = saves.commit_upload(diff) if direction == "upload" else saves.commit_download(diff)
+        record = (
+            saves.commit_upload(diff, progress=progress)
+            if direction == "upload"
+            else saves.commit_download(diff, progress=progress)
+        )
         emit_progress(
             progress,
             "savesync",
@@ -668,7 +692,7 @@ def uidata_savesync_commit(ctx: click.Context) -> None:
 @uidata_group.command("savesync-settings")
 @click.pass_context
 def uidata_savesync_settings(ctx: click.Context) -> None:
-    """Update SaveSync settings (currently only Original Xbox opt-in)."""
+    """Update heavyweight SaveSync opt-ins."""
 
     def build() -> dict:
         from dataclasses import replace
@@ -678,7 +702,26 @@ def uidata_savesync_settings(ctx: click.Context) -> None:
         request = _read_request()
         progress = _progress_sink(request)
         config = _load_context_config(ctx)
-        new_config = replace(config, saves=replace(config.saves, xbox_enabled=bool(request.get("xbox_enabled", config.saves.xbox_enabled))))
+        new_config = replace(
+            config,
+            saves=replace(
+                config.saves,
+                xbox_enabled=bool(
+                    request.get("xbox_enabled", config.saves.xbox_enabled)
+                ),
+                rpcs3_installed_games_enabled=bool(
+                    request.get(
+                        "rpcs3_installed_games_enabled",
+                        config.saves.rpcs3_installed_games_enabled,
+                    )
+                ),
+                include_local_games=bool(
+                    request.get(
+                        "include_local_games", config.saves.include_local_games
+                    )
+                ),
+            ),
+        )
         write_config(new_config, ctx.obj["config_path"])
         emit_progress(
             progress,
@@ -687,6 +730,29 @@ def uidata_savesync_settings(ctx: click.Context) -> None:
             "success",
             "SaveSync settings updated",
         )
-        return {"xbox_enabled": new_config.saves.xbox_enabled}
+        return {
+            "xbox_enabled": new_config.saves.xbox_enabled,
+            "rpcs3_installed_games_enabled": (
+                new_config.saves.rpcs3_installed_games_enabled
+            ),
+            "include_local_games": new_config.saves.include_local_games,
+        }
+
+    _run_action(ctx, build)
+
+
+@uidata_group.command("savesync-reconcile")
+@click.pass_context
+def uidata_savesync_reconcile(ctx: click.Context) -> None:
+    """Run normal conflict-aware NAS save/state reconciliation."""
+
+    def build() -> dict:
+        request = _read_request()
+        progress = _progress_sink(request)
+        _load_context_config(ctx)
+        saves = get_container(ctx).saves
+        plan = saves.preview_reconciliation()
+        report = saves.reconcile(progress=progress)
+        return {"preflight": plan.to_dict(), "report": report.to_dict()}
 
     _run_action(ctx, build)

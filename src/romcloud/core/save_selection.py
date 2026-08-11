@@ -1,5 +1,4 @@
-"""Save-selection policy — which files under a save root are ROMCloud's
-concern for SaveSync v1.
+"""Central save/state selection policy for Batocera's save tree.
 
 Pure logic: takes plain path strings and never touches the filesystem.
 Extend the per-system rule table here as additional real Batocera save
@@ -66,12 +65,32 @@ class SaveSystemRule:
     include: tuple[str, ...]
     root_include: tuple[str, ...] = ()
     exclude: tuple[str, ...] = ()
+    optional_groups: tuple["SaveOptionalGroup", ...] = ()
     optional: bool = False
     """True for a heavyweight, opt-in-only artifact (Original Xbox)."""
     default_enabled: bool = True
     """Whether this system is synced when present, absent an explicit
     setting. Only meaningful when ``optional`` is True — non-optional
     systems are always eligible."""
+
+
+@dataclass(frozen=True)
+class SaveOptionalGroup:
+    """A policy-selected content group that is disabled unless opted in."""
+
+    group_id: str
+    include: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SaveSelectionDecision:
+    included: bool
+    optional_group: Optional[str] = None
+    excluded_reason: str = ""
+
+
+RPCS3_INSTALLED_GAMES_GROUP = "rpcs3_installed_games"
+RPCS3_DEV_HDD0_PREFIX = "rpcs3/dev_hdd0"
 
 
 # Batocera's libretro generator places both save files and savestates directly
@@ -110,17 +129,19 @@ _RETROARCH_SRM_SYSTEMS = frozenset(
 # Dolphin are deliberately absent: selecting their actual game-progress data
 # safely requires more specific validated rules.
 _RULES: dict[str, SaveSystemRule] = {
-    system: SaveSystemRule(include=(), root_include=("*.srm",))
+    system: SaveSystemRule(include=(), root_include=("*.srm", "*.state*"))
     for system in _RETROARCH_SRM_SYSTEMS
 }
 _RULES.update(
     {
-        # Standalone Mupen64Plus stores these native per-game artifacts in the
-        # same n64 directory as its savestates. Root-only matching keeps states
-        # out.
+        # Standalone Mupen64Plus stores native saves and states together in the
+        # n64 system root. Root-only matching keeps nested runtime trees out.
         "n64": SaveSystemRule(
             include=(),
-            root_include=("*.srm", "*.eep", "*.sra", "*.fla", "*.mpk", "*.sav"),
+            root_include=(
+                "*.srm", "*.eep", "*.sra", "*.fla", "*.mpk", "*.sav",
+                "*.state*", "*.st?", "*.st??",
+            ),
         ),
         "n64dd": SaveSystemRule(
             include=(),
@@ -134,22 +155,61 @@ _RULES.update(
                 "*.ndr",
                 "*.d6r",
                 "*.ram",
+                "*.state*",
+                "*.st?",
+                "*.st??",
             ),
         ),
         # Standalone melonDS uses per-game .sav files here. Its DLDI/DSi SD
         # images are shared .bin files and intentionally do not match.
-        "nds": SaveSystemRule(include=(), root_include=("*.srm", "*.sav")),
-        # MAME's NVRAM subtree is game progress; cfg, input, state, diff,
-        # comments, and plugins are separate sibling trees and remain excluded.
-        "mame": SaveSystemRule(include=("nvram/**",), root_include=("*.srm",)),
-        "duckstation": SaveSystemRule(
-            include=("memcards/**",), exclude=("*_resume.sav",)
+        "nds": SaveSystemRule(
+            include=(), root_include=("*.srm", "*.sav", "*.state*", "*.mln")
         ),
+        # MAME's NVRAM and explicit save-state trees are progression/state.
+        # cfg/input/diff/comments/plugins remain outside the allow-list.
+        "mame": SaveSystemRule(
+            include=("nvram/**", "state/**"), root_include=("*.srm", "*.state*")
+        ),
+        "duckstation": SaveSystemRule(
+            include=("memcards/**",),
+            root_include=("*.sav",),
+            exclude=("*_resume.sav",),
+        ),
+        # Legacy/pre-v43 custom layouts retained for compatibility.
         "pcsx2": SaveSystemRule(
-            include=("Mcd*.ps2",), exclude=("sstates/**", "videos/**")
+            include=("Mcd*.ps2", "sstates/**"), exclude=("videos/**",)
+        ),
+        # Batocera v43+ nests PCSX2 data below /userdata/saves/ps2/pcsx2.
+        "ps2": SaveSystemRule(
+            include=("pcsx2/Mcd*.ps2", "pcsx2/sstates/**"),
+            exclude=("pcsx2/videos/**",),
         ),
         "ppsspp": SaveSystemRule(
-            include=("PSP/SAVEDATA/**",), exclude=("PPSSPP_STATE/**",)
+            include=("PSP/SAVEDATA/**", "PPSSPP_STATE/**"),
+        ),
+        # Batocera v44 maps RPCS3 dev_hdd0 here. Normal saves, trophies,
+        # virtual memory cards, and Batocera-managed savestates are selected.
+        # dev_hdd0/game is intentionally a separate heavyweight opt-in.
+        "ps3": SaveSystemRule(
+            include=(
+                f"{RPCS3_DEV_HDD0_PREFIX}/home/{'[0-9]' * 8}/savedata/**",
+                f"{RPCS3_DEV_HDD0_PREFIX}/home/{'[0-9]' * 8}/trophy/**",
+                f"{RPCS3_DEV_HDD0_PREFIX}/savedata/vmc/**",
+                "*/*.SAVESTAT*",
+            ),
+            exclude=(
+                f"{RPCS3_DEV_HDD0_PREFIX}/game/_GDATA_*/**",
+                f"{RPCS3_DEV_HDD0_PREFIX}/tmp/**",
+                f"{RPCS3_DEV_HDD0_PREFIX}/cache/**",
+                "rpcs3/cache/**",
+                "rpcs3/dev_hdd1/**",
+            ),
+            optional_groups=(
+                SaveOptionalGroup(
+                    RPCS3_INSTALLED_GAMES_GROUP,
+                    (f"{RPCS3_DEV_HDD0_PREFIX}/game/**",),
+                ),
+            ),
         ),
         "xbox360": SaveSystemRule(include=("**",)),
         "yuzu": SaveSystemRule(include=(YUZU_ACCOUNT_SAVE_GLOB,)),
@@ -161,7 +221,7 @@ _RULES.update(
 
 
 class SaveSelectionPolicy:
-    """Static, extensible table of which save files SaveSync v1 manages."""
+    """Static, extensible table of save/state files ROMCloud manages."""
 
     def __init__(self, rules: Optional[dict[str, SaveSystemRule]] = None) -> None:
         self._rules: dict[str, SaveSystemRule] = dict(_RULES if rules is None else rules)
@@ -180,19 +240,57 @@ class SaveSelectionPolicy:
         rule = self._rules.get(system)
         return True if rule is None else rule.default_enabled
 
-    def is_included(self, system: str, relative_path: str) -> bool:
+    def classify(
+        self,
+        system: str,
+        relative_path: str,
+        *,
+        enabled_optional_groups: frozenset[str] = frozenset(),
+    ) -> SaveSelectionDecision:
         """*relative_path* is relative to *system*'s own save directory."""
         rule = self._rules.get(system)
         if rule is None:
-            return False
+            return SaveSelectionDecision(False, excluded_reason="unsupported system")
         normalized = relative_path.replace("\\", "/")
         if any(_match(normalized, pattern) for pattern in rule.exclude):
-            return False
+            return SaveSelectionDecision(False, excluded_reason="generated/cache exclusion")
+        for group in rule.optional_groups:
+            if any(_match(normalized, pattern) for pattern in group.include):
+                return SaveSelectionDecision(
+                    group.group_id in enabled_optional_groups,
+                    optional_group=group.group_id,
+                    excluded_reason=(
+                        "" if group.group_id in enabled_optional_groups
+                        else "optional large-content group disabled"
+                    ),
+                )
         if "/" not in normalized and any(
             _match(normalized, pattern) for pattern in rule.root_include
         ):
-            return True
-        return any(_match(normalized, pattern) for pattern in rule.include)
+            return SaveSelectionDecision(True)
+        if any(_match(normalized, pattern) for pattern in rule.include):
+            return SaveSelectionDecision(True)
+        return SaveSelectionDecision(False, excluded_reason="not selected by policy")
+
+    def is_included(
+        self,
+        system: str,
+        relative_path: str,
+        *,
+        enabled_optional_groups: frozenset[str] = frozenset(),
+    ) -> bool:
+        return self.classify(
+            system,
+            relative_path,
+            enabled_optional_groups=enabled_optional_groups,
+        ).included
+
+    def optional_group_ids(self) -> frozenset[str]:
+        return frozenset(
+            group.group_id
+            for rule in self._rules.values()
+            for group in rule.optional_groups
+        )
 
     def excluded_top_level_dirs(self) -> frozenset[str]:
         """Top-level directories under the save root that are never

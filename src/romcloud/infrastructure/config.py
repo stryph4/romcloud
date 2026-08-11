@@ -128,7 +128,7 @@ class LoggingConfig:
 
 @dataclass(frozen=True)
 class SavesConfig:
-    """SaveSync v1 local selection/settings.
+    """Local save/state selection settings.
 
     The remote dataset location is intentionally not configurable here. It
     is always ``<remote_data.root>/saves`` when general remote data storage
@@ -137,6 +137,8 @@ class SavesConfig:
 
     local_path: str = str(_DEFAULT_SAVES_LOCAL_PATH)
     xbox_enabled: bool = False
+    rpcs3_installed_games_enabled: bool = False
+    include_local_games: bool = False
 
 
 @dataclass(frozen=True)
@@ -390,6 +392,10 @@ def _parse(data: dict, path: Path) -> AppConfig:  # noqa: C901
     saves = SavesConfig(
         local_path=saves_raw.get("local_path", str(_DEFAULT_SAVES_LOCAL_PATH)),
         xbox_enabled=bool(saves_raw.get("xbox_enabled", False)),
+        rpcs3_installed_games_enabled=bool(
+            saves_raw.get("rpcs3_installed_games_enabled", False)
+        ),
+        include_local_games=bool(saves_raw.get("include_local_games", False)),
     )
 
     library_sync_raw = data.get("library_sync", {})
@@ -551,9 +557,12 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
     lines += [
         "\n",
         "[saves]\n",
-        "# SaveSync v1 — see `romcloud saves --help`.\n",
+        "# Shared save/state continuity — see `romcloud saves --help`.\n",
         f'local_path = "{config.saves.local_path}"\n',
         f"xbox_enabled = {'true' if config.saves.xbox_enabled else 'false'}\n",
+        "rpcs3_installed_games_enabled = "
+        f"{'true' if config.saves.rpcs3_installed_games_enabled else 'false'}\n",
+        f"include_local_games = {'true' if config.saves.include_local_games else 'false'}\n",
         "\n",
         "[library_sync]\n",
         "# Opt-in metadata/media sync. Source gamelist.xml files are read-only.\n",

@@ -673,6 +673,33 @@ class TestHandleSavesyncEvent:
         app_module._handle_savesync_event(InputEvent(action=Action.CONFIRM), screen)
         assert screen.confirm.pressed is True
 
+    def test_rpc3_warning_requires_confirm_before_long_hold(self):
+        from ports_gfx import app as app_module
+        from ports_gfx.savesync_screen import RPCS3_CONFIRMING, RPCS3_WARNING
+
+        screen = self._screen(step=RPCS3_WARNING)
+        app_module._handle_savesync_event(InputEvent(action=Action.CONFIRM), screen)
+
+        assert screen.step == RPCS3_CONFIRMING
+        assert screen.confirm.pressed is True
+
+    def test_local_game_warning_confirm_starts_settings_update(self):
+        from ports_gfx import app as app_module
+        from ports_gfx.savesync_screen import APPLYING_SETTINGS, LOCAL_GAMES_WARNING
+
+        screen = self._screen(step=LOCAL_GAMES_WARNING)
+        called = []
+
+        def enable(value):
+            called.append(value)
+            screen.step = APPLYING_SETTINGS
+
+        screen.set_include_local_games = enable
+        app_module._handle_savesync_event(InputEvent(action=Action.CONFIRM), screen)
+
+        assert screen.step == APPLYING_SETTINGS
+        assert called == [True]
+
     def test_result_confirm_returns_to_dashboard(self):
         from ports_gfx import app as app_module
         from ports_gfx.savesync_screen import DASHBOARD, RESULT

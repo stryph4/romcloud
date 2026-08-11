@@ -395,10 +395,12 @@ Selecting NAS Mode while Offline Mode is active is an explicit reconnect. The
 transition remounts configured storage, validates the read-only ROM source and
 any separate writable ROMCloud data location, refreshes the complete catalog,
 runs enabled Library Sync, prepares the full proxy/gamelist presentation, and
-refreshes EmulationStation before atomically committing NAS Mode. A failure at
-any point leaves Offline Mode authoritative and cached/local games visible; no
-partial full library is exposed. SaveSync data is validated but never uploaded
-or downloaded merely by changing modes.
+performs ownership-scoped, conflict-aware save/state reconciliation before refreshing
+EmulationStation and atomically committing NAS Mode. A failure at any point
+leaves Offline Mode authoritative and cached/local games visible; no partial
+full library or half-copied save tree is exposed. When no writable
+`remote_data` is configured, the transition skips save reconciliation and
+reports that centralized saves are unavailable without blocking NAS ROM access.
 
 The transition does not delete catalog rows, cached bytes, cache status, pin
 state, local saves, local ROMs, or unrelated `.romcloud` files. Offline Mode
@@ -462,20 +464,66 @@ games may have their own network requirements.
 
 ## SaveSync
 
-SaveSync v1 is **manual and directional**. It does not automatically sync on
-game launch/exit, merge simultaneous changes, or perform bidirectional conflict
-resolution.
+In NAS Mode, ROMCloud keeps the emulator-facing save tree local and reconciles
+eligible ROMCloud-managed game data with a canonical remote save/state dataset.
+The authoritative ownership identity is the catalog's stable `Game.id`; save
+names and emulator title IDs are used only when they can safely attribute an
+already policy-selected artifact to that catalog game. A persisted last-shared manifest
+allows ROMCloud to distinguish local-only and remote-only changes from files
+changed on both devices. One-sided changes synchronize automatically when
+entering NAS Mode; conflicting files remain untouched on both sides and are
+reported instead of being guessed or overwritten. A local game's save is not
+automatically synchronized just because it shares a system save directory with
+a managed game.
 
-Both the GUI and CLI support:
+Offline Mode never polls or modifies remote saves. `/userdata/saves` remains a
+normal writable local working tree, and changes made offline are reconciled on
+the next successful manual transition to NAS Mode. If writable `remote_data`
+is not configured, NAS ROM access still works but shared save/state continuity
+is clearly reported as unavailable.
 
-- status and last-successful-operation information;
-- a complete upload or download preview;
-- added, changed, removed, and unchanged counts;
-- explicit confirmation before committing;
-- staged copying, size and SHA-256 verification, and transactional directory
-  replacement;
-- conservative recovery of interrupted commits;
-- state advancement only after a successful commit.
+The GUI also exposes deliberate **Upload All Saves** and **Download All Saves**
+operations. Unlike automatic reconciliation, these deliberately cover the
+broader eligible save tree, including eligible local-game content. Their
+preflight shows added, changed, removed, unchanged, conflict,
+excluded-file, and estimated transfer-byte counts. These operations make the
+chosen side authoritative for policy-eligible content, require a three-second
+hold, preserve all excluded destination files, and reject a stale preview.
+
+Every replacement is built in a sibling staging directory, SHA-256 verified,
+promoted by directory rename, and verified again. The former live tree is kept
+as one `saves.previous` known-good generation. Recovery restores that generation
+if a process stopped between renames and removes abandoned staging directories.
+Policy-excluded files are preserved in staging with same-filesystem hardlinks,
+so disabled RPCS3 installed games are never copied merely to retain them. If a
+filesystem cannot provide those hardlinks, ROMCloud aborts before changing live
+data instead of silently duplicating a potentially enormous excluded tree.
+SaveSync state advances only after every required promotion succeeds.
+
+**Include Local Games in Save Sync** is disabled by default. Enabling it expands
+automatic NAS reconciliation from safely attributable ROMCloud-managed data to
+all policy-eligible local-game save/state content. It does not weaken any
+cache/generated-data or RPCS3 installed-game exclusion. CLI controls are
+`romcloud saves local-games-enable` and `romcloud saves local-games-disable`.
+
+ROMCloud's current Batocera wrapper resolves an owned proxy through the catalog
+and then uses `exec` to replace itself with `emulatorlauncher`. That provides a
+strong managed-game identity before handoff, but no safe post-exit callback: the
+wrapper process no longer exists while the emulator runs. ROMCloud therefore
+does not yet copy saves at launch/exit or use a background watcher. Automatic
+sync currently occurs during the explicit Offline → NAS transition (and the
+manual `romcloud saves reconcile` operation), after files are not known to be
+actively written. Adding lifecycle sync requires a proven wait-for-real-emulator-
+exit integration before public beta.
+
+Precise per-game attribution is enabled only for audited filename/title-ID
+layouts: root-named RetroArch/Mupen/melonDS saves and states, MAME shortname
+trees, and recognizable RPCS3/PPSSPP/Yuzu title-ID trees. Shared PCSX2 memory
+cards, DuckStation shared/serial-named artifacts, RPCS3 trophies/virtual memory
+cards, Xbox/Xbox 360 opaque data, and other emulator-wide layouts remain out of
+managed-only automatic sync because they cannot be assigned to one catalog game
+reliably. They remain available to the local-game opt-in and explicit whole-tree
+operations.
 
 The remote dataset is always:
 
@@ -492,19 +540,38 @@ CLI examples:
 
 ```bash
 romcloud saves status
+romcloud saves reconcile
 romcloud saves preview-upload
-romcloud saves upload
+romcloud saves upload-all
 romcloud saves preview-download
-romcloud saves download
+romcloud saves download-all
 ```
 
 Selection is deliberately narrower than “everything under
-`/userdata/saves`.” Current rules include audited root-level RetroArch `.srm`
-files, standalone N64 and N64DD native formats, NDS `.sav`, MAME NVRAM,
-DuckStation memory cards, PCSX2 memory cards, PPSSPP savedata, Xbox 360 content,
-and validated Yuzu per-account/per-title save descendants. Unlisted systems
-and unrelated savestates, firmware, keys, caches, configuration, logs, and
-shared disk images are excluded.
+`/userdata/saves`.” The central policy classifies audited content as follows:
+
+| Classification | Default behavior | Examples |
+| --- | --- | --- |
+| Save/state continuity | Included | RetroArch saves/states; Mupen saves/states; melonDS saves/states; MAME NVRAM/states; DuckStation cards/states; PCSX2 cards/states; PPSSPP savedata/states; Xbox 360 content; validated Yuzu title saves; RPCS3 savedata, trophies, virtual memory cards, and Batocera savestates |
+| Generated/cache | Excluded | Shader/cache/log/config trees, MAME `diff`/input/plugins, PCSX2 videos, RPCS3 temporary/cache data and incomplete `_GDATA_` installs |
+| Installed content | Excluded by default | RPCS3 `dev_hdd0/game` installed titles and patches |
+| Ambiguous emulator content | Excluded pending validation | Unknown systems, firmware/keys, RPCS3 `exdata`, shared runtime disk images |
+
+Current post-v43 Batocera source maps RPCS3 data to
+`/userdata/saves/ps3/rpcs3/dev_hdd0`. ROMCloud includes
+`home/<8-digit-user>/savedata`, `home/<8-digit-user>/trophy`, and
+`savedata/vmc`; installed titles under `game` are not included by default.
+Batocera-managed RPCS3 states under `/userdata/saves/ps3/<title>/*.SAVESTAT*`
+are included. Batocera v43 keeps `dev_hdd0` at
+`/userdata/system/configs/rpcs3/dev_hdd0`; ROMCloud maps that legacy physical
+tree into the same canonical remote namespace when the newer path is absent.
+
+**Include RPCS3 Installed Games** is an advanced, disabled-by-default setting.
+The GUI shows the detected file count and size and requires an additional
+warning plus long hold before enabling it. It can transfer tens or hundreds of
+gigabytes. The CLI equivalents are
+`romcloud saves rpcs3-installed-games-enable` and
+`romcloud saves rpcs3-installed-games-disable`.
 
 Original Xbox is disabled by default because xemu stores progress inside the
 entire `xbox_hdd.qcow2` virtual drive. Enabling it transfers that whole opaque
@@ -665,6 +732,8 @@ port = 445
 [saves]
 local_path = "/userdata/saves"
 xbox_enabled = false
+rpcs3_installed_games_enabled = false
+include_local_games = false
 
 [library_sync]
 enabled = false
@@ -688,7 +757,7 @@ Default paths:
 ├── data/library-view.json       Active cached-only Smart Cache presentation
 ├── data/library/library.json    Local canonical Library Sync working copy
 ├── data/library-sync-state.json Last Library Sync result
-├── data/savesync-state.json     Last successful SaveSync records and device ID
+├── data/savesync-state.json     Last shared save manifest, conflicts, records, device ID
 ├── logs/romcloud.log            Rotating application log
 ├── logs/mount-worker.log        Detached SMB worker output
 ├── logs/gui-relaunch.log        Automatic GUI relaunch failures
@@ -786,8 +855,11 @@ recording of the display.
 - A source game that disappears is not automatically removed from the catalog.
 - Offline launch applies only to complete cached games with intact local
   metadata and emulator dependencies.
-- SaveSync is manual, directional, whole-dataset replacement with an explicit
-  audited selection policy; it is not continuous sync or conflict merging.
+- SaveSync automatically reconciles safely attributable managed-game data on
+  Offline → NAS transitions and supports manual three-way reconciliation, but
+  it does not yet hook game launch/exit. Shared or opaque emulator layouts need
+  the local-game opt-in or an explicit whole-tree operation; true conflicts are
+  reported and preserved rather than content-merged.
 - Library Sync is opt-in beta functionality. Its XML merge/render behavior and
   media-path compatibility still require clean-state validation on real
   Batocera/EmulationStation hardware in both access modes.

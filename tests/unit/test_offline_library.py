@@ -20,6 +20,7 @@ from romcloud.infrastructure.config import (
     DIRECT_NAS_MODE,
     LibrarySyncConfig,
     RemoteDataConfig,
+    SavesConfig,
     SMBConfig,
     SMART_CACHE_MODE,
     SourceConfig,
@@ -419,3 +420,121 @@ def test_missing_required_remote_data_aborts_nas_transition(tmp_path: Path) -> N
     assert operating_mode(config) is OperatingMode.OFFLINE
     assert cached_proxy.is_file()
     assert not uncached_proxy.exists()
+
+
+def test_offline_save_change_reconciles_when_returning_to_nas(tmp_path: Path) -> None:
+    remote_data = tmp_path / "remote-data"
+    remote_data.mkdir()
+    local_saves = tmp_path / "saves"
+    local_saves.mkdir()
+    config = replace(
+        _config(tmp_path),
+        remote_data=RemoteDataConfig("local", str(remote_data)),
+        saves=SavesConfig(local_path=str(local_saves)),
+    )
+    db = Database(str(Path(config.data_path) / "catalog.db"))
+    db.initialize()
+    _add_game(config, db, "Game")
+    (Path(config.source.rom_root) / "snes/Game.sfc").write_bytes(b"rom")
+    save = local_saves / "snes/Game.srm"
+    save.parent.mkdir()
+    save.write_bytes(b"base")
+    Container(config).saves.commit_upload(Container(config).saves.preview_upload())
+    set_offline_library_mode(config, True)
+    save.write_bytes(b"offline-progress")
+
+    report = set_offline_library_mode(config, False)
+
+    assert operating_mode(config) is OperatingMode.NAS
+    assert report.save_reconcile is not None
+    assert report.save_reconcile["uploaded"] == 1
+    assert (remote_data / "saves/snes/Game.srm").read_bytes() == b"offline-progress"
+
+
+def test_offline_to_nas_preserves_two_sided_save_conflict(tmp_path: Path) -> None:
+    remote_data = tmp_path / "remote-data"
+    remote_data.mkdir()
+    local_saves = tmp_path / "saves"
+    local_saves.mkdir()
+    config = replace(
+        _config(tmp_path),
+        remote_data=RemoteDataConfig("local", str(remote_data)),
+        saves=SavesConfig(local_path=str(local_saves)),
+    )
+    db = Database(str(Path(config.data_path) / "catalog.db"))
+    db.initialize()
+    _add_game(config, db, "Game")
+    (Path(config.source.rom_root) / "snes/Game.sfc").write_bytes(b"rom")
+    local = local_saves / "snes/Game.srm"
+    local.parent.mkdir()
+    local.write_bytes(b"base")
+    saves = Container(config).saves
+    saves.commit_upload(saves.preview_upload())
+    set_offline_library_mode(config, True)
+    local.write_bytes(b"offline-version")
+    remote = remote_data / "saves/snes/Game.srm"
+    remote.write_bytes(b"nas-version")
+
+    report = set_offline_library_mode(config, False)
+
+    assert operating_mode(config) is OperatingMode.NAS
+    assert report.save_reconcile["conflicts"] == 1
+    assert local.read_bytes() == b"offline-version"
+    assert remote.read_bytes() == b"nas-version"
+
+
+def test_offline_to_nas_leaves_unmanaged_local_game_saves_untouched(
+    tmp_path: Path,
+) -> None:
+    remote_data = tmp_path / "remote-data"
+    remote_data.mkdir()
+    local_saves = tmp_path / "saves"
+    local_saves.mkdir()
+    config = replace(
+        _config(tmp_path),
+        remote_data=RemoteDataConfig("local", str(remote_data)),
+        saves=SavesConfig(local_path=str(local_saves)),
+    )
+    local = local_saves / "snes/Local Game.srm"
+    remote = remote_data / "saves/snes/Local Game.srm"
+    local.parent.mkdir()
+    remote.parent.mkdir(parents=True)
+    local.write_bytes(b"local-only-game")
+    remote.write_bytes(b"other-device-local-game")
+    set_offline_library_mode(config, True)
+
+    report = set_offline_library_mode(config, False)
+
+    assert report.save_reconcile["scope"] == "managed_games"
+    assert report.save_reconcile["uploaded"] == 0
+    assert report.save_reconcile["downloaded"] == 0
+    assert local.read_bytes() == b"local-only-game"
+    assert remote.read_bytes() == b"other-device-local-game"
+
+
+def test_local_rom_with_same_save_basename_prevents_automatic_attribution(
+    tmp_path: Path,
+) -> None:
+    remote_data = tmp_path / "remote-data"
+    remote_data.mkdir()
+    local_saves = tmp_path / "saves"
+    local_saves.mkdir()
+    config = replace(
+        _config(tmp_path),
+        remote_data=RemoteDataConfig("local", str(remote_data)),
+        saves=SavesConfig(local_path=str(local_saves)),
+    )
+    db = Database(str(Path(config.data_path) / "catalog.db"))
+    db.initialize()
+    _add_game(config, db, "Same Name")
+    # A user-owned ROM with the same emulator basename makes the save owner
+    # unknowable even though the catalog also contains a managed game.
+    (Path(config.local_roms_path) / "snes/Same Name.zip").write_bytes(b"local-rom")
+    save = local_saves / "snes/Same Name.srm"
+    save.parent.mkdir()
+    save.write_bytes(b"ambiguous")
+
+    plan = Container(config).saves.preview_reconciliation()
+
+    assert plan.entries == ()
+    assert plan.excluded_files == 1
