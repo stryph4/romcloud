@@ -143,6 +143,7 @@ MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
     "Settings": (
         MenuItem("Health Check", "healthcheck"),
         MenuItem("Controller Test", CONTROLLER_TEST_ACTION),
+        MenuItem("Update ROMCloud", "update-install"),
     ),
 }
 
