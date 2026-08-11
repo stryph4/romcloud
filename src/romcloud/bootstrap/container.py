@@ -19,6 +19,7 @@ from romcloud.core.models.cache import CachePolicy
 from romcloud.core.exceptions import ConfigurationError
 from romcloud.core.storage import StorageProvider
 from romcloud.infrastructure.config import AppConfig, validate_remote_data_boundary
+from romcloud.infrastructure.capabilities import capability_policy
 from romcloud.infrastructure.database import Database
 from romcloud.infrastructure.providers.local import (
     LocalFilesystemProvider,
@@ -127,6 +128,7 @@ class Container:
                 transfer_service=self.transfer,
                 cache_root=self._config.cache.path,
                 policy=policy,
+                capability_policy=capability_policy(self._config),
             )
         return self._cache
 
@@ -145,6 +147,7 @@ class Container:
                     self._config.game_access_mode != "direct_nas"
                     and not offline_library_enabled(self._config)
                 ),
+                capability_policy=capability_policy(self._config),
             )
         return self._catalog
 
@@ -182,6 +185,7 @@ class Container:
                 remote_root=str(remote_base / "saves") if remote_base is not None else None,
                 state_path=Path(self._config.data_path) / "savesync-state.json",
                 xbox_enabled=self._config.saves.xbox_enabled,
+                capability_policy=capability_policy(self._config),
             )
         return self._saves
 
@@ -223,6 +227,7 @@ class Container:
                 game_access_mode=self._config.game_access_mode,
                 game_repo=self.game_repo,
                 proxy_repo=self.proxy_repo,
+                capability_policy=capability_policy(self._config),
             )
         return self._library_sync
 

@@ -12,6 +12,7 @@ from romcloud.cli.main import cli
 from romcloud.core.models.cache import CacheEntry, CacheStatus
 from romcloud.core.models.game import Game, GameAsset
 from romcloud.core.models.proxy import ProxyRecord
+from romcloud.core.exceptions import CapabilityUnavailableError
 from romcloud.infrastructure.config import (
     AppConfig,
     CacheConfig,
@@ -34,6 +35,16 @@ from romcloud.integrations.batocera.game_access import (
     set_offline_library_mode,
 )
 from romcloud.lifecycle.manage import restore_owned_proxies
+
+
+@pytest.fixture(autouse=True)
+def _stub_es_refresh(monkeypatch):
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        "romcloud.integrations.batocera.game_access._refresh_emulationstation",
+        lambda config, systems: calls.append(tuple(systems)),
+    )
+    return calls
 
 
 def _config(tmp_path: Path, mode: str = SMART_CACHE_MODE) -> AppConfig:
@@ -147,7 +158,7 @@ def test_cached_only_presentation_is_reversible_safe_and_idempotent(tmp_path: Pa
     assert uncached.id in catalog_before
 
 
-def test_normal_refresh_retains_cached_only_view_and_records_new_games(tmp_path: Path) -> None:
+def test_offline_refresh_is_blocked_without_catalog_or_proxy_changes(tmp_path: Path) -> None:
     config = _config(tmp_path)
     db = Database(str(Path(config.data_path) / "catalog.db"))
     db.initialize()
@@ -158,26 +169,11 @@ def test_normal_refresh_retains_cached_only_view_and_records_new_games(tmp_path:
     new_source = Path(config.source.rom_root) / "snes" / "New Uncached.sfc"
     new_source.write_bytes(b"new")
     container = Container(config)
-    result = container.catalog.refresh()
-    reconcile_game_access(config)
+    with pytest.raises(Exception, match="Offline Mode"):
+        container.catalog.refresh()
 
-    assert not result.errors
-    new_game = next(game for game in container.game_repo.list_all() if game.title == "New Uncached")
-    record = container.proxy_repo.get(new_game.id)
-    assert record is not None
-    assert not Path(record.proxy_path).exists()
+    assert all(game.title != "New Uncached" for game in container.game_repo.list_all())
     assert offline_library_enabled(config)
-
-    cached_path = Path(config.cache.path) / "snes" / "New Uncached.sfc"
-    cached_path.parent.mkdir(parents=True, exist_ok=True)
-    cached_path.write_bytes(b"new")
-    entry = CacheEntry.create(new_game.id, str(cached_path))
-    entry.status = CacheStatus.COMPLETE
-    entry.size_bytes = 3
-    container.cache_repo.save(entry)
-    reconcile_game_access(config)
-
-    assert Path(record.proxy_path).is_file()
 
 
 def test_direct_mode_clears_offline_state_and_returns_to_full_smart_cache(tmp_path: Path) -> None:
@@ -194,7 +190,7 @@ def test_direct_mode_clears_offline_state_and_returns_to_full_smart_cache(tmp_pa
     assert not offline_library_enabled(direct)
     assert not proxy.exists()
     assert (Path(direct.local_roms_path) / "snes" / LINK_NAME).is_symlink()
-    with pytest.raises(RuntimeError, match="Smart Cache"):
+    with pytest.raises(CapabilityUnavailableError, match="Smart Cache"):
         set_offline_library_mode(direct, True)
 
     reconcile_game_access(smart)
@@ -208,9 +204,6 @@ def test_library_cli_toggles_and_reports_state(tmp_path: Path, monkeypatch) -> N
     config = _config(tmp_path)
     config_path = tmp_path / "config" / "romcloud.toml"
     write_config(config, str(config_path))
-    monkeypatch.setattr(
-        "romcloud.cli.commands.library.es_config.refresh", lambda systems: None
-    )
     runner = CliRunner()
 
     offline = runner.invoke(
@@ -230,11 +223,11 @@ def test_library_cli_toggles_and_reports_state(tmp_path: Path, monkeypatch) -> N
     )
 
     assert offline.exit_code == 0, offline.output
-    assert "cached games only" in offline.output
-    assert status.exit_code == 0 and "cached games only" in status.output
+    assert "Offline Mode" in offline.output
+    assert status.exit_code == 0 and "Offline Mode" in status.output
     assert json.loads(gui_status.output)["offline_library_mode"] is True
     assert json.loads(catalog_status.output)["offline_library_mode"] is True
-    assert online.exit_code == 0 and "full Smart Cache catalog" in online.output
+    assert online.exit_code == 0 and "Online Mode" in online.output
     assert not offline_library_enabled(config)
 
 
@@ -248,7 +241,7 @@ def test_library_cli_is_unavailable_in_direct_mode(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 1
-    assert "unavailable in Direct/NAS mode" in result.output
+    assert "available only in Smart Cache mode" in result.output
 
 
 def test_state_write_failure_rolls_back_to_previous_full_presentation(
@@ -271,3 +264,47 @@ def test_state_write_failure_rolls_back_to_previous_full_presentation(
 
     assert cached_proxy.is_file() and uncached_proxy.is_file()
     assert not offline_library_enabled(config)
+
+
+def test_es_refresh_runs_only_after_successful_transition(
+    tmp_path: Path, monkeypatch, _stub_es_refresh
+) -> None:
+    config = _config(tmp_path)
+    db = Database(str(Path(config.data_path) / "catalog.db"))
+    db.initialize()
+    _add_game(config, db, "Cached", cached=True)
+    restore_owned_proxies(config)
+
+    set_offline_library_mode(config, True)
+    assert _stub_es_refresh == [("snes",)]
+
+    monkeypatch.setattr(
+        "romcloud.integrations.batocera.game_access.reconcile_library_presentation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("reconcile failed")),
+    )
+    with pytest.raises(RuntimeError, match="reconcile failed"):
+        set_offline_library_mode(config, False)
+    assert _stub_es_refresh == [("snes",)]
+
+
+def test_returning_online_restores_full_library_without_provider_refresh(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = _config(tmp_path)
+    db = Database(str(Path(config.data_path) / "catalog.db"))
+    db.initialize()
+    _cached, cached_proxy, _ = _add_game(config, db, "Cached", cached=True)
+    _uncached, uncached_proxy, _ = _add_game(config, db, "Uncached")
+    restore_owned_proxies(config)
+    set_offline_library_mode(config, True)
+    assert cached_proxy.exists() and not uncached_proxy.exists()
+
+    monkeypatch.setattr(
+        "romcloud.infrastructure.providers.local.LocalFilesystemProvider.list_systems",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("provider refresh must not run")
+        ),
+    )
+    set_offline_library_mode(config, False)
+
+    assert cached_proxy.exists() and uncached_proxy.exists()

@@ -401,7 +401,10 @@ def reconcile_install(
 
             configured = load_config(str(config_path))
             before = len(list(Path(configured.local_roms_path).glob("*/*.romcloud")))
-            reconcile_game_access(configured)
+            # The named ES override was already reconciled above; this pass
+            # restores access artifacts only, so an optional ES failure cannot
+            # prevent proxy recovery.
+            reconcile_game_access(configured, refresh_es=False)
             after = len(list(Path(configured.local_roms_path).glob("*/*.romcloud")))
             proxies_restored = max(0, after - before)
         except Exception:  # noqa: BLE001 — optional recovery, never breaks runtime repair

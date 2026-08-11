@@ -41,6 +41,7 @@ from romcloud.lifecycle.setup import (
 )
 from romcloud.core.progress import ProgressEvent, emit_progress, redact_text
 from romcloud.infrastructure.config import load_config
+from romcloud.infrastructure.capabilities import capability_policy
 from romcloud.infrastructure.source_display import source_display_summary
 from romcloud.services.connections import (
     connection_status,
@@ -74,6 +75,16 @@ def _load_context_config(ctx: click.Context):
     config = load_config(ctx.obj["config_path"])
     ctx.obj["config"] = config
     return config
+
+
+def _require_capability_if_configured(
+    ctx: click.Context, capability, operation: str
+) -> None:  # noqa: ANN001
+    """Apply persisted policy to optional setup/lifecycle endpoints."""
+    path = Path(ctx.obj["config_path"])
+    if not path.exists():
+        return
+    capability_policy(load_config(str(path))).require(capability, operation)
 
 
 def _read_request() -> dict:
@@ -133,15 +144,27 @@ def uidata_setup_status(ctx: click.Context) -> None:
 @click.pass_context
 def uidata_setup_discover(ctx: click.Context) -> None:
     """Discover accessible SMB shares from a secret-bearing stdin request."""
-    _run_request_action(ctx, discover_shares)
+    from romcloud.core.capabilities import Capability
+
+    def run(request, progress=None):
+        _require_capability_if_configured(ctx, Capability.REMOTE_VALIDATION, "SMB discovery")
+        return discover_shares(request) if progress is None else discover_shares(request, progress)
+
+    _run_request_action(ctx, run)
 
 
 @uidata_group.command("setup-validate")
 @click.pass_context
 def uidata_setup_validate(ctx: click.Context) -> None:
     """Validate a selected SMB share and report recognized systems."""
-    def validate(request, progress):
+    from romcloud.core.capabilities import Capability
+
+    def validate(request, progress=None):
         action = validate_local_source if request.get("source_type") == "local" else validate_share
+        if action is validate_share:
+            _require_capability_if_configured(
+                ctx, Capability.REMOTE_VALIDATION, "Storage validation"
+            )
         return action(request, progress)
 
     _run_request_action(ctx, validate)
@@ -151,7 +174,17 @@ def uidata_setup_validate(ctx: click.Context) -> None:
 @click.pass_context
 def uidata_setup_browse_smb(ctx: click.Context) -> None:
     """Enumerate one directory inside a previously authenticated SMB share."""
-    _run_request_action(ctx, browse_smb_directory)
+    from romcloud.core.capabilities import Capability
+
+    def browse(request, progress=None):
+        _require_capability_if_configured(ctx, Capability.REMOTE_VALIDATION, "SMB browsing")
+        return (
+            browse_smb_directory(request)
+            if progress is None
+            else browse_smb_directory(request, progress)
+        )
+
+    _run_request_action(ctx, browse)
 
 
 @uidata_group.command("setup-browse-local")
@@ -165,12 +198,13 @@ def uidata_setup_browse_local(ctx: click.Context) -> None:
 @click.pass_context
 def uidata_setup_apply(ctx: click.Context) -> None:
     """Apply, mount, scan, and integrate a validated graphical setup."""
-    _run_request_action(
-        ctx,
-        lambda request, progress=None: apply_setup(
-            Path(ctx.obj["config_path"]), request, progress
-        ),
-    )
+    from romcloud.core.capabilities import Capability
+
+    def apply(request, progress=None):
+        _require_capability_if_configured(ctx, Capability.REMOTE_VALIDATION, "Storage setup")
+        return apply_setup(Path(ctx.obj["config_path"]), request, progress)
+
+    _run_request_action(ctx, apply)
 
 
 @uidata_group.command("status")
@@ -186,6 +220,7 @@ def uidata_status(ctx: click.Context) -> None:
             "games_total": len(games),
             "game_access_mode": container.config.game_access_mode,
             "library_sync_enabled": container.config.library_sync.enabled,
+            "operating_state": capability_policy(container.config).serialize(),
         }
         if container.config.game_access_mode != "direct_nas":
             from romcloud.infrastructure.library_view import offline_library_enabled
@@ -206,16 +241,14 @@ def _run_library_mode_action(ctx: click.Context, enabled: bool) -> None:
     def build() -> dict:
         _load_context_config(ctx)
         container = get_container(ctx)
-        from romcloud.integrations.batocera import es_config
         from romcloud.integrations.batocera.game_access import set_offline_library_mode
 
         progress = _progress_sink({"progress": True})
-        label = "cached games only" if enabled else "full library"
+        label = "Offline Mode" if enabled else "Online Mode"
         emit_progress(
             progress, "library", "reconcile", "running", f"Showing {label}…"
         )
         report = set_offline_library_mode(container.config, enabled)
-        es_config.refresh(container.game_repo.list_systems())
         emit_progress(
             progress, "library", "reconcile", "success", f"Now showing {label}"
         )
@@ -266,24 +299,21 @@ def _run_catalog_refresh(ctx: click.Context, progress) -> None:  # noqa: ANN001
         _load_context_config(ctx)
         container = get_container(ctx)
         result = container.catalog.refresh(progress=progress)
-        from romcloud.integrations.batocera import es_config
         from romcloud.integrations.batocera.game_access import reconcile_game_access
         from romcloud.infrastructure.config import DIRECT_NAS_MODE
 
-        access_result = reconcile_game_access(container.config)
         library_report = (
             container.library_sync.sync()
             if container.config.library_sync.enabled
             else None
         )
+        access_result = reconcile_game_access(container.config)
         if container.config.game_access_mode == DIRECT_NAS_MODE:
-            es_config.remove()
             es_systems: list[str] = []
             es_missing: list[str] = []
         else:
-            es_result = es_config.refresh(container.game_repo.list_systems())
-            es_systems = es_result.included_systems
-            es_missing = es_result.missing_systems
+            es_systems = list(access_result.es_included_systems)
+            es_missing = list(access_result.es_missing_systems)
         errors = [f"{system}: {message}" for system, message in result.errors]
         return {
             "ok": not errors,
@@ -327,7 +357,12 @@ def uidata_library_sync(ctx: click.Context) -> None:
     """Run the shared additive bidirectional Library Sync service."""
     def build() -> dict:
         _load_context_config(ctx)
-        return get_container(ctx).library_sync.sync().as_dict()
+        container = get_container(ctx)
+        report = container.library_sync.sync()
+        from romcloud.integrations.batocera.presentation import refresh_emulationstation
+
+        refresh_emulationstation(container.config, container.game_repo.list_systems())
+        return report.as_dict()
 
     _run_action(ctx, build)
 
@@ -340,6 +375,9 @@ def uidata_update_check(ctx: click.Context) -> None:
     def build() -> dict:
         import sys
 
+        from romcloud.core.capabilities import Capability
+
+        _require_capability_if_configured(ctx, Capability.UPDATE_NETWORK, "Update check")
         from romcloud.lifecycle.update import check_for_update
 
         progress = _progress_sink({"progress": True})
@@ -375,6 +413,9 @@ def uidata_update_install(ctx: click.Context) -> None:
     def build() -> dict:
         import sys
 
+        from romcloud.core.capabilities import Capability
+
+        _require_capability_if_configured(ctx, Capability.UPDATE_NETWORK, "ROMCloud update")
         from romcloud.lifecycle.update import perform_update
 
         progress = _progress_sink({"progress": True})

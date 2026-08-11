@@ -35,6 +35,14 @@ class DirectLinkReport:
 
 
 @dataclass(frozen=True)
+class GameAccessReport:
+    created: int = 0
+    removed: int = 0
+    es_included_systems: tuple[str, ...] = ()
+    es_missing_systems: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class LibraryPresentationReport:
     offline: bool
     removed: int = 0
@@ -182,7 +190,9 @@ def reconcile_direct_links(config: AppConfig, systems: Iterable[str]) -> DirectL
     return DirectLinkReport(created=created, removed=removed)
 
 
-def reconcile_game_access(config: AppConfig) -> DirectLinkReport:
+def reconcile_game_access(
+    config: AppConfig, *, refresh_es: bool = True
+) -> GameAccessReport:
     """Apply the configured strategy to catalog-owned Batocera artifacts."""
     # Imported lazily to avoid a lifecycle/container import cycle.
     from romcloud.infrastructure.library_view import (
@@ -205,7 +215,9 @@ def reconcile_game_access(config: AppConfig) -> DirectLinkReport:
         write_offline_library_state(config, False)
         if getattr(getattr(config, "library_sync", None), "enabled", False):
             container.library_sync.render_local()
-        return report
+        if refresh_es:
+            _refresh_emulationstation(config, container.game_repo.list_systems())
+        return GameAccessReport(created=report.created, removed=report.removed)
     report = remove_direct_links(config)
     if offline_library_enabled(config):
         reconcile_library_presentation(config, offline=True)
@@ -213,7 +225,25 @@ def reconcile_game_access(config: AppConfig) -> DirectLinkReport:
         restore_owned_proxies(config)
     if getattr(getattr(config, "library_sync", None), "enabled", False):
         container.library_sync.render_local()
-    return report
+    es_result = (
+        _refresh_emulationstation(config, container.game_repo.list_systems())
+        if refresh_es
+        else None
+    )
+    if es_result is None:
+        return GameAccessReport(created=report.created, removed=report.removed)
+    return GameAccessReport(
+        created=report.created,
+        removed=report.removed,
+        es_included_systems=tuple(es_result.included_systems),
+        es_missing_systems=tuple(es_result.missing_systems),
+    )
+
+
+def _refresh_emulationstation(config: AppConfig, systems: Iterable[str]):  # noqa: ANN202
+    from romcloud.integrations.batocera.presentation import refresh_emulationstation
+
+    return refresh_emulationstation(config, systems)
 
 
 def _valid_cached_game_ids(config: AppConfig) -> set[str]:
@@ -229,10 +259,10 @@ def reconcile_library_presentation(
     config: AppConfig, *, offline: bool
 ) -> LibraryPresentationReport:
     """Replace only owned proxies with the requested Smart Cache view."""
-    if config.game_access_mode == DIRECT_NAS_MODE:
-        raise RuntimeError(
-            "Offline Library Mode is available only in Smart Cache mode."
-        )
+    from romcloud.core.capabilities import Capability
+    from romcloud.infrastructure.capabilities import capability_policy
+
+    capability_policy(config).require(Capability.OFFLINE_MODE, "Change operating mode")
     from romcloud.lifecycle.manage import remove_owned_proxies, restore_owned_proxies
 
     visible_ids = _valid_cached_game_ids(config) if offline else None
@@ -257,24 +287,35 @@ def set_offline_library_mode(
         write_offline_library_state,
     )
 
-    if config.game_access_mode == DIRECT_NAS_MODE:
-        raise RuntimeError(
-            "Offline Library Mode is available only in Smart Cache mode."
-        )
+    from romcloud.core.capabilities import Capability
+    from romcloud.infrastructure.capabilities import capability_policy
+
+    capability_policy(config).require(Capability.OFFLINE_MODE, "Change operating mode")
     previous = offline_library_enabled(config)
     if previous == enabled:
-        return reconcile_library_presentation(config, offline=enabled)
+        report = reconcile_library_presentation(config, offline=enabled)
+        container = Container(config)
+        if getattr(getattr(config, "library_sync", None), "enabled", False):
+            container.library_sync.render_local()
+        _refresh_emulationstation(config, container.game_repo.list_systems())
+        return report
     try:
         report = reconcile_library_presentation(config, offline=enabled)
         write_offline_library_state(config, enabled)
+        container = Container(config)
         if getattr(getattr(config, "library_sync", None), "enabled", False):
-            Container(config).library_sync.render_local()
+            container.library_sync.render_local()
+        _refresh_emulationstation(config, container.game_repo.list_systems())
         return report
     except Exception:
         # Best-effort rollback restores the prior usable proxy presentation.
         try:
             reconcile_library_presentation(config, offline=previous)
             write_offline_library_state(config, previous)
+            container = Container(config)
+            if getattr(getattr(config, "library_sync", None), "enabled", False):
+                container.library_sync.render_local()
+            _refresh_emulationstation(config, container.game_repo.list_systems())
         except Exception:
             pass
         raise

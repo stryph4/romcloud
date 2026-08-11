@@ -44,6 +44,7 @@ from romcloud.core.save_selection import (
     SaveSelectionPolicy,
 )
 from romcloud.core.storage import StorageProvider
+from romcloud.core.capabilities import Capability, CapabilityPolicy
 from romcloud.infrastructure import save_tree
 from romcloud.infrastructure.atomic_file import atomic_write_text
 from romcloud.infrastructure.logging import get_logger
@@ -65,6 +66,7 @@ class SaveSyncService:
         state_path: Path,
         xbox_enabled: bool = False,
         policy: SaveSelectionPolicy = DEFAULT_SAVE_SELECTION_POLICY,
+        capability_policy: Optional[CapabilityPolicy] = None,
     ) -> None:
         self._provider = provider
         self._connectivity_root = connectivity_root
@@ -73,6 +75,7 @@ class SaveSyncService:
         self._state_path = Path(state_path)
         self._xbox_enabled = xbox_enabled
         self._policy = policy
+        self._capabilities = capability_policy or CapabilityPolicy("smart_cache")
 
     # ── connectivity ──────────────────────────────────────────────────────
 
@@ -141,6 +144,7 @@ class SaveSyncService:
         return self._preview("download")
 
     def _preview(self, direction: str) -> SaveDiff:
+        self._capabilities.require(Capability.SAVE_SYNC, f"SaveSync {direction}")
         self._require_remote()
         if not self.is_remote_reachable():
             raise SaveSyncConnectivityError(
@@ -161,11 +165,13 @@ class SaveSyncService:
     # ── commit (stage → verify → atomic swap → advance state) ───────────
 
     def commit_upload(self, diff: SaveDiff) -> SaveSyncRecord:
+        self._capabilities.require(Capability.SAVE_SYNC, "SaveSync upload")
         self._require_remote()
         assert self._remote_root is not None
         return self._commit(diff, source_root=self._local_root, dest_root=self._remote_root)
 
     def commit_download(self, diff: SaveDiff) -> SaveSyncRecord:
+        self._capabilities.require(Capability.SAVE_SYNC, "SaveSync download")
         self._require_remote()
         assert self._remote_root is not None
         return self._commit(diff, source_root=self._remote_root, dest_root=self._local_root)

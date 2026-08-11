@@ -20,6 +20,7 @@ from typing import Optional
 from xml.etree import ElementTree as ET
 
 from romcloud.core.cue_parser import resolve_cue_dependencies
+from romcloud.core.capabilities import Capability, CapabilityPolicy
 from romcloud.core.exceptions import GameNotFoundError, ProxyError, ProxyNotOwnedError
 from romcloud.core.models.game import Game, GameAsset, derive_title
 from romcloud.core.models.proxy import ProxyRecord
@@ -81,6 +82,7 @@ class CatalogService:
         source_root: str,
         known_systems: Optional[frozenset[str]] = None,
         write_proxies: bool = True,
+        capability_policy: Optional[CapabilityPolicy] = None,
     ) -> None:
         self._provider = provider
         self._game_repo = game_repo
@@ -89,6 +91,7 @@ class CatalogService:
         self._source_root = source_root
         self._known_systems = known_systems or BATOCERA_SYSTEMS
         self._write_proxies_enabled = write_proxies
+        self._capabilities = capability_policy or CapabilityPolicy("smart_cache")
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -103,6 +106,7 @@ class CatalogService:
         removed — only stale entries superseded by a cue/directory grouping
         change are pruned here (see ``removed``).
         """
+        self._capabilities.require(Capability.CATALOG_REFRESH, "Catalog refresh")
         added = skipped = removed = updated = 0
         errors: list[tuple[str, str]] = []
         warnings: list[str] = []

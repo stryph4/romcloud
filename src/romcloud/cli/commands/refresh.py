@@ -6,7 +6,6 @@ import click
 
 from romcloud.core.exceptions import ProviderNotReachableError, ROMCloudError
 from romcloud.cli.context import get_container
-from romcloud.integrations.batocera import es_config
 from romcloud.infrastructure.config import DIRECT_NAS_MODE
 
 
@@ -22,6 +21,14 @@ from romcloud.infrastructure.config import DIRECT_NAS_MODE
 def refresh_cmd(ctx: click.Context, system: str | None, dry_run: bool) -> None:
     """Scan the ROM source and create proxy files for new games."""
     container = get_container(ctx)
+
+    from romcloud.core.capabilities import Capability
+    from romcloud.infrastructure.capabilities import capability_policy
+
+    try:
+        capability_policy(container.config).require(Capability.CATALOG_REFRESH, "Catalog refresh")
+    except ROMCloudError as exc:
+        raise click.ClickException(str(exc)) from exc
 
     if dry_run:
         click.echo("(dry-run: no changes will be made)")
@@ -51,37 +58,33 @@ def refresh_cmd(ctx: click.Context, system: str | None, dry_run: bool) -> None:
             for failure in library_report.failures:
                 click.echo(f"warning: {failure}", err=True)
 
-        managed = container.game_repo.list_systems()
         try:
             from romcloud.integrations.batocera.game_access import reconcile_game_access
 
             access_result = reconcile_game_access(container.config)
-            es_result = (
-                None
-                if container.config.game_access_mode == DIRECT_NAS_MODE
-                else es_config.refresh(managed)
-            )
-            if es_result is None:
-                es_config.remove()
-        except es_config.ESConfigError as exc:
+        except ROMCloudError as exc:
             click.echo(f"error: could not update EmulationStation integration — {exc}", err=True)
             ctx.exit(1)
             return
 
-        if es_result is not None:
+        if container.config.game_access_mode != DIRECT_NAS_MODE:
+            es_systems = getattr(
+                access_result, "es_included_systems", container.game_repo.list_systems()
+            )
             click.echo(
                 "Updated EmulationStation registration for "
-                f"{len(es_result.included_systems)} system(s)."
+                f"{len(es_systems)} system(s)."
             )
         else:
             click.echo(
                 "Updated Direct/NAS exposure "
                 f"({access_result.created} link(s) created, {access_result.removed} removed)."
             )
-        if es_result is not None and es_result.missing_systems:
+        es_missing = getattr(access_result, "es_missing_systems", ())
+        if es_missing:
             click.echo(
                 "warning: no Batocera system definition found for: "
-                + ", ".join(es_result.missing_systems),
+                + ", ".join(es_missing),
                 err=True,
             )
         click.echo("Update game lists or restart EmulationStation to show catalog changes.")

@@ -24,6 +24,7 @@ class MenuItem:
 
     label: str
     action: str
+    description: str = ""
 
 
 EXIT_ACTION = "exit"

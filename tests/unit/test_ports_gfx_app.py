@@ -23,6 +23,8 @@ from ports_gfx.app import (
     format_result,
     initial_screen_for_status,
     menu_categories_for_mode,
+    menu_categories_for_state,
+    root_menu_items_for_state,
     operation_summary_message,
     request_relaunch_for_completed_update,
     render_completed_update_relaunch,
@@ -86,15 +88,42 @@ class TestMenuItems:
             for items in direct.values()
             for item in items
         )
+        direct_roots = root_menu_items_for_state(
+            {"game_access_mode": "direct_nas", "offline_mode_supported": False,
+             "offline_mode": False, "capabilities": {}}
+        )
+        assert all(item.action not in ("library-offline", "library-online") for item in direct_roots)
 
-    def test_smart_cache_library_action_reflects_persisted_view(self):
-        normal = menu_categories_for_mode("smart_cache", False)["Library"]
-        offline = menu_categories_for_mode("smart_cache", True)["Library"]
+    def test_smart_cache_mode_control_is_prominent_and_not_in_library_submenu(self):
+        online_state = {
+            "game_access_mode": "smart_cache", "offline_mode": False,
+            "offline_mode_supported": True, "capabilities": {},
+        }
+        offline_state = {
+            "game_access_mode": "smart_cache", "offline_mode": True,
+            "offline_mode_supported": True,
+            "capabilities": {"catalog_refresh": False, "library_sync": False,
+                             "save_sync": False, "update_network": False,
+                             "remote_validation": False},
+        }
 
-        assert normal[-1].label == "Show Cached Games Only"
-        assert normal[-1].action == "library-offline"
-        assert offline[-1].label == "Restore Full Library"
-        assert offline[-1].action == "library-online"
+        online_roots = root_menu_items_for_state(online_state)
+        offline_roots = root_menu_items_for_state(offline_state)
+        assert online_roots[1].label == "Offline Mode"
+        assert "cached games only" in online_roots[1].description
+        assert offline_roots[1].label == "Online Mode"
+        assert "re-enable network" in offline_roots[1].description
+        assert all(
+            not item.action.startswith("library-")
+            for item in menu_categories_for_state(offline_state, True)["Library"]
+        )
+        assert [item.label for item in offline_roots] == [
+            "Library", "Online Mode", "Storage", "Settings"
+        ]
+        assert all(
+            item.action != "setup"
+            for item in menu_categories_for_state(offline_state)["Storage"]
+        )
 
     def test_library_sync_action_is_visible_only_when_enabled(self):
         disabled = menu_categories_for_mode("smart_cache", False, False)["Library"]
@@ -367,7 +396,7 @@ class TestFormatResult:
             },
         )
 
-        assert "Cached games only" in format_result("status", result)
+        assert "Offline Mode" in format_result("status", result)
 
     def test_healthcheck_result_formats_source_summary(self):
         result = BackendResult(

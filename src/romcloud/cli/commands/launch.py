@@ -61,6 +61,16 @@ def launch_cmd(ctx: click.Context, proxy_path: str, no_ui: bool, override: bool)
         click.echo(launch_path)
         return
 
+    from romcloud.core.capabilities import Capability
+    from romcloud.infrastructure.capabilities import capability_policy
+
+    try:
+        capability_policy(container.config).require(
+            Capability.GAME_DOWNLOAD, "Launching an uncached game"
+        )
+    except ROMCloudError as exc:
+        raise click.ClickException(str(exc)) from exc
+
     # Need to transfer first.
     source_root = game.source_root
     if not container.provider.is_reachable(source_root):

@@ -161,7 +161,7 @@ class TestRefresh:
 
         monkeypatch.setattr(
             es_config,
-            "refresh",
+            "install",
             lambda systems: type(
                 "Result", (), {"included_systems": [], "missing_systems": []}
             )(),

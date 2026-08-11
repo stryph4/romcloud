@@ -111,14 +111,6 @@ MENU_ITEMS: tuple[MenuItem, ...] = (
     MenuItem("Exit", EXIT_ACTION),
 )
 
-ROOT_MENU_ITEMS: tuple[MenuItem, ...] = tuple(
-    MenuItem(
-        label,
-        SAVESYNC_ACTION if label == "SaveSync" else f"{CATEGORY_ACTION_PREFIX}{label}",
-    )
-    for label in ("Library", "Storage", "SaveSync", "Maintenance", "Settings")
-)
-
 MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
     "Library": (
         MenuItem("Catalog Status", "status"),
@@ -143,32 +135,95 @@ MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
 }
 
 
+def _fallback_operating_state(mode: str, offline: bool) -> dict[str, object]:
+    """Compatibility fallback for older backends; current backends serialize policy."""
+    blocked = offline and mode == "smart_cache"
+    return {
+        "game_access_mode": mode,
+        "presentation_intent": "offline" if blocked else "online",
+        "offline_mode": blocked,
+        "offline_mode_supported": mode == "smart_cache",
+        "capabilities": {
+            "catalog_refresh": not blocked,
+            "library_sync": not blocked,
+            "save_sync": not blocked,
+            "update_network": not blocked,
+            "remote_validation": not blocked,
+        },
+    }
+
+
+def operating_state_from_status(data: dict) -> dict[str, object]:
+    state = data.get("operating_state")
+    if isinstance(state, dict):
+        return state
+    return _fallback_operating_state(
+        str(data.get("game_access_mode", "smart_cache")),
+        bool(data.get("offline_library_mode", False)),
+    )
+
+
+def root_menu_items_for_state(state: dict[str, object]) -> tuple[MenuItem, ...]:
+    capabilities = state.get("capabilities", {})
+    capabilities = capabilities if isinstance(capabilities, dict) else {}
+    items = [MenuItem("Library", f"{CATEGORY_ACTION_PREFIX}Library")]
+    if bool(state.get("offline_mode_supported", False)):
+        if bool(state.get("offline_mode", False)):
+            items.append(
+                MenuItem(
+                    "Online Mode",
+                    "library-online",
+                    "Restore the full library and re-enable network features.",
+                )
+            )
+        else:
+            items.append(
+                MenuItem(
+                    "Offline Mode",
+                    "library-offline",
+                    "Show cached games only and disable network features.",
+                )
+            )
+    items.append(MenuItem("Storage", f"{CATEGORY_ACTION_PREFIX}Storage"))
+    if capabilities.get("save_sync", True):
+        items.append(MenuItem("SaveSync", SAVESYNC_ACTION))
+    if capabilities.get("update_network", True):
+        items.append(MenuItem("Maintenance", f"{CATEGORY_ACTION_PREFIX}Maintenance"))
+    items.append(MenuItem("Settings", f"{CATEGORY_ACTION_PREFIX}Settings"))
+    return tuple(items)
+
+
+def menu_categories_for_state(
+    state: dict[str, object], library_sync_enabled: bool = False
+) -> dict[str, tuple[MenuItem, ...]]:
+    capabilities = state.get("capabilities", {})
+    capabilities = capabilities if isinstance(capabilities, dict) else {}
+    mode = str(state.get("game_access_mode", "smart_cache"))
+    library: list[MenuItem] = [MenuItem("Catalog Status", "status")]
+    if capabilities.get("catalog_refresh", True):
+        library.append(MenuItem("Refresh Catalog", "refresh"))
+    if mode != "direct_nas":
+        library.append(MenuItem("Cache Status", "cache-status"))
+    if library_sync_enabled and capabilities.get("library_sync", True):
+        library.append(MenuItem("Sync Library Metadata", "library-sync"))
+    storage = MENU_CATEGORIES["Storage"]
+    if not capabilities.get("remote_validation", True):
+        storage = tuple(item for item in storage if item.action != SETUP_ACTION)
+    return {**MENU_CATEGORIES, "Library": tuple(library), "Storage": storage}
+
+
 def menu_categories_for_mode(
     mode: str,
     offline_library_mode: bool = False,
     library_sync_enabled: bool = False,
 ) -> dict[str, tuple[MenuItem, ...]]:
-    """Expose presentation controls only for Smart Cache."""
-    if mode == "direct_nas":
-        categories = {
-            category: tuple(item for item in items if item.action != "cache-status")
-            for category, items in MENU_CATEGORIES.items()
-        }
-    else:
-        action = MenuItem(
-            "Restore Full Library" if offline_library_mode else "Show Cached Games Only",
-            "library-online" if offline_library_mode else "library-offline",
-        )
-        categories = {
-            **MENU_CATEGORIES,
-            "Library": (*MENU_CATEGORIES["Library"], action),
-        }
-    if library_sync_enabled:
-        categories = {
-            **categories,
-            "Library": (*categories["Library"], MenuItem("Sync Library Metadata", "library-sync")),
-        }
-    return categories
+    """Compatibility wrapper around the serialized-policy menu builder."""
+    return menu_categories_for_state(
+        _fallback_operating_state(mode, offline_library_mode), library_sync_enabled
+    )
+
+
+ROOT_MENU_ITEMS = root_menu_items_for_state(_fallback_operating_state("smart_cache", False))
 
 # Actions dispatched through the reusable long-running operation screen
 # (see operation_screen.py) instead of a quick blocking uidata JSON call.
@@ -185,10 +240,10 @@ _OPERATIONS: dict[str, OperationSpec] = {
     ),
     "refresh": OperationSpec(title="Refresh Catalog", args=("uidata", "refresh-progress")),
     "library-offline": OperationSpec(
-        title="Show Cached Games Only", args=("uidata", "library-offline")
+        title="Offline Mode", args=("uidata", "library-offline")
     ),
     "library-online": OperationSpec(
-        title="Restore Full Library", args=("uidata", "library-online")
+        title="Online Mode", args=("uidata", "library-online")
     ),
     "library-sync": OperationSpec(
         title="Sync Library Metadata", args=("uidata", "library-sync")
@@ -262,7 +317,7 @@ def format_result(action: str, result: BackendResult) -> str:
             ]
             body = f"{' | '.join(source_bits)} | {' '.join(stats)}" if source_prefix else " ".join(stats)
             if result.data.get("offline_library_mode"):
-                body += " | Cached games only"
+                body += " | Offline Mode"
             return f"{action}: {body}"
         reachable = result.data.get("source_reachable")
         body = f"{source_prefix} | {'reachable' if reachable else 'unreachable'}" if source_prefix else (
@@ -674,12 +729,11 @@ def _run(  # noqa: ANN001
         splash = SplashRenderer(pygame, screen)
 
         setup_status, connection = _load_startup_backend_state(splash, romcloud_bin)
-        access_mode = str(setup_status.data.get("game_access_mode", "smart_cache"))
-        offline_library_mode = bool(setup_status.data.get("offline_library_mode", False))
+        operating_state = operating_state_from_status(setup_status.data)
         library_sync_enabled = bool(setup_status.data.get("library_sync_enabled", False))
         state = NavigationState(
-            ROOT_MENU_ITEMS,
-            menu_categories_for_mode(access_mode, offline_library_mode, library_sync_enabled),
+            root_menu_items_for_state(operating_state),
+            menu_categories_for_state(operating_state, library_sync_enabled),
         )
         wizard: WizardState | None = None
         if initial_screen_for_status(setup_status) == "wizard":
@@ -710,7 +764,9 @@ def _run(  # noqa: ANN001
         activity = ActivityLog(max_events=250)
         catalog_progress = CatalogRefreshProgress()
         update_check = UpdateCheckState()
-        update_check.start(romcloud_bin)
+        capabilities = operating_state.get("capabilities", {})
+        if not isinstance(capabilities, dict) or capabilities.get("update_network", True):
+            update_check.start(romcloud_bin)
         splash.render("Starting ROMCloud…", "Finishing startup…", 0.90)
         current_screen = "wizard" if wizard is not None else "menu"
         message: Optional[str] = None
@@ -896,26 +952,18 @@ def _run(  # noqa: ANN001
                             connection = call_backend(romcloud_bin, "connection-status")
                             message = format_result("connection-status", connection)
                             message_kind = classify_message_kind("connection-status", connection)
-                        elif operation_screen.title in (
-                            "Show Cached Games Only", "Restore Full Library"
-                        ):
+                        elif operation_screen.title in ("Offline Mode", "Online Mode"):
                             setup_status = call_backend(romcloud_bin, "setup-status")
-                            access_mode = str(
-                                setup_status.data.get("game_access_mode", "smart_cache")
-                            )
-                            offline_library_mode = bool(
-                                setup_status.data.get("offline_library_mode", False)
-                            )
+                            operating_state = operating_state_from_status(setup_status.data)
                             library_sync_enabled = bool(
                                 setup_status.data.get("library_sync_enabled", False)
                             )
                             state = NavigationState(
-                                ROOT_MENU_ITEMS,
-                                menu_categories_for_mode(
-                                    access_mode, offline_library_mode, library_sync_enabled
-                                ),
+                                root_menu_items_for_state(operating_state),
+                                menu_categories_for_state(operating_state, library_sync_enabled),
                             )
-                            state.open_category("Library")
+                            if bool(operating_state.get("offline_mode", False)):
+                                update_check.update_available = False
                             message, message_kind = operation_summary_message(operation_screen)
                         else:
                             message, message_kind = operation_summary_message(operation_screen)
@@ -950,18 +998,13 @@ def _run(  # noqa: ANN001
                 if wizard.finished:
                     current_screen = "menu"
                     setup_status = call_backend(romcloud_bin, "setup-status")
-                    access_mode = str(
-                        setup_status.data.get("game_access_mode", wizard.game_access_mode)
-                    )
-                    offline_library_mode = bool(
-                        setup_status.data.get("offline_library_mode", False)
-                    )
+                    operating_state = operating_state_from_status(setup_status.data)
                     library_sync_enabled = bool(
                         setup_status.data.get("library_sync_enabled", False)
                     )
                     state = NavigationState(
-                        ROOT_MENU_ITEMS,
-                        menu_categories_for_mode(access_mode, offline_library_mode, library_sync_enabled),
+                        root_menu_items_for_state(operating_state),
+                        menu_categories_for_state(operating_state, library_sync_enabled),
                     )
                     wizard = None
                     message = "Setup complete"
@@ -1206,8 +1249,18 @@ def _render_menu(  # noqa: ANN001
         color = _SELECTED_BG if i == state.selected_index else _CARD_BG
         pygame.draw.rect(screen, color, (rect.x, rect.y, rect.w, rect.h), border_radius=6)
         label = fonts["body"].render(item.label, True, _FG_COLOR)
-        label_rect = label.get_rect(center=rect.center)
+        label_center_y = rect.centery - (layout.fonts.hint // 2 if item.description else 0)
+        label_rect = label.get_rect(center=(rect.centerx, label_center_y))
         screen.blit(label, label_rect)
+        if item.description:
+            max_chars = max(12, rect.w // max(6, layout.fonts.hint // 2))
+            description = fonts["hint"].render(
+                item.description[:max_chars], True, _HINT_COLOR
+            )
+            description_rect = description.get_rect(
+                center=(rect.centerx, label_rect.bottom + layout.fonts.hint)
+            )
+            screen.blit(description, description_rect)
 
     if message:
         max_chars = max(1, layout.message_rect.w // 8)

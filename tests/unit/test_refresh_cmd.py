@@ -26,15 +26,15 @@ def test_successful_refresh_registers_only_cataloged_systems(monkeypatch) -> Non
         game_repo=SimpleNamespace(list_systems=lambda: ["ps2", "snes"]),
     )
     monkeypatch.setattr(refresh_module, "get_container", lambda ctx: container)
+    def reconcile(config):
+        calls.append(container.game_repo.list_systems())
+        return SimpleNamespace(
+            created=0, removed=0,
+            es_included_systems=("ps2", "snes"), es_missing_systems=(),
+        )
+
     monkeypatch.setattr(
-        "romcloud.integrations.batocera.game_access.reconcile_game_access",
-        lambda config: SimpleNamespace(created=0, removed=0),
-    )
-    monkeypatch.setattr(
-        es_config,
-        "refresh",
-        lambda systems: calls.append(list(systems))
-        or SimpleNamespace(included_systems=["ps2", "snes"], missing_systems=[]),
+        "romcloud.integrations.batocera.game_access.reconcile_game_access", reconcile
     )
 
     result = CliRunner().invoke(refresh_cmd, [], obj={})
@@ -54,12 +54,9 @@ def test_es_registration_failure_makes_incomplete_refresh_nonzero(monkeypatch) -
     monkeypatch.setattr(refresh_module, "get_container", lambda ctx: container)
     monkeypatch.setattr(
         "romcloud.integrations.batocera.game_access.reconcile_game_access",
-        lambda config: SimpleNamespace(created=0, removed=0),
-    )
-    monkeypatch.setattr(
-        es_config,
-        "refresh",
-        lambda systems: (_ for _ in ()).throw(es_config.ESConfigError("stock file missing")),
+        lambda config: (_ for _ in ()).throw(
+            es_config.ESConfigError("stock file missing")
+        ),
     )
 
     result = CliRunner().invoke(refresh_cmd, [], obj={})

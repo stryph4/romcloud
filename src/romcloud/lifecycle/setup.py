@@ -252,6 +252,7 @@ def setup_state(config_path: Path) -> dict[str, Any]:
         failed_step = str(saved_state.get("failed_step") or saved_state.get("step") or "setup")
         issues.append(f"Setup did not finish at: {failed_step}.")
 
+    from romcloud.infrastructure.capabilities import capability_policy
     from romcloud.infrastructure.library_view import offline_library_enabled
 
     payload: dict[str, Any] = {
@@ -264,6 +265,7 @@ def setup_state(config_path: Path) -> dict[str, Any]:
             config.game_access_mode != DIRECT_NAS_MODE
             and offline_library_enabled(config)
         ),
+        "operating_state": capability_policy(config).serialize(),
         "rom_root": config.source.rom_root,
         "cache_root": config.cache.path,
         "max_size_gb": config.cache.max_size_gb,
@@ -619,13 +621,8 @@ def apply_setup(
 
         step = "update EmulationStation integration"
         _write_state(state_path, {"status": "applying", "step": step})
-        managed_systems = container.game_repo.list_systems()
         from romcloud.integrations.batocera.game_access import reconcile_game_access
 
-        if config.game_access_mode == DIRECT_NAS_MODE:
-            es_config.remove()
-        else:
-            es_config.install(managed_systems)
         reconcile_game_access(config)
         emit_progress(progress, "configure", "complete", "success", "ROMCloud setup complete")
     except Exception as exc:

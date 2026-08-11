@@ -19,6 +19,9 @@ from pathlib import Path
 import click
 
 from romcloud.core.exceptions import ROMCloudError
+from romcloud.core.capabilities import Capability
+from romcloud.infrastructure.capabilities import capability_policy
+from romcloud.infrastructure.config import load_config
 from romcloud.lifecycle.update import (
     DEFAULT_BRANCH,
     DEFAULT_REPO,
@@ -53,6 +56,15 @@ def _venv_python() -> Path:
 @click.pass_context
 def update_cmd(ctx: click.Context, check_only: bool, repo: str | None, branch: str) -> None:
     """Update ROMCloud to the latest version from GitHub — no git required."""
+    config_value = (ctx.obj or {}).get("config_path")
+    config_path = Path(config_value) if config_value else None
+    if config_path is not None and config_path.exists():
+        try:
+            capability_policy(load_config(str(config_path))).require(
+                Capability.UPDATE_NETWORK, "ROMCloud update"
+            )
+        except ROMCloudError as exc:
+            raise click.ClickException(str(exc)) from exc
     romcloud_home = _romcloud_home()
     repo = repo or DEFAULT_REPO
 

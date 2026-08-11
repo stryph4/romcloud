@@ -27,6 +27,7 @@ from romcloud.core.exceptions import (
     LibrarySyncConnectivityError,
     LibrarySyncError,
 )
+from romcloud.core.capabilities import Capability, CapabilityPolicy
 from romcloud.core.models.game import Game
 from romcloud.core.models.librarysync import LibrarySyncReport
 from romcloud.core.storage import StorageProvider
@@ -132,6 +133,7 @@ class LibrarySyncService:
         game_access_mode: str,
         game_repo: GameRepository,
         proxy_repo: ProxyRepository,
+        capability_policy: Optional[CapabilityPolicy] = None,
     ) -> None:
         self.enabled = enabled
         self._provider = provider
@@ -144,6 +146,7 @@ class LibrarySyncService:
         self._mode = game_access_mode
         self._games = game_repo
         self._proxies = proxy_repo
+        self._capabilities = capability_policy or CapabilityPolicy("smart_cache")
 
     @property
     def is_remote_configured(self) -> bool:
@@ -219,6 +222,7 @@ class LibrarySyncService:
         return removed
 
     def _require_available(self) -> None:
+        self._capabilities.require(Capability.LIBRARY_SYNC, "Library Sync")
         if not self.enabled:
             raise LibrarySyncError("Library Sync is disabled; enable it in configuration first.")
         if not self.is_remote_configured:

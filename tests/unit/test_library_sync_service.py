@@ -6,9 +6,10 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 import pytest
+from click.testing import CliRunner
 
 from romcloud.bootstrap.container import Container
-from romcloud.core.exceptions import LibrarySyncError
+from romcloud.core.exceptions import CapabilityUnavailableError, LibrarySyncError
 from romcloud.core.models.game import Game, GameAsset
 from romcloud.infrastructure.config import (
     AppConfig,
@@ -19,6 +20,7 @@ from romcloud.infrastructure.config import (
 )
 from romcloud.infrastructure.library_view import write_offline_library_state
 from romcloud.services.library_sync import OWNERSHIP_TAG, library_id_for_game
+from romcloud.core.models.librarysync import LibrarySyncReport
 
 
 def _config(tmp_path: Path, *, enabled: bool = True, mode: str = "smart_cache") -> AppConfig:
@@ -106,6 +108,54 @@ def test_opt_in_disabled_does_no_library_work(tmp_path: Path):
 
     assert not _canonical(config).exists()
     assert _local_root(config).read_text().count("<game>") == 1
+
+
+def test_offline_mode_blocks_remote_sync_without_changing_canonical(tmp_path: Path):
+    config, container, _ = _setup(tmp_path)
+    container.library_sync.sync()
+    before = _canonical(config).read_bytes()
+    write_offline_library_state(config, True)
+    offline = Container(config)
+
+    with pytest.raises(CapabilityUnavailableError, match="Offline Mode"):
+        offline.library_sync.sync()
+
+    assert _canonical(config).read_bytes() == before
+
+    write_offline_library_state(config, False)
+    restored = Container(config).library_sync.sync()
+    assert restored.direction == "sync"
+    assert _canonical(config).is_file()
+
+
+def test_cli_refreshes_es_only_after_successful_local_merge(monkeypatch):
+    import romcloud.cli.commands.library_sync as command
+
+    calls: list[str] = []
+    service = type(
+        "Service", (), {"sync": lambda self: LibrarySyncReport(direction="sync")}
+    )()
+    container = type(
+        "Container", (), {
+            "library_sync": service,
+            "config": object(),
+            "game_repo": type("Repo", (), {"list_systems": lambda self: ["ps2"]})(),
+        }
+    )()
+    monkeypatch.setattr(command, "get_container", lambda ctx: container)
+    monkeypatch.setattr(
+        "romcloud.integrations.batocera.presentation.refresh_emulationstation",
+        lambda config, systems: calls.append("refreshed"),
+    )
+
+    success = CliRunner().invoke(command.library_sync_group, ["sync"], obj={})
+    assert success.exit_code == 0
+    assert calls == ["refreshed"]
+
+    service.sync = lambda: (_ for _ in ()).throw(LibrarySyncError("merge failed"))
+    failed = CliRunner().invoke(command.library_sync_group, ["sync"], obj={})
+    assert failed.exit_code == 1
+    assert calls == ["refreshed"]
 
 
 def test_import_sync_and_smart_cache_render_are_safe_and_idempotent(tmp_path: Path):

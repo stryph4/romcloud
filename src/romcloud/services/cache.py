@@ -27,6 +27,7 @@ from romcloud.core.exceptions import (
     GamePinnedError,
     InsufficientSpaceError,
 )
+from romcloud.core.capabilities import Capability, CapabilityPolicy
 from romcloud.core.models.cache import CacheEntry, CachePolicy, CacheStatus
 from romcloud.core.models.game import Game, GameAsset
 from romcloud.services.transfer import TransferService
@@ -47,12 +48,14 @@ class CacheService:
         transfer_service: TransferService,
         cache_root: str,
         policy: CachePolicy,
+        capability_policy: Optional[CapabilityPolicy] = None,
     ) -> None:
         self._cache_repo = cache_repo
         self._game_repo = game_repo
         self._transfer = transfer_service
         self._cache_root = Path(cache_root)
         self._policy = policy
+        self._capabilities = capability_policy or CapabilityPolicy("smart_cache")
         # In-memory set of game_ids currently being launched.
         # Eviction must not remove these.  Does not persist across restarts.
         self._active_launches: set[str] = set()
@@ -212,6 +215,8 @@ class CacheService:
             launch_path = self.get_launch_path(game_id)
             assert launch_path is not None  # guaranteed by is_cached
             return launch_path
+
+        self._capabilities.require(Capability.GAME_DOWNLOAD, "Downloading a game")
 
         game = self._game_repo.get(game_id)
         if game is None:

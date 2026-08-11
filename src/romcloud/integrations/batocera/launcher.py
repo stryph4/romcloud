@@ -284,6 +284,12 @@ def _resolve_and_cache(proxy_path: str) -> str:
         log.info("launch diagnostic: cached-hit selected path=%r", path)
         return path
 
+    from romcloud.core.capabilities import Capability
+    from romcloud.infrastructure.capabilities import capability_policy
+
+    capability_policy(config).require(
+        Capability.GAME_DOWNLOAD, "Launching an uncached game"
+    )
     if not container.provider.is_reachable(game.source_root):
         from romcloud.core.exceptions import GameNotCachedError
         raise GameNotCachedError(

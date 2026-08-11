@@ -358,8 +358,10 @@ romcloud library-sync remove-local
 canonical document. `push` and `sync` add local/source improvements to the
 remote store. `remove-local` removes only marked local entries and preserves
 canonical/source data and media. Catalog refresh runs Library Sync only while
-the opt-in is enabled. Cached-only Offline Library Mode remains authoritative:
-Library Sync never recreates absent online-only proxies.
+the opt-in is enabled and Online Mode is active. Library Sync push, pull, and
+sync are blocked in Offline Mode; the canonical remote library is left
+untouched and locally scraped metadata remains available for a later online
+sync. Local rendering never recreates absent online-only proxies.
 
 ## Local cache and offline use
 
@@ -368,11 +370,12 @@ graphical interface. Explicit CLI maintenance remains possible for diagnostics
 with `romcloud cache --override ...`; the override applies to that invocation
 only and does not change the configured mode.
 
-### Offline Library Mode
+### Offline and Online modes
 
-Smart Cache can manually change EmulationStation's presentation to show only
-ROMCloud games whose complete cached assets are currently valid. Use **Show
-Cached Games Only** in the graphical Library menu, or:
+Smart Cache has an explicit operating-state control on the graphical main
+menu. **Offline Mode** shows only ROMCloud games whose complete cached assets
+are currently valid and disables provider-dependent work. **Online Mode**
+restores the full proxy library and re-enables those features. The CLI remains:
 
 ```bash
 romcloud library offline
@@ -380,12 +383,19 @@ romcloud library status
 romcloud library online
 ```
 
-This is a reversible proxy-view mode, not connectivity detection or cache
-maintenance. It does not delete catalog rows, cached bytes, cache status, pin
-state, local ROMs, or unrelated `.romcloud` files. It does not change eviction
-or SaveSync behavior and never enters or leaves automatically when a NAS goes
-offline. **Restore Full Library** (or `romcloud library online`) recreates the
-normal full Smart Cache proxy set from retained catalog ownership records.
+Offline Mode allows cached launches, cache status/pin/unpin/removal/eviction,
+local settings and diagnostics, and connection recovery bookkeeping. It
+blocks cache misses/downloads, provider/catalog refresh, Library Sync remote
+operations, SaveSync upload/download, and update network operations before
+they contact remote storage. It never enters or leaves automatically when
+connectivity changes. Returning online recreates the normal full Smart Cache
+proxy set from retained local catalog ownership records without refreshing the
+provider, and it does not automatically run SaveSync or Library Sync.
+
+The transition does not delete catalog rows, cached bytes, cache status, pin
+state, local saves, local ROMs, or unrelated `.romcloud` files. Offline Mode
+is unavailable in Direct/NAS mode because that access strategy fundamentally
+depends on the provider.
 
 The active state is stored atomically in
 `/userdata/system/romcloud/data/library-view.json` and remains active across

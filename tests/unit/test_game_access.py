@@ -38,6 +38,14 @@ from romcloud.integrations.batocera.game_access import (
 from romcloud.lifecycle import manage
 
 
+@pytest.fixture(autouse=True)
+def _stub_es_refresh(monkeypatch):
+    monkeypatch.setattr(
+        "romcloud.integrations.batocera.game_access._refresh_emulationstation",
+        lambda config, systems: None,
+    )
+
+
 def _config(tmp_path: Path, mode: str = DIRECT_NAS_MODE) -> AppConfig:
     source = tmp_path / "source"
     local = tmp_path / "roms"

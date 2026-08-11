@@ -9,6 +9,10 @@ class ROMCloudError(Exception):
     """Base class for all ROMCloud errors."""
 
 
+class CapabilityUnavailableError(ROMCloudError):
+    """The current operating state intentionally disables a capability."""
+
+
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 

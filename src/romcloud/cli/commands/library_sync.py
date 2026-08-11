@@ -7,7 +7,7 @@ from dataclasses import replace
 import click
 
 from romcloud.cli.context import get_container
-from romcloud.core.exceptions import LibrarySyncError
+from romcloud.core.exceptions import ROMCloudError
 from romcloud.infrastructure.config import write_config
 
 
@@ -72,10 +72,14 @@ def library_sync_disable(ctx: click.Context) -> None:
 
 
 def _run(ctx: click.Context, direction: str) -> None:
-    service = get_container(ctx).library_sync
+    container = get_container(ctx)
+    service = container.library_sync
     try:
         report = getattr(service, direction)()
-    except LibrarySyncError as exc:
+        from romcloud.integrations.batocera.presentation import refresh_emulationstation
+
+        refresh_emulationstation(container.config, container.game_repo.list_systems())
+    except ROMCloudError as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(
         f"{direction.title()} complete: {report.metadata_added} metadata added, "

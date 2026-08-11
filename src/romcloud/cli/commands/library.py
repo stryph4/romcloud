@@ -5,23 +5,26 @@ from __future__ import annotations
 import click
 
 from romcloud.cli.context import get_container
-from romcloud.infrastructure.config import DIRECT_NAS_MODE
+from romcloud.core.capabilities import Capability
+from romcloud.core.exceptions import ROMCloudError
+from romcloud.infrastructure.capabilities import capability_policy
 from romcloud.infrastructure.library_view import offline_library_enabled
-from romcloud.integrations.batocera import es_config
 from romcloud.integrations.batocera.game_access import set_offline_library_mode
 
 
 @click.group("library")
 def library_group() -> None:
-    """Control which Smart Cache games EmulationStation displays."""
+    """Select Smart Cache Online or Offline operating mode."""
 
 
 def _require_smart_cache(ctx: click.Context):  # noqa: ANN202
     container = get_container(ctx)
-    if container.config.game_access_mode == DIRECT_NAS_MODE:
-        raise click.ClickException(
-            "Offline Library Mode is unavailable in Direct/NAS mode."
+    try:
+        capability_policy(container.config).require(
+            Capability.OFFLINE_MODE, "Change operating mode"
         )
+    except ROMCloudError as exc:
+        raise click.ClickException(str(exc)) from exc
     return container
 
 
@@ -29,12 +32,11 @@ def _set(ctx: click.Context, enabled: bool) -> None:
     container = _require_smart_cache(ctx)
     try:
         report = set_offline_library_mode(container.config, enabled)
-        es_config.refresh(container.game_repo.list_systems())
-    except (RuntimeError, es_config.ESConfigError) as exc:
+    except ROMCloudError as exc:
         raise click.ClickException(str(exc)) from exc
-    label = "cached games only" if enabled else "full Smart Cache catalog"
+    label = "Offline Mode" if enabled else "Online Mode"
     click.echo(
-        f"Library now shows {label}: {report.visible} proxy file(s). "
+        f"{label} is active: {report.visible} visible proxy file(s). "
         "Update game lists or restart EmulationStation to see the change."
     )
 
@@ -44,12 +46,17 @@ def _set(ctx: click.Context, enabled: bool) -> None:
 def library_status(ctx: click.Context) -> None:
     """Show the current Smart Cache library presentation."""
     container = get_container(ctx)
-    if container.config.game_access_mode == DIRECT_NAS_MODE:
-        click.echo("Offline Library Mode: unavailable (Direct/NAS mode)")
+    policy = capability_policy(container.config)
+    if not policy.offline_mode_supported:
+        click.echo("Offline Mode: unavailable (Direct/NAS mode)")
         return
     click.echo(
-        "Offline Library Mode: "
-        + ("cached games only" if offline_library_enabled(container.config) else "full library")
+        "Operating mode: "
+        + (
+            "Offline Mode (cached games only)"
+            if offline_library_enabled(container.config)
+            else "Online Mode (full library and network features)"
+        )
     )
 
 
