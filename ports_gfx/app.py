@@ -1392,7 +1392,9 @@ def _wizard_rects(layout: Layout, wizard: WizardState) -> list[Rect]:
 
 def _wizard_body_lines(wizard: WizardState) -> list[str]:
     if wizard.step == WizardStep.WELCOME:
-        return wizard.issues or ["Choose where your ROMs, cache, and SaveSync data live."]
+        return wizard.issues or [
+            "This setup wizard helps you choose where your ROM library, cache, and SaveSync data will be stored. Press 'Continue' to begin."
+        ]
     if wizard.step == WizardStep.SOURCE:
         return ["Select where your ROM library is stored."]
     if wizard.step in (
