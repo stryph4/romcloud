@@ -28,6 +28,7 @@ their curses render loops untested — they need a real display/terminal).
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 from typing import Optional
@@ -83,6 +84,7 @@ from ports_gfx.savesync_screen import (
     SETTINGS,
     SaveSyncScreenState,
 )
+from ports_gfx.splash import SplashRenderer
 from ports_gfx.update_state import UpdateCheckState
 from ports_gfx.wizard import WizardState, WizardStep
 
@@ -189,6 +191,8 @@ _MIN_SANE_DIMENSION = 240
 _TARGET_FPS = 30
 _HINT_TEXT = "Up/Down/Left/Right select   Enter confirm   Esc exit"
 _WIZARD_HINT = "A/Enter select   B/Esc back   Menu/Tab technical details"
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def format_result(action: str, result: BackendResult) -> str:
@@ -299,6 +303,18 @@ def request_relaunch_for_completed_update(
     return relaunch.mark_update_succeeded(progress_complete=progress_complete)
 
 
+def render_completed_update_relaunch(
+    operation: OperationScreenState,
+    relaunch: GuiRelaunchCoordinator,
+    splash: SplashRenderer,
+) -> bool:
+    """Confirm update success and paint the terminal frame before shutdown."""
+    if not request_relaunch_for_completed_update(operation, relaunch):
+        return False
+    splash.render("Update complete", "Restarting ROMCloud…", 1.0)
+    return True
+
+
 def initial_screen_for_status(status: BackendResult) -> str:
     """Choose startup routing from the backend's structural setup state."""
     if status.ok and status.data.get("state") == "configured":
@@ -369,8 +385,33 @@ def _open_display(pygame, screen_w: int, screen_h: int):  # noqa: ANN001
     fails to initialize (e.g. an unusual/unsupported SDL video driver)."""
     try:
         return pygame.display.set_mode((screen_w, screen_h), pygame.FULLSCREEN)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        try:
+            _LOGGER.warning(
+                "Fullscreen display initialization failed; falling back to windowed mode: %s",
+                exc,
+            )
+        except Exception:  # noqa: BLE001 - diagnostics must not break fallback
+            pass
         return pygame.display.set_mode((screen_w, screen_h))
+
+
+def _load_startup_backend_state(  # noqa: ANN001
+    splash: SplashRenderer,
+    romcloud_bin: str,
+) -> tuple[BackendResult, BackendResult | None]:
+    """Paint real startup stages around the existing synchronous checks."""
+    splash.render("Starting ROMCloud…", "Display ready", 0.12)
+    splash.render("Starting ROMCloud…", "Loading setup and configuration…", 0.25)
+    setup_status = call_backend(romcloud_bin, "setup-status")
+    if initial_screen_for_status(setup_status) == "wizard":
+        splash.render("Starting ROMCloud…", "Preparing setup…", 0.40)
+        return setup_status, None
+
+    splash.render("Starting ROMCloud…", "Checking source availability…", 0.40)
+    connection = call_backend(romcloud_bin, "connection-status")
+    splash.render("Starting ROMCloud…", "Loading ROMCloud interface…", 0.75)
+    return setup_status, connection
 
 
 def _build_fonts(pygame, layout: Layout):  # noqa: ANN001
@@ -430,9 +471,10 @@ def _run(  # noqa: ANN001
         screen_w, screen_h = _detect_screen_size(pygame)
         screen = _open_display(pygame, screen_w, screen_h)
         pygame.display.set_caption("ROMCloud")
+        splash = SplashRenderer(pygame, screen)
 
+        setup_status, connection = _load_startup_backend_state(splash, romcloud_bin)
         state = NavigationState(ROOT_MENU_ITEMS, MENU_CATEGORIES)
-        setup_status = call_backend(romcloud_bin, "setup-status")
         wizard: WizardState | None = None
         if initial_screen_for_status(setup_status) == "wizard":
             wizard = WizardState(setup_status)
@@ -463,13 +505,15 @@ def _run(  # noqa: ANN001
         catalog_progress = CatalogRefreshProgress()
         update_check = UpdateCheckState()
         update_check.start(romcloud_bin)
+        splash.render("Starting ROMCloud…", "Finishing startup…", 0.90)
         current_screen = "wizard" if wizard is not None else "menu"
         message: Optional[str] = None
         message_kind = "info"
         if current_screen == "menu":
-            connection = call_backend(romcloud_bin, "connection-status")
+            assert connection is not None
             message = format_result("connection-status", connection)
             message_kind = classify_message_kind("connection-status", connection)
+        splash.render("Starting ROMCloud…", "Ready", 1.0)
 
         running = True
         text_input_active = False
@@ -610,8 +654,8 @@ def _run(  # noqa: ANN001
                         ievent, controller_test, input_manager,
                     )
                 elif current_screen == OPERATION_SCREEN and operation_screen is not None:
-                    if request_relaunch_for_completed_update(
-                        operation_screen, relaunch
+                    if render_completed_update_relaunch(
+                        operation_screen, relaunch, splash
                     ):
                         # Ignore this and all remaining queued application
                         # input.  The old process may render the final state,
@@ -663,8 +707,8 @@ def _run(  # noqa: ANN001
                     if event is not None:
                         catalog_progress.ingest(event)
                 if operation_screen.title == "Update ROMCloud" and operation_screen.is_finished:
-                    if request_relaunch_for_completed_update(
-                        operation_screen, relaunch
+                    if render_completed_update_relaunch(
+                        operation_screen, relaunch, splash
                     ):
                         update_check.update_available = False
                         current_screen = "restarting"
@@ -732,9 +776,6 @@ def _run(  # noqa: ANN001
                 )
             elif current_screen == "wizard" and wizard is not None:
                 _render_wizard(pygame, screen, fonts, layout, wizard, activity)
-            elif current_screen == "restarting":
-                _render_restarting(pygame, screen, fonts, layout, activity)
-
         return 0
     finally:
         if input_debug is not None:
@@ -743,24 +784,6 @@ def _run(  # noqa: ANN001
             except Exception:  # noqa: BLE001
                 pass
         pygame.quit()
-
-
-def _render_restarting(  # noqa: ANN001
-    pygame,
-    screen,
-    fonts: dict,
-    layout: Layout,
-    activity: ActivityLog,
-) -> None:
-    screen.fill(_BG_COLOR)
-    title = fonts["title"].render("ROMCloud", True, _FG_COLOR)
-    screen.blit(title, (layout.header_rect.x, layout.header_rect.y))
-    message = fonts["body"].render(
-        "ROMCloud updated successfully. Restarting…", True, _SUCCESS_COLOR
-    )
-    screen.blit(message, (layout.navigation_rect.x, layout.navigation_rect.y))
-    _render_activity_panel(pygame, screen, fonts, layout, activity)
-    pygame.display.flip()
 
 
 def _apply_direction(

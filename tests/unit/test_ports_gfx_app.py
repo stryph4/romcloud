@@ -16,12 +16,15 @@ from ports_gfx.app import (
     _apply_direction,
     _handle_controller_test_event,
     _handle_menu_event,
+    _load_startup_backend_state,
+    _open_display,
     _wizard_body_lines,
     classify_message_kind,
     format_result,
     initial_screen_for_status,
     operation_summary_message,
     request_relaunch_for_completed_update,
+    render_completed_update_relaunch,
     start_operation,
 )
 from ports_gfx.actions import Action
@@ -80,6 +83,84 @@ class TestInitialScreen:
         failed = BackendResult(ok=False, error="malformed response")
         assert initial_screen_for_status(partial) == "wizard"
         assert initial_screen_for_status(failed) == "wizard"
+
+
+class _RecordingSplash:
+    def __init__(self, order: list[object]) -> None:
+        self.order = order
+
+    def render(self, title: str, status: str, progress: float) -> None:
+        self.order.append(("splash", title, status, progress))
+
+
+class TestStartupSplash:
+    def test_initial_frame_is_rendered_before_blocking_setup_status(self, monkeypatch):
+        from ports_gfx import app as app_module
+
+        order: list[object] = []
+
+        def backend(_binary: str, action: str):
+            order.append(("backend", action))
+            return BackendResult(ok=True, data={"state": "fresh"})
+
+        monkeypatch.setattr(app_module, "call_backend", backend)
+        _load_startup_backend_state(_RecordingSplash(order), "/opt/romcloud/bin/romcloud")
+
+        assert order[0] == ("splash", "Starting ROMCloud…", "Display ready", 0.12)
+        assert order.index(("backend", "setup-status")) > order.index(
+            ("splash", "Starting ROMCloud…", "Loading setup and configuration…", 0.25)
+        )
+
+    def test_unconfigured_startup_uses_setup_message_and_skips_source_check(self, monkeypatch):
+        from ports_gfx import app as app_module
+
+        order: list[object] = []
+        monkeypatch.setattr(
+            app_module,
+            "call_backend",
+            lambda _binary, action: BackendResult(ok=True, data={"state": "fresh"}),
+        )
+
+        _load_startup_backend_state(_RecordingSplash(order), "romcloud")
+
+        statuses = [entry[2] for entry in order if entry[0] == "splash"]
+        assert "Preparing setup…" in statuses
+        assert "Checking source availability…" not in statuses
+
+    def test_configured_startup_checks_source_after_status_message(self, monkeypatch):
+        from ports_gfx import app as app_module
+
+        order: list[object] = []
+
+        def backend(_binary: str, action: str):
+            order.append(("backend", action))
+            if action == "setup-status":
+                return BackendResult(ok=True, data={"state": "configured"})
+            return BackendResult(ok=True, data={"state": "mounted"})
+
+        monkeypatch.setattr(app_module, "call_backend", backend)
+        _load_startup_backend_state(_RecordingSplash(order), "romcloud")
+
+        source_frame = ("splash", "Starting ROMCloud…", "Checking source availability…", 0.40)
+        assert order.index(source_frame) < order.index(("backend", "connection-status"))
+
+
+def test_fullscreen_failure_is_logged_before_windowed_fallback(caplog):
+    class Display:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def set_mode(self, size, flags=None):
+            self.calls.append((size, flags))
+            if flags is not None:
+                raise RuntimeError("fullscreen unavailable")
+            return "windowed"
+
+    pygame = type("Pygame", (), {"FULLSCREEN": 1, "display": Display()})()
+
+    assert _open_display(pygame, 1280, 720) == "windowed"
+    assert pygame.display.calls == [((1280, 720), 1), ((1280, 720), None)]
+    assert "fullscreen unavailable" in caplog.text
 
 
 class TestWizardValidationPresentation:
@@ -591,6 +672,33 @@ class TestUpdateRelaunchRequest:
 
         assert request_relaunch_for_completed_update(operation, coordinator) is False
         assert coordinator.terminal is False
+
+    def test_success_renders_restart_splash_once(self):
+        coordinator = GuiRelaunchCoordinator("/opt/romcloud/bin/romcloud")
+        operation = self._operation(
+            OperationState.SUCCEEDED,
+            [OperationLine("stdout", '{"ok":true,"restart_required":true}')],
+        )
+        frames: list[object] = []
+        splash = _RecordingSplash(frames)
+
+        assert render_completed_update_relaunch(operation, coordinator, splash) is True
+        assert render_completed_update_relaunch(operation, coordinator, splash) is False
+        assert frames == [("splash", "Update complete", "Restarting ROMCloud…", 1.0)]
+
+    def test_failure_never_renders_successful_restart_splash(self):
+        coordinator = GuiRelaunchCoordinator("/opt/romcloud/bin/romcloud")
+        operation = self._operation(
+            OperationState.FAILED,
+            [OperationLine("stdout", '{"ok":false,"error":"install failed"}')],
+        )
+        frames: list[object] = []
+
+        assert render_completed_update_relaunch(
+            operation, coordinator, _RecordingSplash(frames)
+        ) is False
+        assert frames == []
+        assert coordinator.relaunch_pending is False
 
 
 class TestRunAppRelaunchBoundary:
