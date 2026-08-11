@@ -419,7 +419,9 @@ def reconcile_library_presentation(
     visible_ids = (
         _valid_cached_game_ids(config)
         if offline
-        else {record.game_id for record in Container(config).proxy_repo.list_all()}
+        # Full catalog, not just already-registered proxies — same fix as
+        # `_apply_mode_presentation`'s Cache Mode branch, kept consistent.
+        else {game.id for game in Container(config).game_repo.list_all()}
     )
     # Materialize the desired set before removing anything else, so an
     # already-correct proxy is never unlinked-then-recreated on a no-op
@@ -547,7 +549,11 @@ def _apply_mode_presentation(
         visible_ids = (
             _valid_cached_game_ids(config, progress=progress)
             if mode is OperatingMode.OFFLINE
-            else {record.game_id for record in container.proxy_repo.list_all()}
+            # Cache Mode exposes the complete catalog, not just games that
+            # already happen to have a proxy registration — a game with no
+            # prior registration (e.g. an interrupted catalog refresh) must
+            # still be created, not silently excluded from the visible set.
+            else {game.id for game in container.game_repo.list_all()}
         )
         restored = restore_owned_proxies(
             config,

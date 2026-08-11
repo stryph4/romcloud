@@ -11,6 +11,7 @@ catalog refresh or Library Sync media materialization.
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -257,3 +258,157 @@ class TestLibrarySyncRenderScaling:
 
         content = gamelist_path.read_text(encoding="utf-8")
         assert "<favorite>true</favorite>" in content
+
+
+def _multi_system_config(tmp_path: Path, systems: list[str]) -> AppConfig:
+    source = tmp_path / "source"
+    local = tmp_path / "roms"
+    cache = tmp_path / "cache"
+    for system in systems:
+        (source / system).mkdir(parents=True, exist_ok=True)
+        (local / system).mkdir(parents=True, exist_ok=True)
+    cache.mkdir(parents=True, exist_ok=True)
+    return AppConfig(
+        source=SourceConfig("local", str(source)),
+        cache=CacheConfig(str(cache)),
+        local_roms_path=str(local),
+        data_path=str(tmp_path / "data"),
+    )
+
+
+def _seed_games_only(config: AppConfig, systems: list[str], *, per_system: int) -> None:
+    """Catalog games with NO proxy registrations and no direct links at all
+    -- a fully missing/empty ROMCloud presentation, e.g. right after a
+    fresh catalog scan that never had any mode materialized yet."""
+    db = Database(str(Path(config.data_path) / "catalog.db"))
+    db.initialize()
+    games = GameRepository(db)
+    for system in systems:
+        for i in range(per_system):
+            title = f"{system} Game {i:05d}"
+            filename = f"{title}.rom"
+            asset = GameAsset(
+                filename=filename,
+                relative_path=f"{system}/{filename}",
+                size_bytes=4,
+                is_primary=True,
+            )
+            game = Game.create(system, title, "local", config.source.rom_root, [asset])
+            games.save(game)
+            source_file = Path(config.source.rom_root) / system / filename
+            source_file.parent.mkdir(parents=True, exist_ok=True)
+            source_file.write_bytes(b"data")
+
+
+class TestConnectedModeMaterializesDirectRepresentation:
+    """Required invariant: Connected Mode must expose the complete known
+    managed catalog through the direct/source-backed representation. An
+    empty or partially-missing starting presentation must not be read as
+    "nothing to do"."""
+
+    SYSTEMS = ["ps2", "snes", "nes", "genesis", "gba"]
+
+    def _stub_es(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "romcloud.integrations.batocera.game_access._refresh_emulationstation",
+            lambda config, systems, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "romcloud.integrations.batocera.game_access._reload_emulationstation",
+            lambda: True,
+        )
+
+    def test_materializes_full_direct_representation_from_empty_presentation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        per_system = 300
+        config = _multi_system_config(tmp_path, self.SYSTEMS)
+        _seed_games_only(config, self.SYSTEMS, per_system=per_system)
+        self._stub_es(monkeypatch)
+        monkeypatch.setattr(
+            "romcloud.integrations.batocera.catalog.CatalogService.refresh",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("catalog refresh")),
+        )
+
+        start = time.monotonic()
+        report = set_operating_mode(config, OperatingMode.CONNECTED)
+        elapsed = time.monotonic() - start
+
+        for system in self.SYSTEMS:
+            link = Path(config.local_roms_path) / system / "ROMCloud"
+            assert link.is_symlink(), f"missing direct link for {system}"
+            assert Path(os.readlink(link)) == Path(config.source.rom_root) / system
+        assert report.visible == per_system * len(self.SYSTEMS)
+        # Performance fixes must still apply: this must not take anywhere
+        # near what an O(n) DB-connection-per-game / O(n^2) XML rescan would.
+        assert elapsed < 3.0, f"Connected transition took {elapsed:.2f}s"
+
+    def test_partially_populated_presentation_creates_only_missing_links(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        per_system = 200
+        config = _multi_system_config(tmp_path, self.SYSTEMS)
+        _seed_games_only(config, self.SYSTEMS, per_system=per_system)
+        self._stub_es(monkeypatch)
+        monkeypatch.setattr(
+            "romcloud.integrations.batocera.catalog.CatalogService.refresh",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("catalog refresh")),
+        )
+
+        # Pre-materialize a CORRECT, verified link for one system only,
+        # simulating a partially-applied Connected presentation.
+        already_correct = self.SYSTEMS[0]
+        link = Path(config.local_roms_path) / already_correct / "ROMCloud"
+        target = Path(config.source.rom_root) / already_correct
+        os.symlink(target, link, target_is_directory=True)
+        manifest_path = Path(config.data_path) / "direct-links.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "links": [
+                        {"path": os.path.abspath(str(link)), "target": os.path.abspath(str(target))}
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        inode_before = link.lstat().st_ino
+
+        report = set_operating_mode(config, OperatingMode.CONNECTED)
+
+        for system in self.SYSTEMS:
+            system_link = Path(config.local_roms_path) / system / "ROMCloud"
+            assert system_link.is_symlink(), f"missing direct link for {system}"
+            assert Path(os.readlink(system_link)) == Path(config.source.rom_root) / system
+        # The already-correct link must not have been unlinked/recreated.
+        assert link.lstat().st_ino == inode_before
+        assert report.visible == per_system * len(self.SYSTEMS)
+
+
+def test_cache_mode_exposes_full_catalog_without_prior_proxy_registration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: Cache Mode's visible set must be driven by the full
+    catalog, not by which games already happen to have a `.romcloud` proxy
+    registration -- a catalog with unregistered games (e.g. an interrupted
+    refresh) must still be fully exposed once Cache Mode is selected,
+    mirroring the equivalent Offline Mode fix."""
+    config = _config(tmp_path)
+    _seed_games_only(config, ["snes"], per_system=250)
+    monkeypatch.setattr(
+        "romcloud.integrations.batocera.game_access._refresh_emulationstation",
+        lambda config, systems, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "romcloud.integrations.batocera.game_access._reload_emulationstation",
+        lambda: True,
+    )
+
+    report = set_operating_mode(config, OperatingMode.CACHE)
+
+    proxies = list((Path(config.local_roms_path) / "snes").glob("*.romcloud"))
+    assert len(proxies) == 250
+    assert report.visible == 250
+
