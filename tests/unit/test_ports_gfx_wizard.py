@@ -126,7 +126,7 @@ def test_detected_systems_lead_to_explicit_game_access_and_remote_data_choices()
     assert wizard.options == [
         "SMB network location",
         "Local / external directory",
-        "Skip (SaveSync unavailable)",
+        "Skip (sync features unavailable)",
     ]
 
 
@@ -138,7 +138,23 @@ def test_skipping_remote_data_makes_choice_explicit():
     wizard._confirm("romcloud")  # noqa: SLF001 - pure navigation test
 
     assert wizard.remote_data_type == "none"
+    assert wizard.library_sync_enabled is False
     assert wizard.step == WizardStep.CACHE
+
+
+def test_writable_storage_leads_to_explicit_library_sync_opt_in():
+    wizard = WizardState()
+    wizard.remote_data_type = "local"
+    wizard.remote_data_root = "/userdata/romcloud/remote"
+    wizard.step = WizardStep.LIBRARY_SYNC
+
+    assert wizard.options == ["Enable Library Sync", "Keep Library Sync disabled"]
+    wizard.selected_index = 0
+    wizard._confirm("romcloud")  # noqa: SLF001
+
+    assert wizard.library_sync_enabled is True
+    assert wizard.step == WizardStep.CACHE
+    assert wizard.request_payload()["library_sync_enabled"] is True
 
 
 def test_direct_mode_skips_cache_settings_and_explains_source_requirement():

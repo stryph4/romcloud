@@ -132,3 +132,14 @@ class SaveSyncConnectivityError(SaveSyncError):
 class SaveSyncVerificationError(SaveSyncError):
     """Staged save data failed verification after copying — the source
     changed since the preview, or the copy was corrupted."""
+
+
+# ── Library Sync ────────────────────────────────────────────────────────────────────────────
+
+
+class LibrarySyncError(ROMCloudError):
+    """Library metadata synchronization failed safely."""
+
+
+class LibrarySyncConnectivityError(LibrarySyncError):
+    """The configured canonical library store is unavailable."""

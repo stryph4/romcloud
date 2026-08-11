@@ -140,6 +140,13 @@ class SavesConfig:
 
 
 @dataclass(frozen=True)
+class LibrarySyncConfig:
+    """Opt-in synchronized EmulationStation metadata settings."""
+
+    enabled: bool = False
+
+
+@dataclass(frozen=True)
 class AppConfig:
     source: SourceConfig
     cache: CacheConfig
@@ -149,6 +156,7 @@ class AppConfig:
     smb: Optional[SMBConfig] = None
     remote_data: Optional[RemoteDataConfig] = None
     saves: SavesConfig = field(default_factory=SavesConfig)
+    library_sync: LibrarySyncConfig = field(default_factory=LibrarySyncConfig)
     game_access_mode: str = SMART_CACHE_MODE
 
     @property
@@ -384,6 +392,15 @@ def _parse(data: dict, path: Path) -> AppConfig:  # noqa: C901
         xbox_enabled=bool(saves_raw.get("xbox_enabled", False)),
     )
 
+    library_sync_raw = data.get("library_sync", {})
+    library_sync = LibrarySyncConfig(
+        enabled=bool(library_sync_raw.get("enabled", False)),
+    )
+    if library_sync.enabled and remote_data is None:
+        raise ConfigurationError(
+            f"{path}: Library Sync requires configured writable [remote_data]."
+        )
+
     game_access_mode = str(
         data.get("game_access", {}).get("mode", SMART_CACHE_MODE)
     ).strip().lower()
@@ -417,6 +434,7 @@ def _parse(data: dict, path: Path) -> AppConfig:  # noqa: C901
         smb=smb,
         remote_data=remote_data,
         saves=saves,
+        library_sync=library_sync,
         game_access_mode=game_access_mode,
     )
 
@@ -440,6 +458,10 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
     ):
         raise ConfigurationError(
             f"{path}: Direct/NAS source.rom_root must not overlap local_roms.path."
+        )
+    if config.library_sync.enabled and config.remote_data is None:
+        raise ConfigurationError(
+            f"{path}: Library Sync requires configured writable [remote_data]."
         )
     validate_remote_data_boundary(
         source=config.source,
@@ -532,6 +554,10 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
         "# SaveSync v1 — see `romcloud saves --help`.\n",
         f'local_path = "{config.saves.local_path}"\n',
         f"xbox_enabled = {'true' if config.saves.xbox_enabled else 'false'}\n",
+        "\n",
+        "[library_sync]\n",
+        "# Opt-in metadata/media sync. Source gamelist.xml files are read-only.\n",
+        f"enabled = {'true' if config.library_sync.enabled else 'false'}\n",
     ]
 
     atomic_write_text(path, "".join(lines))

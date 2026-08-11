@@ -185,6 +185,7 @@ def uidata_status(ctx: click.Context) -> None:
         payload = {
             "games_total": len(games),
             "game_access_mode": container.config.game_access_mode,
+            "library_sync_enabled": container.config.library_sync.enabled,
         }
         if container.config.game_access_mode != "direct_nas":
             from romcloud.infrastructure.library_view import offline_library_enabled
@@ -270,6 +271,11 @@ def _run_catalog_refresh(ctx: click.Context, progress) -> None:  # noqa: ANN001
         from romcloud.infrastructure.config import DIRECT_NAS_MODE
 
         access_result = reconcile_game_access(container.config)
+        library_report = (
+            container.library_sync.sync()
+            if container.config.library_sync.enabled
+            else None
+        )
         if container.config.game_access_mode == DIRECT_NAS_MODE:
             es_config.remove()
             es_systems: list[str] = []
@@ -298,7 +304,30 @@ def _run_catalog_refresh(ctx: click.Context, progress) -> None:  # noqa: ANN001
             "es_systems": es_systems,
             "es_missing_systems": es_missing,
             "es_restart_required": True,
+            "library_sync": library_report.as_dict() if library_report else None,
         }
+
+    _run_action(ctx, build)
+
+
+@uidata_group.command("library-sync-status")
+@click.pass_context
+def uidata_library_sync_status(ctx: click.Context) -> None:
+    """Library Sync opt-in/connectivity/last-operation state."""
+    def build() -> dict:
+        _load_context_config(ctx)
+        return get_container(ctx).library_sync.status()
+
+    _run_action(ctx, build)
+
+
+@uidata_group.command("library-sync")
+@click.pass_context
+def uidata_library_sync(ctx: click.Context) -> None:
+    """Run the shared additive bidirectional Library Sync service."""
+    def build() -> dict:
+        _load_context_config(ctx)
+        return get_container(ctx).library_sync.sync().as_dict()
 
     _run_action(ctx, build)
 

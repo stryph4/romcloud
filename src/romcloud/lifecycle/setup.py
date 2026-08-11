@@ -15,6 +15,7 @@ from romcloud.infrastructure.config import (
     AppConfig,
     CacheConfig,
     LoggingConfig,
+    LibrarySyncConfig,
     RemoteDataConfig,
     SavesConfig,
     SMBConfig,
@@ -74,6 +75,7 @@ class SetupRequest:
     remote_reuse_source_credentials: bool = False
     remote_remote_path: str = ""
     game_access_mode: str = SMART_CACHE_MODE
+    library_sync_enabled: bool = False
 
     @classmethod
     def from_payload(
@@ -120,6 +122,7 @@ class SetupRequest:
                 str(payload.get("remote_remote_path", ""))
             ),
             game_access_mode=str(payload.get("game_access_mode", SMART_CACHE_MODE)).strip().lower(),
+            library_sync_enabled=bool(payload.get("library_sync_enabled", False)),
         )
         request.validate(require_share=require_share, validate_cache=validate_cache)
         return request
@@ -157,6 +160,8 @@ class SetupRequest:
             raise ValueError("SMB port must be between 1 and 65535.")
         if self.remote_data_type not in {"none", "local", "smb"}:
             raise ValueError("ROMCloud data storage type must be none, local, or smb.")
+        if self.library_sync_enabled and self.remote_data_type == "none":
+            raise ValueError("Library Sync requires writable ROMCloud data storage.")
         if self.remote_data_type == "local":
             if not self.remote_data_root or not Path(self.remote_data_root).is_absolute():
                 raise ValueError("Local ROMCloud data location must be an absolute path.")
@@ -254,6 +259,7 @@ def setup_state(config_path: Path) -> dict[str, Any]:
         "issues": issues,
         "source_type": "smb" if config.smb is not None else "local",
         "game_access_mode": config.game_access_mode,
+        "library_sync_enabled": config.library_sync.enabled,
         "offline_library_mode": (
             config.game_access_mode != DIRECT_NAS_MODE
             and offline_library_enabled(config)
@@ -598,6 +604,19 @@ def apply_setup(
             raise RuntimeError(details)
         emit_progress(progress, "configure", "catalog", "success", "Catalog refreshed")
 
+        if config.library_sync.enabled:
+            step = "initialize Library Sync"
+            _write_state(state_path, {"status": "applying", "step": step})
+            emit_progress(
+                progress, "configure", "library_sync", "running",
+                "Importing source metadata without modifying source gamelists…",
+            )
+            container.library_sync.sync()
+            emit_progress(
+                progress, "configure", "library_sync", "success",
+                "Library metadata synchronized",
+            )
+
         step = "update EmulationStation integration"
         _write_state(state_path, {"status": "applying", "step": step})
         managed_systems = container.game_repo.list_systems()
@@ -661,6 +680,7 @@ def apply_setup(
         "system_count": validation_result["count"],
         "max_size_gb": request.max_size_gb,
         "remote_data_type": request.remote_data_type,
+        "library_sync_enabled": request.library_sync_enabled,
         "source_validation": source_probe.as_dict(),
         "remote_data_validation": (
             remote_probe.as_dict() if remote_probe is not None else None
@@ -715,6 +735,7 @@ def _build_config(config_path: Path, request: SetupRequest, existing: AppConfig 
         ),
         remote_data=remote_data,
         saves=existing.saves if existing else SavesConfig(),
+        library_sync=LibrarySyncConfig(enabled=request.library_sync_enabled),
         game_access_mode=request.game_access_mode,
     )
 

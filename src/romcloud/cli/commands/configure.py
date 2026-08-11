@@ -14,6 +14,7 @@ from romcloud.infrastructure.config import (
     AppConfig,
     CacheConfig,
     LoggingConfig,
+    LibrarySyncConfig,
     RemoteDataConfig,
     SavesConfig,
     SMBConfig,
@@ -63,6 +64,11 @@ from romcloud.infrastructure.atomic_file import atomic_write_text
     help="Explicit writable local/USB ROMCloud data directory.",
 )
 @click.option(
+    "--library-sync/--no-library-sync",
+    default=None,
+    help="Enable opt-in synchronization of game metadata and scraped media.",
+)
+@click.option(
     "--source-type",
     default=None,
     type=click.Choice(["local", "smb"], case_sensitive=False),
@@ -84,6 +90,7 @@ def configure_cmd(
     game_access_mode: str | None,
     remote_data_type: str | None,
     remote_data_root: str | None,
+    library_sync: bool | None,
     source_type: str | None,
     non_interactive: bool,
 ) -> None:
@@ -277,7 +284,17 @@ def configure_cmd(
                     port=remote_result.port,
                 ),
             )
-            remote_password = remote_result.password
+        remote_password = remote_result.password
+
+    if library_sync is None:
+        library_sync = existing.library_sync.enabled if existing else False
+    if library_sync and remote_data is None:
+        raise click.ClickException(
+            "Library Sync requires writable ROMCloud data storage."
+        )
+    if library_sync:
+        click.echo("\nLibrary Sync will read existing source/NAS gamelist.xml files to initialize metadata.")
+        click.echo("ROMCloud will not modify those source files; it manages local Batocera metadata only.")
 
     # ── cache ─────────────────────────────────────────────────────────────────
     if game_access_mode == SMART_CACHE_MODE and cache_root is None and not non_interactive:
@@ -339,6 +356,7 @@ def configure_cmd(
         smb=smb_cfg,
         remote_data=remote_data,
         saves=existing.saves if existing else SavesConfig(),
+        library_sync=LibrarySyncConfig(enabled=bool(library_sync)),
         game_access_mode=game_access_mode,
     )
 

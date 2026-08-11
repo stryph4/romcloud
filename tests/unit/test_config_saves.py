@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from romcloud.core.exceptions import ConfigurationError
 from romcloud.infrastructure.config import (
     AppConfig,
     CacheConfig,
+    LibrarySyncConfig,
     RemoteDataConfig,
     SavesConfig,
     SMBConfig,
@@ -38,6 +40,7 @@ class TestSavesConfigDefaults:
         assert loaded.saves.local_path == "/userdata/saves"
         assert loaded.saves.xbox_enabled is False
         assert loaded.remote_data is None
+        assert loaded.library_sync.enabled is False
 
     def test_missing_saves_section_in_legacy_config_uses_defaults(self, tmp_path: Path):
         config_path = tmp_path / "romcloud.toml"
@@ -81,6 +84,24 @@ class TestSavesConfigDefaults:
 
 
 class TestSavesConfigRoundTrip:
+    def test_library_sync_opt_in_round_trip(self, tmp_path: Path):
+        config_path = tmp_path / "romcloud.toml"
+        config = replace(
+            _base_config(),
+            remote_data=RemoteDataConfig("local", "/mnt/cloud-data"),
+            library_sync=LibrarySyncConfig(True),
+        )
+        write_config(config, str(config_path))
+
+        assert load_config(str(config_path)).library_sync.enabled is True
+
+    def test_library_sync_cannot_be_enabled_without_remote_data(self, tmp_path: Path):
+        with pytest.raises(ConfigurationError, match="Library Sync requires"):
+            write_config(
+                replace(_base_config(), library_sync=LibrarySyncConfig(True)),
+                str(tmp_path / "romcloud.toml"),
+            )
+
     def test_custom_values_round_trip(self, tmp_path: Path):
         config_path = tmp_path / "romcloud.toml"
         config = _base_config(

@@ -361,6 +361,20 @@ class TestCacheValidation:
                 )
             )
 
+    def test_library_sync_is_opt_in_and_requires_writable_remote_data(self):
+        assert SetupRequest.from_payload(_payload()).library_sync_enabled is False
+        with pytest.raises(ValueError, match="Library Sync requires"):
+            SetupRequest.from_payload(_payload(library_sync_enabled=True))
+
+        request = SetupRequest.from_payload(
+            _payload(
+                remote_data_type="local",
+                remote_data_root="/mnt/romcloud-data",
+                library_sync_enabled=True,
+            )
+        )
+        assert request.library_sync_enabled is True
+
     def test_remote_data_smb_must_not_reuse_rom_share(self):
         with pytest.raises(ValueError, match="separate writable share"):
             SetupRequest.from_payload(

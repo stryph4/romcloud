@@ -12,10 +12,12 @@ Responsibilities
 from __future__ import annotations
 
 import json
+import posixpath
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional
+from xml.etree import ElementTree as ET
 
 from romcloud.core.cue_parser import resolve_cue_dependencies
 from romcloud.core.exceptions import GameNotFoundError, ProxyError, ProxyNotOwnedError
@@ -169,6 +171,12 @@ class CatalogService:
             )
             try:
                 entries = self._provider.list_entries(self._source_root, system)
+                metadata_paths = self._source_metadata_entries(system)
+                entries = [
+                    entry
+                    for entry in entries
+                    if entry.relative_path not in metadata_paths
+                ]
                 games, consumed_paths, group_warnings = self._group_entries(system, entries)
                 warnings.extend(group_warnings)
 
@@ -430,6 +438,44 @@ class CatalogService:
         return self._game_repo.list_all()
 
     # ── grouping ──────────────────────────────────────────────────────────────
+
+    def _source_metadata_entries(self, system: str) -> set[str]:
+        """Exclude source gamelist/media containers from ROM discovery.
+
+        Media directory names are derived from safe references in the source
+        gamelist rather than from one scraper's fixed directory convention.
+        """
+        gamelist_rel = PurePosixPath(system, "gamelist.xml").as_posix()
+        excluded = {gamelist_rel}
+        try:
+            text = self._provider.read_text(
+                str(Path(self._source_root) / system / "gamelist.xml")
+            )
+            root = ET.fromstring(text)
+        except Exception:  # noqa: BLE001 - absent/malformed metadata is non-fatal
+            return excluded
+        if root.tag != "gameList":
+            return excluded
+        for game in root.findall("game"):
+            for tag in (
+                "image", "thumbnail", "video", "marquee", "fanart",
+                "manual", "boxback", "bezel", "wheel",
+            ):
+                raw = (game.findtext(tag) or "").strip().replace("\\", "/")
+                while raw.startswith("./"):
+                    raw = raw[2:]
+                normalized = posixpath.normpath(raw)
+                parts = PurePosixPath(normalized).parts
+                if (
+                    not raw
+                    or raw.startswith(("/", "~"))
+                    or normalized in (".", "..")
+                    or normalized.startswith("../")
+                    or not parts
+                ):
+                    continue
+                excluded.add(PurePosixPath(system, parts[0]).as_posix())
+        return excluded
 
     def _group_entries(
         self, system: str, entries: list[RemoteEntry]

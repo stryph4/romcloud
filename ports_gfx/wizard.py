@@ -39,6 +39,7 @@ class WizardStep(Enum):
     REMOTE_SHARE = "remote_share"
     REMOTE_BROWSE = "remote_browse"
     REMOTE_VALIDATE = "remote_validate"
+    LIBRARY_SYNC = "library_sync"
     CACHE = "cache"
     REVIEW = "review"
     APPLY = "apply"
@@ -106,6 +107,7 @@ class WizardState:
         self.applied_summary: dict[str, Any] = {}
         self.source_validation: dict[str, Any] = {}
         self.remote_validation: dict[str, Any] = {}
+        self.library_sync_enabled = bool(data.get("library_sync_enabled", False))
         self.activity = ActivityLog()
         self.show_details = False
 
@@ -146,6 +148,7 @@ class WizardState:
             WizardStep.REMOTE_SHARE: "Select Data Share",
             WizardStep.REMOTE_BROWSE: "Choose the Data Folder",
             WizardStep.REMOTE_VALIDATE: "Validate Data Share",
+            WizardStep.LIBRARY_SYNC: "Library Sync",
             WizardStep.CACHE: "Cache Settings",
             WizardStep.REVIEW: "Review Setup",
             WizardStep.APPLY: "Configure ROMCloud",
@@ -171,10 +174,12 @@ class WizardState:
             return [
                 "SMB network location",
                 "Local / external directory",
-                "Skip (SaveSync unavailable)",
+                "Skip (sync features unavailable)",
             ]
         if self.step == WizardStep.GAME_ACCESS:
             return ["Smart Cache", "Direct / NAS"]
+        if self.step == WizardStep.LIBRARY_SYNC:
+            return ["Enable Library Sync", "Keep Library Sync disabled"]
         if self.step == WizardStep.REMOTE_AUTH:
             return [
                 "Use same server and credentials",
@@ -473,6 +478,7 @@ class WizardState:
                 self._start_local_browse("remote_data", self.remote_data_root or "/userdata", romcloud_bin)
             else:
                 self.remote_data_type = "none"
+                self.library_sync_enabled = False
                 self.step = (
                     WizardStep.CACHE
                     if self.game_access_mode == "smart_cache"
@@ -509,6 +515,14 @@ class WizardState:
             self._start_operation(
                 WizardStep.REMOTE_VALIDATE, "setup-validate", romcloud_bin
             )
+        elif self.step == WizardStep.LIBRARY_SYNC:
+            self.library_sync_enabled = self.selected_index == 0
+            self.step = (
+                WizardStep.CACHE
+                if self.game_access_mode == "smart_cache"
+                else WizardStep.REVIEW
+            )
+            self.selected_index = 0
         elif self.step == WizardStep.CACHE:
             if self.selected_index == 0:
                 self._start_local_browse("cache", self.cache_root, romcloud_bin)
@@ -567,10 +581,17 @@ class WizardState:
             ),
             WizardStep.REMOTE_BROWSE: WizardStep.REMOTE_SHARE,
             WizardStep.REMOTE_VALIDATE: WizardStep.REMOTE_SHARE,
-            WizardStep.CACHE: WizardStep.REMOTE_DATA,
+            WizardStep.LIBRARY_SYNC: WizardStep.REMOTE_DATA,
+            WizardStep.CACHE: (
+                WizardStep.LIBRARY_SYNC
+                if self.remote_data_type != "none"
+                else WizardStep.REMOTE_DATA
+            ),
             WizardStep.REVIEW: (
                 WizardStep.CACHE
                 if self.game_access_mode == "smart_cache"
+                else WizardStep.LIBRARY_SYNC
+                if self.remote_data_type != "none"
                 else WizardStep.REMOTE_DATA
             ),
             WizardStep.APPLY: WizardStep.REVIEW,
@@ -679,6 +700,7 @@ class WizardState:
             "remote_password": self.remote_password,
             "remote_port": self.remote_port,
             "remote_reuse_source_credentials": self.remote_reuse_source_credentials,
+            "library_sync_enabled": self.library_sync_enabled,
             "purpose": (
                 "remote_data"
                 if self.step in (
@@ -781,8 +803,4 @@ class WizardState:
         self._start_current_browser_operation(romcloud_bin)
 
     def _post_storage_step(self) -> WizardStep:
-        return (
-            WizardStep.CACHE
-            if self.game_access_mode == "smart_cache"
-            else WizardStep.REVIEW
-        )
+        return WizardStep.LIBRARY_SYNC

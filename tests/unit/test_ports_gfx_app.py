@@ -96,6 +96,13 @@ class TestMenuItems:
         assert offline[-1].label == "Restore Full Library"
         assert offline[-1].action == "library-online"
 
+    def test_library_sync_action_is_visible_only_when_enabled(self):
+        disabled = menu_categories_for_mode("smart_cache", False, False)["Library"]
+        enabled = menu_categories_for_mode("smart_cache", False, True)["Library"]
+
+        assert all(item.action != "library-sync" for item in disabled)
+        assert enabled[-1].action == "library-sync"
+
 
 class TestInitialScreen:
     def test_fresh_install_opens_wizard(self):

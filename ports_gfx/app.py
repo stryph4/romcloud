@@ -144,22 +144,31 @@ MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
 
 
 def menu_categories_for_mode(
-    mode: str, offline_library_mode: bool = False
+    mode: str,
+    offline_library_mode: bool = False,
+    library_sync_enabled: bool = False,
 ) -> dict[str, tuple[MenuItem, ...]]:
     """Expose presentation controls only for Smart Cache."""
     if mode == "direct_nas":
-        return {
+        categories = {
             category: tuple(item for item in items if item.action != "cache-status")
             for category, items in MENU_CATEGORIES.items()
         }
-    action = MenuItem(
-        "Restore Full Library" if offline_library_mode else "Show Cached Games Only",
-        "library-online" if offline_library_mode else "library-offline",
-    )
-    return {
-        **MENU_CATEGORIES,
-        "Library": (*MENU_CATEGORIES["Library"], action),
-    }
+    else:
+        action = MenuItem(
+            "Restore Full Library" if offline_library_mode else "Show Cached Games Only",
+            "library-online" if offline_library_mode else "library-offline",
+        )
+        categories = {
+            **MENU_CATEGORIES,
+            "Library": (*MENU_CATEGORIES["Library"], action),
+        }
+    if library_sync_enabled:
+        categories = {
+            **categories,
+            "Library": (*categories["Library"], MenuItem("Sync Library Metadata", "library-sync")),
+        }
+    return categories
 
 # Actions dispatched through the reusable long-running operation screen
 # (see operation_screen.py) instead of a quick blocking uidata JSON call.
@@ -180,6 +189,9 @@ _OPERATIONS: dict[str, OperationSpec] = {
     ),
     "library-online": OperationSpec(
         title="Restore Full Library", args=("uidata", "library-online")
+    ),
+    "library-sync": OperationSpec(
+        title="Sync Library Metadata", args=("uidata", "library-sync")
     ),
     "update-check": OperationSpec(title="Check for Updates", args=("uidata", "update-check")),
     "update-install": OperationSpec(title="Update ROMCloud", args=("uidata", "update-install")),
@@ -664,9 +676,10 @@ def _run(  # noqa: ANN001
         setup_status, connection = _load_startup_backend_state(splash, romcloud_bin)
         access_mode = str(setup_status.data.get("game_access_mode", "smart_cache"))
         offline_library_mode = bool(setup_status.data.get("offline_library_mode", False))
+        library_sync_enabled = bool(setup_status.data.get("library_sync_enabled", False))
         state = NavigationState(
             ROOT_MENU_ITEMS,
-            menu_categories_for_mode(access_mode, offline_library_mode),
+            menu_categories_for_mode(access_mode, offline_library_mode, library_sync_enabled),
         )
         wizard: WizardState | None = None
         if initial_screen_for_status(setup_status) == "wizard":
@@ -893,10 +906,13 @@ def _run(  # noqa: ANN001
                             offline_library_mode = bool(
                                 setup_status.data.get("offline_library_mode", False)
                             )
+                            library_sync_enabled = bool(
+                                setup_status.data.get("library_sync_enabled", False)
+                            )
                             state = NavigationState(
                                 ROOT_MENU_ITEMS,
                                 menu_categories_for_mode(
-                                    access_mode, offline_library_mode
+                                    access_mode, offline_library_mode, library_sync_enabled
                                 ),
                             )
                             state.open_category("Library")
@@ -940,9 +956,12 @@ def _run(  # noqa: ANN001
                     offline_library_mode = bool(
                         setup_status.data.get("offline_library_mode", False)
                     )
+                    library_sync_enabled = bool(
+                        setup_status.data.get("library_sync_enabled", False)
+                    )
                     state = NavigationState(
                         ROOT_MENU_ITEMS,
-                        menu_categories_for_mode(access_mode, offline_library_mode),
+                        menu_categories_for_mode(access_mode, offline_library_mode, library_sync_enabled),
                     )
                     wizard = None
                     message = "Setup complete"
@@ -1688,7 +1707,13 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
     if wizard.step == WizardStep.REMOTE_DATA:
         return [
             "Choose separate writable storage for synchronized ROMCloud data.",
-            "SaveSync is unavailable if this step is skipped.",
+            "SaveSync and Library Sync are unavailable if this step is skipped.",
+        ]
+    if wizard.step == WizardStep.LIBRARY_SYNC:
+        return [
+            "Library Sync is opt-in.",
+            "Existing source/NAS gamelist.xml files may be read to initialize metadata.",
+            "ROMCloud will not modify source files and manages only local Batocera metadata.",
         ]
     if wizard.step == WizardStep.REMOTE_AUTH:
         return [
@@ -1723,6 +1748,7 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
                 if wizard.remote_data_type == "local"
                 else "ROMCloud data: not configured (SaveSync unavailable)"
             ),
+            f"Library Sync: {'enabled' if wizard.library_sync_enabled else 'disabled'}",
         ]
         if wizard.game_access_mode == "smart_cache":
             lines.append(f"Cache: {wizard.cache_root} ({wizard.max_size_gb:g} GB max)")

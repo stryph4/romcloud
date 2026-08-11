@@ -31,6 +31,7 @@ from romcloud.infrastructure.repositories.game import GameRepository
 from romcloud.infrastructure.repositories.proxy import ProxyRepository
 from romcloud.services.cache import CacheService
 from romcloud.services.saves import SaveSyncService
+from romcloud.services.library_sync import LibrarySyncService
 from romcloud.services.transfer import TransferService
 
 
@@ -48,6 +49,7 @@ class Container:
         self._cache: Optional[CacheService] = None
         self._catalog: Optional[CatalogService] = None
         self._saves: Optional[SaveSyncService] = None
+        self._library_sync: Optional[LibrarySyncService] = None
 
     @property
     def config(self) -> AppConfig:
@@ -182,6 +184,47 @@ class Container:
                 xbox_enabled=self._config.saves.xbox_enabled,
             )
         return self._saves
+
+    @property
+    def library_sync(self) -> LibrarySyncService:
+        if self._library_sync is None:
+            from pathlib import Path
+
+            remote_data = self._config.remote_data
+            validate_remote_data_boundary(
+                source=self._config.source,
+                source_smb=self._config.smb,
+                cache=self._config.cache,
+                data_path=self._config.data_path,
+                local_saves_path=self._config.saves.local_path,
+                remote_data=remote_data,
+                context="ROMCloud configuration",
+            )
+            remote_base = Path(remote_data.root) if remote_data is not None else None
+            if remote_data is None:
+                provider = None
+            elif remote_data.provider == "smb":
+                if remote_data.smb is None:
+                    raise ConfigurationError("SMB remote data requires an SMB target")
+                provider = WritableMountedFilesystemProvider(
+                    expected_server=remote_data.smb.server,
+                    expected_share=remote_data.smb.share,
+                )
+            else:
+                provider = WritableLocalFilesystemProvider()
+            self._library_sync = LibrarySyncService(
+                enabled=self._config.library_sync.enabled,
+                provider=provider,
+                connectivity_root=str(remote_base) if remote_base is not None else None,
+                source_root=self._config.source.rom_root,
+                local_roms_root=self._config.local_roms_path,
+                data_root=self._config.data_path,
+                remote_root=str(remote_base / "library") if remote_base is not None else None,
+                game_access_mode=self._config.game_access_mode,
+                game_repo=self.game_repo,
+                proxy_repo=self.proxy_repo,
+            )
+        return self._library_sync
 
     # ── helpers ───────────────────────────────────────────────────────────────
 

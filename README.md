@@ -22,6 +22,9 @@ reachable while browsing and playing.
   not require the ROM source to be reachable. Uncached or incomplete games do.
 - **Sync selected game-progress saves manually.** SaveSync previews uploads or
   downloads, verifies staged data, and commits a whole dataset transactionally.
+- **Optionally sync library metadata.** Library Sync imports scraped metadata
+  and media into ROMCloud-owned canonical records, then renders the correct
+  local paths for Smart Cache or Direct/NAS without modifying source XML.
 - **Use familiar storage.** The current beta supports SMB shares and local or
   externally mounted directories. A NAS or PC can expose an SMB share; USB and
   other mounted storage work through the local-filesystem path.
@@ -38,7 +41,8 @@ reachable while browsing and playing.
 > [!IMPORTANT]
 > The ROM-source SMB mount remains read-only in both modes. Direct/NAS does not
 > provide downloads, pinning, eviction, cache cleanup, or offline games.
-> SaveSync, when enabled, uses a separate explicitly writable data location.
+> SaveSync and Library Sync, when enabled, use a separate explicitly writable
+> data location.
 
 ## Public beta status
 
@@ -111,15 +115,15 @@ Batocera's normal path.
 | --- | --- | --- |
 | SMB ROM source | Supported | Mounted with CIFS at a local path, read-only, then scanned through the local-filesystem provider. |
 | Local or external ROM source | Supported | Uses an existing absolute directory directly. |
-| SMB SaveSync data | Supported | Separate SMB target mounted read/write and verified with a write/read/cleanup probe. |
-| Local or external SaveSync data | Supported | Explicit writable directory verified with the same non-destructive probe. |
+| SMB synchronized data | Supported | Separate SMB target for SaveSync/Library Sync, mounted read/write and verified with a write/read/cleanup probe. |
+| Local or external synchronized data | Supported | Explicit writable directory verified with the same non-destructive probe. |
 | SFTP | Not implemented | No SFTP provider or setup flow exists. |
 | Direct/native SMB provider | Not implemented | The source tree contains only a future placeholder; current SMB support uses mounted CIFS. |
 
 For SMB configurations, ROMCloud keeps two distinct trust boundaries:
 
 - the ROM catalog source is read-only;
-- optional ROMCloud data storage for SaveSync is read/write and may use a
+- optional ROMCloud data storage for SaveSync and Library Sync is read/write and may use a
   different server, share, subdirectory, username, and password.
 
 ROMCloud rejects overlapping source and remote-data locations. Credentials are
@@ -211,7 +215,8 @@ processes communicate through credential-safe JSON subprocess requests;
 
 The current category-based interface provides:
 
-- **Library:** catalog status, catalog refresh, and cache status;
+- **Library:** catalog status/refresh, cache and offline-presentation controls,
+  and Library Sync when enabled;
 - **Storage:** setup/reconfiguration, connection status, mount/reconnect, and
   unmount;
 - **SaveSync:** status, upload/download preview, hold-to-confirm commit, and the
@@ -299,6 +304,62 @@ catalog or ROM source.
 
 Refresh does not restart EmulationStation. Update game lists or restart
 EmulationStation after catalog changes.
+
+## Library Sync
+
+Library Sync is disabled by default. It synchronizes normalized metadata, not
+raw `gamelist.xml` files. Enable it in graphical setup, with
+`romcloud configure --library-sync`, or after setup with:
+
+```bash
+romcloud library-sync enable
+romcloud library-sync sync
+```
+
+When enabled, ROMCloud may read a `gamelist.xml` under each source system to
+initialize names, descriptions, ratings, dates, developer/publisher/genre,
+players, and supported media. Source/NAS XML is never written. Local system
+gamelists are merged atomically: unrelated local-game entries are retained,
+while ROMCloud-managed entries carry a stable `romcloudId` ownership marker.
+Malformed XML and paths escaping a system root are ignored or left untouched.
+
+Canonical records live at:
+
+```text
+<remote_data.root>/library/library.json
+<remote_data.root>/library/media/sha256/...
+```
+
+The device working copy is `data/library/library.json`. Record identity is a
+SHA-256 key derived from the Batocera system and normalized primary source-ROM
+path; mount paths, local `.romcloud` paths, and access mode are excluded.
+Smart Cache renders `./Game.romcloud` and local content-addressed media copies.
+Direct/NAS renders `./ROMCloud/Game.chd` and prefers source-hosted media such as
+`./ROMCloud/images/Game.png`. Switching modes regenerates presentation without
+changing canonical records.
+
+The beta merge policy is non-destructive and additive. Missing fields/media
+are filled; blank local values never delete canonical data. If two non-empty
+values differ, the existing canonical value wins deterministically and a
+conflict is reported. Media are SHA-256 addressed and copied only when missing
+or changed. No operation recursively deletes media trees.
+
+Explicit operations are:
+
+```bash
+romcloud library-sync status
+romcloud library-sync pull
+romcloud library-sync push
+romcloud library-sync sync
+romcloud library-sync remove-local
+```
+
+`pull` updates local canonical/presentation state without writing the remote
+canonical document. `push` and `sync` add local/source improvements to the
+remote store. `remove-local` removes only marked local entries and preserves
+canonical/source data and media. Catalog refresh runs Library Sync only while
+the opt-in is enabled. Cached-only Offline Library Mode remains authoritative:
+Library Sync never recreates absent online-only proxies.
 
 ## Local cache and offline use
 
@@ -517,13 +578,14 @@ use `romcloud` for readability; the default full path is
 `/userdata/system/romcloud/bin/romcloud`.
 
 ```text
-romcloud configure                 Guided source/cache/SaveSync setup
+romcloud configure                 Guided source/cache/synchronization setup
 romcloud status                    Catalog and cache summary
 romcloud healthcheck               Source, cache, integration, and SaveSync checks
 romcloud refresh [--system NAME]   Refresh catalog and EmulationStation registration
 romcloud launch PROXY              Resolve/cache a proxy manually
 romcloud cache ...                 Status, add, remove, pin, and unpin
 romcloud library ...               Cached-only/full Smart Cache presentation
+romcloud library-sync ...          Metadata/media status, pull, push, sync, removal
 romcloud saves ...                 SaveSync status, previews, upload/download, Xbox opt-in
 romcloud mount ...                 Install/start/stop/status/remove SMB mount service
 romcloud es ...                    Install/refresh/status/remove ES integration
@@ -585,6 +647,9 @@ port = 445
 [saves]
 local_path = "/userdata/saves"
 xbox_enabled = false
+
+[library_sync]
+enabled = false
 ```
 
 `source.provider = "local"` is correct for both ordinary directories and SMB:
@@ -603,6 +668,8 @@ Default paths:
 ├── data/catalog.db              Catalog/cache/proxy ownership database
 ├── data/direct-links.json       Verified Direct/NAS symlink ownership manifest
 ├── data/library-view.json       Active cached-only Smart Cache presentation
+├── data/library/library.json    Local canonical Library Sync working copy
+├── data/library-sync-state.json Last Library Sync result
 ├── data/savesync-state.json     Last successful SaveSync records and device ID
 ├── logs/romcloud.log            Rotating application log
 ├── logs/mount-worker.log        Detached SMB worker output
@@ -703,6 +770,9 @@ recording of the display.
   metadata and emulator dependencies.
 - SaveSync is manual, directional, whole-dataset replacement with an explicit
   audited selection policy; it is not continuous sync or conflict merging.
+- Library Sync is opt-in beta functionality. Its XML merge/render behavior and
+  media-path compatibility still require clean-state validation on real
+  Batocera/EmulationStation hardware in both access modes.
 - Original Xbox SaveSync transfers the complete xemu virtual disk and is
   opt-in. Some structured emulator save layouts remain unsupported until they
   are validated.

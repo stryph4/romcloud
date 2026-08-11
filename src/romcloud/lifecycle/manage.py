@@ -27,6 +27,7 @@ class LifecycleReport:
     proxies_removed: int = 0
     proxies_restored: int = 0
     direct_links_removed: int = 0
+    library_entries_removed: int = 0
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -196,6 +197,11 @@ def uninstall(
     from romcloud.integrations.batocera.game_access import remove_direct_links
 
     direct_links_removed = remove_direct_links(config).removed
+    library_entries_removed = (
+        Container(config).library_sync.remove_local_metadata()
+        if (Path(config.data_path) / "catalog.db").is_file()
+        else 0
+    )
     proxies_removed = remove_owned_proxies(config)
     mount_worker.cleanup_runtime_state(romcloud_home)
     cifs_credentials_path(config.credentials_path).unlink(missing_ok=True)
@@ -213,6 +219,7 @@ def uninstall(
     return LifecycleReport(
         proxies_removed=proxies_removed,
         direct_links_removed=direct_links_removed,
+        library_entries_removed=library_entries_removed,
     )
 
 

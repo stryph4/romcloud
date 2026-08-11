@@ -203,12 +203,16 @@ def reconcile_game_access(config: AppConfig) -> DirectLinkReport:
         # Offline Library Mode is Smart Cache-only. A successful Direct/NAS
         # transition deliberately resets the next Smart Cache presentation.
         write_offline_library_state(config, False)
+        if getattr(getattr(config, "library_sync", None), "enabled", False):
+            container.library_sync.render_local()
         return report
     report = remove_direct_links(config)
     if offline_library_enabled(config):
         reconcile_library_presentation(config, offline=True)
     else:
         restore_owned_proxies(config)
+    if getattr(getattr(config, "library_sync", None), "enabled", False):
+        container.library_sync.render_local()
     return report
 
 
@@ -263,6 +267,8 @@ def set_offline_library_mode(
     try:
         report = reconcile_library_presentation(config, offline=enabled)
         write_offline_library_state(config, enabled)
+        if getattr(getattr(config, "library_sync", None), "enabled", False):
+            Container(config).library_sync.render_local()
         return report
     except Exception:
         # Best-effort rollback restores the prior usable proxy presentation.
