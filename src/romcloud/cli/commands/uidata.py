@@ -577,11 +577,12 @@ def uidata_savesync_status(ctx: click.Context) -> None:
     """SaveSync local/configured state without touching remote storage."""
 
     def build() -> dict:
-        _load_context_config(ctx)
+        config = _load_context_config(ctx)
         saves = get_container(ctx).saves
         state = saves.get_state()
         return {
             "remote_configured": saves.is_remote_configured,
+            "auto_sync_enabled": config.saves.auto_sync_enabled,
             "xbox_enabled": saves.xbox_enabled,
             "xbox_hdd_size_bytes": saves.xbox_hdd_size(),
             # Compatibility-only settings. The graphical SaveSync screen no
@@ -745,6 +746,11 @@ def uidata_savesync_settings(ctx: click.Context) -> None:
             config,
             saves=replace(
                 config.saves,
+                auto_sync_enabled=bool(
+                    request.get(
+                        "auto_sync_enabled", config.saves.auto_sync_enabled
+                    )
+                ),
                 xbox_enabled=bool(
                     request.get("xbox_enabled", config.saves.xbox_enabled)
                 ),
@@ -770,6 +776,7 @@ def uidata_savesync_settings(ctx: click.Context) -> None:
             "SaveSync settings updated",
         )
         return {
+            "auto_sync_enabled": new_config.saves.auto_sync_enabled,
             "xbox_enabled": new_config.saves.xbox_enabled,
             "rpcs3_installed_games_enabled": (
                 new_config.saves.rpcs3_installed_games_enabled

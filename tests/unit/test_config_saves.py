@@ -38,6 +38,7 @@ class TestSavesConfigDefaults:
         loaded = load_config(str(config_path))
 
         assert loaded.saves.local_path == "/userdata/saves"
+        assert loaded.saves.auto_sync_enabled is False
         assert loaded.saves.xbox_enabled is False
         assert loaded.saves.rpcs3_installed_games_enabled is False
         assert loaded.saves.include_local_games is False
@@ -54,6 +55,7 @@ class TestSavesConfigDefaults:
         loaded = load_config(str(config_path))
 
         assert loaded.saves.local_path == "/userdata/saves"
+        assert loaded.saves.auto_sync_enabled is False
         assert loaded.saves.xbox_enabled is False
         assert loaded.remote_data is None
 
@@ -125,6 +127,26 @@ class TestSavesConfigRoundTrip:
         reloaded = load_config(str(config_path))
 
         assert reloaded.saves.xbox_enabled is True
+
+    def test_auto_sync_opt_in_round_trips_and_defaults_off(self, tmp_path: Path):
+        config_path = tmp_path / "romcloud.toml"
+        config = AppConfig(
+            source=SourceConfig("local", (tmp_path / "roms").as_posix()),
+            cache=CacheConfig((tmp_path / "cache").as_posix()),
+            local_roms_path=(tmp_path / "local").as_posix(),
+            data_path=(tmp_path / "data").as_posix(),
+            saves=SavesConfig(
+                local_path=(tmp_path / "saves").as_posix(),
+                auto_sync_enabled=True,
+            ),
+        )
+        write_config(config, str(config_path))
+
+        loaded = load_config(str(config_path))
+        assert loaded.saves.auto_sync_enabled is True
+
+        write_config(loaded, str(config_path))
+        assert load_config(str(config_path)).saves.auto_sync_enabled is True
 
     def test_local_remote_data_round_trip(self, tmp_path: Path):
         config_path = tmp_path / "romcloud.toml"

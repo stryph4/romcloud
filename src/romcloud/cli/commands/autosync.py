@@ -30,6 +30,7 @@ def _coordinator(ctx: click.Context) -> AutoSaveSyncCoordinator:
     return AutoSaveSyncCoordinator(
         container.saves,
         data_root=Path(container.config.data_path),
+        enabled=container.config.saves.auto_sync_enabled,
     )
 
 
@@ -39,6 +40,8 @@ def _coordinator(ctx: click.Context) -> AutoSaveSyncCoordinator:
 def game_start(
     ctx: click.Context, system: str, emulator: str, core: str, rom: str
 ) -> None:
+    if not ctx.obj["config"].saves.auto_sync_enabled:
+        return
     try:
         _coordinator(ctx).game_start(
             system=system, emulator=emulator, core=core, rom=rom
@@ -53,6 +56,8 @@ def game_start(
 def game_stop(
     ctx: click.Context, system: str, emulator: str, core: str, rom: str
 ) -> None:
+    if not ctx.obj["config"].saves.auto_sync_enabled:
+        return
     try:
         _coordinator(ctx).game_stop(
             system=system, emulator=emulator, core=core, rom=rom

@@ -139,6 +139,7 @@ class SavesConfig:
     """
 
     local_path: str = str(_DEFAULT_SAVES_LOCAL_PATH)
+    auto_sync_enabled: bool = False
     xbox_enabled: bool = False
     rpcs3_installed_games_enabled: bool = False
     include_local_games: bool = False
@@ -395,6 +396,7 @@ def _parse(data: dict, path: Path) -> AppConfig:  # noqa: C901
     saves_raw = data.get("saves", {})
     saves = SavesConfig(
         local_path=saves_raw.get("local_path", str(_DEFAULT_SAVES_LOCAL_PATH)),
+        auto_sync_enabled=bool(saves_raw.get("auto_sync_enabled", False)),
         xbox_enabled=bool(saves_raw.get("xbox_enabled", False)),
         rpcs3_installed_games_enabled=bool(
             saves_raw.get("rpcs3_installed_games_enabled", False)
@@ -563,6 +565,7 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
         "[saves]\n",
         "# Shared save/state continuity — see `romcloud saves --help`.\n",
         f'local_path = "{config.saves.local_path}"\n',
+        f"auto_sync_enabled = {'true' if config.saves.auto_sync_enabled else 'false'}\n",
         f"xbox_enabled = {'true' if config.saves.xbox_enabled else 'false'}\n",
         "# Compatibility keys: RPCS3 applications remain ineligible and eligible "
         "local-game saves remain included regardless of these values.\n",

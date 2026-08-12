@@ -476,7 +476,7 @@ class TestCommitResult:
 
 
 class TestSettings:
-    def test_xbox_setting_waits_for_local_status(self):
+    def test_auto_sync_setting_waits_for_local_status(self):
         state = SaveSyncScreenState(
             romcloud_bin="romcloud", step=SETTINGS, settings_selected_index=0
         )
@@ -486,6 +486,20 @@ class TestSettings:
         assert state.step == SETTINGS
         assert "still loading" in state.error
         assert state._runner is None  # noqa: SLF001
+
+    def test_set_auto_sync_enabled_applies_and_returns_to_settings(self):
+        state = SaveSyncScreenState(romcloud_bin="romcloud")
+        state.popen = _fake_popen_returning(
+            {"ok": True, "auto_sync_enabled": True, "xbox_enabled": False}
+        )
+        state.set_auto_sync_enabled(True)
+        assert state.step == APPLYING_SETTINGS
+
+        _drain(state)
+
+        assert state.step == SETTINGS
+        assert state.status["auto_sync_enabled"] is True
+        assert state.settings_items[0] == "Auto Sync Saves: On"
 
     def test_set_xbox_enabled_applies_and_returns_to_settings(self):
         state = SaveSyncScreenState(romcloud_bin="romcloud")
@@ -498,7 +512,7 @@ class TestSettings:
         assert state.step == SETTINGS
         assert state.status["xbox_enabled"] is True
 
-    def test_settings_only_exposes_xbox_opt_in_and_back(self):
+    def test_settings_exposes_auto_sync_xbox_and_back(self):
         state = SaveSyncScreenState(
             romcloud_bin="romcloud", step=SETTINGS, settings_selected_index=99
         )
@@ -508,6 +522,18 @@ class TestSettings:
 
         assert result == "back"
         assert state.step == DASHBOARD
+
+    def test_confirm_auto_sync_toggles_current_value(self):
+        state = SaveSyncScreenState(
+            romcloud_bin="romcloud",
+            step=SETTINGS,
+            status={"auto_sync_enabled": False, "xbox_enabled": False},
+        )
+        requested = []
+        state.set_auto_sync_enabled = requested.append
+        state.confirm_settings_selection()
+
+        assert requested == [True]
 
     def test_return_to_dashboard_resets_selection(self):
         state = SaveSyncScreenState(romcloud_bin="romcloud", step=SETTINGS, selected_index=2)

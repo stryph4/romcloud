@@ -8,12 +8,20 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
 from romcloud.core.capabilities import CapabilityPolicy, OperatingMode
 from romcloud.core.models.savesync import SaveGroupCondition
 from romcloud.core.save_selection import DEFAULT_SAVE_SELECTION_POLICY
 from romcloud.core.storage import StorageProvider
 from romcloud.infrastructure import save_transaction
+from romcloud.infrastructure.config import (
+    AppConfig,
+    CacheConfig,
+    SavesConfig,
+    SourceConfig,
+    write_config,
+)
 from romcloud.integrations.batocera.auto_savesync import hook_content, install_hook
 from romcloud.services.auto_savesync import (
     AutoSaveSyncCoordinator,
@@ -80,9 +88,83 @@ def _coordinator(tmp_path: Path, service: SaveSyncService) -> AutoSaveSyncCoordi
     return AutoSaveSyncCoordinator(
         service,
         data_root=tmp_path / "data",
+        enabled=True,
         policy=DEFAULT_SAVE_SELECTION_POLICY,
         quiet_seconds=0,
     )
+
+
+def test_disabled_coordinator_is_an_immediate_filesystem_and_service_noop(
+    tmp_path: Path,
+):
+    class _UnexpectedService:
+        def __getattr__(self, name):
+            raise AssertionError(f"disabled Auto SaveSync accessed service.{name}")
+
+    coordinator = AutoSaveSyncCoordinator(
+        _UnexpectedService(),  # type: ignore[arg-type]
+        data_root=tmp_path / "data",
+        quiet_seconds=60,
+        enabled=False,
+    )
+
+    started = time.monotonic()
+    coordinator.game_start(
+        system="psx", emulator="libretro", core="pcsx", rom="Game.chd"
+    )
+    coordinator.game_stop(
+        system="psx", emulator="libretro", core="pcsx", rom="Game.chd"
+    )
+    coordinator.drain_pending()
+
+    assert time.monotonic() - started < 0.1
+    assert not (tmp_path / "data").exists()
+
+
+def test_disabled_lifecycle_cli_does_not_construct_coordinator(
+    tmp_path: Path, monkeypatch
+):
+    from romcloud.cli.commands import autosync as autosync_commands
+    from romcloud.cli.main import cli
+
+    config_path = tmp_path / "romcloud.toml"
+    write_config(
+        AppConfig(
+            source=SourceConfig("local", (tmp_path / "roms").as_posix()),
+            cache=CacheConfig((tmp_path / "cache").as_posix()),
+            local_roms_path=(tmp_path / "local-roms").as_posix(),
+            data_path=(tmp_path / "data").as_posix(),
+            saves=SavesConfig(
+                local_path=(tmp_path / "saves").as_posix(),
+                auto_sync_enabled=False,
+            ),
+        ),
+        str(config_path),
+    )
+    monkeypatch.setattr(
+        autosync_commands,
+        "_coordinator",
+        lambda _ctx: (_ for _ in ()).throw(
+            AssertionError("disabled lifecycle entry constructed coordinator")
+        ),
+    )
+
+    runner = CliRunner()
+    for event in ("game-start", "game-stop"):
+        result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(config_path),
+                "_autosync",
+                event,
+                "psx",
+                "libretro",
+                "pcsx",
+                "Game.chd",
+            ],
+        )
+        assert result.exit_code == 0, result.output
 
 
 def test_batocera_hook_detaches_game_stop_but_keeps_start_marker_ordered(tmp_path: Path):

@@ -74,6 +74,7 @@ class TestSavesyncStatus:
         payload = json.loads(result.output.strip())
         assert payload["ok"] is True
         assert payload["remote_configured"] is True
+        assert payload["auto_sync_enabled"] is False
         assert "remote_reachable" not in payload
         assert payload["xbox_enabled"] is False
         assert payload["xbox_hdd_size_bytes"] is None
@@ -207,6 +208,33 @@ class TestSavesyncCommit:
 
 
 class TestSavesyncSettings:
+    def test_auto_sync_toggle_persists_without_mutating_savesync_state(self, tmp_path):
+        cfg_path = _config_path(tmp_path)
+        _invoke(cfg_path, ["savesync-status"])
+        state_path = tmp_path / "data" / "savesync-state.json"
+        state_before = state_path.read_bytes()
+
+        enabled = _invoke(
+            cfg_path,
+            ["savesync-settings"],
+            input=json.dumps({"auto_sync_enabled": True}),
+        )
+        assert enabled.exit_code == 0, enabled.output
+        assert json.loads(enabled.output)["auto_sync_enabled"] is True
+        assert json.loads(_invoke(cfg_path, ["savesync-status"]).output)[
+            "auto_sync_enabled"
+        ] is True
+        assert state_path.read_bytes() == state_before
+
+        disabled = _invoke(
+            cfg_path,
+            ["savesync-settings"],
+            input=json.dumps({"auto_sync_enabled": False}),
+        )
+        assert disabled.exit_code == 0, disabled.output
+        assert json.loads(disabled.output)["auto_sync_enabled"] is False
+        assert state_path.read_bytes() == state_before
+
     def test_enable_xbox_persists_to_config(self, tmp_path):
         cfg_path = _config_path(tmp_path)
 

@@ -94,7 +94,6 @@ from ports_gfx.savesync_screen import (
     REMOTE_CHECKING,
     RESULT,
     SETTINGS,
-    SETTINGS_ITEMS,
     SaveSyncScreenState,
 )
 from ports_gfx.splash import SplashRenderer
@@ -1932,7 +1931,7 @@ def _savesync_body_lines(savesync_screen: SaveSyncScreenState) -> list[str]:
         ]
         if savesync_screen.error:
             lines.append(f"SaveSync: {savesync_screen.error}")
-        return [*lines, "", *SETTINGS_ITEMS]
+        return [*lines, "", *savesync_screen.settings_items]
     if step == APPLYING_SETTINGS:
         return ["Applying setting..."]
     return []
@@ -2078,8 +2077,9 @@ def _render_savesync(  # noqa: ANN001
         )
         is_selected_item = is_selected_item or (
             savesync_screen.step == SETTINGS
-            and line in SETTINGS_ITEMS
-            and SETTINGS_ITEMS.index(line) == savesync_screen.settings_selected_index
+            and line in savesync_screen.settings_items
+            and savesync_screen.settings_items.index(line)
+            == savesync_screen.settings_selected_index
         )
         color = _SELECTED_BG if is_selected_item else _FG_COLOR
         text = fonts["body"].render(line, True, color)

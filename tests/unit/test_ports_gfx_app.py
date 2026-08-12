@@ -833,6 +833,16 @@ class TestHandleSavesyncEvent:
 
         assert not any("%" in line for line in lines)
 
+    def test_settings_displays_user_facing_auto_sync_toggle(self):
+        from ports_gfx import app as app_module
+        from ports_gfx.savesync_screen import SETTINGS
+
+        off = self._screen(step=SETTINGS, status={"auto_sync_enabled": False})
+        on = self._screen(step=SETTINGS, status={"auto_sync_enabled": True})
+
+        assert "Auto Sync Saves: Off" in app_module._savesync_body_lines(off)
+        assert "Auto Sync Saves: On" in app_module._savesync_body_lines(on)
+
     def test_preview_back_returns_to_dashboard(self):
         from ports_gfx import app as app_module
         from ports_gfx.savesync_screen import DASHBOARD, PREVIEW

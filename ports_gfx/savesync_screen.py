@@ -37,6 +37,7 @@ DASHBOARD_ITEMS: tuple[str, ...] = (
     "Back",
 )
 SETTINGS_ITEMS: tuple[str, ...] = (
+    "Auto Sync Saves",
     "Original Xbox virtual drive",
     "Back",
 )
@@ -163,11 +164,40 @@ class SaveSyncScreenState:
         self._start_operation("savesync-settings", {"xbox_enabled": enabled})
         self.step = APPLYING_SETTINGS
 
+    def set_auto_sync_enabled(self, enabled: bool) -> None:
+        self._cancel_runner("_status_runner")
+        self.status_loading = False
+        self._start_operation("savesync-settings", {"auto_sync_enabled": enabled})
+        self.step = APPLYING_SETTINGS
+
+    @property
+    def settings_items(self) -> tuple[str, ...]:
+        auto_label = (
+            "On"
+            if self.status.get("auto_sync_enabled") is True
+            else "Off"
+            if self.status.get("auto_sync_enabled") is False
+            else "Loadingâ€¦"
+            if self.status_loading
+            else "Unknown"
+        )
+        return (
+            f"Auto Sync Saves: {auto_label}",
+            "Original Xbox virtual drive",
+            "Back",
+        )
+
     def select_setting(self, index: int) -> None:
         self.settings_selected_index = max(0, min(index, len(SETTINGS_ITEMS) - 1))
 
     def confirm_settings_selection(self) -> Optional[str]:
         if self.settings_selected_index == 0:
+            if "auto_sync_enabled" not in self.status:
+                self.error = "Local SaveSync settings are still loading."
+            else:
+                self.error = ""
+                self.set_auto_sync_enabled(not self.status["auto_sync_enabled"])
+        elif self.settings_selected_index == 1:
             if "xbox_enabled" not in self.status:
                 self.error = "Local SaveSync settings are still loading."
             else:
@@ -279,6 +309,10 @@ class SaveSyncScreenState:
             if result.ok:
                 self.status = {
                     **self.status,
+                    "auto_sync_enabled": result.data.get(
+                        "auto_sync_enabled",
+                        self.status.get("auto_sync_enabled", False),
+                    ),
                     "xbox_enabled": result.data.get(
                         "xbox_enabled", self.status.get("xbox_enabled", False)
                     ),

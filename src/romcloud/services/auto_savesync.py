@@ -142,19 +142,25 @@ class AutoSaveSyncCoordinator:
         service: SaveSyncService,
         *,
         data_root: Path,
+        enabled: bool,
         policy: Optional[SaveSelectionPolicy] = None,
         quiet_seconds: float = 1.0,
     ) -> None:
         self._service = service
         self._data_root = Path(data_root)
-        self._policy = policy or service.selection_policy
+        self._policy = policy or (service.selection_policy if enabled else None)
         self._sessions = ActiveSessionStore(self._data_root)
         self._quiet_seconds = max(0.0, quiet_seconds)
+        self._enabled = enabled
 
     def game_start(self, *, system: str, emulator: str, core: str, rom: str) -> None:
+        if not self._enabled:
+            return
         self._sessions.start(system=system, emulator=emulator, core=core, rom=rom)
 
     def game_stop(self, *, system: str, emulator: str, core: str, rom: str) -> None:
+        if not self._enabled:
+            return
         session = self._sessions.stop(system=system, rom=rom)
         if self._quiet_seconds:
             time.sleep(self._quiet_seconds)
@@ -168,6 +174,8 @@ class AutoSaveSyncCoordinator:
         self.drain_pending()
 
     def drain_pending(self) -> None:
+        if not self._enabled:
+            return
         lock = _AutoWorkerLock(self._data_root / ".savesync-auto.lock")
         for attempt in range(6):
             if lock.acquire():
