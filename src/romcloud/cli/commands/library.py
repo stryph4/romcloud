@@ -23,6 +23,9 @@ def _set(ctx: click.Context, mode: OperatingMode) -> None:
     except ROMCloudError as exc:
         raise click.ClickException(str(exc)) from exc
     label = f"{mode.value.title()} Mode"
+    if not report.mode_changed:
+        click.echo(f"{label} is already active.")
+        return
     click.echo(
         f"{label} is active: {report.visible} managed game(s) visible."
     )

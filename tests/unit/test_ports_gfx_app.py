@@ -30,9 +30,10 @@ from ports_gfx.app import (
     menu_categories_for_mode,
     menu_categories_for_state,
     root_menu_items_for_state,
-    mode_transition_summary_message,
+    completed_mode_transition_requires_exit,
     operation_summary_message,
     request_relaunch_for_completed_update,
+    render_completed_mode_transition_exit,
     render_completed_update_relaunch,
     start_operation,
 )
@@ -1074,6 +1075,24 @@ class TestUpdateRelaunchRequest:
         armed = {action for action, spec in _OPERATIONS.items() if spec.arms_gui_relaunch}
         assert armed == {"update-install"}
 
+    def test_only_mode_operations_own_normal_terminal_exit(self):
+        from ports_gfx.app import _OPERATIONS
+
+        terminal = {
+            action
+            for action, spec in _OPERATIONS.items()
+            if spec.exits_after_mode_change
+        }
+        assert terminal == {
+            "library-connected",
+            "library-cache",
+            "library-offline",
+        }
+        assert all(
+            not (spec.arms_gui_relaunch and spec.exits_after_mode_change)
+            for spec in _OPERATIONS.values()
+        )
+
     def test_finished_succeeded_non_update_operation_never_arms_relaunch(self):
         """Real-hardware regression: a completed Cache/Connected/Offline
         Mode transition (or any other operation) must never relaunch the
@@ -1178,6 +1197,23 @@ class TestRunAppRelaunchBoundary:
         assert result == 0
         assert calls == []
 
+    def test_normal_terminal_exit_never_launches_a_replacement(self, monkeypatch):
+        import sys
+
+        from ports_gfx import app as app_module
+
+        monkeypatch.setitem(sys.modules, "pygame", object())
+        calls: list[list[str]] = []
+        monkeypatch.setattr(app_module, "_run", lambda *_args: 0)
+
+        result = app_module.run_app(
+            "/opt/romcloud/bin/romcloud",
+            relaunch_popen=lambda argv, **_kwargs: calls.append(argv),
+        )
+
+        assert result == 0
+        assert calls == []
+
 
 class TestOperationSummaryMessage:
     def _operation(self, *, state: OperationState, error: str = ""):
@@ -1204,44 +1240,76 @@ class TestOperationSummaryMessage:
         assert kind == "error"
 
 
-class TestModeTransitionSummaryMessage:
-    """`batocera-es-swissknife --restart` is fire-and-forget — real-hardware
-    regression: control must never silently claim ES is ready to launch the
-    new presentation. A genuine mode transition surfaces an explicit,
-    deterministic manual-refresh reminder instead of a bare success line;
-    same-mode re-entry (nothing restarted) does not."""
-
-    def _operation(self, *, state: OperationState, title: str = "Cache Mode"):
+class TestModeTransitionExit:
+    def _operation(
+        self,
+        *,
+        state: OperationState,
+        payload: str,
+        title: str = "Cache Mode",
+        owns_exit: bool = True,
+    ):
         from ports_gfx.operation_screen import OperationScreenState
 
-        return OperationScreenState(title=title, runner=_FakeFinishedRunner(state, ""))
-
-    def test_genuine_transition_recommends_manual_refresh(self):
-        operation = self._operation(state=OperationState.SUCCEEDED)
-        result = BackendResult(ok=True, data={"manual_refresh_recommended": True})
-
-        message, kind = mode_transition_summary_message(operation, result)
-
-        assert message == (
-            "Cache Mode is active. If a game doesn't launch immediately, "
-            "use Batocera's Refresh Games List."
+        return OperationScreenState(
+            title=title,
+            runner=_FakeUpdateRunner(
+                state,
+                [OperationLine("stdout", payload)],
+            ),
+            exits_after_mode_change=owns_exit,
         )
-        assert kind == "warning"
 
-    def test_same_mode_reentry_reports_plain_success(self):
-        operation = self._operation(state=OperationState.SUCCEEDED)
-        result = BackendResult(ok=True, data={"manual_refresh_recommended": False})
+    def test_genuine_transition_renders_notice_and_requests_normal_exit(self):
+        operation = self._operation(
+            state=OperationState.SUCCEEDED,
+            payload=(
+                '{"ok":true,"mode_changed":true,'
+                '"es_restart_requested":true}'
+            ),
+        )
+        frames: list[object] = []
 
-        message, kind = mode_transition_summary_message(operation, result)
+        assert completed_mode_transition_requires_exit(operation) is True
+        assert render_completed_mode_transition_exit(
+            operation, _RecordingSplash(frames)
+        ) is True
+        assert frames == [
+            (
+                "splash",
+                "Mode changed successfully.",
+                "Refreshing EmulationStation game list…",
+                1.0,
+            )
+        ]
 
-        assert message == "Cache Mode: succeeded"
-        assert kind == "success"
+    def test_same_mode_success_stays_in_romcloud(self):
+        operation = self._operation(
+            state=OperationState.SUCCEEDED,
+            payload=(
+                '{"ok":true,"mode_changed":false,'
+                '"es_restart_requested":false}'
+            ),
+        )
 
-    def test_failed_transition_never_recommends_refresh(self):
-        operation = self._operation(state=OperationState.FAILED)
-        result = BackendResult(ok=False, error="boom")
+        assert completed_mode_transition_requires_exit(operation) is False
 
-        message, kind = mode_transition_summary_message(operation, result)
+    def test_failed_transition_never_exits(self):
+        operation = self._operation(
+            state=OperationState.FAILED,
+            payload='{"ok":false,"error":"boom"}',
+        )
 
-        assert message == "Cache Mode: failed"
-        assert kind == "error"
+        assert completed_mode_transition_requires_exit(operation) is False
+
+    def test_non_mode_operation_cannot_claim_mode_exit(self):
+        operation = self._operation(
+            state=OperationState.SUCCEEDED,
+            payload=(
+                '{"ok":true,"mode_changed":true,'
+                '"es_restart_requested":true}'
+            ),
+            owns_exit=False,
+        )
+
+        assert completed_mode_transition_requires_exit(operation) is False

@@ -45,6 +45,10 @@ class OperationSpec:
     # GUI launch — this is a data field, not a display-title string
     # comparison, so it can't drift if titles are ever renamed or reused.
     arms_gui_relaunch: bool = False
+    # Successful, genuine mode changes return control to EmulationStation
+    # instead of becoming a dismissible dashboard result.  This terminal-exit
+    # ownership is deliberately separate from updater relaunch ownership.
+    exits_after_mode_change: bool = False
 
 
 @dataclass
@@ -63,6 +67,7 @@ class OperationScreenState:
     view is reset by starting a new operation)."""
     details_expanded: bool = False
     arms_gui_relaunch: bool = False
+    exits_after_mode_change: bool = False
 
     @property
     def state(self) -> OperationState:

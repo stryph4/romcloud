@@ -24,6 +24,7 @@ from romcloud.core.models.game import Game, GameAsset
 from romcloud.core.models.proxy import ProxyRecord
 from romcloud.infrastructure.config import AppConfig, CacheConfig, SourceConfig
 from romcloud.infrastructure.database import Database
+from romcloud.infrastructure.library_view import write_operating_mode
 from romcloud.infrastructure.repositories.cache import CacheRepository
 from romcloud.infrastructure.repositories.game import GameRepository
 from romcloud.infrastructure.repositories.proxy import ProxyRepository
@@ -406,6 +407,7 @@ def test_cache_mode_exposes_full_catalog_without_prior_proxy_registration(
         lambda: True,
     )
 
+    write_operating_mode(config, OperatingMode.OFFLINE)
     report = set_operating_mode(config, OperatingMode.CACHE)
 
     proxies = list((Path(config.local_roms_path) / "snes").glob("*.romcloud"))

@@ -276,13 +276,19 @@ _OPERATIONS: dict[str, OperationSpec] = {
     ),
     "refresh": OperationSpec(title="Refresh Catalog", args=("uidata", "refresh-progress")),
     "library-offline": OperationSpec(
-        title="Offline Mode", args=("uidata", "library-offline")
+        title="Offline Mode",
+        args=("uidata", "library-offline"),
+        exits_after_mode_change=True,
     ),
     "library-cache": OperationSpec(
-        title="Cache Mode", args=("uidata", "library-cache")
+        title="Cache Mode",
+        args=("uidata", "library-cache"),
+        exits_after_mode_change=True,
     ),
     "library-connected": OperationSpec(
-        title="Connected Mode", args=("uidata", "library-connected")
+        title="Connected Mode",
+        args=("uidata", "library-connected"),
+        exits_after_mode_change=True,
     ),
     "update-check": OperationSpec(title="Check for Updates", args=("uidata", "update-check")),
     "update-install": OperationSpec(
@@ -414,7 +420,10 @@ def start_operation(action: str, romcloud_bin: str, *, popen=None) -> OperationS
     runner = OperationRunner(argv) if popen is None else OperationRunner(argv, popen=popen)
     runner.start()
     return OperationScreenState(
-        title=spec.title, runner=runner, arms_gui_relaunch=spec.arms_gui_relaunch
+        title=spec.title,
+        runner=runner,
+        arms_gui_relaunch=spec.arms_gui_relaunch,
+        exits_after_mode_change=spec.exits_after_mode_change,
     )
 
 
@@ -432,26 +441,41 @@ def operation_summary_message(operation: OperationScreenState) -> tuple[str, str
     return f"{operation.title}: failed{suffix}", "error"
 
 
-def mode_transition_summary_message(
-    operation: OperationScreenState, result: BackendResult
-) -> tuple[str, str]:
-    """Dashboard message for a finished Connected/Cache/Offline Mode switch.
+def completed_mode_transition_requires_exit(operation: OperationScreenState) -> bool:
+    """Return whether a completed operation owns the normal GUI exit handoff.
 
-    ``batocera-es-swissknife --restart`` is fire-and-forget — ROMCloud has
-    no way to confirm EmulationStation has actually finished reloading
-    before control returns here. Rather than silently trust stale ES
-    state, a genuine transition (``manual_refresh_recommended`` true) gets
-    an explicit, deterministic reminder instead of a bare "succeeded"
-    message. Same-mode re-entry (nothing changed, ES was never restarted)
-    keeps the plain summary.
+    A mode transition is terminal only after the backend confirms that the
+    requested mode really changed and that the existing EmulationStation
+    restart path was requested.  Same-mode no-ops and failed transitions stay
+    in ROMCloud.  This helper never touches ``GuiRelaunchCoordinator``.
     """
-    if operation.succeeded and result.ok and result.data.get("manual_refresh_recommended"):
-        return (
-            f"{operation.title} is active. If a game doesn't launch immediately, "
-            "use Batocera's Refresh Games List.",
-            "warning",
-        )
-    return operation_summary_message(operation)
+    if (
+        not operation.exits_after_mode_change
+        or not operation.is_finished
+        or not operation.succeeded
+    ):
+        return False
+    result = operation_result(operation.runner)
+    return bool(
+        result.ok
+        and result.data.get("mode_changed")
+        and result.data.get("es_restart_requested")
+    )
+
+
+def render_completed_mode_transition_exit(
+    operation: OperationScreenState,
+    splash: SplashRenderer,
+) -> bool:
+    """Paint the terminal mode-change notice before normal GUI shutdown."""
+    if not completed_mode_transition_requires_exit(operation):
+        return False
+    splash.render(
+        "Mode changed successfully.",
+        "Refreshing EmulationStation game list…",
+        1.0,
+    )
+    return True
 
 
 def request_relaunch_for_completed_update(
@@ -1017,12 +1041,21 @@ def _run(  # noqa: ANN001
                         update_check.update_available = False
                         current_screen = "restarting"
                         running = False
+                    elif render_completed_mode_transition_exit(
+                        operation_screen, splash
+                    ):
+                        # The backend process has reconciled presentation,
+                        # requested the ES restart, and exited.  Close the old
+                        # GUI through the normal pygame cleanup path; never arm
+                        # the updater's replacement-launch coordinator.
+                        current_screen = "mode-transition-exit"
+                        running = False
                     elif operation_screen.title == "Refresh Catalog":
                         if ievent.action == Action.UP:
                             catalog_progress.scroll(-1, 6)
                         elif ievent.action == Action.DOWN:
                             catalog_progress.scroll(1, 6)
-                    if not relaunch.terminal:
+                    if running and not relaunch.terminal:
                         current_screen = handle_operation_event(ievent, operation_screen)
                     if current_screen == "menu" and not relaunch.terminal:
                         if operation_screen.title == "Check for Updates":
@@ -1058,9 +1091,7 @@ def _run(  # noqa: ANN001
                             )
                             if bool(operating_state.get("offline_mode", False)):
                                 update_check.update_available = False
-                            message, message_kind = mode_transition_summary_message(
-                                operation_screen, operation_result(operation_screen.runner)
-                            )
+                            message, message_kind = operation_summary_message(operation_screen)
                         else:
                             message, message_kind = operation_summary_message(operation_screen)
                         operation_screen = None
@@ -1083,6 +1114,10 @@ def _run(  # noqa: ANN001
                     ):
                         update_check.update_available = False
                         current_screen = "restarting"
+                        running = False
+                elif operation_screen.is_finished:
+                    if render_completed_mode_transition_exit(operation_screen, splash):
+                        current_screen = "mode-transition-exit"
                         running = False
             elif current_screen == "savesync" and savesync_screen is not None:
                 for line in savesync_screen.poll():

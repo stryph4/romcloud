@@ -16,6 +16,7 @@ from romcloud.core.models.game import Game, GameAsset
 from romcloud.core.models.proxy import ProxyRecord
 from romcloud.infrastructure.config import AppConfig, CacheConfig, SourceConfig
 from romcloud.infrastructure.database import Database
+from romcloud.infrastructure.library_view import write_operating_mode
 from romcloud.infrastructure.providers.local import LocalFilesystemProvider
 from romcloud.infrastructure.repositories.cache import CacheRepository
 from romcloud.infrastructure.repositories.game import GameRepository
@@ -331,6 +332,7 @@ def test_cached_launch_after_cache_transition_is_source_independent(
     historical_root = tmp_path / "romcloud-source"
     game = _game(config, "Cached Game", persisted_source_root=historical_root)
     cached_path = _complete_cache(config, game)
+    write_operating_mode(config, OperatingMode.OFFLINE)
 
     set_operating_mode(config, OperatingMode.CACHE)
     record = ProxyRepository(_database(config)).get(game.id)
@@ -360,6 +362,7 @@ def test_uncached_launch_uses_current_source_root_and_records_completion(
     )
     source_file = Path(config.source.rom_root) / "snes" / "Uncached Game.sfc"
     source_file.write_bytes(content)
+    write_operating_mode(config, OperatingMode.OFFLINE)
     set_operating_mode(config, OperatingMode.CACHE)
     record = ProxyRepository(_database(config)).get(game.id)
     assert record is not None
@@ -389,6 +392,7 @@ def test_cache_connected_cache_round_trip_preserves_ownership_and_converges(
         lambda *args, **kwargs: DirectLinkReport(),
     )
 
+    write_operating_mode(config, OperatingMode.OFFLINE)
     set_operating_mode(config, OperatingMode.CACHE)
     assert len(ProxyRepository(_database(config)).list_all()) == 2
     assert len(list(Path(config.local_roms_path).rglob("*.romcloud"))) == 2
@@ -414,6 +418,7 @@ def test_cache_offline_cache_round_trip_and_offline_launch_are_source_independen
     uncached = _game(config, "Uncached")
     cached_path = _complete_cache(config, cached)
 
+    write_operating_mode(config, OperatingMode.OFFLINE)
     set_operating_mode(config, OperatingMode.CACHE)
     set_operating_mode(config, OperatingMode.OFFLINE)
     repo = ProxyRepository(_database(config))

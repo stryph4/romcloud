@@ -223,6 +223,8 @@ def test_offline_to_cache_restores_catalog_while_source_is_unavailable(tmp_path:
 def test_connected_to_offline_does_not_require_source(tmp_path: Path) -> None:
     config = _config(tmp_path, DIRECT_NAS_MODE)
     (_cached, cached_proxy, _), (_uncached, uncached_proxy, _) = _library(config)
+    local_rom = Path(config.local_roms_path) / "snes" / "Local Game.sfc"
+    local_rom.write_bytes(b"local")
     reconcile_game_access(config, refresh_es=False)
     Path(config.source.rom_root).rename(tmp_path / "disconnected")
 
@@ -230,6 +232,7 @@ def test_connected_to_offline_does_not_require_source(tmp_path: Path) -> None:
 
     assert operating_mode(config) is OperatingMode.OFFLINE
     assert cached_proxy.is_file() and not uncached_proxy.exists()
+    assert local_rom.read_bytes() == b"local"
 
 
 def test_failed_connected_to_cache_restores_dangling_direct_links(
@@ -338,7 +341,9 @@ def test_progress_has_truthful_counts_and_indeterminate_phases(tmp_path: Path) -
     counted = [event for event in events if event.total is not None]
     assert counted and all(event.current is not None for event in counted)
     assert any(
-        event.stage == "emulationstation" and event.status == "running"
+        event.stage == "refresh_notice" and event.status == "running"
+        and event.message
+        == "Mode changed successfully. Refreshing EmulationStation game list…"
         and event.current is None and event.total is None
         for event in events
     )
@@ -346,21 +351,32 @@ def test_progress_has_truthful_counts_and_indeterminate_phases(tmp_path: Path) -
     assert events[-1].current is None and events[-1].total is None
 
 
-def test_reentering_the_active_mode_does_not_restart_es(tmp_path: Path, _stub_es) -> None:
-    """Real-hardware regression: re-selecting the mode that is already
-    active (e.g. an idempotent repair, or readiness recovery calling the
-    same mode again) must not restart EmulationStation — only an actual
-    mode transition may."""
-    refreshes, reloads = _stub_es
+@pytest.mark.parametrize("mode", list(OperatingMode))
+def test_reentering_the_active_mode_is_a_full_noop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: OperatingMode
+) -> None:
+    """Same-mode selection performs no source checks or presentation work."""
     config = _config(tmp_path)
     _library(config)
-    set_operating_mode(config, OperatingMode.CACHE)
-    reloads.clear()
+    write_operating_mode(config, mode)
+    for name in (
+        "_verified_direct_link_snapshot",
+        "_prepare_connected_source",
+        "_apply_mode_presentation",
+        "_update_emulationstation",
+    ):
+        monkeypatch.setattr(
+            f"romcloud.integrations.batocera.game_access.{name}",
+            lambda *_args, _name=name, **_kwargs: (_ for _ in ()).throw(
+                AssertionError(f"same-mode request called {_name}")
+            ),
+        )
 
-    set_operating_mode(config, OperatingMode.CACHE)
+    report = set_operating_mode(config, mode)
 
-    assert reloads == []
-    assert operating_mode(config) is OperatingMode.CACHE
+    assert report.mode_changed is False
+    assert report.es_restarted is False
+    assert operating_mode(config) is mode
 
 
 def test_reconnect_readiness_recovery_never_restarts_es(tmp_path: Path, _stub_es) -> None:
@@ -405,7 +421,68 @@ def test_genuine_transition_reports_es_restarted(
 
     report = set_operating_mode(config, requested)
 
+    assert report.mode_changed is True
     assert report.es_restarted is True
+    assert operating_mode(config) is requested
+    refreshes, reloads = _stub_es
+    assert refreshes and refreshes[-1][1] == requested.value
+    assert reloads == [True]
+
+
+def test_mode_state_and_refresh_notice_precede_es_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _library(config)
+    write_operating_mode(config, OperatingMode.CACHE)
+    timeline: list[str] = []
+
+    def progress(event: ProgressEvent) -> None:
+        timeline.append(f"progress:{event.stage}")
+
+    def refresh(_config, _systems, **kwargs) -> None:  # noqa: ANN001
+        assert operating_mode(config) is OperatingMode.OFFLINE
+        assert OperatingMode(kwargs["mode"]) is OperatingMode.OFFLINE
+        timeline.append("es:refresh")
+
+    monkeypatch.setattr(
+        "romcloud.integrations.batocera.game_access._refresh_emulationstation",
+        refresh,
+    )
+    monkeypatch.setattr(
+        "romcloud.integrations.batocera.game_access._reload_emulationstation",
+        lambda: timeline.append("es:restart") or True,
+    )
+
+    set_operating_mode(config, OperatingMode.OFFLINE, progress=progress)
+
+    notice = timeline.index("progress:refresh_notice")
+    refresh_call = timeline.index("es:refresh")
+    restart_call = timeline.index("es:restart")
+    assert notice < refresh_call < restart_call
+
+
+def test_failed_es_refresh_restores_pre_transition_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    (_cached, cached_proxy, _), (_uncached, uncached_proxy, _) = _library(config)
+    write_operating_mode(config, OperatingMode.CACHE)
+
+    def refresh(_config, _systems, **kwargs) -> None:  # noqa: ANN001
+        if OperatingMode(kwargs["mode"]) is OperatingMode.OFFLINE:
+            raise RuntimeError("ES refresh failed")
+
+    monkeypatch.setattr(
+        "romcloud.integrations.batocera.game_access._refresh_emulationstation",
+        refresh,
+    )
+
+    with pytest.raises(ModeTransitionError, match="remains in Cache Mode"):
+        set_operating_mode(config, OperatingMode.OFFLINE)
+
+    assert operating_mode(config) is OperatingMode.CACHE
+    assert cached_proxy.is_file() and uncached_proxy.is_file()
 
 
 @pytest.mark.parametrize(
@@ -424,6 +501,7 @@ def test_same_mode_reentry_reports_es_not_restarted(
     report = set_operating_mode(config, mode)
 
     assert report.es_restarted is False
+    assert report.mode_changed is False
 
 
 def test_operating_mode_lock_still_serializes_backend_transitions(tmp_path: Path) -> None:

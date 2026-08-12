@@ -59,6 +59,10 @@ class LibraryPresentationReport:
     visible: int = 0
     save_sync_available: bool = False
     save_reconcile: dict | None = None
+    # True only when the requested mode differed from the persisted mode and
+    # the presentation/state transition completed.  Same-mode selection is a
+    # lightweight no-op and leaves every count at its default value.
+    mode_changed: bool = False
     # True only when this transition actually asked Batocera to restart ES
     # (a real mode change, never a same-mode re-entry). `--restart` is a
     # fire-and-forget external tool with no readiness signal ROMCloud can
@@ -590,6 +594,7 @@ def _update_emulationstation(
     progress: ProgressSink,
     *,
     restart: bool = True,
+    announce_mode_change: bool = False,
 ) -> None:
     """Regenerate the owned ES override, restarting ES only when *restart*.
 
@@ -598,13 +603,22 @@ def _update_emulationstation(
     transition, or a rollback reverting one), never for an idempotent
     re-entry into the mode that is already active.
     """
-    emit_progress(
-        progress,
-        "operating_mode",
-        "emulationstation",
-        "running",
-        "Updating EmulationStation",
-    )
+    if announce_mode_change:
+        emit_progress(
+            progress,
+            "operating_mode",
+            "refresh_notice",
+            "running",
+            "Mode changed successfully. Refreshing EmulationStation game list…",
+        )
+    else:
+        emit_progress(
+            progress,
+            "operating_mode",
+            "emulationstation",
+            "running",
+            "Updating EmulationStation",
+        )
     _refresh_emulationstation(
         config,
         container.game_repo.list_systems(),
@@ -633,6 +647,17 @@ def set_operating_mode(
     requested = OperatingMode(mode)
     with _operating_mode_lock(config):
         previous = operating_mode(config)
+        if requested is previous:
+            emit_progress(
+                progress,
+                "operating_mode",
+                "complete",
+                "success",
+                f"{requested.value.title()} Mode is already active",
+            )
+            return LibraryPresentationReport(
+                offline=requested is OperatingMode.OFFLINE,
+            )
         previous_links = (
             _verified_direct_link_snapshot(config)
             if previous is OperatingMode.CONNECTED
@@ -646,6 +671,7 @@ def set_operating_mode(
             f"Preparing {requested.value.title()} Mode",
         )
         presentation_attempted = False
+        state_committed = False
         try:
             if requested is OperatingMode.CONNECTED:
                 _prepare_connected_source(config, progress)
@@ -653,21 +679,27 @@ def set_operating_mode(
             report, container = _apply_mode_presentation(
                 config, requested, progress=progress
             )
-            restart_requested = requested is not previous
-            _update_emulationstation(
-                config, container, requested, progress, restart=restart_requested
+            emit_progress(
+                progress,
+                "operating_mode",
+                "finalize",
+                "running",
+                "Finalizing mode",
             )
-            report = replace(report, es_restarted=restart_requested)
-            if previous is not requested:
-                emit_progress(
-                    progress,
-                    "operating_mode",
-                    "finalize",
-                    "running",
-                    "Finalizing mode",
-                )
-                # Atomic state persistence is the transition commit point.
-                write_operating_mode(config, requested)
+            # Atomic state persistence is the transition commit point.  Commit
+            # before asking Batocera to refresh so the restarted frontend and
+            # a later manual ROMCloud launch both observe the requested mode.
+            write_operating_mode(config, requested)
+            state_committed = True
+            _update_emulationstation(
+                config,
+                container,
+                requested,
+                progress,
+                restart=True,
+                announce_mode_change=True,
+            )
+            report = replace(report, mode_changed=True, es_restarted=True)
             emit_progress(
                 progress,
                 "operating_mode",
@@ -695,6 +727,8 @@ def set_operating_mode(
                         _rollback, rollback_container = _apply_mode_presentation(
                             config, previous
                         )
+                    if state_committed:
+                        write_operating_mode(config, previous)
                     _update_emulationstation(
                         config, rollback_container, previous, None
                     )

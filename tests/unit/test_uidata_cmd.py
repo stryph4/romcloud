@@ -180,17 +180,15 @@ class TestRefresh:
 
 
 class TestLibraryModeAction:
-    """`romcloud uidata library-cache|library-connected|library-offline` —
-    the GUI's manual-refresh reminder is driven entirely by whether
-    `set_operating_mode` actually restarted ES, never a hardcoded value."""
+    """Mode lifecycle state is passed explicitly to the graphical client."""
 
-    def test_genuine_transition_recommends_manual_refresh(self, tmp_path, monkeypatch):
+    def test_genuine_transition_requests_terminal_es_handoff(self, tmp_path, monkeypatch):
         from romcloud.integrations.batocera.game_access import LibraryPresentationReport
 
         monkeypatch.setattr(
             "romcloud.integrations.batocera.game_access.set_operating_mode",
             lambda config, mode, progress=None: LibraryPresentationReport(
-                offline=False, es_restarted=True
+                offline=False, mode_changed=True, es_restarted=True
             ),
         )
 
@@ -199,9 +197,10 @@ class TestLibraryModeAction:
         assert result.exit_code == 0, result.output
         payload = json.loads(result.output.strip().splitlines()[-1])
         assert payload["ok"] is True
-        assert payload["manual_refresh_recommended"] is True
+        assert payload["mode_changed"] is True
+        assert payload["es_restart_requested"] is True
 
-    def test_same_mode_reentry_does_not_recommend_manual_refresh(self, tmp_path, monkeypatch):
+    def test_same_mode_reentry_does_not_request_terminal_handoff(self, tmp_path, monkeypatch):
         from romcloud.integrations.batocera.game_access import LibraryPresentationReport
 
         monkeypatch.setattr(
@@ -216,7 +215,8 @@ class TestLibraryModeAction:
         assert result.exit_code == 0, result.output
         payload = json.loads(result.output.strip().splitlines()[-1])
         assert payload["ok"] is True
-        assert payload["manual_refresh_recommended"] is False
+        assert payload["mode_changed"] is False
+        assert payload["es_restart_requested"] is False
 
 
 class TestLibrarySyncBridge:
