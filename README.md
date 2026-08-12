@@ -1,5 +1,8 @@
 # ROMCloud
 
+## Install on Batocera
+curl -fsSL https://romcloud.app/install | bash
+
 **Browse a large ROM library in Batocera without keeping the whole library on
 the device.**
 
