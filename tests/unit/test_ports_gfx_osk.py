@@ -47,6 +47,13 @@ class TestBasicTextEntry:
         state.activate(backspace_index)
         assert state.text == ""
 
+    def test_backspace_works_on_symbols_page(self):
+        state = OskState(initial_text="abc")
+        state.toggle_symbols()
+        backspace_index = next(i for i, k in enumerate(state.keys) if k.kind == "backspace")
+        state.activate(backspace_index)
+        assert state.text == "ab"
+
 
 class TestSymbolsPage:
     def test_symbols_toggle_switches_page(self):
@@ -72,6 +79,11 @@ class TestSymbolsPage:
         symbols_key2 = next(k for k in state.keys if k.kind == "symbols")
         assert state.key_label(symbols_key2) == "ABC"
 
+    def test_shift_label_uses_ascii_text(self):
+        state = OskState()
+        shift_key = next(k for k in state.keys if k.kind == "shift")
+        assert state.key_label(shift_key) == "Shift"
+
     def test_digit_key_on_symbols_page_inserts_digit(self):
         state = OskState()
         state.toggle_symbols()
@@ -94,6 +106,16 @@ class TestConfirmCancel:
         state.activate(cancel_index)
         assert state.cancelled is True
         assert state.confirmed is False
+
+
+class TestSpecialKeyLabels:
+    def test_special_key_labels_are_ascii_portable(self):
+        state = OskState(masked=True)
+        labels = {key.kind: state.key_label(key) for key in state.keys if key.kind != "char"}
+        for label in labels.values():
+            assert label.isascii()
+        assert labels["shift"] == "Shift"
+        assert labels["backspace"] == "Backspace"
 
 
 class TestMaskedPassword:

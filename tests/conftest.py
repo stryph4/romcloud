@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from romcloud.infrastructure.database import Database
 from romcloud.infrastructure.repositories.game import GameRepository
@@ -11,9 +12,11 @@ from romcloud.infrastructure.repositories.cache import CacheRepository
 from romcloud.infrastructure.repositories.proxy import ProxyRepository
 from romcloud.core.models.cache import CachePolicy
 from romcloud.infrastructure.providers.local import LocalFilesystemProvider
-from romcloud.services.transfer import TransferService
-from romcloud.services.cache import CacheService
 from romcloud.integrations.batocera.catalog import CatalogService
+
+if TYPE_CHECKING:
+    from romcloud.services.cache import CacheService
+    from romcloud.services.transfer import TransferService
 
 
 @pytest.fixture
@@ -84,6 +87,8 @@ def provider() -> LocalFilesystemProvider:
 
 @pytest.fixture
 def transfer_service(provider: LocalFilesystemProvider, cache_dir: Path) -> TransferService:
+    from romcloud.services.transfer import TransferService
+
     return TransferService(provider=provider, cache_root=str(cache_dir))
 
 
@@ -100,6 +105,8 @@ def cache_service(
     cache_dir: Path,
     policy: CachePolicy,
 ) -> CacheService:
+    from romcloud.services.cache import CacheService
+
     return CacheService(
         cache_repo=cache_repo,
         game_repo=game_repo,

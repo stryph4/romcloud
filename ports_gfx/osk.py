@@ -146,9 +146,9 @@ class OskState:
         if key.kind == "space":
             return "Space"
         if key.kind == "backspace":
-            return "\u232b"
+            return "Backspace"
         if key.kind == "shift":
-            return "\u21e7"
+            return "Shift"
         if key.kind == "symbols":
             return "123" if self.page == "letters" else "ABC"
         if key.kind == "mask":
