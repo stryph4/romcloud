@@ -68,7 +68,7 @@ def refresh_cmd(ctx: click.Context, system: str | None, dry_run: bool) -> None:
             )
         else:
             click.echo(
-                "Updated Connected Mode exposure "
+                "Updated Direct exposure "
                 f"({access_result.created} link(s) created, {access_result.removed} removed)."
             )
         es_missing = getattr(access_result, "es_missing_systems", ())

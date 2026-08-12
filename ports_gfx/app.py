@@ -186,25 +186,31 @@ def root_menu_items_for_state(state: dict[str, object]) -> tuple[MenuItem, ...]:
     active_mode = str(state.get("operating_mode", "cache"))
     items.append(
         MenuItem(
-            "Connected Mode",
+            "Direct",
             ACTIVE_MODE_ACTION if active_mode == "connected" else "library-connected",
-            "Active" if active_mode == "connected" else "Use your configured ROM source directly.",
+            "Active"
+            if active_mode == "connected"
+            else "Play games directly from the configured ROM source.",
             active=active_mode == "connected",
         )
     )
     items.append(
         MenuItem(
-            "Cache Mode",
+            "Cached Storage",
             ACTIVE_MODE_ACTION if active_mode == "cache" else "library-cache",
-            "Active" if active_mode == "cache" else "Keep your library available and cache games as you play.",
+            "Active"
+            if active_mode == "cache"
+            else "Copy games into ROMCloud-managed local storage as needed, then play them locally.",
             active=active_mode == "cache",
         )
     )
     items.append(
         MenuItem(
-            "Offline Mode",
+            "Offline",
             ACTIVE_MODE_ACTION if active_mode == "offline" else "library-offline",
-            "Active" if active_mode == "offline" else "Use only games already available on this device.",
+            "Active"
+            if active_mode == "offline"
+            else "Show and launch only games already available locally.",
             active=active_mode == "offline",
         )
     )
@@ -276,17 +282,17 @@ _OPERATIONS: dict[str, OperationSpec] = {
     ),
     "refresh": OperationSpec(title="Refresh Catalog", args=("uidata", "refresh-progress")),
     "library-offline": OperationSpec(
-        title="Offline Mode",
+        title="Offline",
         args=("uidata", "library-offline"),
         exits_after_mode_change=True,
     ),
     "library-cache": OperationSpec(
-        title="Cache Mode",
+        title="Cached Storage",
         args=("uidata", "library-cache"),
         exits_after_mode_change=True,
     ),
     "library-connected": OperationSpec(
-        title="Connected Mode",
+        title="Direct",
         args=("uidata", "library-connected"),
         exits_after_mode_change=True,
     ),
@@ -369,7 +375,12 @@ def format_result(action: str, result: BackendResult) -> str:
             if selected is None and result.data.get("offline_library_mode"):
                 selected = "offline"
             if selected in {"connected", "cache", "offline"}:
-                body += f" | {str(selected).title()} Mode"
+                mode_labels = {
+                    "connected": "Direct",
+                    "cache": "Cached Storage",
+                    "offline": "Offline",
+                }
+                body += f" | {mode_labels[str(selected)]}"
             return f"{action}: {body}"
         reachable = result.data.get("source_reachable")
         body = f"{source_prefix} | {'reachable' if reachable else 'unreachable'}" if source_prefix else (
@@ -1077,9 +1088,7 @@ def _run(  # noqa: ANN001
                             connection = call_backend(romcloud_bin, "connection-status")
                             message = format_result("connection-status", connection)
                             message_kind = classify_message_kind("connection-status", connection)
-                        elif operation_screen.title in (
-                            "Connected Mode", "Cache Mode", "Offline Mode"
-                        ):
+                        elif operation_screen.title in ("Direct", "Cached Storage", "Offline"):
                             setup_status = call_backend(romcloud_bin, "setup-status")
                             operating_state = operating_state_from_status(setup_status.data)
                             library_sync_enabled = bool(
@@ -1646,7 +1655,7 @@ def _render_operation(  # noqa: ANN001
             catalog_progress,
             top=output_top,
         )
-    elif operation.title in ("Connected Mode", "Cache Mode", "Offline Mode"):
+    elif operation.title in ("Direct", "Cached Storage", "Offline"):
         _render_mode_progress(
             pygame,
             screen,
@@ -2191,7 +2200,7 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
     if wizard.step == WizardStep.GAME_ACCESS:
         return [
             *context,
-            "You can switch among Connected, Cache, and Offline Mode later from the main menu.",
+            "You can switch among Direct, Cached Storage, and Offline later from the main menu.",
         ]
     if wizard.step == WizardStep.LIBRARY_SYNC:
         return [
@@ -2210,9 +2219,9 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
             "\u2713 Connected  \u2713 Read access verified",
             f"Systems: {len(wizard.systems)}",
             "Game access: " + (
-                "Connected Mode (source required while playing)"
+                "Direct (source required while playing)"
                 if wizard.game_access_mode == "direct_nas"
-                else "Cache Mode"
+                else "Cached Storage"
             ),
             (
                 f"ROMCloud data: //{wizard.remote_server}/{wizard.remote_share} [Read/write]"
@@ -2264,7 +2273,7 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
                 f"Cache size: {wizard.applied_summary.get('max_size_gb', wizard.max_size_gb):g} GB"
             )
         else:
-            lines.append("Connected Mode: the source must remain reachable while playing.")
+            lines.append("Direct: the source must remain reachable while playing.")
         if wizard.library_sync_enabled:
             lines.append(
                 "Optional metadata was not imported. Use Library > Import Source Metadata when ready."

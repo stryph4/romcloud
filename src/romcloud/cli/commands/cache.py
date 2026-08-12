@@ -20,7 +20,7 @@ def _fmt_bytes(n: int) -> str:
 @click.option(
     "--override",
     is_flag=True,
-    help="Allow this cache command while Connected Mode is active.",
+    help="Allow this cache command while Direct is active.",
 )
 @click.pass_context
 def cache_group(ctx: click.Context, override: bool) -> None:
@@ -39,7 +39,7 @@ def _require_cache_mode(ctx: click.Context) -> None:
         and not ctx.obj.get("cache_override", False)
     ):
         raise click.ClickException(
-            "Cache commands are unavailable in Connected Mode because games are "
+            "Cache commands are unavailable in Direct because games are "
             "played from the configured source. Re-run this one command with "
             "`romcloud cache --override ...` to proceed without changing modes."
         )

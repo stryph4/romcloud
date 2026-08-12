@@ -180,9 +180,9 @@ def test_detected_systems_lead_to_explicit_game_access_and_remote_data_choices()
     wizard._confirm("romcloud")  # noqa: SLF001 - pure navigation test
 
     assert wizard.step == WizardStep.GAME_ACCESS
-    assert wizard.options == ["Cache Mode", "Connected Mode"]
+    assert wizard.options == ["Cached Storage", "Direct"]
 
-    wizard._confirm("romcloud")  # Cache Mode
+    wizard._confirm("romcloud")  # Cached Storage
 
     assert wizard.step == WizardStep.REMOTE_DATA
     assert wizard.options == [

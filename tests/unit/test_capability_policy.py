@@ -52,7 +52,7 @@ def test_offline_policy_has_narrow_explicit_capabilities(offline_policy) -> None
     serialized = offline_policy.serialize()
     assert serialized["presentation_intent"] == "offline"
     assert serialized["capabilities"]["save_sync"] is False
-    assert "Offline Mode" in serialized["blocked_reasons"]["save_sync"]
+    assert "Offline" in serialized["blocked_reasons"]["save_sync"]
 
 
 def test_configured_strategy_does_not_override_authoritative_offline_state() -> None:
@@ -85,7 +85,7 @@ def test_catalog_guard_runs_before_provider_access(
         capability_policy=offline_policy,
     )
 
-    with pytest.raises(CapabilityUnavailableError, match="Offline Mode"):
+    with pytest.raises(CapabilityUnavailableError, match="Offline"):
         service.refresh()
     assert not touched
 
@@ -125,7 +125,7 @@ def test_cached_game_and_local_cache_management_work_but_cache_miss_is_blocked(
     assert cache_repo.get(game_with_file.id).is_pinned
     offline_cache.unpin(game_with_file.id)
     offline_cache.remove(game_with_file.id)
-    with pytest.raises(CapabilityUnavailableError, match="Offline Mode"):
+    with pytest.raises(CapabilityUnavailableError, match="Offline"):
         offline_cache.cache_game(game_with_file.id)
 
 
@@ -148,7 +148,7 @@ def test_savesync_guard_precedes_connectivity_and_preserves_local_saves(
         capability_policy=offline_policy,
     )
 
-    with pytest.raises(CapabilityUnavailableError, match="Offline Mode"):
+    with pytest.raises(CapabilityUnavailableError, match="Offline"):
         service.preview_upload()
     provider.is_reachable.assert_not_called()
     assert save.read_bytes() == b"local-save"
@@ -188,8 +188,8 @@ def test_cli_refresh_and_update_are_blocked_without_network_work(tmp_path: Path)
     update = runner.invoke(cli, ["--config", str(config_path), "update", "--check"])
 
     assert refresh.exit_code == update.exit_code == 1
-    assert "Offline Mode" in refresh.output
-    assert "Offline Mode" in update.output
+    assert "Offline" in refresh.output
+    assert "Offline" in update.output
 
 
 def test_uncached_cli_launch_is_blocked_before_provider_probe(
@@ -220,5 +220,5 @@ def test_uncached_cli_launch_is_blocked_before_provider_probe(
     result = CliRunner().invoke(launch_module.launch_cmd, ["Game.romcloud"], obj={})
 
     assert result.exit_code == 1
-    assert "Offline Mode" in result.output
+    assert "Offline" in result.output
     provider.is_reachable.assert_not_called()

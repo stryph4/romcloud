@@ -32,15 +32,15 @@ like Batocera while the bulk of the library lives somewhere else.
 
 -   **Browse your library normally.** Remote games appear in
     EmulationStation alongside ordinary local games.
--   **Cache games automatically.** In Cache Mode, launching an uncached
+-   **Cache games automatically.** In Cached Storage, launching an uncached
     game transfers and verifies it before handing it to Batocera.
 -   **Keep storage bounded.** Configure a cache size and minimum
     free-space reserve; ROMCloud uses LRU eviction and supports pinning.
 -   **Play cached games without the NAS.** Complete cached games can
     launch without the source being reachable.
--   **Use your source directly.** Connected Mode launches from the
+-   **Use your source directly.** Direct launches from the
     configured source instead of duplicating games into the cache.
--   **Take a smaller library offline.** Offline Mode exposes only games
+-   **Take a smaller library offline.** Offline exposes only games
     whose required assets are already cached.
 -   **Keep Batocera in control.** ROMCloud does not replace
     EmulationStation, emulator configuration, or `emulatorlauncher`.
@@ -58,33 +58,33 @@ like Batocera while the bulk of the library lives somewhere else.
 ROMCloud has one explicit operating mode at a time. Losing network
 connectivity does **not** silently change the selected mode.
 
-  -----------------------------------------------------------------------
-  Mode              What you see      How games launch  Source required?
-  ----------------- ----------------- ----------------- -----------------
-  **Connected**     Managed remote    Directly from the Yes
-                    library           configured source 
+-   **Direct**
+        What you see: Managed source library.
+        How games launch: Directly from the configured source.
+        Source required: Yes.
+-   **Cached Storage**
+        What you see: Full managed library.
+        How games launch: Games are copied into ROMCloud-managed local
+        storage as needed, then launched locally.
+        Source required: Only when a game is missing locally.
+-   **Offline**
+        What you see: Only complete cached games.
+        How games launch: Entirely from local cache.
+        Source required: No.
 
-  **Cache**         Full managed      From cache;       Only for cache
-                    library           missing games are misses
-                                      fetched first     
-
-  **Offline**       Only complete     Entirely from     No
-                    cached games      local cache       
-  -----------------------------------------------------------------------
-
-### Connected Mode
+### Direct
 
 Use this when the NAS, PC, or external source is available and you want
 to launch games directly from it. Existing cache files and pins are
 preserved but are not the normal launch path.
 
-### Cache Mode
+### Cached Storage
 
 Use this when you want the full library visible but prefer games to run
 from local storage. Cached games launch immediately. Uncached games are
 transferred, verified, and added to the managed cache before launch.
 
-### Offline Mode
+### Offline
 
 Use this when the source will not be available. ROMCloud exposes only
 managed games with complete local cache assets. Ordinary local Batocera

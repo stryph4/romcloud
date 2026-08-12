@@ -83,7 +83,7 @@ class CapabilityPolicy:
         if self.offline and capability in _OFFLINE_BLOCKED:
             return CapabilityDecision(
                 False,
-                "Unavailable while Offline Mode is active. Switch to Cache or Connected Mode first.",
+                "Unavailable while Offline is active. Switch to Cached Storage or Direct first.",
             )
         return CapabilityDecision(True)
 

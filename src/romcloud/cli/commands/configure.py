@@ -128,15 +128,15 @@ def configure_cmd(
 
     if game_access_mode is None and not non_interactive:
         click.echo("\nWhich initial ROMCloud operating mode should be used?")
-        click.echo("  smart_cache  Cache Mode; download on first launch")
-        click.echo("  direct_nas   Connected Mode; use the source directly")
+        click.echo("  smart_cache  Cached Storage; copy to local storage on first launch")
+        click.echo("  direct_nas   Direct; launch from the configured source")
         game_access_mode = click.prompt(
             "Game access mode",
             type=click.Choice([SMART_CACHE_MODE, DIRECT_NAS_MODE], case_sensitive=False),
             default=existing.game_access_mode if existing else SMART_CACHE_MODE,
         )
         if game_access_mode.lower() == DIRECT_NAS_MODE:
-            click.echo("Connected Mode uses the configured source directly.")
+            click.echo("Direct launches games from the configured source.")
     game_access_mode = (
         game_access_mode
         or (existing.game_access_mode if existing else SMART_CACHE_MODE)

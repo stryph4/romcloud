@@ -13,9 +13,9 @@ from ports_gfx.wizard import WizardState, WizardStep
 def test_root_items_preserve_the_requested_compact_order_and_actions():
     assert [item.label for item in ROOT_MENU_ITEMS] == [
         "Library",
-        "Connected Mode",
-        "Cache Mode",
-        "Offline Mode",
+        "Direct",
+        "Cached Storage",
+        "Offline",
         "Storage",
         "SaveSync",
         "Maintenance",
@@ -49,7 +49,7 @@ def test_every_preexisting_action_is_mapped_once_without_renaming():
         if not item.action.startswith(CATEGORY_ACTION_PREFIX)
     )
     assert old.issubset(set(mapped))
-    assert ("library-offline", "Offline Mode") in mapped
+    assert ("library-offline", "Offline") in mapped
     assert ("refresh", "Refresh Catalog") in mapped
     assert ("connection-mount", "Mount / Reconnect") in mapped
     assert ("connection-unmount", "Unmount") in mapped

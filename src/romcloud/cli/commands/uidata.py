@@ -484,7 +484,7 @@ def uidata_healthcheck(ctx: click.Context) -> None:
 
 
 @uidata_group.command("cache-status")
-@click.option("--override", is_flag=True, help="Allow this request in Connected Mode.")
+@click.option("--override", is_flag=True, help="Allow this request in Direct.")
 @click.pass_context
 def uidata_cache_status(ctx: click.Context, override: bool) -> None:
     """Cache summary as JSON."""
@@ -497,7 +497,7 @@ def uidata_cache_status(ctx: click.Context, override: bool) -> None:
 
         if operating_mode(container.config) is OperatingMode.CONNECTED and not override:
             raise ValueError(
-                "Cache status is unavailable in Connected Mode; pass --override "
+                "Cache status is unavailable in Direct; pass --override "
                 "for this request only."
             )
         summary = container.cache.status_summary()

@@ -13,7 +13,14 @@ from romcloud.integrations.batocera.game_access import set_operating_mode
 
 @click.group("library")
 def library_group() -> None:
-    """Select Connected, Cache, or Offline operating mode."""
+    """Select Direct, Cached Storage, or Offline operating mode."""
+
+
+_MODE_LABELS = {
+    OperatingMode.CONNECTED: "Direct",
+    OperatingMode.CACHE: "Cached Storage",
+    OperatingMode.OFFLINE: "Offline",
+}
 
 
 def _set(ctx: click.Context, mode: OperatingMode) -> None:
@@ -22,7 +29,7 @@ def _set(ctx: click.Context, mode: OperatingMode) -> None:
         report = set_operating_mode(container.config, mode)
     except ROMCloudError as exc:
         raise click.ClickException(str(exc)) from exc
-    label = f"{mode.value.title()} Mode"
+    label = _MODE_LABELS[mode]
     if not report.mode_changed:
         click.echo(f"{label} is already active.")
         return
@@ -38,12 +45,12 @@ def library_status(ctx: click.Context) -> None:
     container = get_container(ctx)
     selected = operating_mode(container.config)
     descriptions = {
-        OperatingMode.CONNECTED: "use the configured ROM source directly",
-        OperatingMode.CACHE: "show the managed library and cache games on demand",
-        OperatingMode.OFFLINE: "show only games playable locally",
+        OperatingMode.CONNECTED: "play games directly from the configured ROM source",
+        OperatingMode.CACHE: "copy games into ROMCloud-managed local storage as needed, then play them locally",
+        OperatingMode.OFFLINE: "show and use only games already available locally",
     }
     click.echo(
-        f"Operating mode: {selected.value.title()} Mode ({descriptions[selected]})"
+        f"Operating mode: {_MODE_LABELS[selected]} ({descriptions[selected]})"
     )
 
 
@@ -71,5 +78,5 @@ def library_offline(ctx: click.Context) -> None:
 @library_group.command("online", hidden=True)
 @click.pass_context
 def library_online_compat(ctx: click.Context) -> None:
-    """Compatibility alias for Connected Mode."""
+    """Compatibility alias for Direct."""
     _set(ctx, OperatingMode.CONNECTED)

@@ -75,7 +75,7 @@ class TestMenuItems:
             display=SimpleNamespace(flip=lambda: None),
         )
         layout = compute_layout(800, 600, 1)
-        state = MenuState([MenuItem("Connected Mode", "connected", "Use configured storage")])
+        state = MenuState([MenuItem("Direct", "connected", "Use configured storage")])
 
         _render_menu(
             pygame,
@@ -140,10 +140,10 @@ class TestMenuItems:
             {"game_access_mode": "direct_nas", "operating_mode": "connected",
              "offline_mode": False, "capabilities": {}}
         )
-        assert [item.label for item in direct_roots if "Mode" in item.label] == [
-            "Connected Mode", "Cache Mode", "Offline Mode"
+        assert [item.label for item in direct_roots if item.label in {"Direct", "Cached Storage", "Offline"}] == [
+            "Direct", "Cached Storage", "Offline"
         ]
-        assert next(item for item in direct_roots if item.label == "Connected Mode").active
+        assert next(item for item in direct_roots if item.label == "Direct").active
 
     def test_mode_control_is_prominent_and_exit_is_top_level(self):
         cache_state = {
@@ -161,11 +161,11 @@ class TestMenuItems:
         cache_roots = root_menu_items_for_state(cache_state)
         offline_roots = root_menu_items_for_state(offline_state)
         assert [item.label for item in cache_roots[1:4]] == [
-            "Connected Mode", "Cache Mode", "Offline Mode"
+            "Direct", "Cached Storage", "Offline"
         ]
         assert not cache_roots[1].active and cache_roots[2].active and not cache_roots[3].active
         assert [item.label for item in offline_roots[1:4]] == [
-            "Connected Mode", "Cache Mode", "Offline Mode"
+            "Direct", "Cached Storage", "Offline"
         ]
         assert not offline_roots[1].active and not offline_roots[2].active and offline_roots[3].active
         assert all(
@@ -173,7 +173,7 @@ class TestMenuItems:
             for item in menu_categories_for_state(offline_state, True)["Library"]
         )
         assert [item.label for item in offline_roots] == [
-            "Library", "Connected Mode", "Cache Mode", "Offline Mode",
+            "Library", "Direct", "Cached Storage", "Offline",
             "Storage", "Settings", "Exit"
         ]
         assert all(item.action != EXIT_ACTION for item in MENU_CATEGORIES["Settings"])
@@ -531,7 +531,7 @@ class TestFormatResult:
             },
         )
 
-        assert "Offline Mode" in format_result("status", result)
+        assert "Offline" in format_result("status", result)
 
     def test_healthcheck_result_formats_source_summary(self):
         result = BackendResult(
@@ -739,10 +739,10 @@ class TestHandleMenuEvent:
         from ports_gfx import app as app_module
         from ports_gfx.operation_screen import OperationScreenState
 
-        state = MenuState([MenuItem("Cache Mode", "library-cache")])
+        state = MenuState([MenuItem("Cached Storage", "library-cache")])
         layout = self._layout(state)
         active = OperationScreenState(
-            title="Cache Mode",
+            title="Cached Storage",
             runner=SimpleNamespace(
                 state=OperationState.RUNNING,
                 is_finished=False,
@@ -1094,15 +1094,15 @@ class TestUpdateRelaunchRequest:
         )
 
     def test_finished_succeeded_non_update_operation_never_arms_relaunch(self):
-        """Real-hardware regression: a completed Cache/Connected/Offline
-        Mode transition (or any other operation) must never relaunch the
+        """Real-hardware regression: a completed Cached Storage/Direct/Offline
+        transition (or any other operation) must never relaunch the
         GUI, even though it is finished and succeeded — only the explicit
         ``arms_gui_relaunch`` flag may authorize that, never the title or
         the fact that the operation succeeded."""
         from ports_gfx.operation_screen import OperationScreenState
 
         coordinator = GuiRelaunchCoordinator("/opt/romcloud/bin/romcloud")
-        for title in ("Cache Mode", "Connected Mode", "Offline Mode", "Refresh Catalog"):
+        for title in ("Cached Storage", "Direct", "Offline", "Refresh Catalog"):
             runner = _FakeUpdateRunner(
                 OperationState.SUCCEEDED,
                 [OperationLine("stdout", '{"ok":true}')],
@@ -1246,7 +1246,7 @@ class TestModeTransitionExit:
         *,
         state: OperationState,
         payload: str,
-        title: str = "Cache Mode",
+        title: str = "Cached Storage",
         owns_exit: bool = True,
     ):
         from ports_gfx.operation_screen import OperationScreenState

@@ -32,7 +32,7 @@ from romcloud.cli.context import get_container
 @click.option(
     "--override",
     is_flag=True,
-    help="Allow this one cache-backed launch while Connected Mode is active.",
+    help="Allow this one cache-backed launch while Direct is active.",
 )
 @click.pass_context
 def launch_cmd(ctx: click.Context, proxy_path: str, no_ui: bool, override: bool) -> None:
@@ -47,7 +47,7 @@ def launch_cmd(ctx: click.Context, proxy_path: str, no_ui: bool, override: bool)
 
     if operating_mode(container.config) is OperatingMode.CONNECTED and not override:
         raise click.ClickException(
-            "Proxy caching is unavailable in Connected Mode. Batocera should launch "
+            "Proxy caching is unavailable in Direct. Batocera should launch "
             "the exposed source game directly; pass --override only for this command."
         )
 

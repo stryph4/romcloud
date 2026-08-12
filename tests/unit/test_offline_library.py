@@ -552,9 +552,9 @@ def test_cli_exposes_three_modes(tmp_path: Path) -> None:
     runner = CliRunner()
 
     for command, expected in (
-        ("offline", "Offline Mode"),
-        ("cache", "Cache Mode"),
-        ("connected", "Connected Mode"),
+        ("offline", "Offline"),
+        ("cache", "Cached Storage"),
+        ("connected", "Direct"),
     ):
         result = runner.invoke(cli, ["--config", str(config_path), "library", command])
         assert result.exit_code == 0, result.output

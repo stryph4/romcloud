@@ -155,7 +155,7 @@ STEP_CONTEXT: dict[WizardStep, WizardStepContext] = {
     ),
     WizardStep.GAME_ACCESS: WizardStepContext(
         "Choose ROMCloud's initial operating mode.",
-        "Cache Mode keeps played games locally; Connected Mode uses the source directly.",
+        "Cached Storage copies games into managed local storage as needed; Direct launches from the configured source.",
     ),
     WizardStep.REMOTE_DATA: WizardStepContext(
         "Choose where ROMCloud should store shared data such as synchronized saves.",
@@ -207,7 +207,7 @@ STEP_CONTEXT: dict[WizardStep, WizardStepContext] = {
     ),
     WizardStep.CACHE: WizardStepContext(
         "Choose how much local space ROMCloud may use for games you play.",
-        "Cached and pinned games can launch faster and remain available in Offline Mode.",
+        "Cached and pinned games can launch faster and remain available in Offline.",
     ),
     WizardStep.REVIEW: WizardStepContext(
         "Review your choices before ROMCloud configures this device.",
@@ -404,7 +404,7 @@ class WizardState:
                 "Skip (sync features unavailable)",
             ]
         if self.step == WizardStep.GAME_ACCESS:
-            return ["Cache Mode", "Connected Mode"]
+            return ["Cached Storage", "Direct"]
         if self.step == WizardStep.LIBRARY_SYNC:
             return ["Enable Library Sync", "Keep Library Sync disabled"]
         if self.step == WizardStep.REMOTE_AUTH:
