@@ -79,68 +79,20 @@ def scan_tree_report(
     enabled_optional_systems: frozenset[str] = frozenset(),
     enabled_optional_groups: frozenset[str] = frozenset(),
 ) -> ScanReport:
-    """Scan selected content and summarize files intentionally left unmanaged."""
-    if not root.is_dir():
-        return ScanReport({})
+    """Scan only roots positively resolved from the supported-layout registry.
 
-    skip_dirs = policy.excluded_top_level_dirs()
-    artifacts: dict[str, SaveArtifact] = {}
-    excluded_files = 0
-    excluded_bytes = 0
-    optional: dict[str, list[int]] = {}
-
-    for system_dir in sorted(
-        p for p in root.iterdir() if p.is_dir() and not p.is_symlink()
-    ):
-        system = system_dir.name
-
-        for file_path in sorted(system_dir.rglob("*")):
-            if not file_path.is_file():
-                continue
-            if file_path.is_symlink():
-                excluded_files += 1
-                excluded_bytes += file_path.lstat().st_size
-                continue
-            size_bytes = file_path.stat().st_size
-            rel_to_system = file_path.relative_to(system_dir).as_posix()
-            decision = policy.classify(
-                system,
-                rel_to_system,
-                enabled_optional_groups=enabled_optional_groups,
-            )
-            system_disabled = (
-                system in skip_dirs
-                or not policy.is_known_system(system)
-                or (policy.is_optional(system) and system not in enabled_optional_systems)
-            )
-            if system_disabled or not decision.included:
-                excluded_files += 1
-                excluded_bytes += size_bytes
-                group = decision.optional_group
-                if group is not None and not decision.included:
-                    stats = optional.setdefault(group, [0, 0])
-                    stats[0] += 1
-                    stats[1] += size_bytes
-                continue
-            relative_path = f"{system}/{rel_to_system}"
-            artifacts[relative_path] = SaveArtifact(
-                relative_path=relative_path,
-                size_bytes=size_bytes,
-                content_hash=hash_file(file_path),
-            )
-
-    # Root files do not belong to an emulator policy and remain unmanaged.
-    for file_path in sorted(p for p in root.iterdir() if p.is_file()):
-        excluded_files += 1
-        excluded_bytes += file_path.lstat().st_size
-
-    return ScanReport(
-        artifacts,
-        excluded_files=excluded_files,
-        excluded_bytes=excluded_bytes,
-        optional_groups=tuple(
-            (group, values[0], values[1]) for group, values in sorted(optional.items())
-        ),
+    Unknown systems and unsupported subtrees are neither entered nor counted as
+    exclusions.  This distinction is important: an empty result must not hide a
+    costly recursive classification walk through arbitrary user data.
+    """
+    roots = policy.watch_roots(
+        root,
+        enabled_optional_systems=enabled_optional_systems,
+    )
+    return _scan_watch_roots(
+        roots,
+        policy,
+        enabled_optional_groups=enabled_optional_groups,
     )
 
 
@@ -158,44 +110,66 @@ def scan_mapped_tree_report(
     The returned paths are mapped into the same canonical ``ps3/rpcs3/dev_hdd0``
     namespace used by newer Batocera releases and by the remote dataset.
     """
-    if not root.is_dir():
-        return ScanReport({})
-    artifacts: dict[str, SaveArtifact] = {}
-    excluded_files = 0
-    excluded_bytes = 0
-    optional: dict[str, list[int]] = {}
-    prefix = relative_prefix.strip("/")
-    for file_path in sorted(root.rglob("*")):
-        if not file_path.is_file():
-            continue
-        if file_path.is_symlink():
-            excluded_files += 1
-            excluded_bytes += file_path.lstat().st_size
-            continue
-        physical_relative = file_path.relative_to(root).as_posix()
-        policy_relative = f"{prefix}/{physical_relative}"
-        size_bytes = file_path.stat().st_size
-        decision = policy.classify(
-            system,
-            policy_relative,
-            enabled_optional_groups=enabled_optional_groups,
-        )
-        if not decision.included:
-            excluded_files += 1
-            excluded_bytes += size_bytes
-            if decision.optional_group is not None:
-                stats = optional.setdefault(decision.optional_group, [0, 0])
-                stats[0] += 1
-                stats[1] += size_bytes
-            continue
-        canonical = f"{system}/{policy_relative}"
-        artifacts[canonical] = SaveArtifact(canonical, size_bytes, hash_file(file_path))
-    return ScanReport(
-        artifacts,
-        excluded_files,
-        excluded_bytes,
-        tuple((group, values[0], values[1]) for group, values in sorted(optional.items())),
+    roots = policy.watch_roots(
+        root,
+        canonical_prefix=f"{system}/{relative_prefix.strip('/')}",
     )
+    return _scan_watch_roots(
+        roots,
+        policy,
+        enabled_optional_groups=enabled_optional_groups,
+    )
+
+
+def _iter_approved_files(root: Path, *, recursive: bool):
+    """Yield regular files without following symlinks from one approved root."""
+    if not recursive:
+        for candidate in sorted(root.iterdir(), key=lambda path: path.name):
+            if candidate.is_symlink() or not candidate.is_file():
+                continue
+            yield candidate
+        return
+
+    for current, directories, filenames in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        directories[:] = sorted(
+            dirname
+            for dirname in directories
+            if not (current_path / dirname).is_symlink()
+        )
+        for filename in sorted(filenames):
+            candidate = current_path / filename
+            if candidate.is_symlink() or not candidate.is_file():
+                continue
+            yield candidate
+
+
+def _scan_watch_roots(
+    roots,
+    policy: SaveSelectionPolicy,
+    *,
+    enabled_optional_groups: frozenset[str],
+) -> ScanReport:
+    artifacts: dict[str, SaveArtifact] = {}
+    for watch in roots:
+        for file_path in _iter_approved_files(watch.path, recursive=watch.recursive):
+            relative = file_path.relative_to(watch.path).as_posix()
+            canonical = f"{watch.canonical_root}/{relative}".strip("/")
+            system, separator, policy_relative = canonical.partition("/")
+            if not separator:
+                continue
+            decision = policy.classify(
+                system,
+                policy_relative,
+                enabled_optional_groups=enabled_optional_groups,
+            )
+            if not decision.included or not policy.is_canonical_path_supported(canonical):
+                continue
+            if canonical in artifacts:
+                raise SaveSyncError(f"SaveSync found duplicate canonical path: {canonical}")
+            size_bytes = file_path.stat().st_size
+            artifacts[canonical] = SaveArtifact(canonical, size_bytes, hash_file(file_path))
+    return ScanReport(artifacts)
 
 
 def merge_scan_reports(*reports: ScanReport) -> ScanReport:
@@ -245,37 +219,8 @@ def materialize(dest_path: Path, *, fresh_source: Path, unchanged_source: Option
             if not chunk:
                 break
             dst.write(chunk)
-
-
-def clone_tree(source: Path, destination: Path) -> None:
-    """Clone a complete working tree into an empty staging directory.
-
-    Files are hardlinked; symlinks are preserved and never followed. Staging
-    is deliberately aborted when the destination filesystem cannot hardlink:
-    silently falling back to copying policy-excluded RPCS3 installations or
-    other large local content could duplicate hundreds of gigabytes merely to
-    preserve it during a selected-data transaction.
-    """
-    if not source.is_dir():
-        return
-
-    def link_for_stage(src: str, dst: str) -> str:
-        try:
-            os.link(src, dst)
-        except OSError as exc:
-            raise SaveSyncError(
-                "SaveSync cannot safely stage this tree because its filesystem "
-                f"does not support hardlinks ({src}). No live data was changed."
-            ) from exc
-        return dst
-
-    shutil.copytree(
-        source,
-        destination,
-        copy_function=link_for_stage,
-        symlinks=True,
-        dirs_exist_ok=True,
-    )
+        dst.flush()
+        os.fsync(dst.fileno())
 
 
 def new_staging_dir(sibling_of: Path) -> Path:

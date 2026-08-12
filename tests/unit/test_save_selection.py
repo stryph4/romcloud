@@ -43,6 +43,17 @@ class TestKnownSystems:
             assert policy.is_known_system(system) is False
             assert policy.is_included(system, "anything.bin") is False
 
+    def test_noncanonical_paths_are_never_supported(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        for path in (
+            "/psx/Game.srm",
+            "psx\\Game.srm",
+            "psx/../Game.srm",
+            "psx//Game.srm",
+            "psx/Game.srm/",
+        ):
+            assert policy.group_for_path(path) is None
+
 
 class TestPS1Native:
     def test_srm_included(self):
@@ -123,6 +134,13 @@ class TestN64Native:
             "logs/Dr. Mario 64 (USA).srm",
         ):
             assert policy.is_included("n64", relative_path) is False
+
+    def test_native_slot_files_share_the_game_conflict_unit(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+
+        assert policy.group_for_path(
+            "n64/Game.srm"
+        ) == policy.group_for_path("n64/Game.1.sav")
 
 
 class TestNDSNative:
@@ -217,17 +235,17 @@ class TestRPCS3:
         ):
             assert policy.is_included("ps3", path) is True
 
-    def test_installed_games_are_a_disabled_optional_group(self):
+    def test_installed_games_are_never_eligible(self):
         policy = DEFAULT_SAVE_SELECTION_POLICY
         path = "rpcs3/dev_hdd0/game/NPUA12345/USRDIR/EBOOT.BIN"
         decision = policy.classify("ps3", path)
         assert decision.included is False
-        assert decision.optional_group == RPCS3_INSTALLED_GAMES_GROUP
+        assert decision.optional_group is None
         assert policy.is_included(
             "ps3",
             path,
-            enabled_optional_groups=frozenset({RPCS3_INSTALLED_GAMES_GROUP}),
-        ) is True
+            enabled_optional_groups=frozenset({"rpcs3_installed_games"}),
+        ) is False
 
     def test_generated_and_ambiguous_rpcs3_content_stays_excluded(self):
         policy = DEFAULT_SAVE_SELECTION_POLICY
@@ -338,3 +356,61 @@ class TestExtensibility:
         assert custom.is_included("newsystem", "profile.bin") is False
         # The default global policy is unaffected by a custom instance.
         assert DEFAULT_SAVE_SELECTION_POLICY.is_known_system("newsystem") is False
+
+
+class TestPositiveLayoutRegistry:
+    def test_registry_is_auditable_and_layout_ids_are_unique(self):
+        layouts = DEFAULT_SAVE_SELECTION_POLICY.layouts
+
+        assert layouts
+        assert len({layout.layout_id for layout in layouts}) == len(layouts)
+        assert all(layout.system and layout.eligible_files for layout in layouts)
+        assert not any(
+            layout.system == "ps3" and "/game" in layout.root_pattern
+            for layout in layouts
+        )
+
+    def test_stable_root_save_group_ignores_state_suffix(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+
+        save = policy.group_for_path("snes/Chrono Trigger.srm")
+        state = policy.group_for_path("snes/Chrono Trigger.state.auto")
+
+        assert save is not None and state is not None
+        assert save.group_id == state.group_id
+        assert save.shared is False
+
+    def test_shared_layouts_are_explicit_and_use_safe_dataset_group(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+
+        first = policy.group_for_path("duckstation/memcards/card1.mcd")
+        second = policy.group_for_path("duckstation/memcards/card2.mcd")
+        xenia = policy.group_for_path("xbox360/0000000000000000/save/data.bin")
+
+        assert first is not None and second is not None and xenia is not None
+        assert first.shared is True
+        assert first.group_id == second.group_id
+        assert xenia.shared is True
+
+    def test_dynamic_title_layouts_produce_stable_groups(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        user = "0123456789ABCDEF0123456789ABCDEF"
+        base = f"yuzu/0000000000000000/{user}/0100F2C0115B6000"
+
+        first = policy.group_for_path(f"{base}/slot1/progress.dat")
+        second = policy.group_for_path(f"{base}/slot2/options.dat")
+
+        assert first is not None and second is not None
+        assert first.group_id == second.group_id
+        assert first.layout_id == "yuzu-account-title-save"
+
+    def test_unknown_or_dangerous_path_has_no_group(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+
+        for path in (
+            "unknown/deep/file.sav",
+            "yuzu/keys/prod.keys",
+            "ps3/rpcs3/dev_hdd0/game/BLUS12345/USRDIR/EBOOT.BIN",
+        ):
+            assert policy.is_canonical_path_supported(path) is False
+            assert policy.group_for_path(path) is None

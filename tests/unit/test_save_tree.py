@@ -138,7 +138,7 @@ class TestScanTree:
 
         assert set(result) == {selected, *states}
 
-    def test_rpc3_optional_group_is_measured_without_hashing_it_into_selection(
+    def test_rpc3_installed_applications_are_not_traversed_or_reported(
         self, tmp_path: Path
     ):
         root = tmp_path / "saves"
@@ -153,7 +153,160 @@ class TestScanTree:
         assert set(report.artifacts) == {
             "ps3/rpcs3/dev_hdd0/home/00000001/savedata/BLUS1/SAVE.DAT"
         }
-        assert report.optional_groups == (("rpcs3_installed_games", 1, 10),)
+        assert report.optional_groups == ()
+        assert report.excluded_files == 0
+
+    def test_unknown_system_tree_is_never_entered(self, tmp_path: Path, policy, monkeypatch):
+        root = tmp_path / "saves"
+        forbidden = root / "totally-unknown" / "large" / "nested"
+        forbidden.mkdir(parents=True)
+        (forbidden / "payload.bin").write_bytes(b"unsafe")
+        real_iterdir = Path.iterdir
+
+        def guarded_iterdir(path):
+            if path == root / "totally-unknown":
+                raise AssertionError("unknown system was traversed")
+            return real_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", guarded_iterdir)
+
+        report = save_tree.scan_tree_report(root, policy)
+
+        assert report.artifacts == {}
+        assert report.excluded_files == 0
+
+    def test_arbitrary_nested_content_in_root_file_layout_is_not_entered(
+        self, tmp_path: Path, policy, monkeypatch
+    ):
+        root = tmp_path / "saves"
+        selected = root / "psx" / "Game.srm"
+        selected.parent.mkdir(parents=True)
+        selected.write_bytes(b"progress")
+        forbidden = root / "psx" / "unsupported" / "huge" / "tree"
+        forbidden.mkdir(parents=True)
+        (forbidden / "Game.srm").write_bytes(b"not-eligible")
+        real_iterdir = Path.iterdir
+
+        def guarded_iterdir(path):
+            if path == root / "psx" / "unsupported":
+                raise AssertionError("unsupported nested tree was traversed")
+            return real_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", guarded_iterdir)
+
+        report = save_tree.scan_tree_report(root, policy)
+
+        assert set(report.artifacts) == {"psx/Game.srm"}
+        assert report.excluded_files == 0
+
+    def test_disabled_xemu_root_is_not_entered(self, tmp_path: Path, policy, monkeypatch):
+        root = tmp_path / "saves"
+        xbox = root / XBOX_SYSTEM
+        xbox.mkdir(parents=True)
+        (xbox / "xbox_hdd.qcow2").write_bytes(b"opaque")
+        real_iterdir = Path.iterdir
+
+        def guarded_iterdir(path):
+            if path == xbox:
+                raise AssertionError("disabled xemu root was traversed")
+            return real_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", guarded_iterdir)
+
+        assert save_tree.scan_tree(root, policy) == {}
+
+    def test_yuzu_and_rpcs3_dynamic_roots_validate_before_descent(
+        self, tmp_path: Path, monkeypatch
+    ):
+        root = tmp_path / "saves"
+        user = "0123456789ABCDEF0123456789ABCDEF"
+        title = "0100F2C0115B6000"
+        yuzu_save = root / "yuzu" / "0000000000000000" / user / title / "save.dat"
+        rpcs3_save = (
+            root
+            / "ps3/rpcs3/dev_hdd0/home/00000001/savedata/BLUS12345-SAVE/SAVE.DAT"
+        )
+        for path in (yuzu_save, rpcs3_save):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"progress")
+        dangerous = (
+            root / "yuzu/cache",
+            root / "yuzu/keys",
+            root / "ps3/rpcs3/dev_hdd0/game",
+            root / "ps3/rpcs3/cache",
+        )
+        for path in dangerous:
+            path.mkdir(parents=True, exist_ok=True)
+            (path / "payload.bin").write_bytes(b"unsafe")
+        real_iterdir = Path.iterdir
+
+        def guarded_iterdir(path):
+            if path in dangerous:
+                raise AssertionError(f"dangerous tree was traversed: {path}")
+            return real_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", guarded_iterdir)
+
+        report = save_tree.scan_tree_report(root, DEFAULT_SAVE_SELECTION_POLICY)
+
+        assert set(report.artifacts) == {
+            yuzu_save.relative_to(root).as_posix(),
+            rpcs3_save.relative_to(root).as_posix(),
+        }
+        assert report.excluded_files == 0
+
+    def test_invalid_yuzu_identity_is_rejected_before_stat_or_descent(
+        self, tmp_path: Path, monkeypatch
+    ):
+        root = tmp_path / "saves"
+        invalid = root / "yuzu/0000000000000000/not-a-user-id"
+        invalid.mkdir(parents=True)
+        (invalid / "payload.bin").write_bytes(b"unsafe")
+        real_is_dir = Path.is_dir
+
+        def guarded_is_dir(path):
+            if path == invalid:
+                raise AssertionError("invalid dynamic segment was inspected")
+            return real_is_dir(path)
+
+        monkeypatch.setattr(Path, "is_dir", guarded_is_dir)
+
+        assert save_tree.scan_tree(root, DEFAULT_SAVE_SELECTION_POLICY) == {}
+
+    def test_watch_roots_expose_only_enabled_and_validated_layouts(self, tmp_path: Path):
+        root = tmp_path / "saves"
+        user = "0123456789ABCDEF0123456789ABCDEF"
+        title = "0100F2C0115B6000"
+        (root / "snes").mkdir(parents=True)
+        (root / "xbox").mkdir()
+        (root / "yuzu/0000000000000000" / user / title).mkdir(parents=True)
+
+        default = DEFAULT_SAVE_SELECTION_POLICY.watch_roots(root)
+        enabled = DEFAULT_SAVE_SELECTION_POLICY.watch_roots(
+            root, enabled_optional_systems=frozenset({XBOX_SYSTEM})
+        )
+
+        default_ids = {item.layout_id for item in default}
+        assert "retroarch-root-snes" in default_ids
+        assert "yuzu-account-title-save" in default_ids
+        assert "xemu-hdd" not in default_ids
+        assert "xemu-hdd" in {item.layout_id for item in enabled}
+
+    def test_legacy_rpcs3_mapping_resolves_only_save_roots(self, tmp_path: Path):
+        root = tmp_path / "dev_hdd0"
+        savedata = root / "home/00000001/savedata"
+        game = root / "game/BLUS12345"
+        savedata.mkdir(parents=True)
+        game.mkdir(parents=True)
+
+        roots = DEFAULT_SAVE_SELECTION_POLICY.watch_roots(
+            root, canonical_prefix="ps3/rpcs3/dev_hdd0"
+        )
+
+        assert {item.canonical_root for item in roots} == {
+            "ps3/rpcs3/dev_hdd0/home/00000001/savedata"
+        }
+        assert all("/game" not in item.canonical_root for item in roots)
 
 
 class TestMaterialize:

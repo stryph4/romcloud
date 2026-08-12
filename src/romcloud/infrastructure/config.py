@@ -564,6 +564,8 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
         "# Shared save/state continuity — see `romcloud saves --help`.\n",
         f'local_path = "{config.saves.local_path}"\n',
         f"xbox_enabled = {'true' if config.saves.xbox_enabled else 'false'}\n",
+        "# Compatibility keys: RPCS3 applications remain ineligible and eligible "
+        "local-game saves remain included regardless of these values.\n",
         "rpcs3_installed_games_enabled = "
         f"{'true' if config.saves.rpcs3_installed_games_enabled else 'false'}\n",
         f"include_local_games = {'true' if config.saves.include_local_games else 'false'}\n",

@@ -10,7 +10,7 @@ from __future__ import annotations
 import subprocess
 from dataclasses import dataclass
 
-from ports_gfx.client import BackendResult, call_backend
+from ports_gfx.client import BackendResult, call_backend, start_backend_operation
 
 
 @dataclass
@@ -57,6 +57,41 @@ class TestSuccessfulCall:
 
         assert result.ok is True
         assert captured["kwargs"]["timeout"] == 120.0
+
+
+def test_background_operation_supports_payload_free_bounded_checks(monkeypatch):
+    captured = {}
+
+    class FakeRunner:
+        def __init__(self, argv, **kwargs):
+            captured["argv"] = argv
+            captured["kwargs"] = kwargs
+            captured["started"] = False
+
+        def start(self):
+            captured["started"] = True
+
+    clock = lambda: 0.0
+    popen = object()
+    monkeypatch.setattr("ports_gfx.client.OperationRunner", FakeRunner)
+
+    runner = start_backend_operation(
+        "romcloud",
+        "savesync-availability",
+        max_runtime=6.0,
+        timeout_message="Remote storage check timed out.",
+        clock=clock,
+        popen=popen,
+    )
+
+    assert isinstance(runner, FakeRunner)
+    assert captured["argv"] == ["romcloud", "uidata", "savesync-availability"]
+    assert captured["kwargs"]["max_runtime"] == 6.0
+    assert captured["kwargs"]["timeout_message"] == "Remote storage check timed out."
+    assert captured["kwargs"]["clock"] is clock
+    assert captured["kwargs"]["popen"] is popen
+    assert "stdin_text" not in captured["kwargs"]
+    assert captured["started"] is True
 
 
 class TestBackendReportedFailure:

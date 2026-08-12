@@ -183,7 +183,7 @@ class SaveReconcilePlan:
     excluded_files: int = 0
     excluded_bytes: int = 0
     optional_groups: tuple[tuple[str, int, int], ...] = ()
-    scope: str = "managed_games"
+    scope: str = "all_eligible"
 
     def _by_action(self, action: SaveReconcileAction) -> tuple[SaveReconcileEntry, ...]:
         return tuple(entry for entry in self.entries if entry.action is action)
@@ -242,7 +242,7 @@ class SaveReconcileReport:
     upload_bytes: int
     download_bytes: int
     conflict_paths: tuple[str, ...] = ()
-    scope: str = "managed_games"
+    scope: str = "all_eligible"
 
     def to_dict(self) -> dict:
         return {
@@ -279,6 +279,154 @@ class SaveSyncRecord:
         return sum(a.size_bytes for a in self.manifest)
 
 
+class SaveGroupCondition(str, Enum):
+    """Durable reconciliation condition for one safe save conflict unit.
+
+    Availability and operation health are intentionally not represented here:
+    a group can remain locally dirty while the remote is unavailable, and an
+    operation can be in progress without erasing the underlying dirty state.
+    """
+
+    CLEAN = "clean"
+    LOCAL_DIRTY = "local-dirty"
+    REMOTE_DIRTY = "remote-dirty"
+    CONFLICT = "conflict"
+
+
+class SaveRemoteAvailability(str, Enum):
+    """Last durable observation of the configured SaveSync remote."""
+
+    UNKNOWN = "unknown"
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+
+
+class SaveSyncStatus(str, Enum):
+    """Lossy summary for callers that need one display status.
+
+    :class:`SaveSyncState` keeps the underlying dimensions orthogonal.  Code
+    making synchronization decisions must inspect those dimensions and verify
+    filesystem content rather than relying on this convenience summary.
+    """
+
+    CLEAN = "clean"
+    LOCAL_DIRTY = "local-dirty"
+    REMOTE_DIRTY = "remote-dirty"
+    CONFLICT = "conflict"
+    SYNCING = "syncing"
+    REMOTE_UNAVAILABLE = "remote-unavailable"
+    ERROR = "error"
+
+
+class SaveConflictResolution(str, Enum):
+    """Explicit side selected when a durable conflict is resolved."""
+
+    KEEP_LOCAL = "keep-local"
+    KEEP_REMOTE = "keep-remote"
+    MANUAL = "manual"
+
+
+@dataclass(frozen=True)
+class SaveGroupSnapshot:
+    """Verified content for one registry-defined safe conflict unit.
+
+    An empty ``artifacts`` tuple represents a verified absent/empty group.  A
+    ``None`` snapshot in another model instead means that side was not observed.
+    """
+
+    group_id: str
+    layout_id: str
+    artifacts: tuple[SaveArtifact, ...] = ()
+    observed_at: Optional[str] = None
+
+    @property
+    def artifact_count(self) -> int:
+        return len(self.artifacts)
+
+    @property
+    def total_bytes(self) -> int:
+        return sum(artifact.size_bytes for artifact in self.artifacts)
+
+
+@dataclass(frozen=True)
+class SaveGroupState:
+    """Durable change state for one registry-defined save group.
+
+    ``dirty_path_hints`` are advisory inputs from a future watcher.  They are
+    never authoritative manifests and must be re-scanned/hashed before a sync.
+    """
+
+    group_id: str
+    layout_id: str
+    condition: SaveGroupCondition = SaveGroupCondition.CLEAN
+    baseline: Optional[SaveGroupSnapshot] = None
+    local_observed: Optional[SaveGroupSnapshot] = None
+    remote_observed: Optional[SaveGroupSnapshot] = None
+    dirty_path_hints: tuple[str, ...] = ()
+    verified_at: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class SaveConflictRecord:
+    """Durable conflict evidence, independent of notification acknowledgement.
+
+    ``acknowledged_at`` means only that the user dismissed or deferred a notice.
+    A conflict remains active until ``resolved_at`` and ``resolution`` are set
+    after a separately verified resolution transaction.
+    """
+
+    conflict_id: str
+    group_id: str
+    layout_id: str
+    detected_at: str
+    last_seen_at: str
+    baseline: Optional[SaveGroupSnapshot]
+    local: SaveGroupSnapshot
+    remote: SaveGroupSnapshot
+    acknowledged_at: Optional[str] = None
+    resolved_at: Optional[str] = None
+    resolution: Optional[SaveConflictResolution] = None
+    resolution_revision: Optional[str] = None
+
+    @property
+    def acknowledged(self) -> bool:
+        return self.acknowledged_at is not None
+
+    @property
+    def resolved(self) -> bool:
+        return self.resolved_at is not None
+
+
+@dataclass(frozen=True)
+class SaveRemoteObservation:
+    """Last provider-neutral availability result, separate from dirty state."""
+
+    availability: SaveRemoteAvailability = SaveRemoteAvailability.UNKNOWN
+    checked_at: Optional[str] = None
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class SaveSyncActiveOperation:
+    """Durable receipt for an operation that has not completed yet."""
+
+    operation_id: str
+    direction: str
+    phase: str
+    started_at: str
+    group_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SaveSyncLastError:
+    """Last durable SaveSync failure without conflating it with dirty state."""
+
+    code: str
+    message: str
+    occurred_at: str
+    operation_id: Optional[str] = None
+
+
 @dataclass(frozen=True)
 class SaveSyncState:
     """Persisted SaveSync state. ``last_upload``/``last_download`` only
@@ -290,3 +438,40 @@ class SaveSyncState:
     shared_manifest: tuple[SaveArtifact, ...] = ()
     """Last content known to be identical on local and remote sides."""
     last_reconcile: Optional[SaveReconcileReport] = None
+    groups: tuple[SaveGroupState, ...] = ()
+    """Per-group verified observations and advisory dirty hints."""
+    conflicts: tuple[SaveConflictRecord, ...] = ()
+    """Conflict records remain here after acknowledgement and until resolution."""
+    remote_observation: SaveRemoteObservation = SaveRemoteObservation()
+    active_operation: Optional[SaveSyncActiveOperation] = None
+    last_error: Optional[SaveSyncLastError] = None
+    last_completed_operation_id: Optional[str] = None
+    """Durable transaction receipt used to distinguish commit from interruption."""
+
+    @property
+    def active_conflicts(self) -> tuple[SaveConflictRecord, ...]:
+        return tuple(conflict for conflict in self.conflicts if not conflict.resolved)
+
+    @property
+    def effective_status(self) -> SaveSyncStatus:
+        """Return a conservative one-value summary for status/reporting UIs."""
+
+        if self.last_error is not None:
+            return SaveSyncStatus.ERROR
+        if self.active_operation is not None:
+            return SaveSyncStatus.SYNCING
+        if self.active_conflicts or any(
+            group.condition is SaveGroupCondition.CONFLICT for group in self.groups
+        ):
+            return SaveSyncStatus.CONFLICT
+        if any(
+            group.condition is SaveGroupCondition.LOCAL_DIRTY for group in self.groups
+        ):
+            return SaveSyncStatus.LOCAL_DIRTY
+        if any(
+            group.condition is SaveGroupCondition.REMOTE_DIRTY for group in self.groups
+        ):
+            return SaveSyncStatus.REMOTE_DIRTY
+        if self.remote_observation.availability is SaveRemoteAvailability.UNAVAILABLE:
+            return SaveSyncStatus.REMOTE_UNAVAILABLE
+        return SaveSyncStatus.CLEAN

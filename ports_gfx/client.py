@@ -94,14 +94,24 @@ def call_backend(
 def start_backend_operation(
     romcloud_bin: str,
     action: str,
-    payload: dict[str, Any],
+    payload: dict[str, Any] | None = None,
     *,
     popen=None,  # noqa: ANN001
+    max_runtime: float | None = None,
+    timeout_message: str = "operation timed out",
+    clock=None,  # noqa: ANN001
 ) -> OperationRunner:
     """Start a JSON uidata request without blocking the pygame event loop."""
-    kwargs = {"stdin_text": json.dumps(payload)}
+    kwargs: dict[str, Any] = {
+        "max_runtime": max_runtime,
+        "timeout_message": timeout_message,
+    }
+    if payload is not None:
+        kwargs["stdin_text"] = json.dumps(payload)
     if popen is not None:
         kwargs["popen"] = popen
+    if clock is not None:
+        kwargs["clock"] = clock
     runner = OperationRunner([romcloud_bin, "uidata", action], **kwargs)
     runner.start()
     return runner

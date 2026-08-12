@@ -10,17 +10,18 @@ import json
 
 from ports_gfx.actions import Action
 from ports_gfx.input_manager import InputEvent
+from ports_gfx.operation import OperationLine
 from ports_gfx.savesync_screen import (
     APPLYING_SETTINGS,
     COMMITTING,
     CONFIRMING,
     DASHBOARD,
-    LOCAL_GAMES_WARNING,
     PREVIEW,
     PREVIEWING,
+    REMOTE_AVAILABLE,
+    REMOTE_CHECKING,
+    REMOTE_UNAVAILABLE,
     RESULT,
-    RPCS3_CONFIRMING,
-    RPCS3_WARNING,
     SETTINGS,
     SaveSyncScreenState,
 )
@@ -71,10 +72,67 @@ def _fake_popen_returning(payload: dict):
     return fake_popen
 
 
+def _fake_popen_by_action(payloads: dict[str, dict], *, pending=None):
+    def fake_popen(argv, **kwargs):
+        action = argv[-1]
+        if action in payloads:
+            return _FakeProcess(json.dumps(payloads[action]) + "\n")
+        if pending is not None:
+            return pending
+        raise AssertionError(f"Unexpected backend action: {action}")
+
+    return fake_popen
+
+
+class _PendingProcess:
+    def __init__(self) -> None:
+        self.stdout = _FakeStderr("")
+        self.stderr = _FakeStderr("")
+        self.stdin = _FakeStdin()
+        self.returncode = None
+        self.terminated = False
+        self.killed = False
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.returncode = -15
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+class _ControlledRunner:
+    def __init__(self, payload: dict, *, finished: bool) -> None:
+        self.lines = [OperationLine("stdout", json.dumps(payload))]
+        self.is_finished = finished
+        self.error = ""
+        self.cancelled = False
+
+    def poll(self):
+        return []
+
+    def cancel(self):
+        self.cancelled = True
+
+
 def _drain(state: SaveSyncScreenState, *, max_iterations: int = 50) -> None:
     for _ in range(max_iterations):
         state.poll()
-        if state._runner is None:  # noqa: SLF001 - test-only introspection
+        if all(
+            runner is None
+            for runner in (
+                state._runner,  # noqa: SLF001 - test-only introspection
+                state._status_runner,  # noqa: SLF001
+                state._availability_runner,  # noqa: SLF001
+            )
+        ):
             return
 
 
@@ -100,6 +158,7 @@ class TestDashboardSelection:
             romcloud_bin="romcloud",
             selected_index=0,
             status={"remote_configured": True},
+            remote_availability=REMOTE_AVAILABLE,
         )
         state.popen = _fake_popen_returning({"ok": True, "diff": {"direction": "upload", "entries": []}})
         state.confirm_dashboard_selection()
@@ -118,6 +177,200 @@ class TestDashboardSelection:
         assert state.step == DASHBOARD
         assert "Configure writable" in state.error
         assert state._runner is None  # noqa: SLF001
+
+    def test_upload_is_gated_while_remote_check_is_pending(self):
+        state = SaveSyncScreenState(
+            romcloud_bin="romcloud",
+            selected_index=0,
+            status={"remote_configured": True},
+            remote_availability=REMOTE_CHECKING,
+        )
+
+        state.confirm_dashboard_selection()
+
+        assert state.step == DASHBOARD
+        assert "still being checked" in state.error
+        assert state._runner is None  # noqa: SLF001
+
+    def test_download_is_gated_when_remote_is_unavailable(self):
+        state = SaveSyncScreenState(
+            romcloud_bin="romcloud",
+            selected_index=1,
+            status={"remote_configured": True},
+            remote_availability=REMOTE_UNAVAILABLE,
+            remote_detail="storage check timed out",
+        )
+
+        state.confirm_dashboard_selection()
+
+        assert state.step == DASHBOARD
+        assert "unavailable" in state.error
+        assert "timed out" in state.error
+        assert state._runner is None  # noqa: SLF001
+
+
+class TestLocalFirstLoading:
+    def test_status_and_availability_start_as_separate_background_operations(self):
+        state = SaveSyncScreenState(romcloud_bin="romcloud")
+        actions = []
+
+        def fake_popen(argv, **kwargs):
+            actions.append(argv[-1])
+            return _FakeProcess('{"ok": true, "remote_configured": true}\n')
+
+        state.popen = fake_popen
+        state.start_loading()
+
+        assert state.step == DASHBOARD
+        assert state.remote_availability == REMOTE_CHECKING
+        assert actions == ["savesync-status", "savesync-availability"]
+
+    def test_local_status_is_visible_while_remote_check_remains_pending(self):
+        pending = _PendingProcess()
+        state = SaveSyncScreenState(romcloud_bin="romcloud")
+        state.popen = _fake_popen_by_action(
+            {
+                "savesync-status": {
+                    "ok": True,
+                    "remote_configured": True,
+                    "xbox_enabled": True,
+                    "last_upload": {"timestamp": "now"},
+                }
+            },
+            pending=pending,
+        )
+
+        state.start_loading()
+        state.poll()
+
+        assert state.status["xbox_enabled"] is True
+        assert state.status_loading is False
+        assert state.remote_availability == REMOTE_CHECKING
+        assert state._availability_runner is not None  # noqa: SLF001
+        state.cancel_pending()
+
+    def test_available_result_enables_remote_actions(self):
+        state = SaveSyncScreenState(romcloud_bin="romcloud")
+        state.popen = _fake_popen_by_action(
+            {
+                "savesync-status": {"ok": True, "remote_configured": True},
+                "savesync-availability": {
+                    "ok": True,
+                    "remote_configured": True,
+                    "remote_available": True,
+                },
+            }
+        )
+
+        state.start_loading()
+        _drain(state)
+
+        assert state.remote_availability == REMOTE_AVAILABLE
+        assert state.remote_actions_available is True
+
+    def test_unavailable_result_preserves_local_status(self):
+        state = SaveSyncScreenState(romcloud_bin="romcloud")
+        state.popen = _fake_popen_by_action(
+            {
+                "savesync-status": {
+                    "ok": True,
+                    "remote_configured": True,
+                    "last_download": {"timestamp": "yesterday"},
+                },
+                "savesync-availability": {
+                    "ok": True,
+                    "remote_configured": True,
+                    "remote_available": False,
+                    "detail": "not mounted",
+                },
+            }
+        )
+
+        state.start_loading()
+        _drain(state)
+
+        assert state.remote_availability == REMOTE_UNAVAILABLE
+        assert state.remote_detail == "not mounted"
+        assert state.status["last_download"]["timestamp"] == "yesterday"
+
+    def test_late_local_status_cannot_restore_stale_remote_observation(self):
+        state = SaveSyncScreenState(romcloud_bin="romcloud", status_loading=True)
+        status_runner = _ControlledRunner(
+            {
+                "ok": True,
+                "remote_configured": True,
+                "sync_status": "remote-unavailable",
+                "active_conflicts": 0,
+                "xbox_enabled": False,
+            },
+            finished=False,
+        )
+        availability_runner = _ControlledRunner(
+            {
+                "ok": True,
+                "remote_configured": True,
+                "remote_available": True,
+                "sync_status": "clean",
+                "active_conflicts": 0,
+            },
+            finished=True,
+        )
+        state._status_runner = status_runner  # noqa: SLF001
+        state._availability_runner = availability_runner  # noqa: SLF001
+
+        state.poll()
+        status_runner.is_finished = True
+        state.poll()
+
+        assert state.remote_availability == REMOTE_AVAILABLE
+        assert state.status["sync_status"] == "clean"
+        assert state.status["xbox_enabled"] is False
+
+    def test_availability_deadline_is_bounded_and_does_not_retry(self):
+        now = [0.0]
+        pending = _PendingProcess()
+        calls = []
+
+        def fake_popen(argv, **kwargs):
+            calls.append(argv[-1])
+            if argv[-1] == "savesync-status":
+                return _FakeProcess('{"ok": true, "remote_configured": true}\n')
+            return pending
+
+        state = SaveSyncScreenState(
+            romcloud_bin="romcloud",
+            popen=fake_popen,
+            clock=lambda: now[0],
+            availability_timeout=1.0,
+        )
+        state.start_loading()
+        now[0] = 2.0
+
+        state.poll()
+        state.poll()
+
+        assert state.remote_availability == REMOTE_UNAVAILABLE
+        assert "timed out" in state.remote_detail
+        assert pending.terminated is True
+        assert calls.count("savesync-availability") == 1
+
+    def test_cancel_pending_abandons_both_background_checks(self):
+        status_process = _PendingProcess()
+        availability_process = _PendingProcess()
+
+        def fake_popen(argv, **kwargs):
+            return status_process if argv[-1] == "savesync-status" else availability_process
+
+        state = SaveSyncScreenState(romcloud_bin="romcloud", popen=fake_popen)
+        state.start_loading()
+
+        state.cancel_pending()
+        state.cancel_pending()
+
+        assert status_process.terminated is True
+        assert availability_process.terminated is True
+        assert state._status_runner is None  # noqa: SLF001
+        assert state._availability_runner is None  # noqa: SLF001
 
 
 class TestPreviewFlow:
@@ -223,6 +476,17 @@ class TestCommitResult:
 
 
 class TestSettings:
+    def test_xbox_setting_waits_for_local_status(self):
+        state = SaveSyncScreenState(
+            romcloud_bin="romcloud", step=SETTINGS, settings_selected_index=0
+        )
+
+        state.confirm_settings_selection()
+
+        assert state.step == SETTINGS
+        assert "still loading" in state.error
+        assert state._runner is None  # noqa: SLF001
+
     def test_set_xbox_enabled_applies_and_returns_to_settings(self):
         state = SaveSyncScreenState(romcloud_bin="romcloud")
         state.popen = _fake_popen_returning({"ok": True, "xbox_enabled": True})
@@ -234,50 +498,16 @@ class TestSettings:
         assert state.step == SETTINGS
         assert state.status["xbox_enabled"] is True
 
-    def test_rpc3_opt_in_requires_warning_and_long_hold(self):
+    def test_settings_only_exposes_xbox_opt_in_and_back(self):
         state = SaveSyncScreenState(
-            romcloud_bin="romcloud",
-            step=SETTINGS,
-            settings_selected_index=1,
-            status={"rpcs3_installed_games_enabled": False},
-        )
-        state.popen = _fake_popen_returning(
-            {"ok": True, "rpcs3_installed_games_enabled": True}
+            romcloud_bin="romcloud", step=SETTINGS, settings_selected_index=99
         )
 
-        state.confirm_settings_selection()
-        assert state.step == RPCS3_WARNING
-        state.begin_rpcs3_confirm()
-        state.handle_confirm_event(InputEvent(action=Action.CONFIRM))
-        state.update_confirm(3.0)
+        state.select_setting(99)
+        result = state.confirm_settings_selection()
 
-        assert state.step == APPLYING_SETTINGS
-        _drain(state)
-        assert state.status["rpcs3_installed_games_enabled"] is True
-
-    def test_rpc3_hold_release_returns_to_warning_without_enabling(self):
-        state = SaveSyncScreenState(romcloud_bin="romcloud", step=RPCS3_WARNING)
-        state.begin_rpcs3_confirm()
-        assert state.step == RPCS3_CONFIRMING
-        state.handle_confirm_event(InputEvent(action=Action.CONFIRM))
-        state.update_confirm(1.0)
-        state.handle_confirm_event(InputEvent(action=Action.BACK))
-        state.update_confirm(0.1)
-
-        assert state.step == RPCS3_WARNING
-        assert state._runner is None  # noqa: SLF001
-
-    def test_local_game_opt_in_has_an_explanatory_warning(self):
-        state = SaveSyncScreenState(
-            romcloud_bin="romcloud",
-            step=SETTINGS,
-            settings_selected_index=2,
-            status={"include_local_games": False},
-        )
-
-        state.confirm_settings_selection()
-
-        assert state.step == LOCAL_GAMES_WARNING
+        assert result == "back"
+        assert state.step == DASHBOARD
 
     def test_return_to_dashboard_resets_selection(self):
         state = SaveSyncScreenState(romcloud_bin="romcloud", step=SETTINGS, selected_index=2)

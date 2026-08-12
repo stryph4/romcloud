@@ -27,6 +27,13 @@ class _PendingOwner:
         self.cancelled = True
 
 
+class _PendingSaveSyncOwner:
+    cancelled = False
+
+    def cancel_pending(self):
+        self.cancelled = True
+
+
 class _FinishedModeRunner:
     state = OperationState.SUCCEEDED
     is_finished = True
@@ -54,17 +61,19 @@ def test_app_exit_cancels_foreground_and_background_network_work():
         title="Mount / Reconnect", runner=_PendingRunner()
     )
     update_check = _PendingOwner()
+    savesync = _PendingSaveSyncOwner()
 
     cancel_owned_background_work(
         update_check=update_check,
         operation_screen=operation,
         wizard=None,
-        savesync_screen=None,
+        savesync_screen=savesync,
         library_sync_screen=None,
     )
 
     assert update_check.cancelled is True
     assert operation.runner.cancelled is True
+    assert savesync.cancelled is True
 
 
 def test_mode_terminal_exit_cancels_unrelated_update_without_arming_relaunch():

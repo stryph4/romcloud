@@ -13,14 +13,12 @@ loaded config.  This keeps tests simple and avoids cross-request state.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Optional
 
 from romcloud.core.capabilities import CapabilityPolicy, OperatingMode
 from romcloud.core.exceptions import ConfigurationError
 from romcloud.core.models.cache import CachePolicy
-from romcloud.core.save_ownership import ManagedSaveOwnershipPolicy
 from romcloud.core.storage import StorageProvider
 from romcloud.infrastructure.config import AppConfig, validate_remote_data_boundary
 from romcloud.infrastructure.capabilities import capability_policy
@@ -40,42 +38,6 @@ from romcloud.services.library_sync import LibrarySyncService
 from romcloud.services.transfer import TransferService
 
 _NETWORK_STORAGE_PROBE_TIMEOUT = 5.0
-
-
-def _local_game_stems(
-    local_roms_root: Path, owned_proxy_paths: set[str]
-) -> dict[str, frozenset[str]]:
-    """Collect possible non-ROMCloud game names without following links.
-
-    The catalog remains authoritative for managed identity. This filesystem
-    evidence is only a conservative ambiguity guard: if an ordinary local ROM
-    could produce the same save basename, automatic synchronization abstains.
-    """
-    if not local_roms_root.is_dir():
-        return {}
-    owned = {os.path.abspath(path) for path in owned_proxy_paths}
-    result: dict[str, frozenset[str]] = {}
-    for system_dir in sorted(local_roms_root.iterdir()):
-        if not system_dir.is_dir() or system_dir.is_symlink():
-            continue
-        stems: set[str] = set()
-        for current, directories, filenames in os.walk(system_dir, followlinks=False):
-            current_path = Path(current)
-            safe_directories = []
-            for dirname in directories:
-                candidate = current_path / dirname
-                if candidate.is_symlink():
-                    continue
-                safe_directories.append(dirname)
-                stems.add(dirname.casefold())
-            directories[:] = safe_directories
-            for filename in filenames:
-                candidate = current_path / filename
-                if candidate.is_symlink() or os.path.abspath(candidate) in owned:
-                    continue
-                stems.add(candidate.stem.casefold())
-        result[system_dir.name] = frozenset(stems)
-    return result
 
 
 class Container:
@@ -254,13 +216,6 @@ class Container:
                 legacy_rpcs3_root = (
                     data_path.parent.parent / "configs" / "rpcs3" / "dev_hdd0"
                 )
-            ownership = ManagedSaveOwnershipPolicy(
-                self.game_repo.list_all(),
-                ambiguous_local_stems=_local_game_stems(
-                    Path(self._config.local_roms_path),
-                    {record.proxy_path for record in self.proxy_repo.list_all()},
-                ),
-            )
             self._saves = SaveSyncService(
                 provider=saves_provider,
                 connectivity_root=str(remote_base) if remote_base is not None else None,
@@ -272,7 +227,6 @@ class Container:
                     self._config.saves.rpcs3_installed_games_enabled
                 ),
                 include_local_games=self._config.saves.include_local_games,
-                ownership_policy=ownership,
                 legacy_rpcs3_root=(
                     str(legacy_rpcs3_root) if legacy_rpcs3_root is not None else None
                 ),

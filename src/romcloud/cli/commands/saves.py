@@ -1,6 +1,6 @@
 """``romcloud saves`` — shared save/state continuity and force operations.
 
-NAS mode uses safe three-way reconciliation. Upload/download are explicit
+Configured writable remote-data storage uses safe three-way reconciliation. Upload/download are explicit
 power-user overrides: preview first, then (after confirmation) the destination
 eligible selection becomes an exact copy of the source selection. Both this CLI and the graphical UI
 (``romcloud uidata savesync-*``) call the same
@@ -36,7 +36,6 @@ def _print_diff(diff: SaveDiff) -> None:
     click.echo(f"  Removed:   {len(diff.removed)}")
     click.echo(f"  Unchanged: {len(diff.unchanged)}")
     click.echo(f"  Conflicts: {len(diff.conflicts)}")
-    click.echo(f"  Excluded by policy: {diff.excluded_files}")
     click.echo(f"  Transfer size: {_human_size(diff.transfer_bytes)}")
     for group, files, size_bytes in diff.optional_groups:
         click.echo(
@@ -69,19 +68,8 @@ def saves_status(ctx: click.Context) -> None:
     xbox_size = saves.xbox_hdd_size()
     if xbox_size is not None:
         click.echo(f"  xbox_hdd.qcow2 size: {_human_size(xbox_size)}")
-    rpcs3_files, rpcs3_bytes = saves.rpcs3_installed_games_size()
-    click.echo(
-        "RPCS3 installed games (very large, opt-in): "
-        f"{'enabled' if saves.rpcs3_installed_games_enabled else 'disabled'}"
-    )
-    if rpcs3_files:
-        click.echo(
-            f"  Installed-title data: {rpcs3_files} file(s), {_human_size(rpcs3_bytes)}"
-        )
-    click.echo(
-        "Automatic local-game saves: "
-        f"{'included' if saves.include_local_games else 'excluded (managed games only)'}"
-    )
+    click.echo("RPCS3 installed applications: ignored (not SaveSync content)")
+    click.echo("Eligible ordinary local-game saves: included")
 
     state = saves.get_state()
     for label, record in (("Last upload", state.last_upload), ("Last download", state.last_download)):
@@ -94,7 +82,7 @@ def saves_status(ctx: click.Context) -> None:
             )
     if state.last_reconcile is not None:
         click.echo(
-            "Last NAS reconciliation: "
+            "Last SaveSync reconciliation: "
             f"{state.last_reconcile.timestamp} "
             f"({state.last_reconcile.uploaded} uploaded, "
             f"{state.last_reconcile.downloaded} downloaded, "
@@ -145,7 +133,8 @@ def _run_commit(ctx: click.Context, *, direction: str, yes: bool) -> None:
     destination, source = ("remote", "local") if direction == "upload" else ("local", "remote")
     click.echo(
         f"\nWARNING: this will replace the {destination} eligible save/state "
-        f"library with the {source} selection above. Policy-excluded content is preserved."
+        f"library with the {source} selection above. Content outside the registered "
+        "save layouts is left untouched."
     )
     if diff.conflicts:
         click.echo(
@@ -211,7 +200,7 @@ def saves_reconcile(ctx: click.Context) -> None:
         plan = saves.preview_reconciliation()
         click.echo(
             f"Preflight: {len(plan.uploads)} upload, {len(plan.downloads)} download, "
-            f"{len(plan.conflicts)} conflict(s), {plan.excluded_files} excluded."
+            f"{len(plan.conflicts)} conflict path(s)."
         )
         if plan.conflicts:
             click.echo("Conflicting local and remote versions will both remain untouched.")
@@ -276,21 +265,10 @@ def _set_rpcs3_installed_games_enabled(ctx: click.Context, enabled: bool) -> Non
 @click.option("--yes", is_flag=True, help="Enable without prompting.")
 @click.pass_context
 def saves_rpcs3_installed_games_enable(ctx: click.Context, yes: bool) -> None:
-    """Include RPCS3 installed titles in future synchronization."""
-    saves = get_container(ctx).saves
-    files, size_bytes = saves.rpcs3_installed_games_size()
-    click.echo(
-        "WARNING: Include RPCS3 Installed Games can transfer tens or hundreds "
-        "of gigabytes and may take a very long time."
+    """Compatibility command; RPCS3 application data is never eligible."""
+    raise click.ClickException(
+        "RPCS3 installed applications are not SaveSync content and cannot be enabled."
     )
-    click.echo(
-        f"Current local estimate: {files} file(s), {_human_size(size_bytes)}."
-    )
-    if not yes and not click.confirm("Include RPCS3 installed games?"):
-        click.echo("Cancelled.")
-        return
-    _set_rpcs3_installed_games_enabled(ctx, True)
-    click.echo("RPCS3 installed-game synchronization enabled.")
 
 
 @saves_group.command("rpcs3-installed-games-disable")
@@ -316,21 +294,16 @@ def _set_include_local_games(ctx: click.Context, enabled: bool) -> None:
 @click.option("--yes", is_flag=True, help="Enable without prompting.")
 @click.pass_context
 def saves_local_games_enable(ctx: click.Context, yes: bool) -> None:
-    """Include eligible non-ROMCloud game saves in automatic NAS sync."""
-    click.echo(
-        "This allows automatic NAS reconciliation of eligible save/state data "
-        "for games that ROMCloud does not manage."
-    )
-    if not yes and not click.confirm("Include Local Games in Save Sync?"):
-        click.echo("Cancelled.")
-        return
+    """Compatibility command; supported layouts already include local games."""
     _set_include_local_games(ctx, True)
-    click.echo("Local-game save synchronization enabled.")
+    click.echo("Eligible ordinary local-game saves are included by default.")
 
 
 @saves_group.command("local-games-disable")
 @click.pass_context
 def saves_local_games_disable(ctx: click.Context) -> None:
-    """Return automatic sync to ROMCloud-managed games only."""
-    _set_include_local_games(ctx, False)
-    click.echo("Local-game save synchronization disabled.")
+    """Compatibility command; catalog ownership is not an eligibility gate."""
+    raise click.ClickException(
+        "Eligible local-game saves cannot be disabled by catalog ownership; "
+        "SaveSync is controlled by the supported-layout allowlist."
+    )

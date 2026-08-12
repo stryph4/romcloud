@@ -149,7 +149,7 @@ intentionally separate operations.
 
 ## How ROMCloud works
 
-In Cache Mode:
+In Cached Storage:
 
 ``` text
 NAS / PC / external storage
@@ -180,11 +180,11 @@ NAS / PC / external storage
 
 ROMCloud proxy files are small managed records, not ROM files. A proxy
 identifies a cataloged game. On launch, ROMCloud resolves that identity,
-makes sure required assets are available locally when Cache Mode
+makes sure required assets are available locally when Cached Storage
 requires them, and hands the real game path to Batocera's normal
 launcher.
 
-Connected Mode instead exposes the known source library through verified
+Direct instead exposes the known source library through verified
 ROMCloud-owned links and launches directly from the configured source.
 
 ROMCloud never owns an entire `/userdata/roms/<system>` directory. It
@@ -260,7 +260,7 @@ deletion or storage failure.
 ## Catalog and EmulationStation integration
 
 ROMCloud catalogs known games and maintains ownership records for its
-generated presentation. In Cache Mode, managed entries look like:
+generated presentation. In Cached Storage, managed entries look like:
 
 ``` text
 /userdata/roms/psx/Alundra (USA).romcloud
@@ -337,7 +337,7 @@ romcloud library-sync sync
 romcloud library-sync remove-local
 ```
 
-Remote Library Sync operations are unavailable in Offline Mode.
+Remote Library Sync operations are unavailable while Offline is active.
 
 ## SaveSync
 
@@ -355,24 +355,26 @@ the read-only ROM source.
 
 ### Safety model
 
-SaveSync is designed around conservative ownership and transactional
+SaveSync is designed around a positive layout allowlist and transactional
 replacement:
 
 -   synchronization runs only through explicit SaveSync operations;
--   Offline Mode does not poll or modify remote saves;
+-   Offline does not poll or modify remote saves;
 -   conflicts are reported instead of guessed or overwritten;
--   local-game data is not automatically synchronized merely because it
-    shares a system save directory with a ROMCloud-managed game;
+-   eligible saves from ROMCloud-managed and ordinary local games receive
+    the same protection; catalog membership is not an eligibility gate;
 -   replacements are staged and verified before promotion;
 -   a previous known-good generation is retained for recovery;
--   policy-excluded content is preserved rather than silently copied or
-    deleted.
+-   unknown roots and unsupported nested content are not traversed, copied,
+    or deleted;
+-   per-group dirty/conflict evidence survives GUI sessions and reboots, and
+    acknowledging a conflict does not resolve it.
 
 SaveSync deliberately does **not** mean "synchronize everything under
-`/userdata/saves`." Only audited, eligible layouts should participate
-automatically. Ambiguous emulator-wide data, generated/cache content,
-firmware/keys, and other unsafe-to-attribute content are excluded unless
-a specific supported workflow says otherwise.
+`/userdata/saves`." Discovery starts only at audited layout roots. Ambiguous
+emulator-wide data, generated/cache content, firmware/keys, and other
+unsupported content are ignored unless a specific supported workflow says
+otherwise.
 
 The GUI provides SaveSync status, preview, upload, and download
 workflows with confirmation before destructive synchronization. CLI
@@ -387,6 +389,10 @@ romcloud saves preview-download
 romcloud saves download-all
 ```
 
+The SaveSync dashboard renders local/configured state immediately. Writable
+`[remote_data]` availability is checked separately with a bounded background
+probe, so Back and application Exit stay responsive when storage is missing.
+
 SaveSync does not currently hook emulator launch/exit. Game lifecycle
 synchronization requires a proven way to wait for the real emulator
 process to exit safely.
@@ -395,9 +401,10 @@ process to exit safely.
 `xbox_hdd.qcow2` virtual disk. Support is disabled by default because
 synchronizing it means transferring the whole opaque file.
 
-**RPCS3 installed games:** installed titles and patches can consume tens
-or hundreds of gigabytes and are excluded by default. An advanced opt-in
-exists for users who deliberately want that data included.
+**RPCS3 installed games:** installed titles, patches, firmware, caches,
+configuration, and logs are never SaveSync content. Only the explicitly
+registered RPCS3 save-data, trophy, virtual-memory-card, and savestate layouts
+participate.
 
 ## Graphical interface
 
@@ -546,8 +553,6 @@ port = 445
 [saves]
 local_path = "/userdata/saves"
 xbox_enabled = false
-rpcs3_installed_games_enabled = false
-include_local_games = false
 
 [library_sync]
 enabled = false
@@ -565,7 +570,7 @@ accesses that mounted filesystem through its local-filesystem provider.
 ├── config/romcloud.toml         Main configuration
 ├── config/credentials.toml      Credentials
 ├── data/catalog.db              Catalog/cache/proxy ownership database
-├── data/direct-links.json       Connected Mode link ownership
+├── data/direct-links.json       Direct link ownership
 ├── data/library-view.json       Current operating mode
 ├── data/library/                Local Library Sync state
 ├── logs/                        ROMCloud diagnostics

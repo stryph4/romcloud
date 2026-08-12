@@ -33,12 +33,12 @@ def _build_config(tmp_path):
     from romcloud.infrastructure.config import SavesConfig
 
     return AppConfig(
-        source=SourceConfig(provider="local", rom_root=str(source_root)),
-        cache=CacheConfig(path=str(cache_root)),
-        local_roms_path=str(local_roms),
-        data_path=str(data_root),
-        remote_data=RemoteDataConfig(provider="local", root=str(remote_data_root)),
-        saves=SavesConfig(local_path=str(saves_root)),
+        source=SourceConfig(provider="local", rom_root=source_root.as_posix()),
+        cache=CacheConfig(path=cache_root.as_posix()),
+        local_roms_path=local_roms.as_posix(),
+        data_path=data_root.as_posix(),
+        remote_data=RemoteDataConfig(provider="local", root=remote_data_root.as_posix()),
+        saves=SavesConfig(local_path=saves_root.as_posix()),
     )
 
 
@@ -56,20 +56,31 @@ def _invoke(cfg_path, args, input=None):
 
 
 class TestSavesyncStatus:
-    def test_reports_connectivity_and_defaults(self, tmp_path):
+    def test_reports_local_state_without_remote_probe(self, tmp_path, monkeypatch):
+        def unexpected_probe(_self):
+            raise AssertionError("local status must not touch remote storage")
+
+        monkeypatch.setattr(
+            "romcloud.services.saves.SaveSyncService.validate_remote_storage",
+            unexpected_probe,
+        )
+        monkeypatch.setattr(
+            "romcloud.services.saves.SaveSyncService.is_remote_reachable",
+            unexpected_probe,
+        )
         result = _invoke(_config_path(tmp_path), ["savesync-status"])
 
         assert result.exit_code == 0, result.output
         payload = json.loads(result.output.strip())
         assert payload["ok"] is True
         assert payload["remote_configured"] is True
-        assert payload["remote_reachable"] is True
+        assert "remote_reachable" not in payload
         assert payload["xbox_enabled"] is False
         assert payload["xbox_hdd_size_bytes"] is None
         assert payload["rpcs3_installed_games_enabled"] is False
-        assert payload["rpcs3_installed_games_files"] == 0
-        assert payload["rpcs3_installed_games_size_bytes"] == 0
-        assert payload["include_local_games"] is False
+        assert payload["include_local_games"] is True
+        assert payload["sync_status"] == "clean"
+        assert payload["active_conflicts"] == 0
         assert payload["last_upload"] is None
         assert payload["last_download"] is None
 
@@ -91,7 +102,60 @@ class TestSavesyncStatus:
         payload = json.loads(result.output.strip())
 
         assert payload["remote_configured"] is False
-        assert payload["remote_reachable"] is False
+
+
+class TestSavesyncAvailability:
+    def test_reports_verified_writable_remote_data(self, tmp_path):
+        cfg_path = _config_path(tmp_path)
+        result = _invoke(cfg_path, ["savesync-availability"])
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output.strip())
+        assert payload["remote_configured"] is True
+        assert payload["remote_available"] is True
+        assert payload["remote_reachable"] is True
+        assert payload["access"]["write_verified"] is True
+        assert payload["access"]["cleanup_verified"] is True
+        assert payload["sync_status"] == "clean"
+        status = json.loads(_invoke(cfg_path, ["savesync-status"]).output)
+        assert status["sync_status"] == "clean"
+
+    def test_reports_unavailable_when_remote_data_path_is_missing(self, tmp_path):
+        cfg_path = _config_path(tmp_path)
+        (tmp_path / "remote-data").rmdir()
+
+        result = _invoke(cfg_path, ["savesync-availability"])
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output.strip())
+        assert payload["remote_configured"] is True
+        assert payload["remote_available"] is False
+        assert payload["access"]["connected"] is False
+        assert payload["sync_status"] == "remote-unavailable"
+        status = json.loads(_invoke(cfg_path, ["savesync-status"]).output)
+        assert status["sync_status"] == "remote-unavailable"
+
+    def test_unconfigured_returns_without_provider_access(self, tmp_path):
+        config = _build_config(tmp_path)
+        config = AppConfig(
+            source=config.source,
+            cache=config.cache,
+            local_roms_path=config.local_roms_path,
+            data_path=config.data_path,
+            saves=config.saves,
+        )
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        cfg_path = config_dir / "romcloud.toml"
+        write_config(config, str(cfg_path))
+
+        result = _invoke(cfg_path, ["savesync-availability"])
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output.strip())
+        assert payload["remote_configured"] is False
+        assert payload["remote_available"] is False
+        assert "not configured" in payload["detail"]
 
 
 class TestSavesyncPreview:
@@ -156,7 +220,7 @@ class TestSavesyncSettings:
         status = json.loads(_invoke(cfg_path, ["savesync-status"]).output.strip())
         assert status["xbox_enabled"] is True
 
-    def test_enable_rpcs3_installed_games_persists_to_config(self, tmp_path):
+    def test_legacy_rpcs3_setting_is_ignored_by_savesync_status(self, tmp_path):
         cfg_path = _config_path(tmp_path)
 
         result = _invoke(
@@ -169,7 +233,7 @@ class TestSavesyncSettings:
         payload = json.loads(result.output.strip())
         assert payload["rpcs3_installed_games_enabled"] is True
         status = json.loads(_invoke(cfg_path, ["savesync-status"]).output.strip())
-        assert status["rpcs3_installed_games_enabled"] is True
+        assert status["rpcs3_installed_games_enabled"] is False
 
     def test_enable_local_games_persists_to_config(self, tmp_path):
         cfg_path = _config_path(tmp_path)

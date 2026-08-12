@@ -17,7 +17,7 @@ from romcloud.core.models.game import Game, GameAsset
 from romcloud.core.models.savesync import SaveChangeKind, SaveDiff
 from romcloud.core.save_ownership import ManagedSaveOwnershipPolicy
 from romcloud.core.storage import StorageProvider
-from romcloud.infrastructure import mount, save_tree
+from romcloud.infrastructure import mount, save_transaction, save_tree
 from romcloud.infrastructure.config import (
     AppConfig,
     CacheConfig,
@@ -492,18 +492,22 @@ class TestStagingCommitFailureSafety:
     ):
         _write(tmp_path / "local-saves" / "psx" / "A.srm", b"a")
         diff = service.preview_upload()
-        monkeypatch.setattr(
-            save_tree,
-            "atomic_replace_dir",
-            lambda *args: (_ for _ in ()).throw(OSError("simulated rename failure")),
-        )
+        real_replace = save_transaction.os.replace
+        target = tmp_path / "remote-saves/psx/A.srm"
+
+        def fail_live_replace(source, destination):
+            if Path(destination) == target:
+                raise OSError("simulated rename failure")
+            return real_replace(source, destination)
+
+        monkeypatch.setattr(save_transaction.os, "replace", fail_live_replace)
 
         with pytest.raises(OSError, match="simulated rename failure"):
             service.commit_upload(diff)
 
         assert service.get_state().last_upload is None
-        assert not (tmp_path / "remote-saves").exists()
-        assert list(tmp_path.glob(".remote-saves.staging-*")) == []
+        assert not (tmp_path / "remote-saves/psx/A.srm").exists()
+        assert list(tmp_path.glob(".remote-saves.savesync-stage-*")) == []
 
     def test_no_staging_directory_left_behind_after_failure(self, tmp_path, service):
         _write(tmp_path / "local-saves" / "psx" / "A.srm", b"a")
@@ -571,7 +575,7 @@ class TestDiffSerialization:
 
 
 class TestRPCS3PolicyAndLegacyLayout:
-    def test_installed_games_excluded_by_default_but_save_data_is_synced(
+    def test_installed_games_are_ignored_but_save_data_is_synced(
         self, tmp_path, service
     ):
         save = (
@@ -590,9 +594,11 @@ class TestRPCS3PolicyAndLegacyLayout:
         assert [entry.relative_path for entry in diff.entries] == [
             "ps3/rpcs3/dev_hdd0/home/00000001/savedata/BLUS1/SAVE.DAT"
         ]
-        assert diff.optional_groups == (("rpcs3_installed_games", 1, 22),)
+        assert diff.optional_groups == ()
 
-    def test_installed_games_sync_only_after_explicit_opt_in(self, tmp_path, provider):
+    def test_legacy_installed_games_opt_in_cannot_enable_application_data(
+        self, tmp_path, provider
+    ):
         local = tmp_path / "local-saves"
         game = local / "ps3/rpcs3/dev_hdd0/game/BLUS1/USRDIR/EBOOT.BIN"
         _write(game, b"game")
@@ -607,8 +613,8 @@ class TestRPCS3PolicyAndLegacyLayout:
 
         record = svc.commit_upload(svc.preview_upload())
 
-        assert record.manifest[0].relative_path.endswith("USRDIR/EBOOT.BIN")
-        assert (tmp_path / "remote-saves" / record.manifest[0].relative_path).exists()
+        assert record.manifest == ()
+        assert not (tmp_path / "remote-saves/ps3/rpcs3/dev_hdd0/game").exists()
 
     def test_batocera_v43_external_dev_hdd0_maps_to_canonical_remote_path(
         self, tmp_path, provider
@@ -737,16 +743,15 @@ class TestThreeWayReconciliation:
         baseline_revision = service.get_state().last_upload.revision
         local.write_bytes(b"local-change")
         _write(tmp_path / "remote-saves/psx/Remote.srm", b"remote-only")
-        real_replace = save_tree.atomic_replace_dir
-        calls = {"count": 0}
+        real_replace = save_transaction.os.replace
+        fail_target = tmp_path / "local-saves/psx/Remote.srm"
 
-        def fail_second(staging, target):
-            calls["count"] += 1
-            if calls["count"] == 2:
+        def fail_second(source, target):
+            if Path(target) == fail_target:
                 raise OSError("second promotion failed")
-            return real_replace(staging, target)
+            return real_replace(source, target)
 
-        monkeypatch.setattr(save_tree, "atomic_replace_dir", fail_second)
+        monkeypatch.setattr(save_transaction.os, "replace", fail_second)
 
         with pytest.raises(OSError, match="second promotion failed"):
             service.reconcile()
@@ -760,7 +765,7 @@ class TestThreeWayReconciliation:
 
 
 class TestAutomaticOwnershipBoundary:
-    def test_unmanaged_local_save_is_not_automatically_uploaded(
+    def test_ordinary_local_save_is_automatically_eligible(
         self, tmp_path, service
     ):
         _write(tmp_path / "local-saves/psx/Local Game.srm", b"local")
@@ -768,10 +773,12 @@ class TestAutomaticOwnershipBoundary:
         plan = service.preview_reconciliation()
         report = service.reconcile()
 
-        assert plan.entries == ()
-        assert plan.excluded_files == 1
-        assert report.uploaded == 0
-        assert not (tmp_path / "remote-saves").exists()
+        assert [entry.relative_path for entry in plan.uploads] == [
+            "psx/Local Game.srm"
+        ]
+        assert plan.excluded_files == 0
+        assert report.uploaded == 1
+        assert (tmp_path / "remote-saves/psx/Local Game.srm").read_bytes() == b"local"
 
     def test_local_game_opt_in_enables_eligible_automatic_sync(
         self, tmp_path, provider
@@ -812,11 +819,11 @@ class TestAutomaticOwnershipBoundary:
         report = svc.reconcile()
 
         assert plan.entries == ()
-        assert plan.optional_groups == (("rpcs3_installed_games", 1, 14),)
+        assert plan.optional_groups == ()
         assert report.uploaded == 0
         assert not (tmp_path / "remote-saves").exists()
 
-    def test_local_save_sharing_managed_system_directory_is_not_included(
+    def test_local_save_sharing_managed_system_directory_is_included(
         self, tmp_path, managed_service
     ):
         _write(tmp_path / "local-saves/psx/Game.srm", b"managed")
@@ -824,14 +831,17 @@ class TestAutomaticOwnershipBoundary:
 
         plan = managed_service.preview_reconciliation()
 
-        assert [entry.relative_path for entry in plan.uploads] == ["psx/Game.srm"]
-        assert plan.excluded_files == 1
+        assert [entry.relative_path for entry in plan.uploads] == [
+            "psx/Game.srm",
+            "psx/Local Game.srm",
+        ]
+        assert plan.excluded_files == 0
 
         report = managed_service.reconcile()
 
-        assert report.uploaded == 1
+        assert report.uploaded == 2
         assert (tmp_path / "remote-saves/psx/Game.srm").read_bytes() == b"managed"
-        assert not (tmp_path / "remote-saves/psx/Local Game.srm").exists()
+        assert (tmp_path / "remote-saves/psx/Local Game.srm").read_bytes() == b"local"
         assert (tmp_path / "local-saves/psx/Local Game.srm").read_bytes() == b"local"
 
     def test_managed_download_preserves_unmanaged_local_save(
@@ -901,9 +911,11 @@ class TestForceReplacementPreservesExcludedContent:
         service.commit_upload(service.preview_upload())
 
         assert (tmp_path / "remote-saves/psx/Game.srm").read_bytes() == b"two"
-        assert (tmp_path / "remote-saves.previous/psx/Game.srm").read_bytes() == b"one"
+        assert (
+            tmp_path / "remote-saves.savesync-previous/psx/Game.srm"
+        ).read_bytes() == b"one"
 
-    def test_hardlink_unsupported_aborts_instead_of_copying_excluded_large_data(
+    def test_unsupported_large_tree_is_not_touched_when_hardlinks_fail(
         self, tmp_path, service, monkeypatch
     ):
         _write(tmp_path / "remote-saves/psx/Remote.srm", b"remote")
@@ -915,8 +927,263 @@ class TestForceReplacementPreservesExcludedContent:
             lambda *args: (_ for _ in ()).throw(OSError("not supported")),
         )
 
-        with pytest.raises(SaveSyncError, match="does not support hardlinks"):
-            service.commit_download(service.preview_download())
+        service.commit_download(service.preview_download())
 
         assert excluded.read_bytes() == b"large-installed-game"
-        assert not (tmp_path / "local-saves/psx/Remote.srm").exists()
+        assert (tmp_path / "local-saves/psx/Remote.srm").read_bytes() == b"remote"
+
+
+class TestSaveSyncFinalizationSafety:
+    def test_commit_rejects_mismatched_preview_direction(self, tmp_path, service):
+        _write(tmp_path / "local-saves/psx/Game.srm", b"save")
+        upload = service.preview_upload()
+
+        with pytest.raises(SaveSyncVerificationError, match="Download requires"):
+            service.commit_download(upload)
+
+    def test_source_change_after_staging_rolls_back_destination_and_state(
+        self, tmp_path, service, monkeypatch
+    ):
+        local = tmp_path / "local-saves/psx/Game.srm"
+        remote = tmp_path / "remote-saves/psx/Game.srm"
+        _write(local, b"old-local")
+        _write(remote, b"known-remote")
+        preview = service.preview_upload()
+        real_prepare = service._prepare_selected_transaction
+
+        def prepare_then_change(*args, **kwargs):
+            transaction = real_prepare(*args, **kwargs)
+            local.write_bytes(b"unpreviewed-change")
+            return transaction
+
+        monkeypatch.setattr(service, "_prepare_selected_transaction", prepare_then_change)
+
+        with pytest.raises(SaveSyncVerificationError, match="changed while staging"):
+            service.commit_upload(preview)
+
+        assert remote.read_bytes() == b"known-remote"
+        assert service.get_state().last_upload is None
+
+    def test_download_verification_failure_never_replaces_local(
+        self, tmp_path, service, monkeypatch
+    ):
+        local = tmp_path / "local-saves/psx/Game.srm"
+        remote = tmp_path / "remote-saves/psx/Game.srm"
+        _write(local, b"known-local")
+        _write(remote, b"remote-source")
+        preview = service.preview_download()
+        real_apply = service._apply_selected_transaction
+
+        def corrupt_stage(transaction, views):
+            staged = transaction.views[0].stage / "psx/Game.srm"
+            staged.write_bytes(b"corrupt")
+            return real_apply(transaction, views)
+
+        monkeypatch.setattr(service, "_apply_selected_transaction", corrupt_stage)
+
+        with pytest.raises(SaveSyncVerificationError):
+            service.commit_download(preview)
+
+        assert local.read_bytes() == b"known-local"
+        assert service.get_state().last_download is None
+
+    def test_shared_layout_disjoint_changes_are_one_explicit_conflict(
+        self, tmp_path, service
+    ):
+        card1 = tmp_path / "local-saves/duckstation/memcards/card1.mcd"
+        card2 = tmp_path / "local-saves/duckstation/memcards/card2.mcd"
+        _write(card1, b"card-one-base")
+        _write(card2, b"card-two-base")
+        service.commit_upload(service.preview_upload())
+        card1.write_bytes(b"card-one-local")
+        remote_card2 = tmp_path / "remote-saves/duckstation/memcards/card2.mcd"
+        remote_card2.write_bytes(b"card-two-remote")
+
+        plan = service.preview_reconciliation()
+        report = service.reconcile()
+
+        assert {entry.relative_path for entry in plan.conflicts} == {
+            "duckstation/memcards/card1.mcd",
+            "duckstation/memcards/card2.mcd",
+        }
+        assert report.conflicts == 2
+        assert card1.read_bytes() == b"card-one-local"
+        assert card2.read_bytes() == b"card-two-base"
+        assert remote_card2.read_bytes() == b"card-two-remote"
+        reloaded = SaveSyncService(
+            provider=service._provider,
+            connectivity_root=service._connectivity_root,
+            local_root=str(service._local_root),
+            remote_root=str(service._remote_root),
+            state_path=service._state_path,
+        ).get_state()
+        assert len(reloaded.active_conflicts) == 1
+        assert reloaded.active_conflicts[0].acknowledged_at is None
+
+    def test_watcher_dirty_hint_survives_restart_but_preview_hashes_actual_files(
+        self, tmp_path, service
+    ):
+        local = tmp_path / "local-saves/psx/Local Game.srm"
+        _write(local, b"actual")
+
+        marked = service.mark_local_dirty("psx/Local Game.srm")
+        assert marked.groups[0].condition.value == "local-dirty"
+        restarted = SaveSyncService(
+            provider=service._provider,
+            connectivity_root=service._connectivity_root,
+            local_root=str(service._local_root),
+            remote_root=str(service._remote_root),
+            state_path=service._state_path,
+        )
+
+        diff = restarted.preview_upload()
+
+        assert diff.added[0].local.content_hash == save_tree.hash_file(local)
+
+    def test_watcher_hint_rejects_disabled_or_cross_group_paths(self, service):
+        with pytest.raises(SaveSyncVerificationError, match="not enabled"):
+            service.mark_local_dirty("xbox/xbox_hdd.qcow2")
+        with pytest.raises(SaveSyncVerificationError, match="same supported"):
+            service.mark_local_dirty(
+                "psx/Game.srm", changed_paths=("psx/Other Game.srm",)
+            )
+
+    def test_verified_empty_reconcile_clears_a_watcher_only_dirty_hint(
+        self, service
+    ):
+        marked = service.mark_local_dirty("psx/Deleted Game.srm")
+        assert marked.groups[0].condition.value == "local-dirty"
+
+        service.reconcile()
+
+        group = service.get_state().groups[0]
+        assert group.condition.value == "clean"
+        assert group.dirty_path_hints == ()
+        assert group.baseline is not None and group.baseline.artifacts == ()
+
+    def test_force_delete_resolves_affected_group_with_verified_empty_snapshot(
+        self, tmp_path, service
+    ):
+        local = tmp_path / "local-saves/psx/Game.srm"
+        remote = tmp_path / "remote-saves/psx/Game.srm"
+        _write(local, b"baseline")
+        service.commit_upload(service.preview_upload())
+        local.unlink()
+        remote.write_bytes(b"independent-remote-change")
+        service.reconcile()
+        assert len(service.get_state().active_conflicts) == 1
+
+        service.commit_upload(service.preview_upload())
+
+        state = service.get_state()
+        descriptor = service._policy.group_for_path("psx/Game.srm")
+        assert descriptor is not None
+        group = next(
+            group for group in state.groups if group.group_id == descriptor.group_id
+        )
+        assert not remote.exists()
+        assert state.active_conflicts == ()
+        assert group.condition.value == "clean"
+        assert group.baseline is not None
+        assert group.baseline.artifacts == ()
+
+    def test_force_sync_preserves_disabled_xemu_conflict_and_baseline(
+        self, tmp_path, provider
+    ):
+        state_path = tmp_path / "data/savesync-state.json"
+        enabled = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "remote-data"),
+            local_root=str(tmp_path / "local-saves"),
+            remote_root=str(tmp_path / "remote-saves"),
+            state_path=state_path,
+            xbox_enabled=True,
+        )
+        local_xbox = tmp_path / "local-saves/xbox/xbox_hdd.qcow2"
+        remote_xbox = tmp_path / "remote-saves/xbox/xbox_hdd.qcow2"
+        _write(local_xbox, b"xbox-baseline")
+        enabled.commit_upload(enabled.preview_upload())
+        local_xbox.write_bytes(b"xbox-local-change")
+        remote_xbox.write_bytes(b"xbox-remote-change")
+        enabled.reconcile()
+        conflict = enabled.get_state().active_conflicts[0]
+
+        disabled = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "remote-data"),
+            local_root=str(tmp_path / "local-saves"),
+            remote_root=str(tmp_path / "remote-saves"),
+            state_path=state_path,
+            xbox_enabled=False,
+        )
+        _write(tmp_path / "local-saves/psx/Local Game.srm", b"local-game")
+        disabled.commit_upload(disabled.preview_upload())
+
+        state = disabled.get_state()
+        assert remote_xbox.read_bytes() == b"xbox-remote-change"
+        assert state.active_conflicts == (conflict,)
+        assert any(
+            artifact.relative_path == "xbox/xbox_hdd.qcow2"
+            for artifact in state.shared_manifest
+        )
+
+    def test_reconcile_preserves_disabled_xemu_conflict_and_baseline(
+        self, tmp_path, provider
+    ):
+        state_path = tmp_path / "data/savesync-state.json"
+        enabled = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "remote-data"),
+            local_root=str(tmp_path / "local-saves"),
+            remote_root=str(tmp_path / "remote-saves"),
+            state_path=state_path,
+            xbox_enabled=True,
+        )
+        local_xbox = tmp_path / "local-saves/xbox/xbox_hdd.qcow2"
+        remote_xbox = tmp_path / "remote-saves/xbox/xbox_hdd.qcow2"
+        _write(local_xbox, b"xbox-baseline")
+        enabled.commit_upload(enabled.preview_upload())
+        local_xbox.write_bytes(b"xbox-local-change")
+        remote_xbox.write_bytes(b"xbox-remote-change")
+        enabled.reconcile()
+        conflict = enabled.get_state().active_conflicts[0]
+
+        disabled = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "remote-data"),
+            local_root=str(tmp_path / "local-saves"),
+            remote_root=str(tmp_path / "remote-saves"),
+            state_path=state_path,
+            xbox_enabled=False,
+        )
+        local_game = tmp_path / "local-saves/psx/Local Game.srm"
+        _write(local_game, b"local-game")
+        disabled.reconcile()
+
+        state = disabled.get_state()
+        assert (tmp_path / "remote-saves/psx/Local Game.srm").read_bytes() == b"local-game"
+        assert local_xbox.read_bytes() == b"xbox-local-change"
+        assert remote_xbox.read_bytes() == b"xbox-remote-change"
+        assert state.active_conflicts == (conflict,)
+        assert any(
+            artifact.relative_path == "xbox/xbox_hdd.qcow2"
+            for artifact in state.shared_manifest
+        )
+
+    def test_verified_empty_reconcile_baseline_is_not_replaced_by_old_receipt(
+        self, tmp_path, service
+    ):
+        local = tmp_path / "local-saves/psx/Game.srm"
+        remote = tmp_path / "remote-saves/psx/Game.srm"
+        _write(local, b"old-content")
+        service.commit_upload(service.preview_upload())
+        local.unlink()
+        remote.unlink()
+        service.reconcile()
+        assert service.get_state().shared_manifest == ()
+
+        _write(remote, b"old-content")
+        plan = service.preview_reconciliation()
+
+        assert [entry.relative_path for entry in plan.downloads] == ["psx/Game.srm"]
+        assert plan.uploads == ()

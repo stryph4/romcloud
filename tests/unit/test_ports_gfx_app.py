@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 from ports_gfx.app import (
     MENU_CATEGORIES,
-    MENU_ITEMS,
+    ROOT_MENU_ITEMS as MENU_ITEMS,
     _ControllerTestScreenState,
     _apply_direction,
     _handle_controller_test_event,
@@ -790,13 +790,19 @@ class TestHandleSavesyncEvent:
         from ports_gfx import app as app_module
 
         screen = self._screen()
+        cancelled = []
+        screen.cancel_pending = lambda: cancelled.append(True)
         assert app_module._handle_savesync_event(InputEvent(action=Action.BACK), screen) == "menu"
+        assert cancelled == [True]
 
     def test_dashboard_confirm_on_back_item_leaves_screen(self):
         from ports_gfx import app as app_module
 
         screen = self._screen(selected_index=3)  # "Back"
+        cancelled = []
+        screen.cancel_pending = lambda: cancelled.append(True)
         assert app_module._handle_savesync_event(InputEvent(action=Action.CONFIRM), screen) == "menu"
+        assert cancelled == [True]
 
     def test_dashboard_confirm_on_settings_switches_step(self):
         from ports_gfx import app as app_module
@@ -843,32 +849,69 @@ class TestHandleSavesyncEvent:
         app_module._handle_savesync_event(InputEvent(action=Action.CONFIRM), screen)
         assert screen.confirm.pressed is True
 
-    def test_rpc3_warning_requires_confirm_before_long_hold(self):
+    def test_dashboard_remains_navigable_while_remote_check_is_pending(self):
         from ports_gfx import app as app_module
-        from ports_gfx.savesync_screen import RPCS3_CONFIRMING, RPCS3_WARNING
+        from ports_gfx.savesync_screen import REMOTE_CHECKING
 
-        screen = self._screen(step=RPCS3_WARNING)
-        app_module._handle_savesync_event(InputEvent(action=Action.CONFIRM), screen)
+        screen = self._screen(remote_availability=REMOTE_CHECKING)
 
-        assert screen.step == RPCS3_CONFIRMING
-        assert screen.confirm.pressed is True
+        result = app_module._handle_savesync_event(InputEvent(action=Action.DOWN), screen)
 
-    def test_local_game_warning_confirm_starts_settings_update(self):
+        assert result == "savesync"
+        assert screen.selected_index == 1
+
+    def test_dashboard_renders_remote_lifecycle_and_local_first_scope(self):
         from ports_gfx import app as app_module
-        from ports_gfx.savesync_screen import APPLYING_SETTINGS, LOCAL_GAMES_WARNING
+        from ports_gfx.savesync_screen import (
+            REMOTE_AVAILABLE,
+            REMOTE_CHECKING,
+            REMOTE_UNAVAILABLE,
+        )
 
-        screen = self._screen(step=LOCAL_GAMES_WARNING)
-        called = []
+        expected = {
+            REMOTE_CHECKING: "Remote: Checking…",
+            REMOTE_AVAILABLE: "Remote: Available",
+            REMOTE_UNAVAILABLE: "Remote: Unavailable",
+        }
+        for availability, line in expected.items():
+            screen = self._screen(
+                remote_availability=availability,
+                status={"remote_configured": True},
+            )
+            lines = app_module._savesync_body_lines(screen)
+            assert line in lines
+            assert "Eligible scope: all supported save layouts" in lines
+            assert not any("NAS" in text for text in lines)
+            assert not any("RPCS3 installed games" in text for text in lines)
 
-        def enable(value):
-            called.append(value)
-            screen.step = APPLYING_SETTINGS
+    def test_dashboard_renders_action_error(self):
+        from ports_gfx import app as app_module
 
-        screen.set_include_local_games = enable
-        app_module._handle_savesync_event(InputEvent(action=Action.CONFIRM), screen)
+        screen = self._screen(error="Remote storage is unavailable.")
 
-        assert screen.step == APPLYING_SETTINGS
-        assert called == [True]
+        assert "SaveSync: Remote storage is unavailable." in app_module._savesync_body_lines(
+            screen
+        )
+
+    def test_dashboard_does_not_report_unknown_local_state_as_never_or_disabled(self):
+        from ports_gfx import app as app_module
+
+        screen = self._screen(status_loading=True)
+        lines = app_module._savesync_body_lines(screen)
+
+        assert "Original Xbox: loading…" in lines
+        assert "Last upload: loading…" in lines
+        assert "Last download: loading…" in lines
+
+    def test_settings_no_longer_exposes_local_game_or_rpcs3_opt_ins(self):
+        from ports_gfx import app as app_module
+        from ports_gfx.savesync_screen import SETTINGS
+
+        screen = self._screen(step=SETTINGS)
+        lines = app_module._savesync_body_lines(screen)
+
+        assert not any("Local Games" in line for line in lines)
+        assert not any("RPCS3" in line for line in lines)
 
     def test_result_confirm_returns_to_dashboard(self):
         from ports_gfx import app as app_module

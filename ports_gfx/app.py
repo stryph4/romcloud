@@ -88,11 +88,10 @@ from ports_gfx.savesync_screen import (
     CONFIRMING,
     DASHBOARD,
     DASHBOARD_ITEMS,
-    LOCAL_GAMES_WARNING,
     PREVIEW,
     PREVIEWING,
-    RPCS3_CONFIRMING,
-    RPCS3_WARNING,
+    REMOTE_AVAILABLE,
+    REMOTE_CHECKING,
     RESULT,
     SETTINGS,
     SETTINGS_ITEMS,
@@ -1006,7 +1005,7 @@ def _run(  # noqa: ANN001
                         message_kind = "info"
                     elif ievent.action == Action.CONFIRM and item.action == SAVESYNC_ACTION:
                         savesync_screen = SaveSyncScreenState(romcloud_bin=romcloud_bin)
-                        savesync_screen.refresh_status()
+                        savesync_screen.start_loading()
                         current_screen = "savesync"
                     elif ievent.action == Action.CONFIRM and item.action == LIBRARY_SYNC_ACTION:
                         library_sync_screen = LibrarySyncScreenState(romcloud_bin=romcloud_bin)
@@ -1026,6 +1025,7 @@ def _run(  # noqa: ANN001
                 elif current_screen == "savesync" and savesync_screen is not None:
                     current_screen = _handle_savesync_event(ievent, savesync_screen)
                     if current_screen == "menu":
+                        savesync_screen.cancel_pending()
                         savesync_screen = None
                 elif current_screen == "library_sync" and library_sync_screen is not None:
                     current_screen = _handle_library_sync_event(
@@ -1361,13 +1361,13 @@ def _handle_controller_test_event(
 
 def _handle_savesync_event(ievent: InputEvent, savesync_screen: SaveSyncScreenState) -> str:
     """Translate one semantic input event into SaveSync screen-state
-    changes. Pure function — no pygame — so it is fully unit-tested.
+    changes without depending on pygame.
 
     Returns the screen name to switch to next ("savesync" to stay, "menu"
-    to leave). While a backend operation is in flight (PREVIEWING /
-    COMMITTING / APPLYING_SETTINGS) input is ignored — the same "a
-    legitimate operation is never interruptible mid-flight" rule the
-    reusable operation screen already follows.
+    to leave). Availability checking is orthogonal to the workflow step, so
+    Dashboard navigation and Back remain live while the bounded check runs.
+    Foreground preview, commit, and settings operations remain
+    non-interruptible here.
     """
     step = savesync_screen.step
 
@@ -1377,8 +1377,12 @@ def _handle_savesync_event(ievent: InputEvent, savesync_screen: SaveSyncScreenSt
             if dy:
                 savesync_screen.select(savesync_screen.selected_index + dy)
         if ievent.action == Action.CONFIRM:
-            return "menu" if savesync_screen.confirm_dashboard_selection() == "back" else "savesync"
+            if savesync_screen.confirm_dashboard_selection() == "back":
+                savesync_screen.cancel_pending()
+                return "menu"
+            return "savesync"
         if ievent.action == Action.BACK:
+            savesync_screen.cancel_pending()
             return "menu"
         return "savesync"
 
@@ -1390,23 +1394,8 @@ def _handle_savesync_event(ievent: InputEvent, savesync_screen: SaveSyncScreenSt
             savesync_screen.return_to_dashboard()
         return "savesync"
 
-    if step in (CONFIRMING, RPCS3_CONFIRMING):
+    if step == CONFIRMING:
         savesync_screen.handle_confirm_event(ievent)
-        return "savesync"
-
-    if step == RPCS3_WARNING:
-        if ievent.action == Action.CONFIRM:
-            savesync_screen.begin_rpcs3_confirm()
-            savesync_screen.handle_confirm_event(ievent)
-        elif ievent.action == Action.BACK:
-            savesync_screen.step = SETTINGS
-        return "savesync"
-
-    if step == LOCAL_GAMES_WARNING:
-        if ievent.action == Action.CONFIRM:
-            savesync_screen.set_include_local_games(True)
-        elif ievent.action == Action.BACK:
-            savesync_screen.step = SETTINGS
         return "savesync"
 
     if step == RESULT:
@@ -1851,35 +1840,55 @@ def _savesync_body_lines(savesync_screen: SaveSyncScreenState) -> list[str]:
     status = savesync_screen.status
 
     if step == DASHBOARD:
-        if status.get("remote_configured") is False:
-            return [
-                "ROMCloud data storage is not configured.",
-                "SaveSync is unavailable until a writable destination is configured.",
-                "",
-                *DASHBOARD_ITEMS,
-            ]
-        reachable = status.get("remote_reachable")
-        xbox_enabled = status.get("xbox_enabled", False)
-        rpcs3_enabled = status.get("rpcs3_installed_games_enabled", False)
-        local_games = status.get("include_local_games", False)
+        remote_label = (
+            "Checking…"
+            if savesync_screen.remote_availability == REMOTE_CHECKING
+            else "Available"
+            if savesync_screen.remote_availability == REMOTE_AVAILABLE
+            else "Unavailable"
+        )
+        if "xbox_enabled" in status:
+            xbox_label = "enabled" if status["xbox_enabled"] else "disabled"
+        else:
+            xbox_label = "loading…" if savesync_screen.status_loading else "unknown"
         last_upload = status.get("last_upload")
         last_download = status.get("last_download")
         reconcile = status.get("last_reconcile")
-        return [
-            f"Remote: {'reachable' if reachable else 'unreachable'}",
-            f"Original Xbox: {'enabled' if xbox_enabled else 'disabled'}",
-            f"RPCS3 installed games: {'included' if rpcs3_enabled else 'excluded (safe default)'}",
-            f"Automatic scope: {'all eligible games' if local_games else 'ROMCloud-managed games'}",
+        empty_history = (
+            "loading…"
+            if savesync_screen.status_loading
+            else "unavailable"
+            if savesync_screen.status_error
+            else "never"
+        )
+        lines = [
+            f"Remote: {remote_label}",
+            f"Original Xbox: {xbox_label}",
+            "Eligible scope: all supported save layouts",
             (
-                f"Last NAS sync: {reconcile.get('conflicts', 0)} conflict(s) preserved"
+                f"Last reconciliation: {reconcile.get('conflicts', 0)} conflict(s) preserved"
                 if reconcile
-                else "Last NAS sync: never"
+                else f"Last reconciliation: {empty_history}"
             ),
-            f"Last upload: {last_upload['timestamp'] if last_upload else 'never'}",
-            f"Last download: {last_download['timestamp'] if last_download else 'never'}",
-            "",
-            *DASHBOARD_ITEMS,
+            f"Last upload: {last_upload['timestamp'] if last_upload else empty_history}",
+            f"Last download: {last_download['timestamp'] if last_download else empty_history}",
         ]
+        if status.get("sync_status"):
+            lines.insert(
+                3,
+                "Save state: "
+                f"{status['sync_status']}; "
+                f"{int(status.get('active_conflicts', 0))} conflict(s) require attention",
+            )
+        if status.get("remote_configured") is False:
+            lines.append("ROMCloud data storage is not configured.")
+        if savesync_screen.status_loading:
+            lines.append("Local status: Loading…")
+        if savesync_screen.status_error:
+            lines.append(f"Local status unavailable: {savesync_screen.status_error}")
+        if savesync_screen.error:
+            lines.append(f"SaveSync: {savesync_screen.error}")
+        return [*lines, "", *DASHBOARD_ITEMS]
     if step == PREVIEWING:
         return ["Comparing local and remote saves..."]
     if step == PREVIEW:
@@ -1891,7 +1900,6 @@ def _savesync_body_lines(savesync_screen: SaveSyncScreenState) -> list[str]:
             f"Removed:   {summary.get('removed', 0)}",
             f"Conflicts: {summary.get('conflicts', 0)}",
             f"Unchanged: {summary.get('unchanged', 0)}",
-            f"Excluded:  {summary.get('excluded_files', 0)}",
             f"Transfer:  {_save_size(summary.get('transfer_bytes', 0))}",
             "",
             (
@@ -1914,39 +1922,17 @@ def _savesync_body_lines(savesync_screen: SaveSyncScreenState) -> list[str]:
             "Press Confirm to return.",
         ]
     if step == SETTINGS:
-        xbox_enabled = status.get("xbox_enabled", False)
-        rpcs3_enabled = status.get("rpcs3_installed_games_enabled", False)
-        local_games = status.get("include_local_games", False)
-        return [
-            f"Original Xbox: {'enabled' if xbox_enabled else 'disabled'}",
-            f"RPCS3 installed games: {'enabled' if rpcs3_enabled else 'disabled'}",
-            f"Local games: {'included' if local_games else 'not automatically synced'}",
-            "",
-            *SETTINGS_ITEMS,
+        if "xbox_enabled" in status:
+            xbox_label = "enabled" if status["xbox_enabled"] else "disabled"
+        else:
+            xbox_label = "loading…" if savesync_screen.status_loading else "unknown"
+        lines = [
+            f"Original Xbox: {xbox_label}",
+            "The virtual drive is explicit opt-in; disabling restores the safe default.",
         ]
-    if step == RPCS3_WARNING:
-        files = int(status.get("rpcs3_installed_games_files", 0))
-        size_bytes = int(status.get("rpcs3_installed_games_size_bytes", 0))
-        return [
-            "WARNING: RPCS3 installed games are not ordinary saves.",
-            "This may transfer tens or hundreds of gigabytes and take hours.",
-            f"Current local estimate: {files} file(s), {_save_size(size_bytes)}.",
-            "",
-            "Press Confirm, then hold for 3 seconds to enable. Back cancels.",
-        ]
-    if step == RPCS3_CONFIRMING:
-        return [
-            "Keep holding Confirm to include RPCS3 installed games.",
-            "Release to cancel.",
-        ]
-    if step == LOCAL_GAMES_WARNING:
-        return [
-            "Include Local Games in Save Sync",
-            "ROMCloud will automatically reconcile eligible save/state data",
-            "for games that are installed locally and are not ROMCloud-managed.",
-            "",
-            "Press Confirm to enable. Back cancels.",
-        ]
+        if savesync_screen.error:
+            lines.append(f"SaveSync: {savesync_screen.error}")
+        return [*lines, "", *SETTINGS_ITEMS]
     if step == APPLYING_SETTINGS:
         return ["Applying setting..."]
     return []
@@ -2100,7 +2086,7 @@ def _render_savesync(  # noqa: ANN001
         screen.blit(text, (layout.navigation_rect.x, y))
         y += line_h
 
-    if savesync_screen.step in (CONFIRMING, RPCS3_CONFIRMING):
+    if savesync_screen.step == CONFIRMING:
         bar_x = layout.navigation_rect.x
         bar_y = y + line_h // 2
         bar_w = max(1, min(layout.navigation_rect.w, 560))

@@ -574,27 +574,53 @@ def _record_dict(record) -> dict | None:
 @uidata_group.command("savesync-status")
 @click.pass_context
 def uidata_savesync_status(ctx: click.Context) -> None:
-    """SaveSync connectivity/settings/last-sync summary as JSON."""
+    """SaveSync local/configured state without touching remote storage."""
 
     def build() -> dict:
         _load_context_config(ctx)
         saves = get_container(ctx).saves
         state = saves.get_state()
-        rpcs3_files, rpcs3_bytes = saves.rpcs3_installed_games_size()
         return {
             "remote_configured": saves.is_remote_configured,
-            "remote_reachable": saves.is_remote_reachable(),
             "xbox_enabled": saves.xbox_enabled,
             "xbox_hdd_size_bytes": saves.xbox_hdd_size(),
+            # Compatibility-only settings. The graphical SaveSync screen no
+            # longer offers unsafe RPCS3 application-data inclusion or makes
+            # ordinary local games conditional on an opt-in.
             "rpcs3_installed_games_enabled": saves.rpcs3_installed_games_enabled,
-            "rpcs3_installed_games_files": rpcs3_files,
-            "rpcs3_installed_games_size_bytes": rpcs3_bytes,
             "include_local_games": saves.include_local_games,
+            "sync_status": state.effective_status.value,
+            "active_conflicts": len(state.active_conflicts),
             "last_upload": _record_dict(state.last_upload),
             "last_download": _record_dict(state.last_download),
             "last_reconcile": (
                 state.last_reconcile.to_dict() if state.last_reconcile else None
             ),
+        }
+
+    _run_action(ctx, build)
+
+
+@uidata_group.command("savesync-availability")
+@click.pass_context
+def uidata_savesync_availability(ctx: click.Context) -> None:
+    """Validate configured writable ``[remote_data]`` storage as JSON."""
+
+    def build() -> dict:
+        _load_context_config(ctx)
+        saves = get_container(ctx).saves
+        access = saves.validate_remote_storage()
+        state = saves.record_remote_observation(access)
+        return {
+            "remote_configured": saves.is_remote_configured,
+            "remote_available": access.ok,
+            # Keep the old boolean spelling in this provider-neutral endpoint
+            # for internal callers migrating from the combined status call.
+            "remote_reachable": access.ok,
+            "access": access.as_dict(),
+            "detail": access.detail,
+            "sync_status": state.effective_status.value,
+            "active_conflicts": len(state.active_conflicts),
         }
 
     _run_action(ctx, build)
@@ -757,7 +783,7 @@ def uidata_savesync_settings(ctx: click.Context) -> None:
 @uidata_group.command("savesync-reconcile")
 @click.pass_context
 def uidata_savesync_reconcile(ctx: click.Context) -> None:
-    """Run normal conflict-aware NAS save/state reconciliation."""
+    """Run conflict-aware writable remote-data reconciliation."""
 
     def build() -> dict:
         request = _read_request()
