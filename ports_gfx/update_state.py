@@ -5,6 +5,8 @@ from __future__ import annotations
 from ports_gfx.client import BackendResult, operation_result
 from ports_gfx.operation import OperationLine, OperationRunner, OperationState
 
+UPDATE_CHECK_TIMEOUT = 35.0
+
 
 class UpdateCheckState:
     def __init__(self) -> None:
@@ -30,11 +32,23 @@ class UpdateCheckState:
             return
         kwargs = {} if popen is None else {"popen": popen}
         self.runner = OperationRunner(
-            [romcloud_bin, "uidata", "update-check"], **kwargs
+            [romcloud_bin, "uidata", "update-check"],
+            max_runtime=UPDATE_CHECK_TIMEOUT,
+            timeout_message=(
+                "Update check timed out; check internet connectivity and try again."
+            ),
+            **kwargs,
         )
         self.runner.start()
         self.status = "checking"
         self.error = ""
+
+    def cancel(self) -> None:
+        if self.runner is not None:
+            self.runner.cancel()
+        if self.checking:
+            self.status = "cancelled"
+            self.error = "Update check cancelled"
 
     def poll(self) -> list[OperationLine]:
         if self.runner is None or self.status != "checking":

@@ -835,6 +835,11 @@ class WizardState:
             self.technical_error = ""
             self.notice = ""
 
+    def cancel_pending(self) -> None:
+        if self.runner is not None:
+            self.runner.cancel()
+            self.runner = None
+
     def select(self, index: int) -> None:
         count = max(1, len(self.options))
         self.selected_index = max(0, min(index, count - 1))

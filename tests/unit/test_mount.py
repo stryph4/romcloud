@@ -10,6 +10,9 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+import subprocess
+import threading
+import time
 
 import pytest
 
@@ -188,6 +191,26 @@ class TestCheckReachable:
         assert result.ok is False
         assert result.stage == "tcp"
 
+    def test_blocked_injected_dns_is_abandoned_at_deadline(self):
+        release = threading.Event()
+
+        def blocked_resolver(_host, _port):
+            release.wait(5.0)
+            return []
+
+        started = time.monotonic()
+        try:
+            result = mount.check_reachable(
+                "nas.local", timeout=0.02, resolver=blocked_resolver
+            )
+        finally:
+            release.set()
+
+        assert time.monotonic() - started < 1.0
+        assert result.ok is False
+        assert result.stage == "dns"
+        assert "timed out" in result.detail
+
 
 class TestWaitUntilReachable:
     def test_returns_immediately_on_first_success(self):
@@ -232,6 +255,24 @@ class TestWaitUntilReachable:
             timeout_total=10.0,
         )
         assert result.ok is False
+
+    def test_pre_set_cancellation_skips_probe_and_sleep(self):
+        cancelled = threading.Event()
+        cancelled.set()
+
+        result = mount.wait_until_reachable(
+            "nas.local",
+            check=lambda *_args: (_ for _ in ()).throw(
+                AssertionError("cancelled wait must not probe")
+            ),
+            sleep=lambda _seconds: (_ for _ in ()).throw(
+                AssertionError("cancelled wait must not sleep")
+            ),
+            cancel_event=cancelled,
+        )
+
+        assert result.ok is False
+        assert result.stage == "cancelled"
 
 
 def _fake_clock(values: list[float]):
@@ -418,6 +459,29 @@ class TestMountCifsSource:
             )
         assert "hunter2" not in str(excinfo.value)
 
+    def test_mount_command_timeout_is_actionable(self, tmp_path, monkeypatch):
+        proc_mounts = tmp_path / "mounts"
+        proc_mounts.write_text("")
+        monkeypatch.setattr(
+            mount,
+            "wait_until_reachable",
+            lambda *a, **k: mount.ReachabilityResult(True, "ok", ""),
+        )
+
+        def timed_out(argv, **kwargs):
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+        with pytest.raises(ProviderNotReachableError, match="mount command timed out"):
+            mount.mount_cifs_source(
+                "nas",
+                "ROMs",
+                str(tmp_path / "roms"),
+                Path("/creds"),
+                runner=timed_out,
+                proc_mounts_path=str(proc_mounts),
+                command_timeout=0.01,
+            )
+
 
 class TestUnmountCifsSource:
     def test_not_mounted_is_noop(self, tmp_path):
@@ -460,3 +524,18 @@ class TestUnmountCifsSource:
             mount.unmount_cifs_source(
                 "/mnt/roms", runner=fake_runner, proc_mounts_path=str(proc_mounts)
             )
+
+    def test_shutdown_lazy_unmount_is_bounded(self, monkeypatch):
+        monkeypatch.setattr(mount, "is_target_mounted", lambda *a, **k: True)
+        captured = {}
+
+        def timed_out(argv, **kwargs):
+            captured["argv"] = argv
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+        with pytest.raises(MountError, match="Timed out"):
+            mount.unmount_cifs_source(
+                "/mnt/roms", runner=timed_out, command_timeout=0.01, lazy=True
+            )
+
+        assert captured["argv"] == ["umount", "-l", "/mnt/roms"]

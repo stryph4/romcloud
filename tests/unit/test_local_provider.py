@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +13,7 @@ from romcloud.infrastructure.providers.local import (
     WritableLocalFilesystemProvider,
     WritableMountedFilesystemProvider,
     probe_directory_access,
+    probe_directory_access_bounded,
 )
 from romcloud.core.exceptions import ProviderError, ProviderNotReachableError, TransferError
 
@@ -320,3 +322,30 @@ class TestWritableRemoteDataProviders:
             expected_server="nas.local", expected_share="ROMCloud"
         )
         assert provider.is_reachable(str(tmp_path)) is False
+
+
+def test_network_filesystem_probe_timeout_is_safely_abandoned(tmp_path):
+    class BlockedProcess:
+        returncode = None
+        killed = False
+
+        def communicate(self, timeout):
+            raise subprocess.TimeoutExpired(["probe"], timeout)
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout):
+            raise subprocess.TimeoutExpired(["probe"], timeout)
+
+    process = BlockedProcess()
+    result = probe_directory_access_bounded(
+        tmp_path,
+        writable=False,
+        timeout=0.01,
+        popen=lambda *_args, **_kwargs: process,
+    )
+
+    assert result.ok is False
+    assert "timed out" in result.detail
+    assert process.killed is True

@@ -116,11 +116,20 @@ def mount_connections(
     return result
 
 
-def unmount_connections(config, progress: ProgressSink = None) -> dict[str, object]:
+def unmount_connections(
+    config,
+    progress: ProgressSink = None,
+    *,
+    shutdown: bool = False,
+) -> dict[str, object]:
     targets = mount_worker.configured_mounts(config)
     if not targets:
         raise ConfigurationError("This configuration uses a local folder and does not need unmounting.")
-    mount_worker.stop_worker(mount_worker.romcloud_home_from_config(config))
+    home = mount_worker.romcloud_home_from_config(config)
+    if shutdown:
+        mount_worker.stop_worker(home, grace_period=1.0)
+    else:
+        mount_worker.stop_worker(home)
     errors: list[str] = []
     changed = False
     for target in reversed(targets):
@@ -132,7 +141,15 @@ def unmount_connections(config, progress: ProgressSink = None) -> dict[str, obje
             f"Disconnecting {target.label}…",
         )
         try:
-            changed = mount.unmount_cifs_source(target.mount_point) or changed
+            if shutdown:
+                unmounted = mount.unmount_cifs_source(
+                    target.mount_point,
+                    lazy=True,
+                    command_timeout=5.0,
+                )
+            else:
+                unmounted = mount.unmount_cifs_source(target.mount_point)
+            changed = unmounted or changed
             emit_progress(
                 progress,
                 "unmount",

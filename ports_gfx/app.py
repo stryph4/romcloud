@@ -109,21 +109,6 @@ top-level menu entry, not a Settings submenu."""
 SETUP_ACTION = "setup"
 LIBRARY_SYNC_ACTION = "library-sync"
 
-MENU_ITEMS: tuple[MenuItem, ...] = (
-    MenuItem("Storage Setup", SETUP_ACTION),
-    MenuItem("Connection Status", "connection-status"),
-    MenuItem("Mount / Reconnect", "connection-mount"),
-    MenuItem("Unmount", "connection-unmount"),
-    MenuItem("Catalog Status", "status"),
-    MenuItem("Refresh Catalog", "refresh"),
-    MenuItem("Health Check", "healthcheck"),
-    MenuItem("Cache Status", "cache-status"),
-    MenuItem("SaveSync", SAVESYNC_ACTION),
-    MenuItem("Check for Updates", "update-check"),
-    MenuItem("Controller Test", CONTROLLER_TEST_ACTION),
-    MenuItem("Exit", EXIT_ACTION),
-)
-
 MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
     "Library": (
         MenuItem("Catalog Status", "status"),
@@ -131,7 +116,7 @@ MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
         MenuItem("Cache Status", "cache-status"),
     ),
     "Storage": (
-        MenuItem("Storage Setup", SETUP_ACTION),
+        MenuItem("Run Setup", SETUP_ACTION),
         MenuItem("Connection Status", "connection-status"),
         MenuItem("Mount / Reconnect", "connection-mount"),
         MenuItem("Unmount", "connection-unmount"),
@@ -139,12 +124,9 @@ MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
     "Maintenance": (
         MenuItem("Check for Updates", "update-check"),
         MenuItem("Update ROMCloud", "update-install"),
-    ),
-    "Settings": (
         MenuItem("Health Check", "healthcheck"),
         MenuItem("Controller Test", CONTROLLER_TEST_ACTION),
-        MenuItem("Update ROMCloud", "update-install"),
-    ),
+    )
 }
 
 
@@ -296,7 +278,11 @@ _OPERATIONS: dict[str, OperationSpec] = {
         args=("uidata", "library-connected"),
         exits_after_mode_change=True,
     ),
-    "update-check": OperationSpec(title="Check for Updates", args=("uidata", "update-check")),
+    "update-check": OperationSpec(
+        title="Check for Updates",
+        args=("uidata", "update-check"),
+        max_runtime=35.0,
+    ),
     "update-install": OperationSpec(
         title="Update ROMCloud", args=("uidata", "update-install"), arms_gui_relaunch=True
     ),
@@ -326,7 +312,7 @@ _STATE_LABELS = {
     OperationState.SUCCEEDED: "Succeeded",
     OperationState.FAILED: "Failed",
 }
-_OPERATION_HINT_RUNNING = "Please wait — operation is running"
+_OPERATION_HINT_RUNNING = "B/Esc cancel and return to menu — Exit always wins"
 _OPERATION_HINT_FINISHED = "A/Enter/Esc/Tap return to menu   Up/Down scroll"
 
 # Fallback used only if the display driver reports a nonsensical size
@@ -428,7 +414,14 @@ def start_operation(action: str, romcloud_bin: str, *, popen=None) -> OperationS
     :class:`OperationScreenState`. *popen* is injectable for tests."""
     spec = _OPERATIONS[action]
     argv = [romcloud_bin, *spec.args]
-    runner = OperationRunner(argv) if popen is None else OperationRunner(argv, popen=popen)
+    runner_kwargs = {"max_runtime": spec.max_runtime}
+    if spec.max_runtime is not None:
+        runner_kwargs["timeout_message"] = (
+            "Update check timed out; check internet connectivity and try again."
+        )
+    if popen is not None:
+        runner_kwargs["popen"] = popen
+    runner = OperationRunner(argv, **runner_kwargs)
     runner.start()
     return OperationScreenState(
         title=spec.title,
@@ -801,6 +794,31 @@ class _ControllerTestScreenState:
         self.selected_index = max(0, min(index, len(_REMAPPABLE_ACTIONS) - 1))
 
 
+def cancel_owned_background_work(
+    *,
+    update_check: UpdateCheckState | None,
+    operation_screen: OperationScreenState | None,
+    wizard: WizardState | None,
+    savesync_screen: SaveSyncScreenState | None,
+    library_sync_screen: LibrarySyncScreenState | None,
+) -> None:
+    """Cancel every subprocess still owned by this GUI session."""
+    owners = (
+        (update_check, "cancel"),
+        (operation_screen, "cancel_pending"),
+        (wizard, "cancel_pending"),
+        (savesync_screen, "cancel_pending"),
+        (library_sync_screen, "cancel_pending"),
+    )
+    for owner, method_name in owners:
+        if owner is None:
+            continue
+        try:
+            getattr(owner, method_name)()
+        except Exception:  # noqa: BLE001 - shutdown must continue regardless
+            _LOGGER.exception("Could not cancel GUI-owned background work")
+
+
 def _run(  # noqa: ANN001
     pygame,
     romcloud_bin: str,
@@ -832,6 +850,11 @@ def _run(  # noqa: ANN001
             pass
 
     input_debug: InputDebugLogger | None = None
+    wizard: WizardState | None = None
+    operation_screen: Optional[OperationScreenState] = None
+    savesync_screen: Optional[SaveSyncScreenState] = None
+    library_sync_screen: Optional[LibrarySyncScreenState] = None
+    update_check: UpdateCheckState | None = None
 
     try:
         screen_w, screen_h = _detect_screen_size(pygame, diagnostics)
@@ -848,7 +871,6 @@ def _run(  # noqa: ANN001
             root_menu_items_for_state(operating_state),
             menu_categories_for_state(operating_state, library_sync_enabled),
         )
-        wizard: WizardState | None = None
         if initial_screen_for_status(setup_status) == "wizard":
             wizard = WizardState(setup_status)
         layout = compute_layout(screen_w, screen_h, len(state.items))
@@ -872,9 +894,6 @@ def _run(  # noqa: ANN001
             pass
 
         controller_test = _ControllerTestScreenState()
-        operation_screen: Optional[OperationScreenState] = None
-        savesync_screen: Optional[SaveSyncScreenState] = None
-        library_sync_screen: Optional[LibrarySyncScreenState] = None
         activity = ActivityLog(max_events=250)
         catalog_progress = CatalogRefreshProgress()
         update_check = UpdateCheckState()
@@ -1212,6 +1231,13 @@ def _run(  # noqa: ANN001
                 )
         return 0
     finally:
+        cancel_owned_background_work(
+            update_check=update_check,
+            operation_screen=operation_screen,
+            wizard=wizard,
+            savesync_screen=savesync_screen,
+            library_sync_screen=library_sync_screen,
+        )
         if input_debug is not None:
             try:
                 input_debug.close()

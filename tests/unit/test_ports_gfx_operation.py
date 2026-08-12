@@ -9,8 +9,12 @@ real, not mocked away.
 
 from __future__ import annotations
 
+import os
+import signal
 import sys
 import time
+
+import pytest
 
 from ports_gfx.operation import OperationLine, OperationRunner, OperationState
 
@@ -165,3 +169,62 @@ class TestPollAfterFinished:
         runner.start()
         _drain_until_finished(runner)
         assert runner.poll() == []
+
+
+class TestCancellationAndDeadlines:
+    def test_cancel_reaps_a_running_owned_process(self):
+        runner = OperationRunner(
+            [sys.executable, "-c", "import time; time.sleep(30)"]
+        )
+        runner.start()
+        process = runner._process  # noqa: SLF001 - ownership assertion
+
+        runner.cancel(grace_period=0.5)
+
+        assert runner.state == OperationState.FAILED
+        assert runner.error == "cancelled"
+        assert process is not None
+        assert process.poll() is not None
+
+    def test_explicit_network_deadline_cancels_with_actionable_error(self):
+        ticks = iter([0.0, 2.0])
+        runner = OperationRunner(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            max_runtime=1.0,
+            timeout_message="network operation timed out; check connectivity",
+            clock=lambda: next(ticks),
+        )
+        runner.start()
+
+        runner.poll()
+
+        assert runner.state == OperationState.FAILED
+        assert runner.error == "network operation timed out; check connectivity"
+
+    @pytest.mark.skipif(os.name != "posix", reason="process groups are POSIX ownership")
+    def test_cancel_signals_the_owned_process_group(self, monkeypatch):
+        calls = []
+
+        class FakeProcess:
+            pid = 4242
+            stdout = None
+            stderr = None
+            returncode = None
+
+            def wait(self, timeout):
+                self.returncode = -signal.SIGTERM
+
+        monkeypatch.setattr("ports_gfx.operation.os.getpgid", lambda pid: pid)
+        monkeypatch.setattr(
+            "ports_gfx.operation.os.killpg",
+            lambda pgid, sig: calls.append((pgid, sig)),
+        )
+        runner = OperationRunner(
+            ["romcloud", "uidata", "connection-mount"],
+            popen=lambda *a, **k: FakeProcess(),
+        )
+        runner.start()
+
+        runner.cancel()
+
+        assert calls == [(4242, signal.SIGTERM)]

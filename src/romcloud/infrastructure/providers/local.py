@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,14 +55,26 @@ class LocalFilesystemProvider(StorageProvider):
 
     PROVIDER_ID = "local"
 
+    def __init__(self, *, probe_timeout: float | None = None) -> None:
+        # Plain local/USB paths keep the direct fast path. Mounted network
+        # filesystems use a short-lived subprocess so a kernel filesystem
+        # call can be abandoned without pinning the ROMCloud caller.
+        self._probe_timeout = probe_timeout
+
     @property
     def provider_id(self) -> str:
         return self.PROVIDER_ID
 
     def is_reachable(self, root: str) -> bool:
-        return Path(root).is_dir()
+        if self._probe_timeout is None:
+            return Path(root).is_dir()
+        return self.validate_access(root).ok
 
     def validate_access(self, root: str) -> StorageAccessResult:
+        if self._probe_timeout is not None:
+            return probe_directory_access_bounded(
+                Path(root), writable=False, timeout=self._probe_timeout
+            )
         return probe_directory_access(Path(root), writable=False)
 
     def list_systems(self, rom_root: str) -> list[str]:
@@ -124,7 +139,14 @@ class WritableMountedFilesystemProvider(LocalFilesystemProvider):
     behind after a disconnect must not be mistaken for the remote dataset.
     """
 
-    def __init__(self, *, expected_server: str, expected_share: str) -> None:
+    def __init__(
+        self,
+        *,
+        expected_server: str,
+        expected_share: str,
+        probe_timeout: float | None = None,
+    ) -> None:
+        super().__init__(probe_timeout=probe_timeout)
         self._expected_server = expected_server
         self._expected_share = expected_share
 
@@ -148,6 +170,10 @@ class WritableMountedFilesystemProvider(LocalFilesystemProvider):
                 False,
                 False,
                 detail="the configured read-write SMB share is not mounted",
+            )
+        if self._probe_timeout is not None:
+            return probe_directory_access_bounded(
+                Path(root), writable=True, timeout=self._probe_timeout
             )
         return probe_directory_access(Path(root), writable=True)
 
@@ -221,6 +247,69 @@ def probe_directory_access(path: Path, *, writable: bool) -> StorageAccessResult
         cleanup_verified=cleanup_verified,
         detail=detail,
     )
+
+
+def probe_directory_access_bounded(
+    path: Path,
+    *,
+    writable: bool,
+    timeout: float = 5.0,
+    popen: Callable[..., "subprocess.Popen[str]"] = subprocess.Popen,
+) -> StorageAccessResult:
+    """Run a mounted-filesystem probe behind an abandonable process boundary."""
+    script = (
+        "import json,sys\n"
+        "from pathlib import Path\n"
+        "from romcloud.infrastructure.providers.local import probe_directory_access\n"
+        "r=probe_directory_access(Path(sys.argv[1]), writable=sys.argv[2]=='1')\n"
+        "print(json.dumps({'connected':r.connected,'read_verified':r.read_verified,"
+        "'write_verified':r.write_verified,'cleanup_verified':r.cleanup_verified,"
+        "'detail':r.detail}))\n"
+    )
+    process: "subprocess.Popen[str] | None" = None
+    try:
+        process = popen(
+            [sys.executable, "-c", script, str(path), "1" if writable else "0"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        stdout, stderr = process.communicate(timeout=max(0.01, timeout))
+    except subprocess.TimeoutExpired:
+        if process is not None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=0.2)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        return StorageAccessResult(
+            False,
+            False,
+            detail=f"storage availability check timed out after {timeout:.1f}s",
+        )
+    except OSError as exc:
+        return StorageAccessResult(False, False, detail=f"storage check failed: {exc}")
+
+    if process.returncode != 0:
+        detail = (stderr or "storage probe failed").strip()
+        return StorageAccessResult(False, False, detail=detail)
+    try:
+        payload = json.loads(stdout)
+        return StorageAccessResult(
+            connected=bool(payload["connected"]),
+            read_verified=bool(payload["read_verified"]),
+            write_verified=payload.get("write_verified"),
+            cleanup_verified=payload.get("cleanup_verified"),
+            detail=str(payload.get("detail", "")),
+        )
+    except (KeyError, TypeError, ValueError):
+        return StorageAccessResult(
+            False, False, detail="storage availability check returned an invalid response"
+        )
 
 
 def _directory_is_writable(path: Path) -> bool:

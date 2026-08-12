@@ -39,6 +39,8 @@ from romcloud.services.saves import SaveSyncService
 from romcloud.services.library_sync import LibrarySyncService
 from romcloud.services.transfer import TransferService
 
+_NETWORK_STORAGE_PROBE_TIMEOUT = 5.0
+
 
 def _local_game_stems(
     local_roms_root: Path, owned_proxy_paths: set[str]
@@ -147,7 +149,13 @@ class Container:
         if self._provider is None:
             provider_id = self._config.source.provider
             if provider_id == "local":
-                self._provider = LocalFilesystemProvider()
+                self._provider = LocalFilesystemProvider(
+                    probe_timeout=(
+                        _NETWORK_STORAGE_PROBE_TIMEOUT
+                        if self._config.smb is not None
+                        else None
+                    )
+                )
             elif provider_id == "smb":
                 self._provider = self._build_smb_provider()
             else:
@@ -224,6 +232,7 @@ class Container:
                 saves_provider = WritableMountedFilesystemProvider(
                     expected_server=remote_data.smb.server,
                     expected_share=remote_data.smb.share,
+                    probe_timeout=_NETWORK_STORAGE_PROBE_TIMEOUT,
                 )
             else:
                 saves_provider = WritableLocalFilesystemProvider()
@@ -295,6 +304,7 @@ class Container:
                 provider = WritableMountedFilesystemProvider(
                     expected_server=remote_data.smb.server,
                     expected_share=remote_data.smb.share,
+                    probe_timeout=_NETWORK_STORAGE_PROBE_TIMEOUT,
                 )
             else:
                 provider = WritableLocalFilesystemProvider()

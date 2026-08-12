@@ -29,7 +29,7 @@ class TestGenerateServiceScript:
 
     def test_stop_and_status_dispatch_correctly(self):
         content = mount_service.generate_service_script("/path/to/romcloud")
-        assert '"${ROMCLOUD_BIN}" mount stop' in content
+        assert '"${ROMCLOUD_BIN}" mount stop --shutdown' in content
         assert '"${ROMCLOUD_BIN}" mount status' in content
 
     def test_start_and_stop_always_exit_zero(self):

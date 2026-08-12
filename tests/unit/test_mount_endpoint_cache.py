@@ -8,6 +8,8 @@ configured server so a stale/foreign entry is never followed blindly.
 from __future__ import annotations
 
 import socket
+import threading
+import time
 
 from romcloud.infrastructure import mount_endpoint_cache as mec
 
@@ -77,3 +79,21 @@ class TestResolveEndpoint:
             return [(socket.AF_INET, None, None, "", (host, port))]
 
         assert mec.resolve_endpoint("192.0.2.5", 445, resolver=fake_getaddrinfo) == "192.0.2.5"
+
+    def test_blocked_resolution_returns_none_at_deadline(self):
+        release = threading.Event()
+
+        def blocked_getaddrinfo(_host, _port):
+            release.wait(5.0)
+            return []
+
+        started = time.monotonic()
+        try:
+            result = mec.resolve_endpoint(
+                "omnivault", 445, resolver=blocked_getaddrinfo, timeout=0.02
+            )
+        finally:
+            release.set()
+
+        assert result is None
+        assert time.monotonic() - started < 1.0

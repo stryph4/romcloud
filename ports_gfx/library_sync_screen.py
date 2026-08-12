@@ -66,6 +66,11 @@ class LibrarySyncScreenState:
         self.error = "Import canceled. ROMCloud remains usable and the import is safe to retry."
         self.step = RESULT
 
+    def cancel_pending(self) -> None:
+        if self._runner is not None:
+            self._runner.cancel()
+            self._runner = None
+
     def poll(self) -> list:
         if self._runner is None:
             return []

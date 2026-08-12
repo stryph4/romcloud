@@ -49,6 +49,7 @@ class OperationSpec:
     # instead of becoming a dismissible dashboard result.  This terminal-exit
     # ownership is deliberately separate from updater relaunch ownership.
     exits_after_mode_change: bool = False
+    max_runtime: float | None = None
 
 
 @dataclass
@@ -87,6 +88,10 @@ class OperationScreenState:
         if self.auto_scroll:
             self.scroll_offset = 0
         return drained
+
+    def cancel_pending(self) -> None:
+        if not self.runner.is_finished:
+            self.runner.cancel()
 
 
 def display_lines(runner: OperationRunner, *, details: bool = True) -> list[str]:
@@ -168,12 +173,9 @@ def handle_operation_event(ievent: InputEvent, screen: OperationScreenState) -> 
     """Translate one semantic input event into scroll/dismiss behavior.
 
     Returns the screen name to switch to next (``OPERATION_SCREEN`` to
-    stay, ``MENU_SCREEN`` to return to the dashboard). Dismissing back to
-    the menu is only ever allowed once the operation has actually
-    finished — this is the safety rule that keeps a genuinely long-running
-    backend action from being abandoned mid-flight by an impatient BACK
-    press, matching "a legitimately long operation must not be treated as
-    failed/interruptible just because it takes a while".
+    stay, ``MENU_SCREEN`` to return to the dashboard). BACK explicitly
+    cancels pending work so the user can always reach Exit; confirm/touch
+    dismissal still waits for a terminal result.
     """
     action = ievent.action
 
@@ -194,7 +196,12 @@ def handle_operation_event(ievent: InputEvent, screen: OperationScreenState) -> 
         screen.auto_scroll = True
         return OPERATION_SCREEN
 
-    if action in (Action.BACK, Action.CONFIRM, Action.MENU):
+    if action == Action.BACK:
+        if not screen.runner.is_finished:
+            screen.runner.cancel()
+        return MENU_SCREEN
+
+    if action in (Action.CONFIRM, Action.MENU):
         return MENU_SCREEN if screen.runner.is_finished else OPERATION_SCREEN
 
     return OPERATION_SCREEN

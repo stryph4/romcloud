@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -678,6 +679,57 @@ class TestStopWorker:
             if child.poll() is None:
                 child.kill()
                 child.wait()
+
+    def test_detached_worker_signal_targets_owned_process_group(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(mw.os, "getpgid", lambda pid: pid, raising=False)
+        monkeypatch.setattr(
+            mw.os, "killpg", lambda pgid, sig: calls.append((pgid, sig)), raising=False
+        )
+        monkeypatch.setattr(
+            mw.os,
+            "kill",
+            lambda *_args: (_ for _ in ()).throw(
+                AssertionError("must signal the owned process group")
+            ),
+        )
+
+        mw._signal_worker_process_group(4242, mw.signal.SIGTERM)
+
+        assert calls == [(4242, mw.signal.SIGTERM)]
+
+
+def test_retry_loop_stops_as_soon_as_shutdown_is_requested(tmp_path, monkeypatch):
+    stop_event = threading.Event()
+    attempts = []
+
+    def unavailable(**kwargs):
+        attempts.append(kwargs)
+        stop_event.set()
+        raise ProviderNotReachableError("NAS disappeared")
+
+    monkeypatch.setattr(mw.mountlib, "mount_cifs_source", unavailable)
+
+    with pytest.raises(ProviderNotReachableError, match="shutdown"):
+        mw._mount_with_retry(
+            server="nas.local",
+            share="ROMs",
+            mount_point=str(tmp_path / "roms"),
+            credentials_path=tmp_path / "credentials",
+            port=445,
+            attempt_timeout=1.0,
+            attempt_interval=0.1,
+            retry_timeout=30.0,
+            retry_initial_delay=10.0,
+            retry_max_delay=10.0,
+            sleep=lambda _seconds: (_ for _ in ()).throw(
+                AssertionError("event-aware backoff must not use sleep")
+            ),
+            clock=time.monotonic,
+            stop_event=stop_event,
+        )
+
+    assert len(attempts) == 1
 
 
 class TestCleanupRuntimeState:

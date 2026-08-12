@@ -23,9 +23,13 @@ message.
 
 from __future__ import annotations
 
+import ipaddress
+import json
 import os
 import socket
 import subprocess
+import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -224,8 +228,102 @@ def is_target_mounted_cifs(
 @dataclass(frozen=True)
 class ReachabilityResult:
     ok: bool
-    stage: str  # "dns" | "tcp" | "ok"
+    stage: str  # "dns" | "tcp" | "cancelled" | "ok"
     detail: str
+
+
+def _terminate_probe_process(process: "subprocess.Popen[str]") -> None:
+    """Best-effort, bounded cleanup for a DNS helper process."""
+    try:
+        process.kill()
+    except OSError:
+        return
+    try:
+        process.wait(timeout=0.2)
+    except (OSError, subprocess.TimeoutExpired):
+        # A kernel-stuck child must never make its caller wait forever. It
+        # inherits the ROMCloud operation/worker process group, so GUI or
+        # system shutdown can still terminate the entire owned group.
+        pass
+
+
+def _resolve_default_bounded(host: str, port: int, timeout: float) -> list[object]:
+    """Resolve through a short-lived owned process so libc DNS is abandonable."""
+    script = (
+        "import json,socket,sys\n"
+        "try:\n"
+        " print(json.dumps(socket.getaddrinfo(sys.argv[1], int(sys.argv[2]), "
+        "type=socket.SOCK_STREAM)))\n"
+        "except OSError as exc:\n"
+        " print(str(exc), file=sys.stderr)\n"
+        " raise SystemExit(1)\n"
+    )
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-c", script, host, str(port)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as exc:
+        raise OSError(f"could not start bounded DNS resolver: {exc}") from exc
+    try:
+        stdout, stderr = process.communicate(timeout=max(0.01, timeout))
+    except subprocess.TimeoutExpired as exc:
+        _terminate_probe_process(process)
+        raise TimeoutError(f"DNS resolution timed out after {timeout:.1f}s") from exc
+    if process.returncode != 0:
+        raise OSError((stderr or "DNS resolver failed").strip())
+    try:
+        result = json.loads(stdout)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise OSError("DNS resolver returned an invalid response") from exc
+    if not isinstance(result, list) or not result:
+        raise OSError("DNS resolver returned no addresses")
+    return result
+
+
+def _resolve_in_daemon_thread(
+    resolver: Callable[[str, int], object], host: str, port: int, timeout: float
+) -> object:
+    """Bound an injected resolver that cannot generally be process-serialized.
+
+    Production ``socket.getaddrinfo`` uses the owned-process path above.
+    This test/extension seam is explicitly safe for a short-lived backend
+    process to abandon because its thread is daemonized.
+    """
+    completed = threading.Event()
+    outcome: list[object] = []
+
+    def resolve() -> None:
+        try:
+            outcome.append(resolver(host, port))
+        except BaseException as exc:  # noqa: BLE001 - transferred to caller
+            outcome.append(exc)
+        finally:
+            completed.set()
+
+    threading.Thread(target=resolve, name="romcloud-dns-probe", daemon=True).start()
+    if not completed.wait(max(0.01, timeout)):
+        raise TimeoutError(f"DNS resolution timed out after {timeout:.1f}s")
+    result = outcome[0]
+    if isinstance(result, BaseException):
+        raise result
+    return result
+
+
+def resolve_addresses_bounded(
+    host: str,
+    port: int,
+    *,
+    timeout: float = 3.0,
+    resolver: Callable[[str, int], object] = socket.getaddrinfo,
+) -> object:
+    """Resolve addresses within a deadline, including libc ``getaddrinfo``."""
+    if resolver is socket.getaddrinfo:
+        return _resolve_default_bounded(host, port, timeout)
+    return _resolve_in_daemon_thread(resolver, host, port, timeout)
 
 
 def check_reachable(
@@ -241,17 +339,56 @@ def check_reachable(
     *resolver*/*connector* are injectable so this can be unit-tested without
     any real network access.
     """
+    deadline = time.monotonic() + max(0.01, timeout)
     try:
-        resolver(host, port)
-    except OSError as exc:
+        if resolver is socket.getaddrinfo:
+            try:
+                ipaddress.ip_address(host)
+            except ValueError:
+                addresses = resolve_addresses_bounded(host, port, timeout=timeout)
+            else:
+                addresses = socket.getaddrinfo(
+                    host, port, type=socket.SOCK_STREAM, flags=socket.AI_NUMERICHOST
+                )
+        else:
+            addresses = resolve_addresses_bounded(
+                host, port, timeout=timeout, resolver=resolver
+            )
+    except (OSError, TimeoutError) as exc:
         return ReachabilityResult(False, "dns", f"DNS resolution failed for {host!r}: {exc}")
 
     try:
-        conn = connector((host, port), timeout)
-        close = getattr(conn, "close", None)
-        if close is not None:
-            close()
-    except OSError as exc:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"reachability check timed out after {timeout:.1f}s")
+        if connector is not socket.create_connection:
+            conn = connector((host, port), remaining)
+            close = getattr(conn, "close", None)
+            if close is not None:
+                close()
+        else:
+            connected = False
+            last_error: OSError | TimeoutError | None = None
+            for family, socktype, proto, _canonname, sockaddr in addresses:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    last_error = TimeoutError(
+                        f"reachability check timed out after {timeout:.1f}s"
+                    )
+                    break
+                conn = socket.socket(int(family), int(socktype), int(proto))
+                try:
+                    conn.settimeout(remaining)
+                    conn.connect(tuple(sockaddr))
+                    connected = True
+                    break
+                except OSError as exc:
+                    last_error = exc
+                finally:
+                    conn.close()
+            if not connected:
+                raise last_error or OSError("DNS resolver returned no usable address")
+    except (OSError, TimeoutError) as exc:
         return ReachabilityResult(False, "tcp", f"Cannot reach {host}:{port}: {exc}")
 
     return ReachabilityResult(True, "ok", "")
@@ -266,6 +403,7 @@ def wait_until_reachable(
     check: Callable[[str, int], ReachabilityResult] = check_reachable,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
+    cancel_event=None,  # noqa: ANN001 - threading.Event-compatible test seam
 ) -> ReachabilityResult:
     """Retry :func:`check_reachable` until it succeeds or *timeout_total* elapses.
 
@@ -273,13 +411,36 @@ def wait_until_reachable(
     boot before attempting to mount. *check*/*sleep*/*clock* are injectable
     so tests never actually sleep or touch the network.
     """
-    deadline = clock() + timeout_total
-    result = check(host, port)
+    deadline = clock() + max(0.0, timeout_total)
+    if cancel_event is not None and cancel_event.is_set():
+        return ReachabilityResult(False, "cancelled", "Reachability wait was cancelled")
+
+    def run_check() -> ReachabilityResult:
+        if check is check_reachable:
+            remaining = deadline - clock()
+            if remaining <= 0:
+                return ReachabilityResult(
+                    False,
+                    "tcp",
+                    f"Reachability deadline expired for {host}:{port}",
+                )
+            return check_reachable(host, port, timeout=min(3.0, remaining))
+        return check(host, port)
+
+    result = run_check()
     while not result.ok:
-        if clock() >= deadline:
+        now = clock()
+        if now >= deadline:
             return result
-        sleep(interval)
-        result = check(host, port)
+        sleep_for = min(max(0.0, interval), max(0.0, deadline - now))
+        if cancel_event is not None:
+            if cancel_event.wait(sleep_for):
+                return ReachabilityResult(False, "cancelled", "Reachability wait was cancelled")
+        else:
+            sleep(sleep_for)
+        if cancel_event is not None and cancel_event.is_set():
+            return ReachabilityResult(False, "cancelled", "Reachability wait was cancelled")
+        result = run_check()
     return result
 
 
@@ -320,6 +481,42 @@ def _classify_mount_failure(stderr: str) -> Exception:
     return MountError(f"mount failed: {stderr.strip()}")
 
 
+def _run_owned_command_bounded(
+    argv: list[str], timeout: float
+) -> "subprocess.CompletedProcess[str]":
+    """Run a mount helper without an unbounded kill-and-wait timeout path."""
+    process = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=0.2)
+        except (OSError, subprocess.TimeoutExpired):
+            # Do not turn a kernel-stuck mount helper into an unbounded wait.
+            # It remains in the caller's owned process group for GUI/system
+            # shutdown to terminate as a unit.
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+        raise exc
+    return subprocess.CompletedProcess(
+        argv, process.returncode, stdout=stdout, stderr=stderr
+    )
+
+
 @dataclass(frozen=True)
 class MountOutcome:
     mounted: bool
@@ -338,6 +535,8 @@ def mount_cifs_source(
     port: int = _DEFAULT_SMB_PORT,
     wait_timeout: float = 60.0,
     wait_interval: float = 2.0,
+    command_timeout: float = 15.0,
+    cancel_event=None,  # noqa: ANN001 - threading.Event-compatible test seam
     runner: Callable[..., "subprocess.CompletedProcess[str]"] = subprocess.run,
     proc_mounts_path: str = _DEFAULT_PROC_MOUNTS,
 ) -> MountOutcome:
@@ -375,10 +574,17 @@ def mount_cifs_source(
         log.info("%s is already mounted — nothing to do", mount_point)
         return MountOutcome(mounted=True, already_mounted=True, detail="already mounted")
 
+    operation_deadline = time.monotonic() + max(0.01, wait_timeout)
     reach = wait_until_reachable(
-        server, port=port, timeout_total=wait_timeout, interval=wait_interval
+        server,
+        port=port,
+        timeout_total=wait_timeout,
+        interval=wait_interval,
+        cancel_event=cancel_event,
     )
     if not reach.ok:
+        if reach.stage == "cancelled":
+            raise ProviderNotReachableError("SMB connection attempt was cancelled")
         raise ProviderNotReachableError(
             f"Timed out waiting for SMB target {server!r} to become reachable "
             f"({reach.stage}): {reach.detail}"
@@ -394,7 +600,26 @@ def mount_cifs_source(
         remote_path=remote_path,
     )
     log.info("Mounting %s at %s", f"//{server}/{share}", mount_point)
-    result = runner(argv, capture_output=True, text=True)
+    remaining = operation_deadline - time.monotonic()
+    if remaining <= 0:
+        raise ProviderNotReachableError(
+            f"Timed out before SMB mount command could start for {server!r}"
+        )
+    effective_timeout = min(max(0.01, command_timeout), remaining)
+    try:
+        if runner is subprocess.run:
+            result = _run_owned_command_bounded(argv, effective_timeout)
+        else:
+            result = runner(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=effective_timeout,
+            )
+    except subprocess.TimeoutExpired as exc:
+        raise ProviderNotReachableError(
+            f"SMB mount command timed out after {effective_timeout:.1f}s for {server!r}"
+        ) from exc
     if result.returncode != 0:
         raise _classify_mount_failure(result.stderr or result.stdout or "unknown error")
 
@@ -407,12 +632,32 @@ def unmount_cifs_source(
     *,
     runner: Callable[..., "subprocess.CompletedProcess[str]"] = subprocess.run,
     proc_mounts_path: str = _DEFAULT_PROC_MOUNTS,
+    command_timeout: float = 10.0,
+    lazy: bool = False,
 ) -> bool:
     """Unmount *mount_point*. Returns False (no-op) if it wasn't mounted."""
     if not is_target_mounted(mount_point, proc_mounts_path=proc_mounts_path):
         return False
 
-    result = runner(build_unmount_argv(mount_point), capture_output=True, text=True)
+    argv = build_unmount_argv(mount_point)
+    if lazy:
+        argv.insert(1, "-l")
+    try:
+        if runner is subprocess.run:
+            result = _run_owned_command_bounded(
+                argv, max(0.01, command_timeout)
+            )
+        else:
+            result = runner(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=max(0.01, command_timeout),
+            )
+    except subprocess.TimeoutExpired as exc:
+        raise MountError(
+            f"Timed out after {command_timeout:.1f}s while unmounting {mount_point}"
+        ) from exc
     if result.returncode != 0:
         raise MountError(f"Failed to unmount {mount_point}: {(result.stderr or '').strip()}")
 

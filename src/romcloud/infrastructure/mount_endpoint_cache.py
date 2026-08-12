@@ -98,6 +98,7 @@ def resolve_endpoint(
     port: int,
     *,
     resolver: Callable[[str, int], list] = socket.getaddrinfo,
+    timeout: float = 3.0,
 ) -> Optional[str]:
     """Best-effort resolve *host* to a concrete IP address string.
 
@@ -119,9 +120,13 @@ def resolve_endpoint(
     :func:`romcloud.infrastructure.mount.check_reachable`) before trusting
     it.
     """
+    from romcloud.infrastructure.mount import resolve_addresses_bounded
+
     try:
-        results = resolver(host, port)
-    except OSError:
+        results = resolve_addresses_bounded(
+            host, port, timeout=timeout, resolver=resolver
+        )
+    except (OSError, TimeoutError):
         return None
 
     ipv4_address: Optional[str] = None

@@ -33,3 +33,21 @@ def test_only_active_install_disables_conflicting_controls():
     assert update_controls_disabled(OperationState.STARTING)
     assert not update_controls_disabled(OperationState.SUCCEEDED)
     assert not update_controls_disabled(None)
+
+
+def test_shutdown_cancels_pending_update_check():
+    class PendingRunner:
+        cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+
+    state = UpdateCheckState()
+    state.runner = PendingRunner()
+    state.status = "checking"
+
+    state.cancel()
+
+    assert state.runner.cancelled is True
+    assert state.status == "cancelled"
+    assert state.error == "Update check cancelled"

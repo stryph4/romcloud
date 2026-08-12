@@ -46,6 +46,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -374,7 +375,7 @@ def stop_worker(
         return False
 
     try:
-        os.kill(pid, signal.SIGTERM)
+        _signal_worker_process_group(pid, signal.SIGTERM)
     except ProcessLookupError:
         lock_path(romcloud_home).unlink(missing_ok=True)
         return False
@@ -386,13 +387,30 @@ def stop_worker(
         sleep(poll_interval)
     else:
         try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
+            _signal_worker_process_group(
+                pid, getattr(signal, "SIGKILL", signal.SIGTERM)
+            )
+        except (ProcessLookupError, PermissionError):
             pass
 
     lock_path(romcloud_home).unlink(missing_ok=True)
     log.info("Stopped mount worker (pid %d)", pid)
     return True
+
+
+def _signal_worker_process_group(pid: int, sig: int) -> None:
+    """Signal the detached worker and every mount/DNS child it owns."""
+    getpgid = getattr(os, "getpgid", None)
+    killpg = getattr(os, "killpg", None)
+    if getpgid is not None and killpg is not None:
+        try:
+            pgid = getpgid(pid)
+        except OSError:
+            pgid = None
+        if pgid == pid:
+            killpg(pgid, sig)
+            return
+    os.kill(pid, sig)
 
 
 def cleanup_runtime_state(romcloud_home: Path) -> None:
@@ -456,6 +474,7 @@ def run_worker(
     retry_max_delay: float = DEFAULT_RETRY_MAX_DELAY,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
+    stop_event: threading.Event | None = None,
 ) -> int:
     """Run the mount worker to completion — this call *blocks*, and is meant
     to execute only inside a detached background process (see
@@ -479,6 +498,7 @@ def run_worker(
                 retry_max_delay,
                 sleep,
                 clock,
+                stop_event,
             )
     except WorkerAlreadyRunning:
         log.info("A mount worker is already running — exiting without doing anything.")
@@ -494,6 +514,7 @@ def _run_worker_locked(
     retry_max_delay: float,
     sleep: Callable[[float], None],
     clock: Callable[[], float],
+    stop_event: threading.Event | None,
 ) -> int:
     try:
         targets = configured_mounts(config)
@@ -508,6 +529,10 @@ def _run_worker_locked(
 
         details: list[str] = []
         for target in targets:
+            if stop_event is not None and stop_event.is_set():
+                raise ProviderNotReachableError(
+                    "Mount worker cancelled because system shutdown was requested"
+                )
             if _configured_mount_is_ready(target):
                 details.append(f"{target.label}: already mounted")
                 continue
@@ -543,6 +568,7 @@ def _run_worker_locked(
                     retry_max_delay=retry_max_delay,
                     sleep=sleep,
                     clock=clock,
+                    stop_event=stop_event,
                 )
             details.append(f"{target.label}: {outcome.detail}")
         detail = "; ".join(details)
@@ -580,6 +606,7 @@ def _mount_with_cached_endpoint_fallback(
     retry_max_delay: float,
     sleep: Callable[[float], None],
     clock: Callable[[], float],
+    stop_event: threading.Event | None = None,
 ) -> mountlib.MountOutcome:
     """Try a cached resolved endpoint first, then fall back to the existing
     bounded hostname retry loop — the ultimate reliability safety net.
@@ -615,6 +642,7 @@ def _mount_with_cached_endpoint_fallback(
                 port=port,
                 wait_timeout=attempt_timeout,
                 wait_interval=attempt_interval,
+                cancel_event=stop_event,
                 **mount_kwargs,
             )
             log.info("Mount worker succeeded via cached endpoint %s", cached.endpoint)
@@ -644,12 +672,15 @@ def _mount_with_cached_endpoint_fallback(
         retry_max_delay=retry_max_delay,
         sleep=sleep,
         clock=clock,
+        stop_event=stop_event,
     )
     # A fresh resolution here is only a *candidate* (see
     # mount_endpoint_cache.resolve_endpoint's docstring) — it is not
     # provably the exact address the mount above used internally. Verify it
     # is independently reachable right now before trusting it for next
     # boot's fast path; an unreachable candidate is worse than no hint.
+    if stop_event is not None and stop_event.is_set():
+        return outcome
     resolved = mount_endpoint_cache.resolve_endpoint(server, port) if use_endpoint_cache else None
     if resolved and resolved != server and mountlib.check_reachable(resolved, port).ok:
         mount_endpoint_cache.write_endpoint_cache(romcloud_home, server, resolved)
@@ -672,6 +703,7 @@ def _mount_with_retry(
     retry_max_delay: float,
     sleep: Callable[[float], None],
     clock: Callable[[], float],
+    stop_event: threading.Event | None = None,
 ) -> mountlib.MountOutcome:
     """Retry a single mount/reachability attempt within an overall budget.
 
@@ -686,6 +718,10 @@ def _mount_with_retry(
     delay = max(0.0, retry_initial_delay)
 
     while True:
+        if stop_event is not None and stop_event.is_set():
+            raise ProviderNotReachableError(
+                "Mount worker cancelled because system shutdown was requested"
+            )
         remaining = deadline - clock()
         if remaining <= 0:
             message = (
@@ -720,6 +756,7 @@ def _mount_with_retry(
                 port=port,
                 wait_timeout=per_attempt_timeout,
                 wait_interval=attempt_interval,
+                cancel_event=stop_event,
                 **mount_kwargs,
             )
             if attempt > 1:
@@ -742,7 +779,13 @@ def _mount_with_retry(
                 exc,
                 sleep_for,
             )
-            sleep(sleep_for)
+            if stop_event is not None:
+                if stop_event.wait(sleep_for):
+                    raise ProviderNotReachableError(
+                        "Mount worker cancelled because system shutdown was requested"
+                    ) from exc
+            else:
+                sleep(sleep_for)
             delay = min(max(delay * 2, retry_initial_delay if retry_initial_delay > 0 else delay), retry_max_delay)
             attempt += 1
 

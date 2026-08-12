@@ -226,6 +226,11 @@ class SaveSyncScreenState:
             self.step = SETTINGS
         return drained
 
+    def cancel_pending(self) -> None:
+        if self._runner is not None:
+            self._runner.cancel()
+            self._runner = None
+
     # ── internal ──────────────────────────────────────────────────────────
 
     def _start_operation(self, action: str, payload: dict[str, Any]) -> None:

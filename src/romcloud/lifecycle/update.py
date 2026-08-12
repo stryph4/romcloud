@@ -50,13 +50,17 @@ service script, and ROMCloud's own EmulationStation override file.
 from __future__ import annotations
 
 import json
+import signal
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import urllib.error
 import urllib.request
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -83,6 +87,44 @@ from romcloud.lifecycle.install import DEFAULT_PORTS_DIR as _DEFAULT_PORTS_DIR
 from romcloud.infrastructure.logging import get_logger
 
 log = get_logger("update")
+
+
+@contextmanager
+def _hard_network_deadline(seconds: float):  # noqa: ANN202
+    """Interrupt a stuck stdlib socket call at a true wall-clock deadline.
+
+    Batocera runs updater work on the CLI process's main thread, where POSIX
+    ``SIGALRM`` can interrupt even a trickle-fed blocking read. Other hosts
+    retain urllib's per-socket timeout and the caller's process deadline.
+    """
+    if (
+        not hasattr(signal, "setitimer")
+        or not hasattr(signal, "SIGALRM")
+        or threading.current_thread() is not threading.main_thread()
+    ):
+        yield
+        return
+
+    duration = max(0.01, seconds)
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    started = time.monotonic()
+
+    def timed_out(_signum, _frame) -> None:  # noqa: ANN001
+        raise TimeoutError(f"network operation exceeded its {duration:.1f}s deadline")
+
+    signal.signal(signal.SIGALRM, timed_out)
+    effective = min(duration, previous_timer[0]) if previous_timer[0] > 0 else duration
+    signal.setitimer(signal.ITIMER_REAL, effective)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer[0] > 0:
+            remaining = max(0.01, previous_timer[0] - (time.monotonic() - started))
+            signal.setitimer(signal.ITIMER_REAL, remaining, previous_timer[1])
+
 
 DEFAULT_REPO = "stryph4/romcloud"
 DEFAULT_BRANCH = "main"
@@ -160,18 +202,36 @@ def get_project_version_at_commit(
     opener: OpenerType = urllib.request.urlopen,
 ) -> str | None:
     """Fetch only pyproject metadata for a user-facing available version."""
+    try:
+        return _fetch_project_version(repo, ref, opener=opener)
+    except UpdateDownloadError:
+        # This metadata is cosmetic when the installed build already has a
+        # commit identity; the commit comparison remains authoritative.
+        return None
+
+
+def _fetch_project_version(
+    repo: str,
+    ref: str,
+    *,
+    opener: OpenerType,
+    timeout: float = 15.0,
+) -> str | None:
     if tomllib is None:
         return None
     request = urllib.request.Request(
         project_version_url(repo, ref), headers={"User-Agent": _USER_AGENT}
     )
     try:
-        with opener(request, timeout=15.0) as response:
-            data = tomllib.loads(response.read().decode("utf-8"))
+        with _hard_network_deadline(timeout):
+            with opener(request, timeout=timeout) as response:
+                data = tomllib.loads(response.read().decode("utf-8"))
         value = data.get("project", {}).get("version")
         return str(value) if value else None
-    except Exception:  # noqa: BLE001 - display metadata never fails an update check
-        return None
+    except (OSError, ValueError, UnicodeError) as exc:
+        raise UpdateDownloadError(
+            f"Failed to read update version metadata for {ref}: {exc}"
+        ) from exc
 
 
 def fetch_json(url: str, *, opener: OpenerType = urllib.request.urlopen, timeout: float = 15.0) -> dict:
@@ -179,8 +239,9 @@ def fetch_json(url: str, *, opener: OpenerType = urllib.request.urlopen, timeout
         url, headers={"User-Agent": _USER_AGENT, "Accept": "application/vnd.github+json"}
     )
     try:
-        with opener(request, timeout=timeout) as response:
-            data = response.read()
+        with _hard_network_deadline(timeout):
+            with opener(request, timeout=timeout) as response:
+                data = response.read()
     except urllib.error.HTTPError as exc:
         raise UpdateDownloadError(f"GitHub API request failed for {url}: HTTP {exc.code} {exc.reason}") from exc
     except urllib.error.URLError as exc:
@@ -217,16 +278,28 @@ def download_file(
     *,
     opener: OpenerType = urllib.request.urlopen,
     timeout: float = 60.0,
+    total_timeout: float = 120.0,
+    clock: Callable[[], float] = time.monotonic,
 ) -> None:
     request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
     try:
-        with opener(request, timeout=timeout) as response, open(dest_path, "wb") as out:
-            shutil.copyfileobj(response, out)
+        deadline = clock() + max(0.01, total_timeout)
+        with _hard_network_deadline(total_timeout):
+            with opener(request, timeout=timeout) as response, open(dest_path, "wb") as out:
+                while True:
+                    if clock() >= deadline:
+                        raise TimeoutError(
+                            f"download exceeded its {total_timeout:.1f}s total deadline"
+                        )
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
     except urllib.error.HTTPError as exc:
         raise UpdateDownloadError(f"Failed to download {url}: HTTP {exc.code} {exc.reason}") from exc
     except urllib.error.URLError as exc:
         raise UpdateDownloadError(f"Failed to download {url}: {exc.reason}") from exc
-    except OSError as exc:
+    except (OSError, TimeoutError) as exc:
         raise UpdateDownloadError(f"Failed to download {url}: {exc}") from exc
 
 
@@ -424,17 +497,8 @@ def _read_latest_project_version(
     latest: CommitInfo,
     opener: OpenerType,
 ) -> str:
-    tmp_root = _make_temp_dir(romcloud_home)
-    try:
-        archive_path = tmp_root / "romcloud-update.zip"
-        download_file(archive_download_url(repo, latest.sha), archive_path, opener=opener)
-
-        extract_dir = tmp_root / "extracted"
-        safe_extract_zip(archive_path, extract_dir)
-        project_root = find_extracted_project_root(extract_dir)
-        return read_project_version(project_root)
-    finally:
-        shutil.rmtree(tmp_root, ignore_errors=True)
+    del romcloud_home  # check-only mode never creates temporary files
+    return _fetch_project_version(repo, latest.sha, opener=opener) or "unknown"
 
 
 def _make_temp_dir(romcloud_home: Path) -> Path:
@@ -458,6 +522,8 @@ def perform_update(
     ports_dir: Optional[Path] = None,
     system_python: Optional[str] = None,
     progress: ProgressSink = None,
+    install_timeout: float = 300.0,
+    reconcile_timeout: float = 120.0,
 ) -> UpdateResult:
     """Download the latest commit's archive, upgrade the persistent venv,
     and reconcile every ROMCloud-managed runtime artifact (wrappers,
@@ -500,11 +566,17 @@ def perform_update(
         emit_progress(
             progress, "update", "install", "running", "Installing the ROMCloud update"
         )
-        result = runner(
-            [str(venv_python), "-m", "pip", "install", "--upgrade", "--quiet", str(project_root)],
-            capture_output=True,
-            text=True,
-        )
+        try:
+            result = runner(
+                [str(venv_python), "-m", "pip", "install", "--upgrade", "--quiet", str(project_root)],
+                capture_output=True,
+                text=True,
+                timeout=install_timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise UpdateInstallError(
+                f"Update installation timed out after {install_timeout:.0f}s"
+            ) from exc
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "unknown pip error").strip()
             raise UpdateInstallError(f"Failed to install update into the venv: {detail}")
@@ -518,24 +590,30 @@ def perform_update(
             "running",
             "Updating ROMCloud launchers and integrations",
         )
-        reconcile_result = runner(
-            [
-                str(venv_python),
-                "-m",
-                "romcloud.cli.main",
-                "_reconcile-install",
-                "--romcloud-home",
-                str(romcloud_home),
-                "--project-root",
-                str(project_root),
-                "--ports-dir",
-                str(resolved_ports_dir),
-                "--system-python",
-                system_python or "",
-            ],
-            capture_output=True,
-            text=True,
-        )
+        try:
+            reconcile_result = runner(
+                [
+                    str(venv_python),
+                    "-m",
+                    "romcloud.cli.main",
+                    "_reconcile-install",
+                    "--romcloud-home",
+                    str(romcloud_home),
+                    "--project-root",
+                    str(project_root),
+                    "--ports-dir",
+                    str(resolved_ports_dir),
+                    "--system-python",
+                    system_python or "",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=reconcile_timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise UpdateInstallError(
+                f"Runtime reconciliation timed out after {reconcile_timeout:.0f}s"
+            ) from exc
         reconcile_log = (reconcile_result.stdout or "") + (reconcile_result.stderr or "")
         if reconcile_result.returncode != 0:
             detail = reconcile_log.strip() or "unknown reconciliation error"

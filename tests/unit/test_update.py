@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import io
 import json
+import signal
 import subprocess
+import time
 import zipfile
 from pathlib import Path
 
@@ -21,6 +23,17 @@ from romcloud.core.exceptions import (
     UpdateInstallError,
 )
 from romcloud.lifecycle import update as upd
+
+
+@pytest.mark.skipif(
+    not hasattr(signal, "setitimer"), reason="hard socket deadline is POSIX-only"
+)
+def test_hard_network_deadline_interrupts_a_blocked_call():
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="network operation exceeded"):
+        with upd._hard_network_deadline(0.02):
+            time.sleep(5.0)
+    assert time.monotonic() - started < 1.0
 
 
 # ── test helpers ──────────────────────────────────────────────────────────────
@@ -167,6 +180,19 @@ class TestDownloadFile:
         opener = _make_opener({"http://x/f.zip": urllib.error.URLError("no route to host")})
         with pytest.raises(UpdateDownloadError):
             upd.download_file("http://x/f.zip", Path("/tmp/whatever.zip"), opener=opener)
+
+    def test_total_download_deadline_is_actionable(self, tmp_path):
+        opener = _make_opener({"http://x/f.zip": b"never read"})
+        ticks = iter([0.0, 2.0])
+
+        with pytest.raises(UpdateDownloadError, match="total deadline"):
+            upd.download_file(
+                "http://x/f.zip",
+                tmp_path / "out.zip",
+                opener=opener,
+                total_timeout=1.0,
+                clock=lambda: next(ticks),
+            )
 
 
 # ── safe_extract_zip ──────────────────────────────────────────────────────────
@@ -317,8 +343,11 @@ class TestCheckForUpdate:
             tmp_path,
             upd.BuildInfo(version="9.9.9", commit=None, commit_short=None, build_date="x", source="s"),
         )
-        archive = _make_archive_bytes(sha=_SHA, version="9.9.9")
-        opener = _make_opener(_full_payloads(archive_bytes=archive))
+        payloads = _full_payloads()
+        payloads[upd.project_version_url(upd.DEFAULT_REPO, _SHA)] = (
+            b'[project]\nversion = "9.9.9"\n'
+        )
+        opener = _make_opener(payloads)
 
         result = upd.check_for_update(tmp_path, opener=opener)
 
@@ -330,8 +359,11 @@ class TestCheckForUpdate:
             tmp_path,
             upd.BuildInfo(version="1.0.0", commit=None, commit_short=None, build_date="x", source="s"),
         )
-        archive = _make_archive_bytes(sha=_SHA, version="2.0.0")
-        opener = _make_opener(_full_payloads(archive_bytes=archive))
+        payloads = _full_payloads()
+        payloads[upd.project_version_url(upd.DEFAULT_REPO, _SHA)] = (
+            b'[project]\nversion = "2.0.0"\n'
+        )
+        opener = _make_opener(payloads)
 
         result = upd.check_for_update(tmp_path, opener=opener)
 
@@ -492,6 +524,23 @@ class TestPerformUpdateFailedInstall:
             upd.perform_update(
                 home, home / "venv" / "bin" / "python", opener=opener,
                 runner=_fake_runner_failure("ERROR: disk full"),
+            )
+
+    def test_pip_subprocess_timeout_is_actionable(self, tmp_path):
+        home = tmp_path / "romcloud"
+        archive = _make_archive_bytes(sha=_SHA)
+        opener = _make_opener(_full_payloads(archive_bytes=archive))
+
+        def timed_out(argv, **kwargs):
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+        with pytest.raises(UpdateInstallError, match="timed out after 1s"):
+            upd.perform_update(
+                home,
+                home / "venv" / "bin" / "python",
+                opener=opener,
+                runner=timed_out,
+                install_timeout=1.0,
             )
 
     def test_no_partially_upgraded_install_recorded(self, tmp_path):

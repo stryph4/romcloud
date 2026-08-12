@@ -74,7 +74,7 @@ def generate_service_script(romcloud_bin: str) -> str:
         "        exit 0\n"
         "        ;;\n"
         "    stop)\n"
-        '        "${ROMCLOUD_BIN}" mount stop || true\n'
+        '        "${ROMCLOUD_BIN}" mount stop --shutdown || true\n'
         "        exit 0\n"
         "        ;;\n"
         "    status)\n"
@@ -125,11 +125,17 @@ def install_service(romcloud_bin: str, *, service_path: Path = SERVICE_SCRIPT_PA
             capture_output=True,
             text=True,
             check=False,
+            timeout=10.0,
         )
     except FileNotFoundError:
         log.warning(
             "batocera-services not found — enable manually: "
             "batocera-services enable %s",
+            SERVICE_NAME,
+        )
+    except subprocess.TimeoutExpired:
+        log.warning(
+            "Timed out enabling %s; enable it manually after Batocera services recover",
             SERVICE_NAME,
         )
 
@@ -147,9 +153,12 @@ def remove_service(*, service_path: Path = SERVICE_SCRIPT_PATH) -> bool:
             capture_output=True,
             text=True,
             check=False,
+            timeout=10.0,
         )
     except FileNotFoundError:
         pass
+    except subprocess.TimeoutExpired:
+        log.warning("Timed out disabling Batocera service %s", SERVICE_NAME)
 
     removed = False
     if service_path.exists():

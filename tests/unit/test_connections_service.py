@@ -69,3 +69,31 @@ def test_unmount_reverses_targets_and_reports_transition(tmp_path, monkeypatch):
 
     assert calls == [str(tmp_path / "source")]
     assert result == {"state": "disconnected", "changed": True}
+
+
+def test_shutdown_stop_uses_short_worker_grace_and_lazy_unmount(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        connections.mount_worker,
+        "stop_worker",
+        lambda home, **kwargs: calls.append(("stop", kwargs)),
+    )
+    monkeypatch.setattr(
+        connections.mount,
+        "unmount_cifs_source",
+        lambda path, **kwargs: calls.append(("unmount", kwargs)) or True,
+    )
+    monkeypatch.setattr(
+        connections,
+        "connection_status",
+        lambda config: {"state": "disconnected"},
+    )
+
+    result = connections.unmount_connections(config, shutdown=True)
+
+    assert result["changed"] is True
+    assert calls == [
+        ("stop", {"grace_period": 1.0}),
+        ("unmount", {"lazy": True, "command_timeout": 5.0}),
+    ]

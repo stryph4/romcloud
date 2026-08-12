@@ -31,6 +31,7 @@ class _FakeRunner:
     state: OperationState = OperationState.RUNNING
     lines: list[OperationLine] = field(default_factory=list)
     poll_return: list[OperationLine] = field(default_factory=list)
+    cancelled: bool = False
 
     @property
     def is_finished(self) -> bool:
@@ -38,6 +39,10 @@ class _FakeRunner:
 
     def poll(self) -> list[OperationLine]:
         return self.poll_return
+
+    def cancel(self) -> None:
+        self.cancelled = True
+        self.state = OperationState.FAILED
 
 
 class TestOperationSpec:
@@ -160,10 +165,11 @@ class TestHandleOperationEvent:
         assert result == OPERATION_SCREEN
         assert screen.scroll_offset == 0
 
-    def test_back_while_running_is_ignored(self):
+    def test_back_while_running_cancels_and_returns_to_menu(self):
         screen = self._screen(finished=False)
         result = handle_operation_event(InputEvent(action=Action.BACK), screen)
-        assert result == OPERATION_SCREEN
+        assert result == MENU_SCREEN
+        assert screen.runner.cancelled is True
 
     def test_confirm_while_running_is_ignored(self):
         screen = self._screen(finished=False)

@@ -27,6 +27,8 @@ for the Batocera boot-time service integration.
 
 from __future__ import annotations
 
+import signal
+import threading
 from pathlib import Path
 
 import click
@@ -159,17 +161,36 @@ def mount_worker_cmd(ctx: click.Context) -> None:
     container = get_container(ctx)
     config = container.config
     romcloud_home = _romcloud_home(config)
-    code = mount_worker.run_worker(romcloud_home, config)
+    stop_event = threading.Event()
+
+    def request_stop(_signum, _frame) -> None:  # noqa: ANN001
+        stop_event.set()
+
+    previous_term = signal.signal(signal.SIGTERM, request_stop)
+    previous_int = signal.signal(signal.SIGINT, request_stop)
+    try:
+        code = mount_worker.run_worker(
+            romcloud_home, config, stop_event=stop_event
+        )
+    finally:
+        signal.signal(signal.SIGTERM, previous_term)
+        signal.signal(signal.SIGINT, previous_int)
     ctx.exit(code)
 
 
 @mount_group.command("stop")
+@click.option(
+    "--shutdown",
+    is_flag=True,
+    hidden=True,
+    help="Use shutdown-priority worker stop and lazy unmount behavior.",
+)
 @click.pass_context
-def mount_stop_cmd(ctx: click.Context) -> None:
+def mount_stop_cmd(ctx: click.Context, shutdown: bool) -> None:
     """Stop the mount worker, then unmount every configured SMB location."""
     config = _require_mounts(ctx)
     try:
-        result = unmount_connections(config)
+        result = unmount_connections(config, shutdown=shutdown)
     except ROMCloudError as exc:
         click.echo(f"error: {exc}", err=True)
         ctx.exit(1)

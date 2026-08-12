@@ -19,17 +19,20 @@ mount — just in-process with threads instead of an OS-level detached
 process, since the operation screen needs the output live rather than
 only a final status file.
 
-No timeout is ever applied to the subprocess itself — an operation is
-"running" for as long as the process is alive, however long that legitimately
-takes; only an actual non-zero exit (or a failure to even launch) is ever
-reported as failure.
+No timeout is applied to a long local subprocess by default — an operation is
+"running" for as long as the process is alive unless its caller supplies an
+explicit network-operation deadline. Every runner also owns a bounded
+terminate/kill path for application shutdown.
 """
 
 from __future__ import annotations
 
+import os
 import queue
+import signal
 import subprocess
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
@@ -74,6 +77,9 @@ class OperationRunner:
         popen: PopenFunc = subprocess.Popen,
         max_lines: int = DEFAULT_MAX_LINES,
         stdin_text: str | None = None,
+        max_runtime: float | None = None,
+        timeout_message: str = "operation timed out",
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._argv = list(argv)
         self._popen = popen
@@ -86,6 +92,10 @@ class OperationRunner:
         self._error = ""
         self._started = False
         self._stdin_text = stdin_text
+        self._max_runtime = max_runtime
+        self._timeout_message = timeout_message
+        self._clock = clock
+        self._started_at: float | None = None
 
     @property
     def state(self) -> OperationState:
@@ -121,6 +131,7 @@ class OperationRunner:
                 "stderr": subprocess.PIPE,
                 "text": True,
                 "bufsize": 1,
+                "start_new_session": os.name == "posix",
             }
             if self._stdin_text is not None:
                 kwargs["stdin"] = subprocess.PIPE
@@ -135,14 +146,13 @@ class OperationRunner:
             return
 
         self._state = OperationState.RUNNING
+        self._started_at = self._clock()
         if self._stdin_text is not None and self._process.stdin is not None:
             try:
                 self._process.stdin.write(self._stdin_text)
                 self._process.stdin.close()
             except OSError as exc:
-                self._process.terminate()
-                self._state = OperationState.FAILED
-                self._error = f"could not send request: {exc}"
+                self.cancel(reason=f"could not send request: {exc}")
                 return
         self._threads = [
             threading.Thread(target=self._pump, args=(self._process.stdout, "stdout"), daemon=True),
@@ -178,22 +188,55 @@ class OperationRunner:
             self._lines.append(line)
         return drained
 
-    def cancel(self) -> None:
-        """Terminate a running operation without blocking the UI thread."""
+    def _signal_owned_process(self, sig: int, *, force: bool) -> None:
+        assert self._process is not None
+        pid = getattr(self._process, "pid", None)
+        if os.name == "posix" and isinstance(pid, int):
+            try:
+                pgid = os.getpgid(pid)
+                if pgid == pid:
+                    os.killpg(pgid, sig)
+                    return
+            except (OSError, ProcessLookupError):
+                return
+        action = getattr(self._process, "kill" if force else "terminate", None)
+        if action is not None:
+            action()
+
+    def cancel(self, *, reason: str = "cancelled", grace_period: float = 0.2) -> None:
+        """Boundedly terminate the operation and every subprocess it owns."""
         if self._state != OperationState.RUNNING or self._process is None:
             return
         try:
-            self._process.terminate()
-        except OSError:
+            self._signal_owned_process(signal.SIGTERM, force=False)
+        except (OSError, ProcessLookupError):
             pass
+        wait = getattr(self._process, "wait", None)
+        if wait is not None:
+            try:
+                wait(timeout=max(0.0, grace_period))
+            except (OSError, subprocess.TimeoutExpired, TypeError):
+                try:
+                    self._signal_owned_process(signal.SIGKILL, force=True)
+                except (OSError, ProcessLookupError):
+                    pass
         self._state = OperationState.FAILED
-        self._error = "cancelled"
+        self._returncode = getattr(self._process, "returncode", None)
+        self._error = reason
 
     def poll(self) -> list[OperationLine]:
         """Call once per frame: drains whatever output has arrived so far
         (never blocks) and, once the process has exited, records the
         final state. Returns just the lines newly drained this call."""
         if self._state != OperationState.RUNNING:
+            return []
+
+        if (
+            self._max_runtime is not None
+            and self._started_at is not None
+            and self._clock() - self._started_at >= self._max_runtime
+        ):
+            self.cancel(reason=self._timeout_message)
             return []
 
         drained = self._drain()
