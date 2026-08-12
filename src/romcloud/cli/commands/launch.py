@@ -74,8 +74,10 @@ def launch_cmd(ctx: click.Context, proxy_path: str, no_ui: bool, override: bool)
     except ROMCloudError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    # Need to transfer first.
-    source_root = game.source_root
+    # Need to transfer first. Check reachability against the currently
+    # configured source root, not the game's persisted (possibly historical)
+    # `source_root` — see romcloud.services.transfer.TransferService.
+    source_root = container.config.source.rom_root
     if not container.provider.is_reachable(source_root):
         click.echo(
             "error: Game is not cached and the configured source is unavailable. "

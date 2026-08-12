@@ -165,6 +165,7 @@ class Container:
             self._transfer = TransferService(
                 provider=self.provider,
                 cache_root=self._config.cache.path,
+                source_root=self._config.source.rom_root,
             )
         return self._transfer
 

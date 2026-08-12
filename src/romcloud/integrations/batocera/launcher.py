@@ -293,11 +293,16 @@ def _resolve_and_cache(proxy_path: str) -> str:
     capability_policy(config).require(
         Capability.GAME_DOWNLOAD, "Launching an uncached game"
     )
-    if not container.provider.is_reachable(game.source_root):
+    # Reachability is checked against the *currently configured* source
+    # root, never `game.source_root` — that field is catalog data captured
+    # when the game was last scanned and does not track a later source-path
+    # reconfiguration/runtime-layout migration (e.g. legacy
+    # `/userdata/romcloud-source` -> `/userdata/romcloud/source`).
+    if not container.provider.is_reachable(config.source.rom_root):
         from romcloud.core.exceptions import GameNotCachedError
         raise GameNotCachedError(
             "Game is not cached and the configured source is unavailable. "
-            f"Reconnect the source and try again: {game.source_root}"
+            f"Reconnect the source and try again: {config.source.rom_root}"
         )
 
     path = _transfer_with_progress(container, config, game)

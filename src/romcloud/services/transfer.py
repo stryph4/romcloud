@@ -49,10 +49,20 @@ log = get_logger("transfer")
 class TransferService:
     """Orchestrates staged, resumable transfers for a single game."""
 
-    def __init__(self, provider: StorageProvider, cache_root: str) -> None:
+    def __init__(
+        self,
+        provider: StorageProvider,
+        cache_root: str,
+        source_root: Optional[str] = None,
+    ) -> None:
         self._provider = provider
         self._cache_root = Path(cache_root)
         self._partial_root = self._cache_root / ".partial"
+        # The currently configured source root, if known — takes priority
+        # over a game's persisted `source_root` (see `_asset_source` below),
+        # since that is catalog data written when the game was last scanned
+        # and does not track later source-path reconfiguration/migration.
+        self._source_root = source_root
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -100,7 +110,7 @@ class TransferService:
                 # settings by filename (e.g. snes["Some Game.sfc"].*);
                 # renaming here would silently break any game-specific
                 # emulator/core overrides.
-                src = str(Path(game.source_root) / asset.relative_path)
+                src = str(Path(self._asset_source_root(game)) / asset.relative_path)
                 dst = self._staging_path(game.system, asset.relative_path)
                 dst.parent.mkdir(parents=True, exist_ok=True)
 
@@ -128,6 +138,12 @@ class TransferService:
                 exc,
             )
             raise
+
+    def _asset_source_root(self, game: Game) -> str:
+        """The root to read *game*'s assets from: the live configured root
+        when known, else the game's own persisted (possibly historical)
+        value — see the `source_root` constructor parameter."""
+        return self._source_root if self._source_root is not None else game.source_root
 
     def staging_size(self, game: Game) -> int:
         """Return the byte total of whatever is currently staged for *game*."""

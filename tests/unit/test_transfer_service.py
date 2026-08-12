@@ -371,3 +371,44 @@ class TestMultiAssetCueBinTransfer:
         assert (cache_dir / "psx" / "Game.cue").exists() or (
             cache_dir / ".partial" / "psx" / "Game.cue"
         ).exists()
+
+
+class TestSourceRootOverride:
+    """A game's persisted `source_root` is catalog data captured at scan
+    time; the explicit constructor override represents the currently
+    configured root and must win when both are supplied."""
+
+    def test_override_takes_priority_over_persisted_game_source_root(
+        self, tmp_path, cache_dir
+    ):
+        from romcloud.infrastructure.providers.local import LocalFilesystemProvider
+
+        legacy_root = tmp_path / "romcloud-source"  # never created on disk
+        current_root = tmp_path / "current-source"
+        (current_root / "snes").mkdir(parents=True)
+        (current_root / "snes" / "Game.sfc").write_bytes(b"current-content")
+
+        asset = GameAsset(
+            filename="Game.sfc", relative_path="snes/Game.sfc", is_primary=True
+        )
+        game = Game.create("snes", "Game", "local", str(legacy_root), [asset])
+
+        svc = TransferService(
+            provider=LocalFilesystemProvider(),
+            cache_root=str(cache_dir),
+            source_root=str(current_root),
+        )
+
+        final = svc.transfer(game)
+        assert Path(final).read_bytes() == b"current-content"
+
+    def test_no_override_falls_back_to_game_source_root(self, simple_game, cache_dir):
+        """Backward compatibility: existing callers that never pass
+        `source_root` keep resolving from the game's own persisted value."""
+        from romcloud.infrastructure.providers.local import LocalFilesystemProvider
+
+        game, source_root = simple_game
+        svc = TransferService(provider=LocalFilesystemProvider(), cache_root=str(cache_dir))
+
+        final = svc.transfer(game)
+        assert Path(final).read_bytes() == b"rom_content" * 100

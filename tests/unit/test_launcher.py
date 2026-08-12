@@ -16,6 +16,7 @@ Key invariants proved here:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import call, patch
 
@@ -562,6 +563,198 @@ class TestCacheMissLaunchResolution:
         assert result == str(expected)
         assert expected.is_file()
         assert Path(cache.get_entry(game.id).cache_path).is_dir()
+
+
+# ── stale persisted Game.source_root must never affect launch resolution ────
+
+
+class TestStaleSourceRootResolution:
+    """Real-hardware regression: a game catalogued before a source-path
+    change (e.g. the legacy `/userdata/romcloud-source` -> current
+    `/userdata/romcloud/source` runtime-layout migration) keeps its
+    historical `source_root` in the DB forever unless `romcloud refresh`
+    runs. Launch-time resolution must always use the *currently configured*
+    source root, never that persisted value — no catalog refresh required."""
+
+    def _build_config(self, tmp_path, *, current_source_name="source"):
+        from romcloud.infrastructure.config import AppConfig, CacheConfig, SourceConfig
+
+        current_source = tmp_path / current_source_name
+        cache_root = tmp_path / "cache"
+        local_roms = tmp_path / "roms"
+        for root in (current_source / "snes", cache_root, local_roms / "snes"):
+            root.mkdir(parents=True)
+        config = AppConfig(
+            source=SourceConfig("local", str(current_source)),
+            cache=CacheConfig(str(cache_root)),
+            local_roms_path=str(local_roms),
+            data_path=str(tmp_path / "data"),
+        )
+        return config, current_source
+
+    def _catalog_legacy_game(self, tmp_path, config, legacy_source_root: Path):
+        from romcloud.core.models.game import Game, GameAsset
+        from romcloud.infrastructure.database import Database
+        from romcloud.infrastructure.repositories.game import GameRepository
+
+        database = Database(str(Path(config.data_path) / "catalog.db"))
+        database.initialize()
+        game_repo = GameRepository(database)
+        filename = "Chrono Trigger.sfc"
+        # size_bytes left unknown: these tests are about source-root path
+        # resolution, not size validation, and use content of varying length.
+        asset = GameAsset(
+            filename=filename, relative_path=f"snes/{filename}", size_bytes=None, is_primary=True
+        )
+        # Persisted with the legacy root, exactly as an already-catalogued
+        # game would be after a source-path migration — never re-refreshed.
+        game = Game.create("snes", "Chrono Trigger", "local", str(legacy_source_root), [asset])
+        game_repo.save(game)
+
+        proxy_path = Path(config.local_roms_path) / "snes" / "Chrono Trigger.romcloud"
+        proxy_path.write_text(json.dumps({"game_id": game.id}), encoding="utf-8")
+        return game, proxy_path
+
+    def _run(self, tmp_path, monkeypatch, config, proxy_path):
+        import romcloud.infrastructure.config as config_module
+        import romcloud.integrations.batocera.launcher as launcher_module
+        import romcloud.ui.graphical_progress as gp
+
+        monkeypatch.setattr(config_module, "load_config", lambda: config)
+        monkeypatch.setattr(gp, "graphical_progress_binary", lambda cfg: None)
+        monkeypatch.setattr(launcher_module.sys.stdout, "isatty", lambda: False)
+        return launcher_module._resolve_and_cache(str(proxy_path))
+
+    def test_uncached_legacy_game_transfers_from_current_source_without_refresh(
+        self, tmp_path, monkeypatch
+    ):
+        config, current_source = self._build_config(tmp_path)
+        legacy_source = tmp_path / "romcloud-source"  # never mounted/created
+        game, proxy_path = self._catalog_legacy_game(tmp_path, config, legacy_source)
+        rom = current_source / "snes" / "Chrono Trigger.sfc"
+        rom.write_bytes(b"data")
+
+        result = self._run(tmp_path, monkeypatch, config, proxy_path)
+
+        expected = Path(config.cache.path) / "snes" / "Chrono Trigger.sfc"
+        assert result == str(expected)
+        assert expected.read_bytes() == b"data"
+
+    def test_custom_nonstandard_current_source_root_still_works(
+        self, tmp_path, monkeypatch
+    ):
+        config, current_source = self._build_config(
+            tmp_path, current_source_name="my-custom-nas-mount"
+        )
+        legacy_source = tmp_path / "romcloud-source"
+        game, proxy_path = self._catalog_legacy_game(tmp_path, config, legacy_source)
+        rom = current_source / "snes" / "Chrono Trigger.sfc"
+        rom.write_bytes(b"custom-root-data")
+
+        result = self._run(tmp_path, monkeypatch, config, proxy_path)
+
+        expected = Path(config.cache.path) / "snes" / "Chrono Trigger.sfc"
+        assert result == str(expected)
+        assert expected.read_bytes() == b"custom-root-data"
+
+    def test_stale_source_root_never_reports_false_unavailable_error(
+        self, tmp_path, monkeypatch
+    ):
+        config, current_source = self._build_config(tmp_path)
+        # A legacy root that not only differs but doesn't exist on disk at
+        # all — the strongest possible stand-in for a stale historical path.
+        legacy_source = tmp_path / "romcloud-source"
+        game, proxy_path = self._catalog_legacy_game(tmp_path, config, legacy_source)
+        rom = current_source / "snes" / "Chrono Trigger.sfc"
+        rom.write_bytes(b"data")
+
+        # Must not raise: the current source root is reachable even though
+        # the persisted (legacy) source_root path never existed.
+        result = self._run(tmp_path, monkeypatch, config, proxy_path)
+        assert Path(result).read_bytes() == b"data"
+
+    def test_unavailable_error_names_current_root_not_stale_historical_root(
+        self, tmp_path, monkeypatch
+    ):
+        from romcloud.core.exceptions import GameNotCachedError
+        from romcloud.infrastructure.config import AppConfig, SourceConfig
+
+        config, _current_source = self._build_config(tmp_path)
+        legacy_source = tmp_path / "romcloud-source"
+        game, proxy_path = self._catalog_legacy_game(tmp_path, config, legacy_source)
+
+        # The *current* configured root is genuinely unavailable here.
+        unreachable_root = tmp_path / "does-not-exist-actually"
+        unreachable_config = AppConfig(
+            source=SourceConfig("local", str(unreachable_root)),
+            cache=config.cache,
+            local_roms_path=config.local_roms_path,
+            data_path=config.data_path,
+        )
+        with pytest.raises(GameNotCachedError) as exc_info:
+            self._run(tmp_path, monkeypatch, unreachable_config, proxy_path)
+        assert str(unreachable_root) in str(exc_info.value)
+        assert "romcloud-source" not in str(exc_info.value)
+
+    def test_cached_game_launches_locally_regardless_of_stale_source_root(
+        self, tmp_path, monkeypatch
+    ):
+        from romcloud.core.models.cache import CacheEntry, CacheStatus
+        from romcloud.infrastructure.repositories.cache import CacheRepository
+        from romcloud.infrastructure.database import Database
+
+        config, _current_source = self._build_config(tmp_path)
+        legacy_source = tmp_path / "romcloud-source"  # never created
+        game, proxy_path = self._catalog_legacy_game(tmp_path, config, legacy_source)
+
+        database = Database(str(Path(config.data_path) / "catalog.db"))
+        cache_repo = CacheRepository(database)
+        cached_path = Path(config.cache.path) / "snes" / "Chrono Trigger.sfc"
+        cached_path.parent.mkdir(parents=True, exist_ok=True)
+        cached_path.write_bytes(b"already-cached")
+        entry = CacheEntry.create(game.id, str(cached_path))
+        entry.status = CacheStatus.COMPLETE
+        entry.size_bytes = len(b"already-cached")
+        cache_repo.save(entry)
+
+        result = self._run(tmp_path, monkeypatch, config, proxy_path)
+
+        assert result == str(cached_path)
+
+    def test_offline_mode_never_touches_source_for_valid_cached_game(
+        self, tmp_path, monkeypatch
+    ):
+        from romcloud.core.capabilities import OperatingMode
+        from romcloud.core.models.cache import CacheEntry, CacheStatus
+        from romcloud.infrastructure.database import Database
+        from romcloud.infrastructure.library_view import write_operating_mode
+        from romcloud.infrastructure.repositories.cache import CacheRepository
+
+        config, _current_source = self._build_config(tmp_path)
+        legacy_source = tmp_path / "romcloud-source"
+        game, proxy_path = self._catalog_legacy_game(tmp_path, config, legacy_source)
+        write_operating_mode(config, OperatingMode.OFFLINE)
+
+        database = Database(str(Path(config.data_path) / "catalog.db"))
+        cache_repo = CacheRepository(database)
+        cached_path = Path(config.cache.path) / "snes" / "Chrono Trigger.sfc"
+        cached_path.parent.mkdir(parents=True, exist_ok=True)
+        cached_path.write_bytes(b"offline-cached")
+        entry = CacheEntry.create(game.id, str(cached_path))
+        entry.status = CacheStatus.COMPLETE
+        entry.size_bytes = len(b"offline-cached")
+        cache_repo.save(entry)
+
+        import romcloud.core.storage as storage_module
+
+        def _fail_reachable(self, root):
+            raise AssertionError("Offline Mode must never check source reachability")
+
+        monkeypatch.setattr(storage_module.StorageProvider, "is_reachable", _fail_reachable)
+
+        result = self._run(tmp_path, monkeypatch, config, proxy_path)
+
+        assert result == str(cached_path)
 
 
 # ── launch must never change operating mode or trigger presentation work ────
