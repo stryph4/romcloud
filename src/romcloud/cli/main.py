@@ -76,6 +76,7 @@ from romcloud.cli.commands.mount import mount_group
 from romcloud.cli.commands.uidata import uidata_group
 from romcloud.cli.commands.reconcile import reconcile_install_cmd
 from romcloud.cli.commands.lifecycle import repair_cmd, uninstall_cmd, purge_cmd
+from romcloud.cli.commands.autosync import autosync_group
 
 cli.add_command(configure_cmd, name="configure")
 cli.add_command(refresh_cmd, name="refresh")
@@ -94,6 +95,7 @@ cli.add_command(reconcile_install_cmd, name="_reconcile-install")
 cli.add_command(repair_cmd, name="repair")
 cli.add_command(uninstall_cmd, name="uninstall")
 cli.add_command(purge_cmd, name="purge")
+cli.add_command(autosync_group, name="_autosync")
 
 
 if __name__ == "__main__":

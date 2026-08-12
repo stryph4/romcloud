@@ -85,5 +85,10 @@ def reconcile_install_cmd(
     elif report.ports_gamelist is False:
         click.echo("  Note: failed to reconcile Ports gamelist entry.")
 
+    if report.autosync_hook:
+        click.echo("  Reconciled Batocera Auto SaveSync lifecycle hook.")
+    else:
+        click.echo("  Note: failed to reconcile Auto SaveSync lifecycle hook.")
+
     if report.proxies_restored:
         click.echo(f"  Restored generated proxies: {report.proxies_restored}")

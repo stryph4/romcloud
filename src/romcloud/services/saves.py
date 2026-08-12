@@ -216,6 +216,73 @@ class SaveSyncService:
             paths=hints,
         )
 
+    def detect_and_mark_local_changes(
+        self,
+        layout_ids: frozenset[str],
+        *,
+        changed_since: float,
+    ) -> SaveSyncState:
+        """Hash audited local layouts and persist changed group hints.
+
+        This method performs no provider or remote access. Existing baselines
+        are authoritative. For a group never observed before, file mtimes are
+        used only to nominate a candidate; reconciliation always rescans and
+        hashes both sides before making a decision.
+        """
+        allowed_layouts = frozenset(
+            layout_id
+            for layout_id in layout_ids
+            if layout_id != "xemu-hdd" and self._layout_enabled(layout_id)
+        )
+        if not allowed_layouts:
+            return self.get_state()
+        with self._operation_lock():
+            state = self._get_state_unlocked()
+            current = self._scan_local_layouts(allowed_layouts).artifacts
+            baseline = self._automatic_baseline(state)
+            known_groups = {group.group_id for group in state.groups}
+            paths_by_group: dict[str, set[str]] = {}
+            descriptors = {}
+            for path in sorted(set(current) | set(baseline)):
+                descriptor = self._policy.group_for_path(path)
+                if descriptor is None or descriptor.layout_id not in allowed_layouts:
+                    continue
+                paths_by_group.setdefault(descriptor.group_id, set()).add(path)
+                descriptors[descriptor.group_id] = descriptor
+
+            next_state = state
+            for group_id, group_paths in sorted(paths_by_group.items()):
+                descriptor = descriptors[group_id]
+                local_group = _group_manifest(current, sorted(group_paths))
+                baseline_group = _group_manifest(baseline, sorted(group_paths))
+                has_baseline = group_id in known_groups or bool(baseline_group)
+                if has_baseline:
+                    changed = not _same_manifest(local_group, baseline_group)
+                else:
+                    changed = any(
+                        _mtime_at_or_after(
+                            self._local_path(artifact.relative_path),
+                            changed_since - 2.0,
+                        )
+                        for artifact in local_group
+                    )
+                if not changed:
+                    continue
+                hints = tuple(
+                    path
+                    for path in sorted(group_paths)
+                    if not _same_artifact(current.get(path), baseline.get(path))
+                )
+                next_state = durable_state.mark_local_dirty(
+                    next_state,
+                    group_id=group_id,
+                    layout_id=descriptor.layout_id,
+                    paths=hints,
+                )
+            if next_state != state:
+                _write_state(self._state_path, next_state)
+            return next_state
+
     def acknowledge_conflict(self, conflict_id: str) -> SaveSyncState:
         """Record Review-Later acknowledgement without resolving a conflict."""
         return durable_state.SaveSyncStateStore(
@@ -241,6 +308,10 @@ class SaveSyncService:
 
     def _operation_lock(self):  # noqa: ANN202
         return durable_state.state_file_lock(self._state_path)
+
+    @property
+    def selection_policy(self) -> SaveSelectionPolicy:
+        return self._policy
 
     # ── scanning and physical path mapping ───────────────────────────────
 
@@ -268,6 +339,38 @@ class SaveSyncService:
         legacy = save_tree.scan_mapped_tree_report(
             self._legacy_rpcs3_root,
             self._policy,
+            system="ps3",
+            relative_prefix=RPCS3_DEV_HDD0_PREFIX,
+            enabled_optional_groups=self._enabled_optional_groups(),
+        )
+        return save_tree.merge_scan_reports(primary, legacy)
+
+    def _scan_local_layouts(
+        self, layout_ids: frozenset[str]
+    ) -> save_tree.ScanReport:
+        """Scan only explicit registry roots associated with a game session."""
+        layouts = tuple(
+            layout
+            for layout in self._policy.layouts
+            if layout.layout_id in layout_ids
+        )
+        if not layouts:
+            return save_tree.ScanReport({})
+        selected_policy = SaveSelectionPolicy(layouts=layouts)
+        primary = save_tree.scan_tree_report(
+            self._local_root,
+            selected_policy,
+            enabled_optional_systems=self._enabled_optional_systems(),
+            enabled_optional_groups=self._enabled_optional_groups(),
+        )
+        if not self._uses_legacy_rpcs3() or not any(
+            layout.system == "ps3" for layout in layouts
+        ):
+            return primary
+        assert self._legacy_rpcs3_root is not None
+        legacy = save_tree.scan_mapped_tree_report(
+            self._legacy_rpcs3_root,
+            selected_policy,
             system="ps3",
             relative_prefix=RPCS3_DEV_HDD0_PREFIX,
             enabled_optional_groups=self._enabled_optional_groups(),
@@ -410,7 +513,51 @@ class SaveSyncService:
 
     def reconcile(self, *, progress: ProgressSink = None) -> SaveReconcileReport:
         """Apply all non-conflicting changes and preserve both conflict versions."""
+        result = self._reconcile(progress=progress)
+        assert result is not None
+        return result
+
+    def reconcile_pending_groups(
+        self,
+        group_ids: frozenset[str],
+        *,
+        is_group_active: Optional[Callable[[str], bool]] = None,
+        progress: ProgressSink = None,
+    ) -> Optional[SaveReconcileReport]:
+        """Reconcile dirty groups without ever downloading into the live tree.
+
+        This is the deliberately narrow game-exit API.  The durable group IDs
+        are only hints about the work to inspect: both sides are freshly
+        scanned and hashed under the normal global operation lock.  A group
+        which becomes active before promotion is deferred without state or
+        remote mutation.
+        """
+        if not group_ids:
+            return None
+        return self._reconcile(
+            progress=progress,
+            selected_group_ids=group_ids,
+            upload_only=True,
+            is_group_active=is_group_active,
+        )
+
+    def _reconcile(
+        self,
+        *,
+        progress: ProgressSink = None,
+        selected_group_ids: Optional[frozenset[str]] = None,
+        upload_only: bool = False,
+        is_group_active: Optional[Callable[[str], bool]] = None,
+    ) -> Optional[SaveReconcileReport]:
         with self._operation_lock():
+            if selected_group_ids is not None:
+                selected_group_ids = frozenset(
+                    group_id
+                    for group_id in selected_group_ids
+                    if not (is_group_active and is_group_active(group_id))
+                )
+                if not selected_group_ids:
+                    return None
             self._capabilities.require(Capability.SAVE_SYNC, "Save/state reconciliation")
             self._require_remote()
             if not self.is_remote_reachable():
@@ -427,13 +574,26 @@ class SaveSyncService:
             self._recover()
             local_report = self._scan_automatic_local()
             remote_report = self._scan_automatic_remote()
+            complete_local = dict(local_report.artifacts)
+            complete_remote = dict(remote_report.artifacts)
             state = self._get_state_unlocked()
+            baseline = self._automatic_baseline(state)
+            if selected_group_ids is not None:
+                local_report = _report_for_groups(
+                    local_report, selected_group_ids, self._policy
+                )
+                remote_report = _report_for_groups(
+                    remote_report, selected_group_ids, self._policy
+                )
+                baseline = _manifest_for_groups(
+                    baseline, selected_group_ids, self._policy
+                )
             plan = _reconcile_plan(
                 local_report,
                 remote_report,
-                self._automatic_baseline(state),
+                baseline,
                 policy=self._policy,
-                scope="all_eligible",
+                scope=("pending_dirty" if selected_group_ids is not None else "all_eligible"),
             )
             emit_progress(
                 progress,
@@ -454,7 +614,7 @@ class SaveSyncService:
             for entry in plan.entries:
                 if entry.action is SaveReconcileAction.UPLOAD:
                     _assign(desired_remote, entry.relative_path, entry.local)
-                elif entry.action is SaveReconcileAction.DOWNLOAD:
+                elif entry.action is SaveReconcileAction.DOWNLOAD and not upload_only:
                     _assign(desired_local, entry.relative_path, entry.remote)
 
             operation_id = uuid.uuid4().hex
@@ -475,7 +635,7 @@ class SaveSyncService:
                             ),
                         )
                     )
-                if plan.downloads:
+                if plan.downloads and not upload_only:
                     local_views = self._local_views()
                     destination_views.extend(local_views)
                     selected_views.extend(
@@ -497,20 +657,46 @@ class SaveSyncService:
                     if selected_views
                     else None
                 )
+                current_local = self._scan_automatic_local()
+                current_remote = self._scan_automatic_remote()
                 if (
-                    self._scan_automatic_local().artifacts != local
-                    or self._scan_automatic_remote().artifacts != remote
+                    current_local.artifacts != complete_local
+                    or current_remote.artifacts != complete_remote
                 ):
                     raise SaveSyncVerificationError(
                         "Save/state data changed while staging; reconciliation was abandoned."
                     )
+                if selected_group_ids is not None and is_group_active and any(
+                    is_group_active(group_id) for group_id in selected_group_ids
+                ):
+                    if transaction is not None:
+                        transaction.rollback()
+                    return None
                 if transaction is not None:
                     self._apply_selected_transaction(
                         transaction, tuple(destination_views)
                     )
+                final_local_report = self._scan_automatic_local()
+                final_remote_report = self._scan_automatic_remote()
                 if (
-                    self._scan_automatic_local().artifacts != desired_local
-                    or self._scan_automatic_remote().artifacts != desired_remote
+                    final_local_report.artifacts
+                    != (
+                        _replace_selected_groups(
+                            complete_local,
+                            desired_local,
+                            selected_group_ids,
+                            self._policy,
+                        )
+                    )
+                    or final_remote_report.artifacts
+                    != (
+                        _replace_selected_groups(
+                            complete_remote,
+                            desired_remote,
+                            selected_group_ids,
+                            self._policy,
+                        )
+                    )
                 ):
                     raise SaveSyncVerificationError(
                         "Save/state data changed before reconciliation completed."
@@ -526,16 +712,18 @@ class SaveSyncService:
                 revision=uuid.uuid4().hex,
                 timestamp=timestamp,
                 uploaded=len(plan.uploads),
-                downloaded=len(plan.downloads),
+                downloaded=0 if upload_only else len(plan.downloads),
                 conflicts=len(plan.conflicts),
                 unchanged=len(plan.unchanged),
                 upload_bytes=plan.upload_bytes,
-                download_bytes=plan.download_bytes,
+                download_bytes=0 if upload_only else plan.download_bytes,
                 conflict_paths=tuple(entry.relative_path for entry in plan.conflicts),
                 scope=plan.scope,
             )
-            selected_baseline = _reconciled_baseline(
-                plan, existing=self._automatic_baseline(state)
+            selected_baseline = (
+                _upload_only_reconciled_baseline(plan, existing=baseline)
+                if upload_only
+                else _reconciled_baseline(plan, existing=baseline)
             )
             final_local_values = tuple(
                 desired_local[path] for path in sorted(desired_local)
@@ -571,6 +759,11 @@ class SaveSyncService:
             # identity; obsolete group identities remain conservative.
             for group in state.groups:
                 if not self._layout_enabled(group.layout_id):
+                    continue
+                if (
+                    selected_group_ids is not None
+                    and group.group_id not in selected_group_ids
+                ):
                     continue
                 for hint in group.dirty_path_hints:
                     descriptor = self._policy.group_for_path(hint)
@@ -965,6 +1158,10 @@ class SaveSyncService:
         views: tuple[_DestinationView, ...],
     ) -> None:
         by_root = {view.root.absolute(): view for view in views}
+        selected_paths = {
+            view.root.absolute(): frozenset(view.current) | frozenset(view.desired)
+            for view in transaction.views
+        }
 
         def verify(root: Path, expected: dict[str, SaveArtifact]) -> None:
             view = by_root.get(root.absolute())
@@ -972,7 +1169,13 @@ class SaveSyncService:
                 raise SaveSyncVerificationError(
                     f"Unexpected SaveSync transaction destination: {root}"
                 )
-            if self._scan_view(root, view) != expected:
+            observed = self._scan_view(root, view)
+            observed = {
+                path: artifact
+                for path, artifact in observed.items()
+                if path in selected_paths.get(root.absolute(), frozenset())
+            }
+            if observed != expected:
                 raise SaveSyncVerificationError(
                     f"Selected save/state tree verification failed for {root}"
                 )
@@ -1255,6 +1458,13 @@ def _assign(
         manifest[path] = artifact
 
 
+def _mtime_at_or_after(path: Path, threshold: float) -> bool:
+    try:
+        return path.stat(follow_symlinks=False).st_mtime >= threshold
+    except (FileNotFoundError, OSError):
+        return False
+
+
 def _is_conflict(
     local: Optional[SaveArtifact],
     remote: Optional[SaveArtifact],
@@ -1371,6 +1581,68 @@ def _reconciled_baseline(
             artifact = entry.remote if entry.remote is not None else entry.local
         _assign(baseline, entry.relative_path, artifact)
     return baseline
+
+
+def _upload_only_reconciled_baseline(
+    plan: SaveReconcilePlan,
+    *,
+    existing: Optional[dict[str, SaveArtifact]] = None,
+) -> dict[str, SaveArtifact]:
+    """Advance only groups proven equal or successfully uploaded.
+
+    Remote-only changes intentionally remain remote-dirty for a later manual
+    reconciliation. Conflicts retain their previous common ancestor.
+    """
+    baseline: dict[str, SaveArtifact] = dict(existing or {})
+    for entry in plan.entries:
+        if entry.action is SaveReconcileAction.UPLOAD:
+            artifact = entry.local
+        elif entry.action is SaveReconcileAction.UNCHANGED:
+            artifact = entry.local if entry.local is not None else entry.remote
+        else:
+            artifact = entry.baseline
+        _assign(baseline, entry.relative_path, artifact)
+    return baseline
+
+
+def _manifest_for_groups(
+    manifest: dict[str, SaveArtifact],
+    group_ids: frozenset[str],
+    policy: SaveSelectionPolicy,
+) -> dict[str, SaveArtifact]:
+    return {
+        path: artifact
+        for path, artifact in manifest.items()
+        if _group_id(policy, path) in group_ids
+    }
+
+
+def _report_for_groups(
+    report: save_tree.ScanReport,
+    group_ids: frozenset[str],
+    policy: SaveSelectionPolicy,
+) -> save_tree.ScanReport:
+    return replace(
+        report,
+        artifacts=_manifest_for_groups(report.artifacts, group_ids, policy),
+    )
+
+
+def _replace_selected_groups(
+    complete: dict[str, SaveArtifact],
+    selected: dict[str, SaveArtifact],
+    group_ids: Optional[frozenset[str]],
+    policy: SaveSelectionPolicy,
+) -> dict[str, SaveArtifact]:
+    if group_ids is None:
+        return dict(selected)
+    result = {
+        path: artifact
+        for path, artifact in complete.items()
+        if _group_id(policy, path) not in group_ids
+    }
+    result.update(selected)
+    return result
 
 
 def _merge_optional_groups(*reports: save_tree.ScanReport) -> tuple[tuple[str, int, int], ...]:

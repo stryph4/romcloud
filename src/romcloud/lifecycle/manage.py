@@ -19,7 +19,12 @@ from romcloud.infrastructure.credentials import (
     remote_data_cifs_credentials_path,
 )
 from romcloud.core.progress import ProgressSink, emit_progress
-from romcloud.integrations.batocera import es_config, mount_service, ports_gamelist_config
+from romcloud.integrations.batocera import (
+    auto_savesync,
+    es_config,
+    mount_service,
+    ports_gamelist_config,
+)
 from romcloud.lifecycle import install
 
 
@@ -295,6 +300,7 @@ def uninstall(
     mount_service.remove_service()
     es_config.remove()
     ports_gamelist_config.remove(ports_dir=resolved_ports_dir)
+    auto_savesync.HOOK_PATH.unlink(missing_ok=True)
     from romcloud.integrations.batocera.game_access import remove_direct_links
 
     direct_links_removed = remove_direct_links(config).removed

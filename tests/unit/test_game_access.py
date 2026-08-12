@@ -368,12 +368,17 @@ def test_uninstall_unlinks_verified_direct_link_and_preserves_roms(tmp_path: Pat
     monkeypatch.setattr(manage.mount_service, "remove_service", lambda: False)
     monkeypatch.setattr(manage.es_config, "remove", lambda: False)
     monkeypatch.setattr(manage.ports_gamelist_config, "remove", lambda **kwargs: False)
+    autosync_hook = tmp_path / "scripts" / "romcloud-autosync"
+    autosync_hook.parent.mkdir(parents=True)
+    autosync_hook.write_text("managed", encoding="utf-8")
+    monkeypatch.setattr(manage.auto_savesync, "HOOK_PATH", autosync_hook)
 
     report = manage.uninstall(config=config, romcloud_home=tmp_path / "home", ports_dir=tmp_path / "ports")
 
     assert report.direct_links_removed == 1
     assert not (local / LINK_NAME).exists()
     assert local_game.exists()
+    assert not autosync_hook.exists()
 
 
 def test_cache_cli_requires_per_command_override_in_direct_mode(monkeypatch) -> None:

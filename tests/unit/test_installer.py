@@ -424,12 +424,26 @@ class TestReconcilePortsGamelist:
 
 
 class TestReconcileInstall:
+    def test_reconciles_auto_savesync_hook(self, tmp_path: Path, monkeypatch) -> None:
+        from romcloud.integrations.batocera import auto_savesync
+
+        hook = tmp_path / "scripts" / "romcloud-autosync"
+        monkeypatch.setattr(auto_savesync, "HOOK_PATH", hook)
+
+        assert inst.reconcile_auto_savesync_hook(tmp_path / "bin") is True
+        assert hook.is_file()
+        assert "_autosync gameStop" not in hook.read_text(encoding="utf-8")
+        assert "_autosync game-stop" in hook.read_text(encoding="utf-8")
+
     def test_reconciles_core_and_ports_ui(self, tmp_path: Path, monkeypatch) -> None:
-        from romcloud.integrations.batocera import mount_service, es_config
+        from romcloud.integrations.batocera import auto_savesync, mount_service, es_config
 
         # Isolate from any real Batocera paths on the machine running tests.
         monkeypatch.setattr(mount_service, "SERVICE_SCRIPT_PATH", tmp_path / "services" / "romcloud_mount")
         monkeypatch.setattr(es_config, "ROMCLOUD_OVERRIDE_PATH", tmp_path / "es_systems_romcloud.cfg")
+        monkeypatch.setattr(
+            auto_savesync, "HOOK_PATH", tmp_path / "scripts" / "romcloud-autosync"
+        )
 
         romcloud_home = tmp_path / "romcloud"
         project_root = tmp_path / "project"
@@ -452,6 +466,8 @@ class TestReconcileInstall:
         assert report.mount_service is None
         assert report.es_override is None
         assert report.ports_gamelist is True
+        assert report.autosync_hook is True
+        assert auto_savesync.HOOK_PATH.is_file()
         assert report.ports_ui.launch_progress_wrapper_path == romcloud_home / "bin" / "romcloud-launch-progress"
         assert report.ports_ui.launch_progress_wrapper_path.exists()
         gamelist_content = (ports_dir / "gamelist.xml").read_text()
@@ -460,10 +476,13 @@ class TestReconcileInstall:
         assert (ports_dir / "images" / "ROMCloud.png").exists()
 
     def test_repeated_reconciliation_is_harmless(self, tmp_path: Path, monkeypatch) -> None:
-        from romcloud.integrations.batocera import mount_service, es_config
+        from romcloud.integrations.batocera import auto_savesync, mount_service, es_config
 
         monkeypatch.setattr(mount_service, "SERVICE_SCRIPT_PATH", tmp_path / "services" / "romcloud_mount")
         monkeypatch.setattr(es_config, "ROMCLOUD_OVERRIDE_PATH", tmp_path / "es_systems_romcloud.cfg")
+        monkeypatch.setattr(
+            auto_savesync, "HOOK_PATH", tmp_path / "scripts" / "romcloud-autosync"
+        )
 
         romcloud_home = tmp_path / "romcloud"
         project_root = tmp_path / "project"

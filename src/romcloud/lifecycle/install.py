@@ -6,10 +6,11 @@ exact same set of managed runtime artifacts: the ``romcloud``/``romcloud-run``
 wrappers, the optional graphical Ports UI payload (including its
 EmulationStation Ports ``gamelist.xml`` entry/icon), and — only if
 previously enabled — the Batocera mount service script and the
-EmulationStation override. This module is the single, idempotent implementation of that
-logic so neither caller duplicates it, and so a fresh install and a later
-self-update always produce byte-identical artifacts from the same source
-revision.
+EmulationStation override. The small Batocera lifecycle hook used by Auto
+SaveSync is also refreshed best-effort. This module is the single, idempotent
+implementation of that logic so neither caller duplicates it, and so a fresh
+install and a later self-update always produce byte-identical artifacts from
+the same source revision.
 
 Failure semantics ("ROMCloud may fail; Batocera must not")
 -----------------------------------------------------------
@@ -337,6 +338,18 @@ def reconcile_ports_gamelist(ports_ui: PortsUiResult, ports_dir: Path) -> Option
         return False
 
 
+def reconcile_auto_savesync_hook(bin_dir: Path) -> bool:
+    """Install/refresh the best-effort Batocera game lifecycle hook."""
+    try:
+        from romcloud.integrations.batocera import auto_savesync
+
+        auto_savesync.install_hook(bin_dir / "romcloud")
+        return True
+    except Exception:  # noqa: BLE001 - optional integration, never fatal
+        log.warning("Failed to reconcile Batocera Auto SaveSync hook", exc_info=True)
+        return False
+
+
 # ── full reconciliation ───────────────────────────────────────────────────────
 
 
@@ -347,6 +360,7 @@ class ReconcileReport:
     mount_service: Optional[bool]
     es_override: Optional[bool]
     ports_gamelist: Optional[bool]
+    autosync_hook: bool
     proxies_restored: int = 0
 
 
@@ -395,6 +409,7 @@ def reconcile_install(
     mount_service_status = reconcile_mount_service(bin_dir)
     es_override_status = reconcile_es_override(config_path)
     ports_gamelist_status = reconcile_ports_gamelist(ports_ui, resolved_ports_dir)
+    autosync_hook_status = reconcile_auto_savesync_hook(bin_dir)
     proxies_restored = 0
     if config_path.exists():
         try:
@@ -418,5 +433,6 @@ def reconcile_install(
         mount_service=mount_service_status,
         es_override=es_override_status,
         ports_gamelist=ports_gamelist_status,
+        autosync_hook=autosync_hook_status,
         proxies_restored=proxies_restored,
     )
