@@ -113,6 +113,84 @@ class TestScanTree:
 
         assert set(result) == {selected}
 
+    def test_real_dolphin_tree_selects_only_audited_gamecube_and_wii_saves(
+        self, tmp_path: Path, monkeypatch
+    ):
+        root = tmp_path / "saves"
+        selected = (
+            "dolphin-emu/GC/MemoryCardA.USA.raw",
+            "dolphin-emu/GC/USA/Card A/01-GAME-progress.gci",
+            "dolphin-emu/Wii/title/00010004/524d4345/data/banner.bin",
+            "dolphin-emu/Wii/title/00010004/524d4345/data/rksys.dat",
+        )
+        excluded = (
+            "dolphin-emu/Config/Dolphin.ini",
+            "dolphin-emu/Cache/Shaders/cache.bin",
+            "dolphin-emu/Logs/dolphin.log",
+            "dolphin-emu/ScreenShots/RMCE01.png",
+            "dolphin-emu/StateSaves/RMCE01.s01",
+            "dolphin-emu/Load/Textures/RMCE01/texture.png",
+            "dolphin-emu/GameSettings/RMCE01.ini",
+            "dolphin-emu/GC/USA/IPL.bin",
+            "dolphin-emu/GC/USA/Card A/MC_SYSTEM_AREA",
+            "dolphin-emu/GC/USA/Card A/deleted.gci.deleted",
+            "dolphin-emu/Wii/shared2/sys/SYSCONF",
+            "dolphin-emu/Wii/title/00000001/00000002/data/setting.txt",
+            "dolphin-emu/Wii/title/00010002/48414341/data/system-channel.dat",
+            "dolphin-emu/Wii/title/00010004/524d4345/content/title.tmd",
+        )
+        for relative_path in (*selected, *excluded):
+            path = root / relative_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"data")
+
+        unknown = root / "dolphin-emu/Arbitrary/huge/nested/tree"
+        unknown.mkdir(parents=True)
+        (unknown / "save.gci").write_bytes(b"unsafe")
+        real_iterdir = Path.iterdir
+
+        def guarded_iterdir(path):
+            if path == root / "dolphin-emu/Arbitrary":
+                raise AssertionError("unknown Dolphin content was traversed")
+            return real_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", guarded_iterdir)
+
+        report = save_tree.scan_tree_report(root, DEFAULT_SAVE_SELECTION_POLICY)
+
+        assert set(report.artifacts) == set(selected)
+        assert report.excluded_files == 0
+
+    def test_dolphin_save_symlink_is_not_followed(self, tmp_path: Path):
+        root = tmp_path / "saves"
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "stolen.dat").write_bytes(b"outside")
+        data = root / "dolphin-emu/Wii/title/00010004/524d4345/data"
+        data.mkdir(parents=True)
+        try:
+            (data / "linked").symlink_to(outside, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"directory symlinks unavailable: {exc}")
+
+        assert save_tree.scan_tree(root, DEFAULT_SAVE_SELECTION_POLICY) == {}
+
+    def test_dolphin_recursive_scan_prunes_symlinked_directories(
+        self, tmp_path: Path, monkeypatch
+    ):
+        root = tmp_path / "saves"
+        linked = root / "dolphin-emu/Wii/title/00010004/524d4345/data/linked"
+        linked.mkdir(parents=True)
+        (linked / "stolen.dat").write_bytes(b"outside")
+        real_is_symlink = Path.is_symlink
+
+        def marked_symlink(path):
+            return path == linked or real_is_symlink(path)
+
+        monkeypatch.setattr(Path, "is_symlink", marked_symlink)
+
+        assert save_tree.scan_tree(root, DEFAULT_SAVE_SELECTION_POLICY) == {}
+
     def test_real_n64_tree_selects_progress_and_states_but_not_runtime_artifacts(
         self, tmp_path: Path
     ):

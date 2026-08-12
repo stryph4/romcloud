@@ -72,7 +72,7 @@ class SaveLayout:
     """One auditable, positively traversable save layout.
 
     ``root_pattern`` is relative to ``/userdata/saves/<system>``. Literal
-    segments are opened directly; the four brace tokens are enumerated one
+    segments are opened directly; brace tokens are enumerated one
     level at a time and validated before ROMCloud descends into them.
     ``eligible_files`` is relative to the resolved root.  A non-recursive
     layout examines direct children only.
@@ -113,10 +113,29 @@ class SaveWatchRoot:
 
 _TOKEN_VALIDATORS = {
     "{digits8}": re.compile(r"[0-9]{8}").fullmatch,
+    "{hex8}": re.compile(r"[0-9A-Fa-f]{8}").fullmatch,
     "{hex32}": re.compile(r"[0-9A-Fa-f]{32}").fullmatch,
     "{hex16}": re.compile(r"[0-9A-Fa-f]{16}").fullmatch,
     "{sony_title_id}": re.compile(r"[A-Za-z]{4}[0-9]{5}").fullmatch,
+    "{dolphin_gc_region}": frozenset({"EUR", "USA", "JAP", "JPN"}).__contains__,
+    "{dolphin_gc_card}": frozenset({"Card A", "Card B"}).__contains__,
+    # Dolphin's game, downloadable-channel, and game-with-channel title
+    # namespaces. System channels, DLC, hidden channels, and other NAND
+    # namespaces are deliberately not traversable SaveSync roots.
+    "{dolphin_wii_save_type}": frozenset(
+        {"00010000", "00010001", "00010004"}
+    ).__contains__,
 }
+
+_DOLPHIN_GC_MEMORY_CARD_FILES = tuple(
+    filename
+    for slot in ("A", "B")
+    for region in ("EUR", "USA", "JAP", "JPN")
+    for filename in (
+        f"MemoryCard{slot}.{region}.raw",
+        *(f"MemoryCard{slot}.{region}.{blocks}.raw" for blocks in (59, 123, 251, 507, 1019)),
+    )
+)
 
 
 # Batocera systems whose audited default is a root-only RetroArch save/state.
@@ -289,6 +308,31 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
         description="Yuzu user/title saves; NAND, keys, cache, shaders and config omitted",
     ),
     _layout(
+        "dolphin-gc-memory-card-images",
+        "dolphin-emu",
+        root="GC",
+        files=_DOLPHIN_GC_MEMORY_CARD_FILES,
+        shared=True,
+        group_by="root_stem",
+        description="Opaque Dolphin GameCube memory-card images",
+    ),
+    _layout(
+        "dolphin-gc-gci-saves",
+        "dolphin-emu",
+        root="GC/{dolphin_gc_region}/{dolphin_gc_card}",
+        files=("*.gci",),
+        group_by="root_file",
+        description="Dolphin GCI folder-card saves, one physical GCI per conflict unit",
+    ),
+    _layout(
+        "dolphin-wii-title-saves",
+        "dolphin-emu",
+        root="Wii/title/{dolphin_wii_save_type}/{hex8}/data",
+        recursive=True,
+        group_by="root",
+        description="Per-title Dolphin Wii save data; other NAND content omitted",
+    ),
+    _layout(
         "xemu-hdd",
         XBOX_SYSTEM,
         files=(XBOX_HDD_RELATIVE_PATH,),
@@ -362,6 +406,9 @@ def _group_key(layout: SaveLayout, root: tuple[str, ...], remainder: tuple[str, 
         return f"{prefix}/{child}".strip("/")
     if layout.group_by == "root_stem":
         return _root_stem(remainder[-1])
+    if layout.group_by == "root_file":
+        filename = PurePosixPath(remainder[-1]).stem
+        return "/".join((*root, filename)).casefold()
     if layout.group_by == "n64_title":
         # Mupen can emit controller-slot files such as ``Game.1.sav`` beside
         # ``Game.srm``. They are one game dataset, so independent edits across

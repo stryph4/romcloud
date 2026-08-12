@@ -31,13 +31,12 @@ class TestKnownSystems:
             "xbox",
             "ps2",
             "ps3",
+            "dolphin-emu",
         ):
             assert policy.is_known_system(system) is True
 
     def test_unvalidated_systems_are_unsupported(self):
-        """3DS/Citra and Dolphin require system-specific selection that
-        hasn't been validated yet — they must stay unsupported, not
-        blindly included."""
+        """Unregistered emulator trees stay unsupported, not blindly included."""
         policy = DEFAULT_SAVE_SELECTION_POLICY
         for system in ("3ds", "citra", "dolphin", "gamecube", "totally-unknown-system"):
             assert policy.is_known_system(system) is False
@@ -317,6 +316,68 @@ class TestYuzu:
             "yuzu",
             f"nand/user/save/0000000000000000/{self._USER}/{self._TITLE}/save_data",
         ) is False
+
+
+class TestDolphin:
+    def test_default_gamecube_memory_cards_and_gci_saves_are_included(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        for path in (
+            "GC/MemoryCardA.USA.raw",
+            "GC/MemoryCardB.EUR.251.raw",
+            "GC/USA/Card A/01-GAME-save.gci",
+        ):
+            assert policy.is_included("dolphin-emu", path) is True
+
+    def test_gamecube_shared_and_per_file_groups_match_storage_semantics(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        raw = policy.group_for_path("dolphin-emu/GC/MemoryCardA.USA.raw")
+        gci_a = policy.group_for_path("dolphin-emu/GC/USA/Card A/01-GAME-save.gci")
+        gci_b = policy.group_for_path("dolphin-emu/GC/USA/Card B/01-GAME-save.gci")
+
+        assert raw is not None and raw.shared is True
+        assert gci_a is not None and gci_a.shared is False
+        assert gci_b is not None and gci_b.shared is False
+        assert gci_a.group_id != gci_b.group_id
+
+    def test_wii_game_and_channel_saves_are_grouped_per_title(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        first = policy.group_for_path(
+            "dolphin-emu/Wii/title/00010004/524d4345/data/rksys.dat"
+        )
+        sibling = policy.group_for_path(
+            "dolphin-emu/Wii/title/00010004/524d4345/data/banner.bin"
+        )
+        other = policy.group_for_path(
+            "dolphin-emu/Wii/title/00010004/52534245/data/save.dat"
+        )
+
+        assert first is not None and sibling is not None and other is not None
+        assert first.group_id == sibling.group_id
+        assert first.group_id != other.group_id
+        assert first.shared is False
+
+    def test_non_save_dolphin_content_and_invalid_ids_are_excluded(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        for path in (
+            "Config/Dolphin.ini",
+            "Cache/Shaders/cache.bin",
+            "Logs/dolphin.log",
+            "ScreenShots/RMCE01.png",
+            "StateSaves/RMCE01.s01",
+            "Load/Textures/RMCE01/texture.png",
+            "GameSettings/RMCE01.ini",
+            "GC/USA/IPL.bin",
+            "GC/SRAM.raw",
+            "GC/USA/Card A/MC_SYSTEM_AREA",
+            "Wii/shared2/sys/SYSCONF",
+            "Wii/title/00000001/00000002/data/setting.txt",
+            "Wii/title/00010002/48414341/data/system-channel.dat",
+            "Wii/title/00010005/524d4345/data/dlc.bin",
+            "Wii/title/00010004/not-hex/data/save.dat",
+            "Wii/title/00010004/524d4345/content/title.tmd",
+            "unknown/deep/save.gci",
+        ):
+            assert policy.is_included("dolphin-emu", path) is False
 
 
 class TestFlatpakExclusion:

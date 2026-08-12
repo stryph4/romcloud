@@ -162,6 +162,59 @@ class TestBatoceraSaveSelection:
         ).read_bytes() == b"dr-mario-progress"
         assert (remote / "Dr. Mario 64 (USA).state").read_bytes() == b"savestate"
 
+    def test_dolphin_gamecube_and_wii_saves_appear_in_preview(self, tmp_path, service):
+        gamecube = (
+            tmp_path
+            / "local-saves/dolphin-emu/GC/USA/Card A/01-GAME-progress.gci"
+        )
+        wii = (
+            tmp_path
+            / "local-saves/dolphin-emu/Wii/title/00010004/524d4345/data/rksys.dat"
+        )
+        _write(gamecube, b"gamecube-progress")
+        _write(wii, b"wii-progress")
+
+        diff = service.preview_upload()
+
+        assert [entry.relative_path for entry in diff.entries] == [
+            "dolphin-emu/GC/USA/Card A/01-GAME-progress.gci",
+            "dolphin-emu/Wii/title/00010004/524d4345/data/rksys.dat",
+        ]
+
+    def test_dolphin_saves_do_not_require_catalog_ownership(
+        self, tmp_path, provider
+    ):
+        managed_games = [
+            Game.create(
+                system,
+                name,
+                "local",
+                str(tmp_path / "roms"),
+                [GameAsset(f"{name}.rvz", f"{system}/{name}.rvz", is_primary=True)],
+            )
+            for system, name in (("gamecube", "Catalog Cube"), ("wii", "Catalog Wii"))
+        ]
+        svc = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "remote-data"),
+            local_root=str(tmp_path / "local-saves"),
+            remote_root=str(tmp_path / "remote-saves"),
+            state_path=tmp_path / "data/savesync-state.json",
+            ownership_policy=ManagedSaveOwnershipPolicy(managed_games),
+        )
+        paths = {
+            "dolphin-emu/GC/USA/Card A/01-CATALOG-progress.gci": b"catalog-cube",
+            "dolphin-emu/GC/USA/Card A/01-LOCAL-progress.gci": b"local-cube",
+            "dolphin-emu/Wii/title/00010004/43415457/data/save.dat": b"catalog-wii",
+            "dolphin-emu/Wii/title/00010004/4c4f434c/data/save.dat": b"local-wii",
+        }
+        for relative, content in paths.items():
+            _write(tmp_path / "local-saves" / relative, content)
+
+        plan = svc.preview_reconciliation()
+
+        assert {entry.relative_path for entry in plan.uploads} == set(paths)
+
 
 class TestWritableRemoteBoundary:
     def test_smb_upload_never_stages_under_read_only_catalog_mount(
@@ -1019,6 +1072,44 @@ class TestSaveSyncFinalizationSafety:
         ).get_state()
         assert len(reloaded.active_conflicts) == 1
         assert reloaded.active_conflicts[0].acknowledged_at is None
+
+    def test_dolphin_shared_memory_card_divergence_is_an_explicit_conflict(
+        self, tmp_path, service
+    ):
+        local = tmp_path / "local-saves/dolphin-emu/GC/MemoryCardA.USA.raw"
+        remote = tmp_path / "remote-saves/dolphin-emu/GC/MemoryCardA.USA.raw"
+        _write(local, b"common-card-image")
+        service.commit_upload(service.preview_upload())
+        local.write_bytes(b"offline-card-edit")
+        remote.write_bytes(b"other-device-card-edit")
+
+        plan = service.preview_reconciliation()
+
+        assert [entry.relative_path for entry in plan.conflicts] == [
+            "dolphin-emu/GC/MemoryCardA.USA.raw"
+        ]
+        group = service._policy.group_for_path(plan.conflicts[0].relative_path)
+        assert group is not None and group.shared is True
+
+    def test_independent_dolphin_wii_titles_reconcile_without_conflict(
+        self, tmp_path, service
+    ):
+        first_relative = "dolphin-emu/Wii/title/00010004/524d4345/data/save.dat"
+        second_relative = "dolphin-emu/Wii/title/00010004/52534245/data/save.dat"
+        first_local = tmp_path / "local-saves" / first_relative
+        second_local = tmp_path / "local-saves" / second_relative
+        _write(first_local, b"first-base")
+        _write(second_local, b"second-base")
+        service.commit_upload(service.preview_upload())
+        first_local.write_bytes(b"first-local")
+        second_remote = tmp_path / "remote-saves" / second_relative
+        second_remote.write_bytes(b"second-remote")
+
+        plan = service.preview_reconciliation()
+
+        assert [entry.relative_path for entry in plan.uploads] == [first_relative]
+        assert [entry.relative_path for entry in plan.downloads] == [second_relative]
+        assert plan.conflicts == ()
 
     def test_watcher_dirty_hint_survives_restart_but_preview_hashes_actual_files(
         self, tmp_path, service
