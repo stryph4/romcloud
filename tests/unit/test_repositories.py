@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timezone
 
 import pytest
@@ -245,6 +246,21 @@ class TestProxyRepository:
         fetched = proxy_repo.get_by_path("/roms/ps2/Test.romcloud")
         assert fetched is not None
         assert fetched.game_id == game.id
+
+    def test_path_conflict_never_replaces_another_games_ownership(
+        self, game_repo, proxy_repo
+    ):
+        first = self._add_game(game_repo)
+        second = self._add_game(game_repo)
+        shared_path = "/roms/ps2/Test.romcloud"
+        proxy_repo.save(ProxyRecord.create(first.id, shared_path))
+
+        with pytest.raises(sqlite3.IntegrityError):
+            proxy_repo.save(ProxyRecord.create(second.id, shared_path))
+
+        assert proxy_repo.get(first.id).proxy_path == shared_path
+        assert proxy_repo.get(second.id) is None
+        assert len(proxy_repo.list_all()) == 1
 
     def test_delete(self, game_repo, proxy_repo):
         game = self._add_game(game_repo)

@@ -803,10 +803,7 @@ class CatalogService:
 
         proxy_dir = self._local_roms_root / game.system
         proxy_dir.mkdir(parents=True, exist_ok=True)
-        safe_title = _safe_filename(game.title)
-        proxy_path = proxy_dir / f"{safe_title}.romcloud"
-        if proxy_path.exists() and not self._proxy_repo.owns_path(str(proxy_path)):
-            proxy_path = proxy_dir / f"{safe_title}.{game.id[:8]}.romcloud"
+        proxy_path = self._allocate_proxy_path(game)
 
         self._write_proxy_payload(proxy_path, game)
         record = ProxyRecord.create(game_id=game.id, proxy_path=str(proxy_path))
@@ -819,18 +816,45 @@ class CatalogService:
         if self._write_proxies_enabled:
             proxy_dir.mkdir(parents=True, exist_ok=True)
 
-        safe_title = _safe_filename(game.title)
-        proxy_path = proxy_dir / f"{safe_title}.romcloud"
-
-        # Resolve filename collision by appending a short id suffix.
-        if proxy_path.exists() and not self._proxy_repo.owns_path(str(proxy_path)):
-            proxy_path = proxy_dir / f"{safe_title}.{game.id[:8]}.romcloud"
+        proxy_path = self._allocate_proxy_path(game)
 
         if self._write_proxies_enabled:
             self._write_proxy_payload(proxy_path, game)
 
         record = ProxyRecord.create(game_id=game.id, proxy_path=str(proxy_path))
         self._proxy_repo.save(record)
+
+    def _allocate_proxy_path(self, game: Game) -> Path:
+        """Return a path that does not steal another game's durable identity.
+
+        Connected and Offline presentation may intentionally remove a proxy
+        *file* while retaining its ownership row.  Collision detection must
+        therefore consult both states: filesystem existence alone cannot tell
+        whether a title-derived path is available.  This also protects an
+        unregistered/foreign file and handles the unlikely case that two game
+        IDs share the same eight-character suffix.
+        """
+        proxy_dir = self._local_roms_root / game.system
+        safe_title = _safe_filename(game.title)
+        default = proxy_dir / f"{safe_title}.romcloud"
+        if not self._proxy_path_conflicts(default, game.id):
+            return default
+
+        safe_id = _safe_filename(game.id[:8]) or "game"
+        candidate = proxy_dir / f"{safe_title}.{safe_id}.romcloud"
+        collision = 2
+        while self._proxy_path_conflicts(candidate, game.id):
+            candidate = proxy_dir / f"{safe_title}.{safe_id}.{collision}.romcloud"
+            collision += 1
+        return candidate
+
+    def _proxy_path_conflicts(self, path: Path, game_id: str) -> bool:
+        owner = self._proxy_repo.get_by_path(str(path))
+        if owner is not None:
+            return owner.game_id != game_id
+        # An existing path with no ownership row is user/foreign state and
+        # must never be adopted or overwritten.
+        return path.exists()
 
     def _rewrite_owned_proxy(self, game: Game) -> None:
         """Refresh an existing owned proxy without changing its path."""

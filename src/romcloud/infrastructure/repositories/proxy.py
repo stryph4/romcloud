@@ -28,11 +28,23 @@ class ProxyRepository:
     # ── write ─────────────────────────────────────────────────────────────────
 
     def save(self, record: ProxyRecord) -> None:
+        """Insert or update one game's durable proxy ownership.
+
+        A proxy path is unique across games.  This must be a true upsert on
+        ``game_id`` rather than SQLite ``INSERT OR REPLACE``: REPLACE resolves
+        a conflicting ``proxy_path`` by deleting the *other* game's row before
+        inserting this one, silently transferring ownership and keeping the
+        registration count flat.  A path-allocation bug must fail without
+        destroying either ownership record.
+        """
         with self._db.connect() as conn:
             conn.execute(
                 """
-                INSERT OR REPLACE INTO proxy_records (game_id, proxy_path, created_at)
+                INSERT INTO proxy_records (game_id, proxy_path, created_at)
                 VALUES (?, ?, ?)
+                ON CONFLICT(game_id) DO UPDATE SET
+                    proxy_path = excluded.proxy_path,
+                    created_at = excluded.created_at
                 """,
                 (
                     record.game_id,
