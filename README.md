@@ -1,587 +1,384 @@
 # ROMCloud
 
+> **Your Batocera library, without keeping your entire ROM collection on
+> the device.**
+
+ROMCloud makes games stored on a NAS, another PC, or external storage
+appear in Batocera's normal EmulationStation library. Use the source
+directly, cache games locally as you play them, or take selected cached
+games offline.
+
+> \[!IMPORTANT\] ROMCloud is currently beta software. Keep independent
+> backups of important saves and configuration.
+
 ## Install on Batocera
+
+From a Batocera shell:
+
+``` bash
 curl -fsSL https://romcloud.app/install | bash
-
-**Browse a large ROM library in Batocera without keeping the whole library on
-the device.**
-
-ROMCloud makes ROMs stored on a NAS, another PC, or external storage appear in
-Batocera's normal EmulationStation library. **Cache Mode** downloads games on
-first launch and keeps frequently used games locally. **Connected Mode** uses
-the configured primary source directly and requires it to remain available.
-
-## Why use ROMCloud?
-
-- **Browse the full library in EmulationStation.** Small `.romcloud` entries
-  represent remote games alongside ordinary local games.
-- **Download on first launch.** A cache miss shows transfer progress, verifies
-  the result, and hands the local copy to Batocera.
-- **Keep a bounded local library automatically.** Configurable cache capacity,
-  a minimum free-space reserve, least-recently-used eviction, and pinning keep
-  storage use predictable.
-- **Play cached games while the source is offline.** A complete cache hit does
-  not require the ROM source to be reachable. Uncached or incomplete games do.
-- **Sync selected game-progress saves manually.** SaveSync previews uploads or
-  downloads, verifies staged data, and commits a whole dataset transactionally.
-- **Optionally sync library metadata.** Library Sync imports scraped metadata
-  and media into ROMCloud-owned canonical records, then renders the correct
-  local paths for Cache or Connected Mode without modifying source XML.
-- **Use familiar storage.** The current beta supports SMB shares and local or
-  externally mounted directories. A NAS or PC can expose an SMB share; USB and
-  other mounted storage work through the local-filesystem path.
-- **Set up and maintain ROMCloud graphically.** The Batocera Ports interface
-  handles storage setup, connection controls, catalog refresh, SaveSync,
-  health checks, and updates with controller, touch, or keyboard input.
-- **Recover instead of starting over.** Interrupted game transfers retain
-  staging data; completed assets can be reused on the next attempt. Repair and
-  update reconcile installed artifacts and restore missing ROMCloud-owned
-  proxies when catalog records are available.
-- **Manage the complete lifecycle.** Built-in update, repair, uninstall, and
-  purge workflows distinguish replaceable runtime files from user data.
-
-> [!IMPORTANT]
-> The ROM-source SMB mount remains read-only in every operating mode. Connected
-> Mode does not use cache-backed proxies for normal launches.
-> SaveSync and Library Sync, when enabled, use a separate explicitly writable
-> data location.
-
-## Public beta status
-
-ROMCloud is ready for public beta use, but it is still under active development.
-The core proxy, launch, cache, SMB mount, updater, and Batocera integration paths
-have evidence from a Steam Deck running **Batocera 42**. Save-selection rules
-also include layouts audited against **Batocera v43** generators, but that is not
-the same as full end-to-end v43 hardware validation.
-
-Back up important saves before using any beta synchronization tool. Review the
-[known limitations](#known-limitations) and [SaveSync scope](#savesync) before
-depending on ROMCloud as the only copy of data.
-
-## Common setups
-
-- **NAS library:** expose a read-only-capable SMB share containing Batocera
-  system folders such as `ps2`, `psx`, and `snes`.
-- **PC-hosted library:** share a folder over SMB from Linux, Windows, or another
-  system reachable by the Batocera device.
-- **External storage:** select an already mounted local/USB directory through
-  the graphical folder browser or CLI configuration.
-- **Remote NAS over a private network:** ROMCloud can use an SMB address made
-  reachable by software such as Tailscale, but ROMCloud does not configure or
-  monitor Tailscale itself.
-
-SFTP is **not implemented** in the current beta. Native, userspace SMB access is
-also not implemented; SMB sources use Batocera's `mount.cifs` support and are
-then read through ROMCloud's local-filesystem provider.
-
-## How it works
-
-```text
-NAS / PC / external storage
-        │
-        │  complete ROM library
-        ▼
-ROMCloud catalog refresh
-        │
-        │  creates tiny local .romcloud entries
-        ▼
-Batocera EmulationStation library
-        │
-        ├── cached ───────────────► launch local copy immediately
-        │
-        └── not cached
-                │
-                ├── transfer and verify game assets
-                ▼
-        managed local LRU cache
-                │
-                ▼
-        Batocera emulatorlauncher
 ```
 
-In Connected Mode ROMCloud creates only a verified, manifest-owned `ROMCloud`
-directory symlink inside each existing `/userdata/roms/<system>/` directory.
-Local ROMs remain alongside it. ROMCloud never owns the system directory and
-uninstall/reconfigure unlinks only symlinks whose recorded path and target still
-match. An existing foreign file, directory, or symlink at that reserved path is
-reported as a conflict and left untouched.
+After installation, refresh EmulationStation's game list if needed and
+open **Ports → ROMCloud**. The graphical setup wizard handles normal
+configuration; typical users do not need to edit configuration files or
+use the CLI.
 
-ROMCloud does not replace EmulationStation, Batocera's emulator configuration,
-or `emulatorlauncher`. Cache Mode's launch wrapper changes only the ROM path
-for a `.romcloud` game. Ordinary local and Connected Mode ROM launches use
-Batocera's normal path.
+## Why ROMCloud?
 
-## Storage support
+A large ROM collection can easily exceed the storage available on a
+handheld or small Batocera device. ROMCloud lets Batocera keep behaving
+like Batocera while the bulk of the library lives somewhere else.
 
-| Source or destination | Current status | How it works |
-| --- | --- | --- |
-| SMB ROM source | Supported | Mounted with CIFS at a local path, read-only, then scanned through the local-filesystem provider. |
-| Local or external ROM source | Supported | Uses an existing absolute directory directly. |
-| SMB synchronized data | Supported | Separate SMB target for SaveSync/Library Sync, mounted read/write and verified with a write/read/cleanup probe. |
-| Local or external synchronized data | Supported | Explicit writable directory verified with the same non-destructive probe. |
-| SFTP | Not implemented | No SFTP provider or setup flow exists. |
-| Direct/native SMB provider | Not implemented | The source tree contains only a future placeholder; current SMB support uses mounted CIFS. |
+-   **Browse your library normally.** Remote games appear in
+    EmulationStation alongside ordinary local games.
+-   **Cache games automatically.** In Cache Mode, launching an uncached
+    game transfers and verifies it before handing it to Batocera.
+-   **Keep storage bounded.** Configure a cache size and minimum
+    free-space reserve; ROMCloud uses LRU eviction and supports pinning.
+-   **Play cached games without the NAS.** Complete cached games can
+    launch without the source being reachable.
+-   **Use your source directly.** Connected Mode launches from the
+    configured source instead of duplicating games into the cache.
+-   **Take a smaller library offline.** Offline Mode exposes only games
+    whose required assets are already cached.
+-   **Keep Batocera in control.** ROMCloud does not replace
+    EmulationStation, emulator configuration, or `emulatorlauncher`.
+-   **Keep local games local.** Ordinary ROMs already on the Batocera
+    device remain untouched.
+-   **Optional metadata and save synchronization.** Library Sync and
+    SaveSync add cross-device continuity without being required for
+    normal ROM access.
+-   **Controller-friendly management.** Setup, storage, modes, catalog
+    refresh, synchronization, diagnostics, and updates are available
+    through the Ports UI.
 
-For SMB configurations, ROMCloud keeps two distinct trust boundaries:
+## Three operating modes
 
-- the ROM catalog source is read-only;
-- optional ROMCloud data storage for SaveSync and Library Sync is read/write and may use a
-  different server, share, subdirectory, username, and password.
+ROMCloud has one explicit operating mode at a time. Losing network
+connectivity does **not** silently change the selected mode.
 
-ROMCloud rejects overlapping source and remote-data locations. Credentials are
-stored separately from `romcloud.toml`, atomically, with mode `0600`, and are
-not placed in process arguments or normal logs.
+  -----------------------------------------------------------------------
+  Mode              What you see      How games launch  Source required?
+  ----------------- ----------------- ----------------- -----------------
+  **Connected**     Managed remote    Directly from the Yes
+                    library           configured source 
 
-## Quick start on Batocera
+  **Cache**         Full managed      From cache;       Only for cache
+                    library           missing games are misses
+                                      fetched first     
 
-### 1. Prepare the library
+  **Offline**       Only complete     Entirely from     No
+                    cached games      local cache       
+  -----------------------------------------------------------------------
 
-The selected source root should contain folders named with Batocera system
+### Connected Mode
+
+Use this when the NAS, PC, or external source is available and you want
+to launch games directly from it. Existing cache files and pins are
+preserved but are not the normal launch path.
+
+### Cache Mode
+
+Use this when you want the full library visible but prefer games to run
+from local storage. Cached games launch immediately. Uncached games are
+transferred, verified, and added to the managed cache before launch.
+
+### Offline Mode
+
+Use this when the source will not be available. ROMCloud exposes only
+managed games with complete local cache assets. Ordinary local Batocera
+games remain available.
+
+> \[!NOTE\] Mode switching changes ROMCloud's presentation of the
+> existing catalog; it does not rescan the source library. Run **Refresh
+> Catalog** when the source library itself changes. Depending on the
+> current beta build and Batocera behavior, EmulationStation may need a
+> game-list refresh after presentation changes.
+
+## Quick start
+
+### 1. Prepare your ROM source
+
+The selected source root should contain folders using Batocera system
 identifiers:
 
-```text
+``` text
 Roms/
 ├── dreamcast/
+├── gamecube/
 ├── ps2/
 ├── psx/
 ├── snes/
 └── xbox360/
 ```
 
-Only folders that match systems known to the installed Batocera system
-definitions are cataloged. Systems do not all need to exist.
+Only folders matching systems known to the installed Batocera system
+definitions are cataloged. You do not need to have every system.
 
-### 2. Install
+### 2. Install ROMCloud
 
-From a Batocera shell:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/stryph4/romcloud/main/scripts/bootstrap.sh | bash
+``` bash
+curl -fsSL https://romcloud.app/install | bash
 ```
 
-The bootstrap requires `curl`, `tar`, a writable `/userdata`, and `python3`.
-It downloads the requested GitHub archive, runs the idempotent installer, and
-creates a private Python environment under `/userdata/system/romcloud`. It does
-not install packages into Batocera's system Python or edit
-`/userdata/system/custom.sh`.
+The installer creates an isolated ROMCloud environment under
+`/userdata/system/romcloud`. It does not install packages into
+Batocera's system Python or modify `/userdata/system/custom.sh`.
 
-To install a specific tag, branch, or full commit SHA:
+### 3. Open ROMCloud
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/stryph4/romcloud/main/scripts/bootstrap.sh \
-  | ROMCLOUD_REF=<tag-branch-or-commit> bash
+Launch **Ports → ROMCloud**.
+
+The first-run wizard can configure an SMB source (server, share,
+credentials, and optional folder) or an already mounted local/external
+directory. It validates the source, detects recognizable systems,
+configures cache limits, and builds the initial catalog.
+
+### 4. Choose how you want to play
+
+For most NAS users, choose **Connected** for direct NAS access,
+**Cache** for local copies fetched on demand, or **Offline** before
+using only already-cached games without the source.
+
+### 5. Refresh after changing the source library
+
+When ROMs are added or reorganized on the source, use **Library →
+Refresh Catalog**. Catalog refresh and operating-mode changes are
+intentionally separate operations.
+
+## How ROMCloud works
+
+In Cache Mode:
+
+``` text
+NAS / PC / external storage
+            │
+            │ complete ROM library
+            ▼
+     ROMCloud catalog
+            │
+            │ tiny .romcloud proxies
+            ▼
+ Batocera EmulationStation
+            │
+       launch game
+            │
+      ┌─────┴─────┐
+      │           │
+   cached      not cached
+      │           │
+      │      transfer + verify
+      │           │
+      └─────┬─────┘
+            ▼
+      local game copy
+            │
+            ▼
+ Batocera emulatorlauncher
 ```
 
-### 3. Run graphical setup
+ROMCloud proxy files are small managed records, not ROM files. A proxy
+identifies a cataloged game. On launch, ROMCloud resolves that identity,
+makes sure required assets are available locally when Cache Mode
+requires them, and hands the real game path to Batocera's normal
+launcher.
 
-Update EmulationStation's game lists if necessary, then launch
-**Ports → ROMCloud**.
+Connected Mode instead exposes the known source library through verified
+ROMCloud-owned links and launches directly from the configured source.
 
-The first-run wizard can configure either:
+ROMCloud never owns an entire `/userdata/roms/<system>` directory. It
+tracks the files, links, and records it creates and refuses to overwrite
+unrelated content.
 
-- an SMB source, including server, port, credentials, share discovery, and an
-  optional folder inside the share; or
-- a local/external directory selected with the graphical folder browser.
+## Storage support
 
-The wizard validates the source, detects recognizable system folders, asks for
-cache limits, and optionally configures independent writable storage for
-SaveSync. It then applies the configuration, mounts configured SMB targets,
-performs the initial catalog refresh, creates proxies, and reconciles the
-EmulationStation integration.
+  -----------------------------------------------------------------------
+  Source or destination   Status                  Notes
+  ----------------------- ----------------------- -----------------------
+  SMB ROM source          **Supported**           Mounted with CIFS
+                                                  read-only, then
+                                                  accessed through the
+                                                  local-filesystem
+                                                  provider
 
-Every wizard step includes a short explanation of the choice and what follows.
-Connection, authentication, mount, validation, and
-EmulationStation phases use an animated activity indicator because those calls
-do not expose reliable totals. Catalog scanning shows real per-system game
-counts and progress. All of this work runs through the existing non-blocking
-operation runner so controller, keyboard, and touch input remain responsive.
+  Local/external ROM      **Supported**           Uses an existing
+  source                                          absolute directory
 
-Setup is retryable. A failed fresh setup retains credential-free failure state;
-a failed repair of an existing valid setup restores the previous configuration
-and credentials. EmulationStation still needs a game-list refresh or restart to
-show newly cataloged games.
+  SMB ROMCloud data       **Supported**           Separate read/write
+                                                  target for optional
+                                                  SaveSync and Library
+                                                  Sync
 
-### CLI setup alternative
+  Local/external ROMCloud **Supported**           Explicit writable
+  data                                            directory
 
-The guided CLI remains available:
+  SFTP                    **Not implemented**     No current SFTP
+                                                  provider/setup flow
 
-```bash
-/userdata/system/romcloud/bin/romcloud configure
-/userdata/system/romcloud/bin/romcloud healthcheck
-/userdata/system/romcloud/bin/romcloud refresh
-```
+  Native/userspace SMB    **Not implemented**     Current SMB support
+  provider                                        uses Batocera's CIFS
+                                                  mount support
+  -----------------------------------------------------------------------
 
-`romcloud configure` supports guided SMB discovery and local/external paths.
-Non-interactive options are available through `romcloud configure --help`.
+For SMB setups, ROMCloud deliberately separates two trust boundaries:
+the **ROM source** is read-only, while optional **ROMCloud data
+storage** for synchronization is explicitly read/write. The two
+locations may use different servers, shares, paths, and credentials.
+ROMCloud rejects unsafe overlapping source/data locations.
 
-## Graphical interface
+Credentials are stored separately from `romcloud.toml`, atomically, with
+restrictive permissions, and are not placed in normal logs or process
+arguments.
 
-The optional graphical application is installed when Batocera has a system
-Python capable of importing pygame. It runs under that system Python while all
-ROMCloud backend work remains in the isolated virtual environment. The two
-processes communicate through credential-safe JSON subprocess requests;
-`ports_gfx` never imports the installed `romcloud` package.
+## Smart local cache
 
-The current category-based interface provides:
+The default cache is `/userdata/romcloud/cache`.
 
-- **Library:** catalog status/refresh, cache and offline-presentation controls,
-  and a preflighted, hold-to-start source metadata import when Library Sync is enabled;
-- **Storage:** setup/reconfiguration, connection status, mount/reconnect, and
-  unmount;
-- **SaveSync:** status, upload/download preview, hold-to-confirm commit, and the
-  Original Xbox opt-in setting;
-- **Maintenance:** check for updates and install an update;
-- **Settings:** health check, controller diagnostics/remapping, and exit.
+ROMCloud tracks complete game assets rather than treating a partially
+transferred game as playable. Transfers are staged below `.partial`,
+verified, and promoted into their final cache locations. Interrupted
+transfers retain useful staging data so a later attempt can reuse
+already completed assets.
 
-Long operations run without a fixed subprocess timeout. Their progress and
-technical details remain scrollable while the graphical event loop stays
-responsive. The UI supports SDL game controllers, touchscreen input, physical
-keyboards, and a controller/touch on-screen keyboard for setup fields.
+Two settings govern automatic eviction:
 
-If pygame is unavailable, installation of the graphical component is skipped
-without disabling the CLI, cache, launcher, or mount service.
+-   `max_size_gb` --- maximum tracked cache usage;
+-   `min_free_gb` --- free space ROMCloud must preserve on the cache
+    filesystem.
 
-## Batocera and EmulationStation integration
+When space is required, ROMCloud evicts eligible least-recently-used
+entries. It does not automatically evict games that are pinned,
+transferring, or currently launching. If protected data leaves
+insufficient capacity, the operation fails with a space diagnostic
+rather than deleting protected content.
 
-A catalog refresh writes small JSON `.romcloud` proxy files into Batocera's
-normal ROM directories, for example:
+Pinning protects an existing cached game from ROMCloud's automatic
+eviction. It is not a backup and does not protect against manual
+deletion or storage failure.
 
-```text
+## Catalog and EmulationStation integration
+
+ROMCloud catalogs known games and maintains ownership records for its
+generated presentation. In Cache Mode, managed entries look like:
+
+``` text
 /userdata/roms/psx/Alundra (USA).romcloud
 /userdata/roms/ps2/Some Game.romcloud
 ```
 
-ROMCloud records ownership and refuses to overwrite or remove an unrelated
-file. Existing local ROMs are left byte-for-byte untouched and can coexist in a
-managed system directory.
+ROMCloud refuses to overwrite or remove unrelated files. Existing local
+ROMs can coexist in the same system directories.
 
 The EmulationStation override is stored at:
 
-```text
+``` text
 /userdata/system/configs/emulationstation/es_systems_romcloud.cfg
 ```
 
 ROMCloud does not modify Batocera's stock
-`/usr/share/emulationstation/es_systems.cfg`. The generated override preserves
-Batocera's launcher arguments and extensions, adds `.romcloud`, and routes only
-those proxy launches through `romcloud-run`.
+`/usr/share/emulationstation/es_systems.cfg`. The generated integration
+preserves Batocera's normal launcher arguments and extensions while
+adding ROMCloud's managed launch path.
 
-At launch:
+### Refreshing the catalog
 
-1. `romcloud-run` recognizes a `.romcloud` path.
-2. ROMCloud resolves its catalog entry and verifies whether every required game
-   asset is already cached.
-3. A cache hit launches immediately from local storage.
-4. A cache miss requires a reachable source, transfers into staging, validates
-   the assets, and promotes them into the cache.
-5. The wrapper passes the local primary asset to Batocera's normal
-   `emulatorlauncher`, preserving all other launch arguments.
+Use **Library → Refresh Catalog** or:
 
-The launcher supports ordinary single-file or directory-valued games and
-multi-asset BIN/CUE games. CUE dependencies are cataloged together, and a
-missing companion makes the cache incomplete. `.m3u` multi-disc playlists and
-CCD/IMG/SUB dependency grouping are not yet implemented.
-
-## Catalog refresh and recovery
-
-Initial setup performs a catalog refresh automatically. After changing the
-source library, run **Library → Refresh Catalog** or:
-
-```bash
+``` bash
 /userdata/system/romcloud/bin/romcloud refresh
 ```
 
-Refresh behavior is intentionally conservative:
-
-- known system directories are scanned independently and report per-system
-  progress;
-- existing games are not duplicated;
-- changed companion-asset metadata is updated in place, preserving game IDs,
-  cache history, and pin state;
-- stale entries that have become companions of a CUE set are pruned;
-- a source game that simply disappears is **not** automatically deleted from
-  the catalog;
-- only ROMCloud-owned proxy files may be rewritten or removed;
-- EmulationStation registration is regenerated from cataloged systems after a
-  successful refresh.
-
-Updates and `romcloud repair` reconcile managed launchers/integrations and can
-restore a missing owned proxy from retained catalog data. Launch-time CUE
-resolution also repairs legacy companion metadata when the current source is
-available. These are targeted recovery paths, not a general backup of the
-catalog or ROM source.
-
-Refresh does not restart EmulationStation. Update game lists or restart
-EmulationStation after catalog changes.
+Refresh is intentionally conservative: known system directories are
+scanned independently; existing logical games should retain stable
+identities; temporary source unavailability is not treated as permission
+to delete the catalog; and only ROMCloud-owned presentation files may be
+rewritten or removed. A mode switch does **not** perform catalog
+discovery.
 
 ## Library Sync
 
-Library Sync is disabled by default. It synchronizes normalized metadata, not
-raw `gamelist.xml` files. Enable it in graphical setup, with
-`romcloud configure --library-sync`, or after setup with:
+Library Sync is an **optional beta feature** for synchronizing scraped
+game metadata and media. It is disabled by default. Its purpose is to
+maintain provider-neutral canonical metadata while rendering paths
+appropriate to the current operating mode.
 
-```bash
-romcloud library-sync enable
-romcloud library-sync sync
-```
+Library Sync can synchronize names, descriptions, ratings, release
+dates, developer/publisher/genre/player metadata, artwork, and supported
+media. Source `gamelist.xml` files are read-only to ROMCloud and are
+never rewritten.
 
-Enabling Library Sync during setup does not import source metadata or media.
-Setup completes as soon as the source, catalog, game-access strategy, and
-EmulationStation integration are usable. Start the optional enrichment later
-from **Library > Import Source Metadata**. The graphical flow first counts
-catalog games, systems, game-list files/bytes, artwork references, videos, and
-other media references without hashing or copying media. It then requires a
-three-second hold. Exact transfer bytes are not guessed in advance; they are
-counted only as changed files are copied. The UI says duration depends on
-library size and storage/network speed rather than inventing an ETA.
+Canonical data lives under the configured writable ROMCloud data target:
 
-When enabled, ROMCloud may read a `gamelist.xml` under each source system to
-initialize names, descriptions, ratings, dates, developer/publisher/genre,
-players, and supported media. Source/NAS XML is never written. Local system
-gamelists are merged atomically: unrelated local-game entries are retained,
-while ROMCloud-managed entries carry a stable `romcloudId` ownership marker.
-Malformed XML and paths escaping a system root are ignored or left untouched.
-
-Canonical records live at:
-
-```text
+``` text
 <remote_data.root>/library/library.json
 <remote_data.root>/library/media/sha256/...
 ```
 
-The device working copy is `data/library/library.json`. Record identity is a
-SHA-256 key derived from the Batocera system and normalized primary source-ROM
-path; mount paths, local `.romcloud` paths, and access mode are excluded.
-Cache Mode renders `./Game.romcloud` and local content-addressed media copies.
-Connected Mode renders `./ROMCloud/Game.chd` and prefers source-hosted media such as
-`./ROMCloud/images/Game.png`. Switching modes regenerates presentation without
-changing canonical records.
+ROMCloud uses stable game identity independent of the local mount root
+or current access mode. Media is content-addressed and unchanged media
+can be skipped on later synchronization passes.
 
-The beta merge policy is non-destructive and additive. Missing fields/media
-are filled; blank local values never delete canonical data. If two non-empty
-values differ, the existing canonical value wins deterministically and a
-conflict is reported. A media file changed at the same persisted source path
-is treated as a new content-addressed revision; competing media origins still
-retain the canonical value and report a conflict. Media are SHA-256 addressed
-and copied only when missing or changed. No operation recursively deletes
-media trees.
+The merge policy is additive and conservative: missing information may
+be filled; blank values do not delete canonical data; conflicting
+non-empty values preserve the existing canonical value and report the
+conflict; and unrelated local EmulationStation entries are preserved.
 
-After a media file has been fully hashed and a destination copy has been
-verified, ROMCloud persists separate source, remote-blob, and device-local
-validation fingerprints. A fingerprint combines size, nanosecond modification
-time, and bounded beginning/middle/end content samples; timestamps alone are
-never accepted. The reported change time (ctime) is recorded but deliberately
-excluded from the match decision — on CIFS/SMB mounts it is not stable across
-independent stat() calls for a file whose content and modification time have
-not changed, and gating on it would force a full re-hash of every unchanged
-media file on every import. A matching fingerprint avoids rereading the full
-file on later imports. Missing or mismatched fingerprint data falls back to a
-full SHA-256, and every newly copied file is still fully verified before its
-atomic replacement. Runtime progress reports media examined, cheaply skipped,
-fully hashed, copied, and actual bytes transferred rather than presenting the
-whole referenced library as transfer volume.
+Library Sync does not run merely because you switch operating modes or
+refresh the ROM catalog.
 
-Explicit operations are:
-
-```bash
+``` bash
 romcloud library-sync status
+romcloud library-sync enable
+romcloud library-sync disable
 romcloud library-sync pull
 romcloud library-sync push
 romcloud library-sync sync
 romcloud library-sync remove-local
 ```
 
-`pull` updates local canonical/presentation state without writing the remote
-canonical document. `push` and `sync` add local/source improvements to the
-remote store. `remove-local` removes only marked local entries and preserves
-canonical/source data and media. Catalog refresh does not start this optional
-import. Library Sync push, pull, and
-sync are blocked in Offline Mode; the canonical remote library is left
-untouched and locally scraped metadata remains available for a later connected
-sync. Local rendering never recreates absent source-only proxies.
-
-## Operating modes, local cache, and offline use
-
-ROMCloud persists exactly one authoritative operating state in
-`/userdata/system/romcloud/data/library-view.json`: `connected`, `cache`, or
-`offline`. Source reachability is status, not mode. ROMCloud never silently
-changes the selected mode when a source is disconnected or restored. Legacy
-version-2 `nas` state migrates once to `connected`.
-
-- **Connected Mode:** use the configured primary source directly. The source
-  may be an SMB-mounted library, an external drive, or another supported local
-  provider. The persisted catalog remains the managed-library identity, while
-  verified `ROMCloud` directory links expose its known systems. The source is
-  required; cache files and pins are preserved but are not the normal launch
-  path.
-- **Cache Mode:** recreate the known `.romcloud` library from catalog and proxy
-  ownership records. Cached games launch locally. An uncached launch uses the
-  existing transfer, verification, LRU eviction, and pinning path; if the
-  source is unavailable only that cache miss fails. Entering this mode does not
-  scan the source.
-- **Offline Mode:** expose only managed games whose complete cached assets are
-  valid. Remote-only titles are hidden, cache misses are blocked, and ordinary
-  local Batocera games remain untouched.
-
-The graphical main menu presents these as three mutually exclusive choices.
-The equivalent CLI is:
-
-```bash
-romcloud library connected
-romcloud library cache
-romcloud library offline
-romcloud library status
-```
-
-Offline Mode allows cached launches, cache status/pin/unpin/removal/eviction,
-local settings and diagnostics, and connection recovery bookkeeping. It
-blocks cache misses/downloads, provider/catalog refresh, Library Sync remote
-operations, SaveSync upload/download, and update network operations before
-they contact remote storage. Connected Mode source loss remains a connection
-failure; Cache Mode source loss keeps cache hits playable and fails uncached
-launches clearly; neither changes the authoritative mode.
-
-Every transition is a fast representation change over the persisted database:
-it reconciles verified direct links or owned proxies, updates locally rendered
-metadata when enabled, refreshes the ROMCloud-owned EmulationStation override,
-asks Batocera to restart EmulationStation, and only then atomically commits the
-new mode. It does not run catalog discovery, Library Sync source import, or
-SaveSync reconciliation. A failed transition restores the previous
-presentation and leaves the previous state authoritative.
-
-Catalog refresh is deliberately separate. If source games changed while the
-device was disconnected, the known catalog may remain stale until the user
-runs **Refresh Catalog**. Mode switching never traverses the source tree just
-to change access representation.
-
-Transitions do not delete catalog rows, cached bytes, cache status, LRU data,
-pin state, local saves, local ROMs, or unrelated `.romcloud` files.
-
-The default cache is:
-
-```text
-/userdata/romcloud/cache
-```
-
-The on-disk layout mirrors each game's system-relative source path. Transfers
-stage data below `.partial`, verify expected sizes when known, and promote
-completed assets into their final locations. Interrupted game transfers leave
-staging data in place. A later attempt reuses complete files/assets, while an
-incomplete individual file is copied again from its beginning.
-
-Two limits govern automatic eviction:
-
-- `max_size_gb`: maximum tracked cache usage;
-- `min_free_gb`: free space that must remain on the cache filesystem.
-
-Before caching a game, ROMCloud evicts least-recently-used eligible entries
-until both limits can be satisfied. It never automatically evicts a game that
-is pinned, transferring, or currently launching. If protected entries leave
-insufficient capacity, the launch fails with a space diagnostic instead of
-deleting them.
-
-Useful cache commands:
-
-```bash
-romcloud cache status
-romcloud cache add <game-id>
-romcloud cache remove <game-id>
-romcloud cache pin <game-id>
-romcloud cache unpin <game-id>
-```
-
-Pinning protects a cached game from ROMCloud's automatic eviction. It does not
-copy an uncached game by itself and cannot protect against manual filesystem
-deletion or storage failure.
-
-### Offline behavior
-
-A complete cache hit is selected before ROMCloud checks source reachability, so
-it can launch while the NAS/share/source is unavailable. This assumes the
-local config, proxy, catalog information, complete cache assets, and Batocera
-emulator dependencies remain intact. An uncached or incomplete game cannot be
-launched until the source becomes reachable again.
-
-ROMCloud does not promise that every cached game is permanently offline:
-unpinned entries remain eligible for LRU eviction, and external emulators or
-games may have their own network requirements.
+Remote Library Sync operations are unavailable in Offline Mode.
 
 ## SaveSync
 
-ROMCloud keeps the emulator-facing save tree local and can reconcile
-eligible ROMCloud-managed game data with a canonical remote save/state dataset.
-The authoritative ownership identity is the catalog's stable `Game.id`; save
-names and emulator title IDs are used only when they can safely attribute an
-already policy-selected artifact to that catalog game. A persisted last-shared manifest
-allows ROMCloud to distinguish local-only and remote-only changes from files
-changed on both devices. SaveSync runs only through its explicit operations;
-operating-mode transitions do not start it. Conflicting files remain untouched
-on both sides and are reported instead of being guessed or overwritten. A local game's save is not
-automatically synchronized just because it shares a system save directory with
-a managed game.
+SaveSync is an **optional beta synchronization system** for eligible
+game-progress data.
 
-Offline Mode never polls or modifies remote saves. `/userdata/saves` remains a
-normal writable local working tree. If writable `remote_data` is not
-configured, Connected or Cache Mode ROM access still works but shared
-save/state continuity is unavailable.
+> \[!WARNING\] Keep independent backups of important saves while
+> SaveSync remains beta. Save synchronization should never be the only
+> copy of irreplaceable progress.
 
-The GUI also exposes deliberate **Upload All Saves** and **Download All Saves**
-operations. Unlike automatic reconciliation, these deliberately cover the
-broader eligible save tree, including eligible local-game content. Their
-preflight shows added, changed, removed, unchanged, conflict,
-excluded-file, and estimated transfer-byte counts. These operations make the
-chosen side authoritative for policy-eligible content, require a three-second
-hold, preserve all excluded destination files, and reject a stale preview.
+ROMCloud keeps Batocera's emulator-facing save tree local. SaveSync
+reconciles eligible data with a canonical dataset at
+`<remote_data.root>/saves/`. The writable data location is separate from
+the read-only ROM source.
 
-Every replacement is built in a sibling staging directory, SHA-256 verified,
-promoted by directory rename, and verified again. The former live tree is kept
-as one `saves.previous` known-good generation. Recovery restores that generation
-if a process stopped between renames and removes abandoned staging directories.
-Policy-excluded files are preserved in staging with same-filesystem hardlinks,
-so disabled RPCS3 installed games are never copied merely to retain them. If a
-filesystem cannot provide those hardlinks, ROMCloud aborts before changing live
-data instead of silently duplicating a potentially enormous excluded tree.
-SaveSync state advances only after every required promotion succeeds.
+### Safety model
 
-**Include Local Games in Save Sync** is disabled by default. Enabling it expands
-automatic NAS reconciliation from safely attributable ROMCloud-managed data to
-all policy-eligible local-game save/state content. It does not weaken any
-cache/generated-data or RPCS3 installed-game exclusion. CLI controls are
-`romcloud saves local-games-enable` and `romcloud saves local-games-disable`.
+SaveSync is designed around conservative ownership and transactional
+replacement:
 
-ROMCloud's current Batocera wrapper resolves an owned proxy through the catalog
-and then uses `exec` to replace itself with `emulatorlauncher`. That provides a
-strong managed-game identity before handoff, but no safe post-exit callback: the
-wrapper process no longer exists while the emulator runs. ROMCloud therefore
-does not yet copy saves at launch/exit or use a background watcher. Automatic
-sync currently occurs during the explicit Offline → NAS transition (and the
-manual `romcloud saves reconcile` operation), after files are not known to be
-actively written. Adding lifecycle sync requires a proven wait-for-real-emulator-
-exit integration before public beta.
+-   synchronization runs only through explicit SaveSync operations;
+-   Offline Mode does not poll or modify remote saves;
+-   conflicts are reported instead of guessed or overwritten;
+-   local-game data is not automatically synchronized merely because it
+    shares a system save directory with a ROMCloud-managed game;
+-   replacements are staged and verified before promotion;
+-   a previous known-good generation is retained for recovery;
+-   policy-excluded content is preserved rather than silently copied or
+    deleted.
 
-Precise per-game attribution is enabled only for audited filename/title-ID
-layouts: root-named RetroArch/Mupen/melonDS saves and states, MAME shortname
-trees, and recognizable RPCS3/PPSSPP/Yuzu title-ID trees. Shared PCSX2 memory
-cards, DuckStation shared/serial-named artifacts, RPCS3 trophies/virtual memory
-cards, Xbox/Xbox 360 opaque data, and other emulator-wide layouts remain out of
-managed-only automatic sync because they cannot be assigned to one catalog game
-reliably. They remain available to the local-game opt-in and explicit whole-tree
-operations.
+SaveSync deliberately does **not** mean "synchronize everything under
+`/userdata/saves`." Only audited, eligible layouts should participate
+automatically. Ambiguous emulator-wide data, generated/cache content,
+firmware/keys, and other unsafe-to-attribute content are excluded unless
+a specific supported workflow says otherwise.
 
-The remote dataset is always:
+The GUI provides SaveSync status, preview, upload, and download
+workflows with confirmation before destructive synchronization. CLI
+examples:
 
-```text
-<remote_data.root>/saves/
-```
-
-The user chooses the general writable data root; ROMCloud owns the `saves`
-dataset and its sibling transaction artifacts. For SMB, this is a separate
-read/write mount. SaveSync is unavailable when no writable remote-data target
-has been configured or when its write/read/cleanup probe fails.
-
-CLI examples:
-
-```bash
+``` bash
 romcloud saves status
 romcloud saves reconcile
 romcloud saves preview-upload
@@ -590,155 +387,130 @@ romcloud saves preview-download
 romcloud saves download-all
 ```
 
-Selection is deliberately narrower than “everything under
-`/userdata/saves`.” The central policy classifies audited content as follows:
+SaveSync does not currently hook emulator launch/exit. Game lifecycle
+synchronization requires a proven way to wait for the real emulator
+process to exit safely.
 
-| Classification | Default behavior | Examples |
-| --- | --- | --- |
-| Save/state continuity | Included | RetroArch saves/states; Mupen saves/states; melonDS saves/states; MAME NVRAM/states; DuckStation cards/states; PCSX2 cards/states; PPSSPP savedata/states; Xbox 360 content; validated Yuzu title saves; RPCS3 savedata, trophies, virtual memory cards, and Batocera savestates |
-| Generated/cache | Excluded | Shader/cache/log/config trees, MAME `diff`/input/plugins, PCSX2 videos, RPCS3 temporary/cache data and incomplete `_GDATA_` installs |
-| Installed content | Excluded by default | RPCS3 `dev_hdd0/game` installed titles and patches |
-| Ambiguous emulator content | Excluded pending validation | Unknown systems, firmware/keys, RPCS3 `exdata`, shared runtime disk images |
+**Original Xbox:** xemu stores progress inside the complete
+`xbox_hdd.qcow2` virtual disk. Support is disabled by default because
+synchronizing it means transferring the whole opaque file.
 
-Current post-v43 Batocera source maps RPCS3 data to
-`/userdata/saves/ps3/rpcs3/dev_hdd0`. ROMCloud includes
-`home/<8-digit-user>/savedata`, `home/<8-digit-user>/trophy`, and
-`savedata/vmc`; installed titles under `game` are not included by default.
-Batocera-managed RPCS3 states under `/userdata/saves/ps3/<title>/*.SAVESTAT*`
-are included. Batocera v43 keeps `dev_hdd0` at
-`/userdata/system/configs/rpcs3/dev_hdd0`; ROMCloud maps that legacy physical
-tree into the same canonical remote namespace when the newer path is absent.
+**RPCS3 installed games:** installed titles and patches can consume tens
+or hundreds of gigabytes and are excluded by default. An advanced opt-in
+exists for users who deliberately want that data included.
 
-**Include RPCS3 Installed Games** is an advanced, disabled-by-default setting.
-The GUI shows the detected file count and size and requires an additional
-warning plus long hold before enabling it. It can transfer tens or hundreds of
-gigabytes. The CLI equivalents are
-`romcloud saves rpcs3-installed-games-enable` and
-`romcloud saves rpcs3-installed-games-disable`.
+## Graphical interface
 
-Original Xbox is disabled by default because xemu stores progress inside the
-entire `xbox_hdd.qcow2` virtual drive. Enabling it transfers that whole opaque
-file; ROMCloud does not inspect or merge it.
+The Ports interface is the normal way to configure and maintain ROMCloud
+on Batocera. It provides operating-mode selection, catalog
+status/refresh, cache controls, storage configuration, SaveSync, Library
+Sync, health checks, controller diagnostics/remapping, updates, and
+maintenance operations.
+
+Long-running backend operations are executed outside the graphical event
+loop so the UI can continue processing controller, keyboard, and touch
+input.
+
+The GUI is installed when the Batocera environment provides a compatible
+system Python/Pygame combination. If it cannot be installed, the
+backend, CLI, cache, launcher, and storage functionality remain
+available.
 
 ## Updates
 
-ROMCloud has a Git-free updater. Use **Maintenance → Check for Updates** and
-**Update ROMCloud**, or run:
+ROMCloud includes a Git-free updater. Use **Maintenance → Check for
+Updates** or:
 
-```bash
+``` bash
 romcloud update --check
 romcloud update
 ```
 
-An update resolves a GitHub commit, downloads and safely extracts its archive,
-upgrades the persistent virtual environment, and reconciles installed wrappers,
-the graphical payload, the Ports entry, and previously enabled Batocera
-integrations. Configuration, credentials, catalog data, cache, logs, proxies,
-and SaveSync data are not replaced wholesale.
-
-Required wrapper reconciliation must succeed before the new build metadata is
-recorded. Graphical and other optional Batocera integrations remain
-best-effort, so an environment without a compatible system Python/pygame can
-still update the backend and CLI.
-
-### Automatic GUI restart after an update
-
-For a GUI-initiated update, the old graphical process waits for the updater's
-final successful result, which occurs only after installation, reconciliation,
-version persistence, and update cleanup. It then:
-
-1. shows `ROMCloud updated successfully. Restarting…`;
-2. stops accepting normal application actions;
-3. closes GUI diagnostics and Pygame;
-4. launches the installer-managed
-   `/userdata/system/romcloud/bin/romcloud-ports` wrapper exactly once; and
-5. exits so the replacement process imports the newly installed GUI code.
-
-A failed update does not trigger a restart. If the update succeeded but the
-launcher cannot be started, the old GUI still exits and writes a diagnostic to
-`/userdata/system/romcloud/logs/gui-relaunch.log`; reopen ROMCloud manually
-from Batocera's Ports menu.
+Updates reconcile ROMCloud-owned runtime files and integrations while
+preserving configuration, credentials, catalog data, cache, logs,
+proxies, and synchronization data. A successful GUI-initiated update can
+relaunch the installed ROMCloud GUI; failed updates do not request a
+relaunch.
 
 ## Repair, uninstall, and purge
 
-These lifecycle workflows are currently CLI commands:
+  -----------------------------------------------------------------------
+  Command                             Behavior
+  ----------------------------------- -----------------------------------
+  `romcloud repair`                   Reconciles ROMCloud-owned runtime
+                                      artifacts and integrations without
+                                      deleting user data
 
-| Command | Behavior |
-| --- | --- |
-| `romcloud repair` | Rewrites required launch wrappers, reconciles the installed graphical payload and enabled integrations, and restores missing ROMCloud-owned proxies when retained catalog records permit. It does not delete user data. If the virtual environment is missing, rerun the bootstrap installer. |
-| `romcloud uninstall` | Stops the mount worker, unmounts configured SMB targets, removes the service, EmulationStation override, Ports entry/artwork, generated proxies, runtime wrappers, virtual environment, graphical payload, and build metadata. It preserves configuration, canonical credentials, catalog/data, cache, logs, and external SaveSync data so reinstall/repair remains possible. Derived CIFS mount credential files are removed. |
-| `romcloud purge` | Performs uninstall and then permanently removes ROMCloud-owned configuration, credentials, catalog/data, cache, logs, and runtime state. It preserves real source ROMs, ordinary local ROMs, unrelated Batocera files, and user-controlled remote SaveSync data. Safety checks refuse broad or overlapping destructive targets. |
+  `romcloud uninstall`                Removes runtime/integration
+                                      components while preserving
+                                      recoverable ROMCloud
+                                      configuration/data/cache
 
-Uninstall and purge ask for confirmation unless `--yes` is supplied. If an SMB
-target cannot be unmounted, uninstall stops before deleting runtime state so
-the operation can be diagnosed and retried.
+  `romcloud purge`                    Removes ROMCloud-owned persistent
+                                      local state as well as the
+                                      installed runtime
+  -----------------------------------------------------------------------
 
-## Network availability and retries
+`purge` is intentionally much more destructive than `uninstall`. Neither
+workflow should delete real source ROMs, ordinary local ROMs, unrelated
+Batocera files, or user-controlled remote synchronization data. Safety
+checks refuse broad or overlapping destructive targets.
 
-At Batocera boot, ROMCloud's custom service starts a detached mount worker and
-returns immediately; network, DNS, Tailscale, NAS, or CIFS delays therefore do
-not block the boot sequence. The worker retries unavailable SMB targets with
-bounded attempts and backoff for an overall default budget of five minutes.
-It uses a single-instance lock and records its last status.
+## Network behavior
 
-This is a startup retry window, not a guarantee that a NAS will reconnect at
-any future time. If the source becomes available later, use
-**Storage → Mount / Reconnect** or:
+ROMCloud is designed so unavailable network storage does not make
+Batocera itself unavailable. At boot, the SMB mount worker runs
+independently with bounded retries rather than blocking the Batocera
+startup sequence.
 
-```bash
-romcloud mount start
-```
+Expected behavior when the source is unavailable:
 
-Expected behavior when storage is unavailable:
+-   EmulationStation and ordinary local games continue to work;
+-   complete cached ROMCloud games can launch in Cache/Offline
+    workflows;
+-   uncached games cannot be fetched;
+-   catalog refresh fails without treating temporary source absence as
+    permission to erase the catalog;
+-   SaveSync requires its configured writable data target to be
+    reachable and writable.
 
-- EmulationStation and ordinary local games continue to work;
-- complete cached ROMCloud games can still launch;
-- uncached/incomplete games fail with a source-unreachable diagnostic;
-- catalog refresh fails without deleting the existing catalog merely because
-  the source root could not be scanned;
-- SaveSync refuses to proceed unless its configured data target is actually
-  reachable and writable.
+If an SMB source becomes available after startup, reconnect from the
+Storage screen or run `romcloud mount start`.
 
 ## CLI reference
 
-The installer intentionally does not add ROMCloud to `PATH`. Examples below
-use `romcloud` for readability; the default full path is
+The installer intentionally does not add ROMCloud to the global `PATH`.
+Examples use `romcloud` for readability; the default executable is
 `/userdata/system/romcloud/bin/romcloud`.
 
-```text
-romcloud configure                 Guided source/cache/synchronization setup
-romcloud status                    Catalog and cache summary
-romcloud healthcheck               Source, cache, integration, and SaveSync checks
-romcloud refresh [--system NAME]   Refresh catalog and EmulationStation registration
-romcloud launch PROXY              Resolve/cache a proxy manually
-romcloud cache ...                 Status, add, remove, pin, and unpin
-romcloud library ...               Connected/Cache/Offline operating mode
-romcloud library-sync ...          Metadata/media status, pull, push, sync, removal
-romcloud saves ...                 SaveSync status, previews, upload/download, Xbox opt-in
-romcloud mount ...                 Install/start/stop/status/remove SMB mount service
-romcloud es ...                    Install/refresh/status/remove ES integration
-romcloud update [--check]          Check for or install an update
-romcloud repair                    Reconcile installed runtime artifacts
-romcloud uninstall                Remove runtime/integration; preserve recoverable data
-romcloud purge                    Remove all ROMCloud-owned persistent local state
+``` text
+romcloud configure                  Guided configuration
+romcloud status                     Catalog/cache summary
+romcloud healthcheck                Source, cache, integration, and sync checks
+romcloud refresh [--system NAME]    Refresh the catalog
+romcloud library ...                Connected/Cache/Offline mode
+romcloud cache ...                  Cache status/add/remove/pin/unpin
+romcloud library-sync ...           Metadata/media synchronization
+romcloud saves ...                  SaveSync operations
+romcloud mount ...                  SMB mount management
+romcloud es ...                     EmulationStation integration
+romcloud update [--check]           Update ROMCloud
+romcloud repair                     Reconcile installed artifacts
+romcloud uninstall                  Remove runtime; preserve recoverable data
+romcloud purge                      Remove ROMCloud-owned local state
 ```
 
 Run `romcloud <command> --help` for command-specific options.
 
-## Configuration example
+## Advanced configuration
 
-The graphical setup flow normally writes this file. A representative SMB
-source plus independent SMB SaveSync target looks like:
+The graphical setup flow normally writes the configuration. A
+representative layout is:
 
-```toml
+``` toml
 [source]
 provider = "local"
 rom_root = "/userdata/romcloud/source"
-
-[game_access]
-# Legacy setup preference used to initialize a missing operating-mode state.
-# "direct_nas" initializes Connected Mode; "smart_cache" initializes Cache Mode.
-mode = "smart_cache"
 
 [cache]
 path = "/userdata/romcloud/cache"
@@ -760,7 +532,6 @@ server = "rom-nas"
 share = "Roms"
 username = "reader"
 port = 445
-# remote_path = "optional/folder/inside/share"
 
 [remote_data]
 provider = "smb"
@@ -771,7 +542,6 @@ server = "backup-nas"
 share = "ROMCloud"
 username = "writer"
 port = 445
-# remote_path = "optional/data/folder"
 
 [saves]
 local_path = "/userdata/saves"
@@ -783,50 +553,36 @@ include_local_games = false
 enabled = false
 ```
 
-`source.provider = "local"` is correct for both ordinary directories and SMB:
-the current SMB architecture mounts the share first and accesses that mount
-through the local-filesystem provider.
+`source.provider = "local"` is also used for the current SMB
+architecture because ROMCloud mounts the SMB source first and then
+accesses that mounted filesystem through its local-filesystem provider.
 
-## Paths and logs
+## Important paths
 
-Default paths:
-
-```text
+``` text
 /userdata/system/romcloud/
 ├── bin/                         CLI and Batocera wrappers
 ├── config/romcloud.toml         Main configuration
-├── config/credentials.toml      Passwords, mode 0600
+├── config/credentials.toml      Credentials
 ├── data/catalog.db              Catalog/cache/proxy ownership database
-├── data/direct-links.json       Verified Connected Mode symlink ownership manifest
-├── data/library-view.json       Authoritative connected/cache/offline state
-├── data/library/library.json    Local canonical Library Sync working copy
-├── data/library-sync-state.json Last Library Sync result
-├── data/savesync-state.json     Last shared save manifest, conflicts, records, device ID
-├── logs/romcloud.log            Rotating application log
-├── logs/mount-worker.log        Detached SMB worker output
-├── logs/gui-relaunch.log        Automatic GUI relaunch failures
-├── logs/gui-display.log         Ports-to-Pygame display handoff timings
-├── run/mount-worker.status.json Last mount-worker status
-├── ports-gfx/                   Installed graphical payload
+├── data/direct-links.json       Connected Mode link ownership
+├── data/library-view.json       Current operating mode
+├── data/library/                Local Library Sync state
+├── logs/                        ROMCloud diagnostics
+├── ports-gfx/                   Installed graphical UI
 └── venv/                        Isolated backend Python environment
 
 /userdata/romcloud/
 ├── source/                      Default read-only SMB source mount
-├── remote/                      Default read/write SMB data mount
-└── cache/                       Local managed game cache
+├── remote/                      Default read/write ROMCloud data mount
+└── cache/                       Managed local game cache
 ```
-
-Optional controller diagnostics are written to
-`/userdata/system/romcloud/logs/controller-debug.log` only when
-`ROMCLOUD_PORTS_GFX_INPUT_DEBUG=1` is set in the graphical launcher
-environment. The file records controller events and identity details, not text
-input or backend credentials, and is truncated at each enabled launch.
 
 ## Troubleshooting
 
 Start with:
 
-```bash
+``` bash
 /userdata/system/romcloud/bin/romcloud healthcheck
 /userdata/system/romcloud/bin/romcloud status
 /userdata/system/romcloud/bin/romcloud mount status
@@ -834,99 +590,107 @@ Start with:
 
 ### ROMCloud is missing from Ports
 
-- Update EmulationStation's game lists or restart EmulationStation.
-- Confirm `/userdata/roms/ports/ROMCloud.sh` exists.
-- The GUI is best-effort and requires a system Python that can import pygame;
-  the CLI remains usable if it was skipped.
-- Run `romcloud repair` to reconcile a damaged Ports entry or wrapper.
+-   Refresh EmulationStation's game lists or restart EmulationStation.
+-   Confirm `/userdata/roms/ports/ROMCloud.sh` exists.
+-   Run `romcloud repair` to reconcile a damaged Ports entry or wrapper.
+-   If the GUI could not be installed because Pygame is unavailable, the
+    CLI remains usable.
 
 ### The NAS is unavailable after boot
 
-- Check `run/mount-worker.status.json` and `logs/mount-worker.log`.
-- Confirm the server address, share, optional `remote_path`, and credentials.
-- Run `romcloud mount start` after network connectivity is available.
-- If only one cached game is needed, try launching it: a complete cache hit
-  does not require the source mount.
+-   Check ROMCloud's mount-worker status and logs.
+-   Verify the server, share, optional subdirectory, and credentials.
+-   Run `romcloud mount start` after connectivity is available.
+-   Complete cached games do not require the ROM source merely to read
+    their cached assets.
 
-### A game transfer was interrupted
+### A transfer was interrupted
 
-Launch the game again. ROMCloud preserves `.partial` staging and reuses files
-that already match their expected complete size. An incomplete individual file
-is copied again from its beginning, while completed assets of a multi-asset
-game are not downloaded again. A size mismatch or missing companion remains an
-incomplete cache rather than being launched as if valid.
+Launch the game again. ROMCloud retains useful staging data and can
+reuse already completed assets. Incomplete files are not treated as
+valid games.
 
-### New or removed games are not reflected
+### New games are missing
 
-Run a catalog refresh and then update EmulationStation's game lists. Remember
-that completely disappeared source games are retained conservatively; refresh
-does not treat temporary source absence as permission to delete catalog data.
+Run **Refresh Catalog**, then refresh EmulationStation's game list if
+necessary. A source game disappearing is not automatically treated as
+permission to delete its catalog record.
 
-### A GUI update completed but did not reopen
+### An update completed but ROMCloud did not reopen
 
-Review `logs/gui-relaunch.log`, then reopen **Ports → ROMCloud** manually. The
-update may still have completed successfully even though starting the
-replacement GUI failed.
+Reopen **Ports → ROMCloud** manually and inspect
+`/userdata/system/romcloud/logs/gui-relaunch.log`.
 
-### The display flickers before ROMCloud appears
+## Known beta limitations
 
-Review `logs/gui-display.log`. It records monotonic timestamps for the Ports
-entry, launcher wrapper, Python/Pygame initialization, display probing and
-creation, selected display path, SDL driver, and relevant X11/Wayland
-environment. Compare a fresh **Ports → ROMCloud** launch with an update-driven
-restart, then preserve these Batocera logs from the same run:
+-   ROMCloud is beta software; keep independent backups of important
+    saves and configuration.
+-   Hardware validation is not exhaustive across every Batocera release,
+    architecture, controller, display environment, or bundled
+    Python/Pygame combination.
+-   SFTP and a native/userspace SMB provider are not implemented.
+-   The graphical interface depends on a compatible Batocera system
+    Python/Pygame environment.
+-   Catalog refresh is explicit after setup rather than continuously
+    watching the source.
+-   Source games that disappear are retained conservatively rather than
+    automatically deleted.
+-   Offline play requires complete, intact local cache assets and normal
+    local emulator dependencies.
+-   SaveSync remains beta, does not currently hook emulator launch/exit,
+    and intentionally excludes data it cannot safely classify or
+    attribute.
+-   Library Sync remains opt-in beta functionality.
+-   Original Xbox SaveSync requires transferring xemu's complete virtual
+    disk and is disabled by default.
+-   Some multi-file/playlist formats still require additional validation
+    or support.
+-   EmulationStation presentation changes may require a game-list
+    refresh while mode-transition behavior continues to be stabilized.
 
-```text
-/userdata/system/logs/es_launch_stdout.log
-/userdata/system/logs/es_launch_stderr.log
-/userdata/system/logs/display.log
-```
+## Safety and design principles
 
-The GUI trace includes both UTC and monotonic time once Python starts, allowing
-the shell events and Batocera log entries to be aligned with a slow-motion
-recording of the display.
+**Batocera stays in control.** ROMCloud integrates with EmulationStation
+and `emulatorlauncher`; it does not replace them.
 
-## Known limitations
+**The ROM source is read-only.** Normal ROM access must not modify the
+source library.
 
-- This is beta software; keep independent backups of important saves and
-  configuration.
-- Full end-to-end hardware evidence is centered on Batocera 42. Do not assume
-  every Batocera release, architecture, controller, display mode, or bundled
-  Python/pygame combination has been validated.
-- SFTP and direct/native SMB providers are not implemented.
-- The graphical UI is optional and depends on Batocera's system Python/pygame.
-- Catalog refresh is automatic during setup but not periodic afterward.
-- A source game that disappears is not automatically removed from the catalog.
-- Offline launch applies only to complete cached games with intact local
-  metadata and emulator dependencies.
-- SaveSync supports deliberate three-way reconciliation, but operating-mode
-  transitions do not start it and it does not yet hook game launch/exit.
-  Shared or opaque emulator layouts need
-  the local-game opt-in or an explicit whole-tree operation; true conflicts are
-  reported and preserved rather than content-merged.
-- Library Sync is opt-in beta functionality. Its XML merge/render behavior and
-  media-path compatibility still require clean-state validation on real
-  Batocera/EmulationStation hardware in both access modes.
-- Original Xbox SaveSync transfers the complete xemu virtual disk and is
-  opt-in. Some structured emulator save layouts remain unsupported until they
-  are validated.
-- `.m3u` and CCD/IMG/SUB companion parsing are not implemented. BIN/CUE is.
-- EmulationStation is automatically restarted after successful operating-mode
-  transitions. Setup and explicit catalog refresh still require updating game
-  lists or restarting EmulationStation manually.
-- GUI update relaunch behavior still requires confirmation across real
-  Batocera/SDL environments.
+**Local games stay local.** ROMCloud tracks and removes only artifacts
+it owns.
+
+**Offline means offline.** Selecting Offline Mode must not quietly
+depend on remote storage.
+
+**Cache state is not catalog identity.** Evicting a game should not make
+ROMCloud forget what the game is.
+
+**Synchronization must fail safely.** Ambiguous save ownership,
+conflicts, incomplete transfers, and unavailable storage should result
+in a clear failure rather than guessed destructive behavior.
+
+**ROMCloud may fail; Batocera must not.** A broken mount, unavailable
+NAS, failed update, or ROMCloud error should not prevent ordinary
+Batocera use.
 
 ## Development
 
-ROMCloud targets Python 3.10 or newer. From a development checkout:
+ROMCloud targets Python 3.10 or newer.
 
-```bash
+``` bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -e '.[dev]'
 .venv/bin/python -m pytest
 ```
 
-The test suite uses temporary filesystem layouts and mocked process/network
-boundaries; automated tests do not mount real SMB shares, restart
-EmulationStation, or relaunch the test runner.
+Automated tests use temporary filesystem layouts and mocked
+process/network boundaries. Real Batocera hardware remains necessary for
+final validation of platform-specific behavior.
+
+## Project status
+
+ROMCloud is under active development and preparing for wider public beta
+use. Bug reports and hardware validation are especially valuable around
+clean installs and upgrades, large catalogs, operating-mode transitions,
+unavailable network storage, cache recovery/eviction, Library Sync,
+SaveSync, and different Batocera releases and hardware platforms.
