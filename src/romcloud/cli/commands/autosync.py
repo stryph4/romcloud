@@ -64,3 +64,26 @@ def game_stop(
         )
     except Exception:  # noqa: BLE001 - detached best-effort background work
         log.warning("Background SaveSync game-exit pass failed", exc_info=True)
+
+
+@autosync_group.command("menu-tick", hidden=True)
+@click.option("--force", is_flag=True, default=False)
+@click.pass_context
+def menu_tick(ctx: click.Context, force: bool) -> None:
+    if not ctx.obj["config"].saves.auto_sync_enabled:
+        return
+    try:
+        _coordinator(ctx).menu_tick(force=force)
+    except Exception:  # noqa: BLE001 - lifecycle hooks never block Batocera
+        log.warning("Periodic SaveSync quick pull tick failed", exc_info=True)
+
+
+@autosync_group.command("menu-loop", hidden=True)
+@click.pass_context
+def menu_loop(ctx: click.Context) -> None:
+    if not ctx.obj["config"].saves.auto_sync_enabled:
+        return
+    try:
+        _coordinator(ctx).menu_loop()
+    except Exception:  # noqa: BLE001 - detached best-effort background work
+        log.warning("Periodic SaveSync quick pull loop failed", exc_info=True)

@@ -16,7 +16,11 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from romcloud.core.capabilities import Capability, CapabilityPolicy
-from romcloud.core.exceptions import SaveSyncConnectivityError, SaveSyncVerificationError
+from romcloud.core.exceptions import (
+    SaveSyncConnectivityError,
+    SaveSyncError,
+    SaveSyncVerificationError,
+)
 from romcloud.core.models.savesync import (
     SaveArtifact,
     SaveChangeKind,
@@ -34,6 +38,7 @@ from romcloud.core.models.savesync import (
     SaveGroupState,
     SaveRemoteAvailability,
     SaveRemoteObservation,
+    SaveQuickSyncResult,
 )
 from romcloud.core.progress import ProgressSink, emit_progress
 from romcloud.core.save_selection import (
@@ -49,9 +54,11 @@ from romcloud.infrastructure import save_transaction
 from romcloud.infrastructure.logging import get_logger
 from romcloud.infrastructure.providers.local import StorageAccessResult
 from romcloud.infrastructure import savesync_state as durable_state
+from romcloud.infrastructure import savesync_journal
 
 log = get_logger("saves")
 _RPCS3_CANONICAL_PREFIX = f"ps3/{RPCS3_DEV_HDD0_PREFIX}"
+_QUICK_SYNC_HISTORY_REQUIRED = 1
 
 
 @dataclass(frozen=True)
@@ -381,6 +388,25 @@ class SaveSyncService:
         assert self._remote_root is not None
         return self._scan_primary(self._remote_root)
 
+    def _scan_remote_layouts(
+        self, layout_ids: frozenset[str]
+    ) -> save_tree.ScanReport:
+        assert self._remote_root is not None
+        layouts = tuple(
+            layout
+            for layout in self._policy.layouts
+            if layout.layout_id in layout_ids
+        )
+        if not layouts:
+            return save_tree.ScanReport({})
+        selected_policy = SaveSelectionPolicy(layouts=layouts)
+        return save_tree.scan_tree_report(
+            self._remote_root,
+            selected_policy,
+            enabled_optional_systems=self._enabled_optional_systems(),
+            enabled_optional_groups=self._enabled_optional_groups(),
+        )
+
     def _automatic_report(self, report: save_tree.ScanReport) -> save_tree.ScanReport:
         # The supported layout is the eligibility boundary.  Catalog
         # membership and .romcloud proxy presence never filter a valid save.
@@ -422,6 +448,12 @@ class SaveSyncService:
     @property
     def _transaction_journal_path(self) -> Path:
         return self._state_path.with_name("savesync-transaction.json")
+
+    @property
+    def _remote_journal_path(self) -> Optional[Path]:
+        if self._remote_root is None:
+            return None
+        return savesync_journal.default_journal_path(self._remote_root)
 
     def _all_destination_roots(self) -> tuple[Path, ...]:
         roots = [view.root for view in self._local_views()]
@@ -487,6 +519,211 @@ class SaveSyncService:
             optional_groups=_merge_optional_groups(local_report, remote_report),
         )
 
+    def full_sync(self, *, progress: ProgressSink = None) -> SaveReconcileReport:
+        """Run authoritative reconciliation and establish Quick Sync baseline."""
+        self._require_remote()
+        self._load_remote_journal(reset_on_error=True)
+        report = self.reconcile(progress=progress)
+        journal = self._load_remote_journal(reset_on_error=True)
+        observed_generation = int(journal["generation"])
+        with self._operation_lock():
+            state = self._get_state_unlocked()
+            _write_state(
+                self._state_path,
+                replace(
+                    state,
+                    quick_sync_ready=True,
+                    quick_sync_cursor_generation=observed_generation,
+                ),
+            )
+        return report
+
+    def quick_sync(
+        self,
+        *,
+        progress: ProgressSink = None,
+        is_group_active: Optional[Callable[[str], bool]] = None,
+        is_layout_active: Optional[Callable[[str], bool]] = None,
+        exclude_layout_ids: Optional[frozenset[str]] = None,
+    ) -> SaveQuickSyncResult:
+        """Journal-driven discovery optimization for authoritative reconciliation."""
+        self._capabilities.require(Capability.SAVE_SYNC, "Quick SaveSync")
+        self._require_remote()
+        if not self.is_remote_reachable():
+            raise SaveSyncConnectivityError(
+                f"Remote save location is not reachable: {self._connectivity_root}"
+            )
+
+        with self._operation_lock():
+            state = self._get_state_unlocked()
+            cursor = state.quick_sync_cursor_generation
+            known_groups = {group.group_id for group in state.groups}
+            if not state.quick_sync_ready or cursor is None:
+                return SaveQuickSyncResult(
+                    status="requires-full-sync",
+                    remote_generation=cursor or 0,
+                    cursor_before=cursor,
+                    cursor_after=cursor,
+                    reason="quick-sync-baseline-missing",
+                )
+            journal = self._load_remote_journal(reset_on_error=False)
+            if journal is None:
+                return SaveQuickSyncResult(
+                    status="requires-full-sync",
+                    remote_generation=cursor,
+                    cursor_before=cursor,
+                    cursor_after=cursor,
+                    reason="journal-untrustworthy",
+                )
+            remote_generation = int(journal["generation"])
+            if remote_generation == cursor:
+                return SaveQuickSyncResult(
+                    status="unchanged",
+                    remote_generation=remote_generation,
+                    cursor_before=cursor,
+                    cursor_after=cursor,
+                )
+            history = list(journal["history"])
+            first_retained = (
+                int(history[0]["generation"]) if history else remote_generation + 1
+            )
+            if cursor < first_retained - _QUICK_SYNC_HISTORY_REQUIRED:
+                return SaveQuickSyncResult(
+                    status="requires-full-sync",
+                    remote_generation=remote_generation,
+                    cursor_before=cursor,
+                    cursor_after=cursor,
+                    reason="journal-gap",
+                )
+            unseen = [
+                entry for entry in history if int(entry["generation"]) > cursor
+            ]
+            if not unseen and remote_generation > cursor:
+                return SaveQuickSyncResult(
+                    status="requires-full-sync",
+                    remote_generation=remote_generation,
+                    cursor_before=cursor,
+                    cursor_after=cursor,
+                    reason="journal-history-incomplete",
+                )
+
+        selected_groups, selected_layouts, reason = self._quick_sync_scope(
+            unseen,
+            known_groups=known_groups,
+            exclude_layout_ids=(exclude_layout_ids or frozenset()),
+        )
+        if reason is not None:
+            return SaveQuickSyncResult(
+                status="requires-full-sync",
+                remote_generation=remote_generation,
+                cursor_before=cursor,
+                cursor_after=cursor,
+                reason=reason,
+            )
+
+        if selected_groups == frozenset() and selected_layouts is None:
+            with self._operation_lock():
+                state = self._get_state_unlocked()
+                _write_state(
+                    self._state_path,
+                    replace(
+                        state,
+                        quick_sync_ready=True,
+                        quick_sync_cursor_generation=remote_generation,
+                    ),
+                )
+            return SaveQuickSyncResult(
+                status="unchanged",
+                remote_generation=remote_generation,
+                cursor_before=cursor,
+                cursor_after=remote_generation,
+                processed_entries=len(unseen),
+                processed_groups=(),
+            )
+
+        report = self._reconcile(
+            progress=progress,
+            selected_group_ids=selected_groups,
+            selected_layout_ids=selected_layouts,
+            upload_only=False,
+            is_group_active=is_group_active,
+            is_layout_active=is_layout_active,
+        )
+        if report is None:
+            return SaveQuickSyncResult(
+                status="deferred",
+                remote_generation=remote_generation,
+                cursor_before=cursor,
+                cursor_after=cursor,
+                processed_entries=len(unseen),
+                processed_groups=tuple(sorted(selected_groups or frozenset())),
+                reason="active-session",
+            )
+
+        with self._operation_lock():
+            state = self._get_state_unlocked()
+            _write_state(
+                self._state_path,
+                replace(
+                    state,
+                    quick_sync_ready=True,
+                    quick_sync_cursor_generation=remote_generation,
+                ),
+            )
+        return SaveQuickSyncResult(
+            status="reconciled",
+            remote_generation=remote_generation,
+            cursor_before=cursor,
+            cursor_after=remote_generation,
+            processed_entries=len(unseen),
+            processed_groups=tuple(sorted(selected_groups or frozenset())),
+            report=report,
+        )
+
+    def _load_remote_journal(self, *, reset_on_error: bool) -> Optional[dict[str, object]]:
+        path = self._remote_journal_path
+        if path is None:
+            raise SaveSyncConnectivityError("SaveSync remote location is not configured")
+        with savesync_journal.journal_lock(path):
+            if reset_on_error:
+                return savesync_journal.load_or_reset(path)
+            try:
+                return savesync_journal.load(path)
+            except SaveSyncError:
+                return None
+
+    def _quick_sync_scope(
+        self,
+        entries: list[dict[str, object]],
+        *,
+        known_groups: set[str],
+        exclude_layout_ids: frozenset[str],
+    ) -> tuple[Optional[frozenset[str]], Optional[frozenset[str]], Optional[str]]:
+        groups: set[str] = set()
+        layouts: set[str] = set()
+        for entry in entries:
+            layout_id = str(entry.get("layout_id") or "").strip()
+            if not layout_id:
+                return None, None, "journal-entry-missing-layout"
+            if layout_id in exclude_layout_ids:
+                continue
+            if not self._layout_enabled(layout_id):
+                continue
+            group_id = str(entry.get("group_id") or "").strip()
+            if group_id:
+                if group_id in known_groups:
+                    groups.add(group_id)
+                else:
+                    layouts.add(layout_id)
+                continue
+            # Ambiguous object identity: reconcile the whole affected layout.
+            layouts.add(layout_id)
+        if groups:
+            return frozenset(groups), (frozenset(layouts) if layouts else None), None
+        if layouts:
+            return None, frozenset(layouts), None
+        return frozenset(), None, None
+
     # ── ordinary three-way remote-data reconciliation ───────────────────
 
     def preview_reconciliation(self) -> SaveReconcilePlan:
@@ -546,10 +783,14 @@ class SaveSyncService:
         *,
         progress: ProgressSink = None,
         selected_group_ids: Optional[frozenset[str]] = None,
+        selected_layout_ids: Optional[frozenset[str]] = None,
         upload_only: bool = False,
         is_group_active: Optional[Callable[[str], bool]] = None,
+        is_layout_active: Optional[Callable[[str], bool]] = None,
     ) -> Optional[SaveReconcileReport]:
         with self._operation_lock():
+            if selected_group_ids is not None and selected_layout_ids is not None:
+                selected_layout_ids = frozenset(selected_layout_ids)
             if selected_group_ids is not None:
                 selected_group_ids = frozenset(
                     group_id
@@ -557,6 +798,15 @@ class SaveSyncService:
                     if not (is_group_active and is_group_active(group_id))
                 )
                 if not selected_group_ids:
+                    return None
+            if selected_layout_ids is not None:
+                selected_layout_ids = frozenset(
+                    layout_id
+                    for layout_id in selected_layout_ids
+                    if self._layout_enabled(layout_id)
+                    and not (is_layout_active and is_layout_active(layout_id))
+                )
+                if not selected_layout_ids and selected_group_ids is None:
                     return None
             self._capabilities.require(Capability.SAVE_SYNC, "Save/state reconciliation")
             self._require_remote()
@@ -572,11 +822,37 @@ class SaveSyncService:
                 "Comparing local and shared save/state data",
             )
             self._recover()
-            local_report = self._scan_automatic_local()
-            remote_report = self._scan_automatic_remote()
+            state = self._get_state_unlocked()
+            if selected_layout_ids is not None:
+                local_report = self._scan_local_layouts(selected_layout_ids)
+                remote_report = self._scan_remote_layouts(selected_layout_ids)
+                local_report = self._automatic_report(local_report)
+                remote_report = self._automatic_report(remote_report)
+            elif selected_group_ids is not None:
+                group_layout_map = {
+                    group.group_id: group.layout_id for group in state.groups
+                }
+                scoped_layouts = frozenset(
+                    layout_id
+                    for group_id in selected_group_ids
+                    for layout_id in [group_layout_map.get(group_id)]
+                    if layout_id is not None and self._layout_enabled(layout_id)
+                )
+                if scoped_layouts:
+                    local_report = self._automatic_report(
+                        self._scan_local_layouts(scoped_layouts)
+                    )
+                    remote_report = self._automatic_report(
+                        self._scan_remote_layouts(scoped_layouts)
+                    )
+                else:
+                    local_report = save_tree.ScanReport({})
+                    remote_report = save_tree.ScanReport({})
+            else:
+                local_report = self._scan_automatic_local()
+                remote_report = self._scan_automatic_remote()
             complete_local = dict(local_report.artifacts)
             complete_remote = dict(remote_report.artifacts)
-            state = self._get_state_unlocked()
             baseline = self._automatic_baseline(state)
             if selected_group_ids is not None:
                 local_report = _report_for_groups(
@@ -588,12 +864,27 @@ class SaveSyncService:
                 baseline = _manifest_for_groups(
                     baseline, selected_group_ids, self._policy
                 )
+            elif selected_layout_ids is not None:
+                baseline = {
+                    path: artifact
+                    for path, artifact in baseline.items()
+                    if (
+                        (descriptor := self._policy.group_for_path(path)) is not None
+                        and descriptor.layout_id in selected_layout_ids
+                    )
+                }
             plan = _reconcile_plan(
                 local_report,
                 remote_report,
                 baseline,
                 policy=self._policy,
-                scope=("pending_dirty" if selected_group_ids is not None else "all_eligible"),
+                scope=(
+                    "pending_dirty"
+                    if selected_group_ids is not None
+                    else "journal-layout"
+                    if selected_layout_ids is not None
+                    else "all_eligible"
+                ),
             )
             emit_progress(
                 progress,
@@ -668,6 +959,12 @@ class SaveSyncService:
                     )
                 if selected_group_ids is not None and is_group_active and any(
                     is_group_active(group_id) for group_id in selected_group_ids
+                ):
+                    if transaction is not None:
+                        transaction.rollback()
+                    return None
+                if selected_layout_ids is not None and is_layout_active and any(
+                    is_layout_active(layout_id) for layout_id in selected_layout_ids
                 ):
                     if transaction is not None:
                         transaction.rollback()
@@ -870,6 +1167,23 @@ class SaveSyncService:
                 if transaction is not None:
                     transaction.rollback()
                 raise
+            if plan.uploads:
+                mutations = self._journal_mutations_for_remote_transition(
+                    before=remote,
+                    after=desired_remote,
+                )
+                if mutations:
+                    generation = self._append_remote_journal(
+                        revision=report.revision,
+                        timestamp=timestamp,
+                        mutations=mutations,
+                    )
+                    if next_state.quick_sync_ready:
+                        next_state = replace(
+                            next_state,
+                            quick_sync_cursor_generation=generation,
+                        )
+                        _write_state(self._state_path, next_state)
             if transaction is not None:
                 try:
                     transaction.finalize()
@@ -1000,6 +1314,26 @@ class SaveSyncService:
                 if transaction is not None:
                     transaction.rollback()
                 raise
+            if diff.direction == "upload":
+                mutations = self._journal_mutations_for_remote_transition(
+                    before=remote,
+                    after=source,
+                )
+                if mutations:
+                    generation = self._append_remote_journal(
+                        revision=record.revision,
+                        timestamp=record.timestamp,
+                        mutations=mutations,
+                    )
+                    state = self._get_state_unlocked()
+                    if state.quick_sync_ready:
+                        _write_state(
+                            self._state_path,
+                            replace(
+                                state,
+                                quick_sync_cursor_generation=generation,
+                            ),
+                        )
             if transaction is not None:
                 try:
                     transaction.finalize()
@@ -1319,6 +1653,65 @@ class SaveSyncService:
             ),
         )
 
+    def _append_remote_journal(
+        self,
+        *,
+        revision: str,
+        timestamp: str,
+        mutations: list[dict[str, object]],
+    ) -> int:
+        path = self._remote_journal_path
+        if path is None:
+            return 0
+        state = self._get_state_unlocked()
+        return savesync_journal.append_mutations(
+            path,
+            device_id=state.device_id,
+            revision=revision,
+            timestamp=timestamp,
+            mutations=mutations,
+        )
+
+    def _journal_mutations_for_remote_transition(
+        self,
+        *,
+        before: dict[str, SaveArtifact],
+        after: dict[str, SaveArtifact],
+    ) -> list[dict[str, object]]:
+        grouped_before = _grouped_manifest(before, self._policy)
+        grouped_after = _grouped_manifest(after, self._policy)
+        mutations: list[dict[str, object]] = []
+        for group_id in sorted(set(grouped_before) | set(grouped_after)):
+            before_group = grouped_before.get(group_id, ())
+            after_group = grouped_after.get(group_id, ())
+            if before_group == after_group:
+                continue
+            descriptor = self._policy.group_for_path(
+                (after_group[0].relative_path if after_group else before_group[0].relative_path)
+            )
+            if descriptor is None:
+                continue
+            operation = "update"
+            if not before_group and after_group:
+                operation = "create"
+            elif before_group and not after_group:
+                operation = "delete"
+            object_id = None
+            if len(after_group) == 1:
+                object_id = after_group[0].relative_path
+            elif len(before_group) == 1:
+                object_id = before_group[0].relative_path
+            mutations.append(
+                {
+                    "system": descriptor.system,
+                    "layout_id": descriptor.layout_id,
+                    "group_id": descriptor.group_id,
+                    "object_id": object_id,
+                    "operation": operation,
+                }
+            )
+        return mutations
+
 
 def _same_artifact(left: Optional[SaveArtifact], right: Optional[SaveArtifact]) -> bool:
     if left is None or right is None:
@@ -1358,6 +1751,19 @@ def _group_manifest(
     manifest: dict[str, SaveArtifact], paths: list[str]
 ) -> tuple[SaveArtifact, ...]:
     return tuple(manifest[path] for path in paths if path in manifest)
+
+
+def _grouped_manifest(
+    manifest: dict[str, SaveArtifact],
+    policy: SaveSelectionPolicy,
+) -> dict[str, tuple[SaveArtifact, ...]]:
+    grouped_paths: dict[str, list[str]] = {}
+    for path in sorted(manifest):
+        grouped_paths.setdefault(_group_id(policy, path), []).append(path)
+    return {
+        group_id: _group_manifest(manifest, paths)
+        for group_id, paths in grouped_paths.items()
+    }
 
 
 def _same_manifest(

@@ -591,6 +591,8 @@ def uidata_savesync_status(ctx: click.Context) -> None:
             "rpcs3_installed_games_enabled": saves.rpcs3_installed_games_enabled,
             "include_local_games": saves.include_local_games,
             "sync_status": state.effective_status.value,
+            "quick_sync_ready": state.quick_sync_ready,
+            "quick_sync_cursor_generation": state.quick_sync_cursor_generation,
             "active_conflicts": len(state.active_conflicts),
             "last_upload": _record_dict(state.last_upload),
             "last_download": _record_dict(state.last_download),
@@ -800,5 +802,53 @@ def uidata_savesync_reconcile(ctx: click.Context) -> None:
         plan = saves.preview_reconciliation()
         report = saves.reconcile(progress=progress)
         return {"preflight": plan.to_dict(), "report": report.to_dict()}
+
+    _run_action(ctx, build)
+
+
+@uidata_group.command("savesync-full-sync")
+@click.pass_context
+def uidata_savesync_full_sync(ctx: click.Context) -> None:
+    """Run authoritative Full Sync and establish Quick Sync baseline."""
+
+    def build() -> dict:
+        request = _read_request()
+        progress = _progress_sink(request)
+        _load_context_config(ctx)
+        saves = get_container(ctx).saves
+        report = saves.full_sync(progress=progress)
+        state = saves.get_state()
+        return {
+            "report": report.to_dict(),
+            "quick_sync_ready": state.quick_sync_ready,
+            "quick_sync_cursor_generation": state.quick_sync_cursor_generation,
+        }
+
+    _run_action(ctx, build)
+
+
+@uidata_group.command("savesync-quick-sync")
+@click.pass_context
+def uidata_savesync_quick_sync(ctx: click.Context) -> None:
+    """Run journal-driven Quick Sync when a trusted baseline exists."""
+
+    def build() -> dict:
+        request = _read_request()
+        progress = _progress_sink(request)
+        _load_context_config(ctx)
+        saves = get_container(ctx).saves
+        result = saves.quick_sync(progress=progress)
+        payload = {
+            "status": result.status,
+            "remote_generation": result.remote_generation,
+            "cursor_before": result.cursor_before,
+            "cursor_after": result.cursor_after,
+            "processed_entries": result.processed_entries,
+            "processed_groups": list(result.processed_groups),
+            "reason": result.reason,
+        }
+        if result.report is not None:
+            payload["report"] = result.report.to_dict()
+        return payload
 
     _run_action(ctx, build)

@@ -22,6 +22,12 @@ def hook_content(romcloud_bin: Path) -> str:
         "  gameStop)\n"
         '    nohup "$ROMCLOUD_BIN" _autosync game-stop "$2" "$3" "$4" "$5" '
         ">/dev/null 2>&1 </dev/null &\n"
+        '    nohup "$ROMCLOUD_BIN" _autosync menu-loop '
+        ">/dev/null 2>&1 </dev/null &\n"
+        "    ;;\n"
+        "  emulationstationStart|systemStart|frontendStart)\n"
+        '    nohup "$ROMCLOUD_BIN" _autosync menu-loop '
+        ">/dev/null 2>&1 </dev/null &\n"
         "    ;;\n"
         "esac\n"
         "exit 0\n"

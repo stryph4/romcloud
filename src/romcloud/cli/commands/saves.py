@@ -215,6 +215,51 @@ def saves_reconcile(ctx: click.Context) -> None:
     )
 
 
+@saves_group.command("full-sync")
+@click.pass_context
+def saves_full_sync(ctx: click.Context) -> None:
+    """Run authoritative SaveSync reconciliation and establish Quick Sync baseline."""
+    saves = get_container(ctx).saves
+    try:
+        report = saves.full_sync()
+    except ROMCloudError as exc:
+        click.echo(f"error: {exc}", err=True)
+        ctx.exit(1)
+        return
+    state = saves.get_state()
+    click.echo(
+        f"Done. {report.uploaded} uploaded, {report.downloaded} downloaded, "
+        f"{report.conflicts} conflict(s) preserved. "
+        f"Quick Sync cursor={state.quick_sync_cursor_generation}."
+    )
+
+
+@saves_group.command("quick-sync")
+@click.pass_context
+def saves_quick_sync(ctx: click.Context) -> None:
+    """Run journal-driven Quick Sync using the trusted Full Sync baseline."""
+    saves = get_container(ctx).saves
+    try:
+        result = saves.quick_sync()
+    except ROMCloudError as exc:
+        click.echo(f"error: {exc}", err=True)
+        ctx.exit(1)
+        return
+    if result.status == "requires-full-sync":
+        click.echo(f"Quick Sync requires Full Sync first ({result.reason}).")
+        return
+    if result.status == "unchanged":
+        click.echo("Quick Sync: no remote SaveSync changes detected.")
+        return
+    if result.status == "deferred":
+        click.echo("Quick Sync deferred because active gameplay data is protected.")
+        return
+    click.echo(
+        f"Quick Sync complete through generation {result.cursor_after} "
+        f"({result.processed_entries} journal entries)."
+    )
+
+
 def _set_xbox_enabled(ctx: click.Context, enabled: bool) -> None:
     config = get_container(ctx).config
     write_config(replace(config, saves=replace(config.saves, xbox_enabled=enabled)), ctx.obj["config_path"])

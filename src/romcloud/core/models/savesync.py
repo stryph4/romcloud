@@ -447,6 +447,10 @@ class SaveSyncState:
     last_error: Optional[SaveSyncLastError] = None
     last_completed_operation_id: Optional[str] = None
     """Durable transaction receipt used to distinguish commit from interruption."""
+    quick_sync_cursor_generation: Optional[int] = None
+    """Last remote SaveSync journal generation fully reconciled on this device."""
+    quick_sync_ready: bool = False
+    """True only after a successful Full Sync establishes a trusted quick baseline."""
 
     @property
     def active_conflicts(self) -> tuple[SaveConflictRecord, ...]:
@@ -475,3 +479,18 @@ class SaveSyncState:
         if self.remote_observation.availability is SaveRemoteAvailability.UNAVAILABLE:
             return SaveSyncStatus.REMOTE_UNAVAILABLE
         return SaveSyncStatus.CLEAN
+
+
+@dataclass(frozen=True)
+class SaveQuickSyncResult:
+    """Result of a journal-driven Quick Sync pass."""
+
+    status: str
+    """One of: unchanged, reconciled, requires-full-sync, deferred."""
+    remote_generation: int
+    cursor_before: Optional[int]
+    cursor_after: Optional[int]
+    processed_entries: int = 0
+    processed_groups: tuple[str, ...] = ()
+    reason: str = ""
+    report: Optional[SaveReconcileReport] = None

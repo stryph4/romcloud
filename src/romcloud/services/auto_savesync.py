@@ -17,6 +17,7 @@ from romcloud.infrastructure.logging import get_logger
 from romcloud.services.saves import SaveSyncService
 
 log = get_logger("auto-savesync")
+_MENU_PULL_INTERVAL_SECONDS = 300.0
 
 _DOLPHIN_LAYOUTS = {
     "gamecube": frozenset(
@@ -152,6 +153,7 @@ class AutoSaveSyncCoordinator:
         self._sessions = ActiveSessionStore(self._data_root)
         self._quiet_seconds = max(0.0, quiet_seconds)
         self._enabled = enabled
+        self._menu_state_path = self._data_root / "savesync-menu-pull.json"
 
     def game_start(self, *, system: str, emulator: str, core: str, rom: str) -> None:
         if not self._enabled:
@@ -172,6 +174,80 @@ class AutoSaveSyncCoordinator:
             layout_ids, changed_since=changed_since
         )
         self.drain_pending()
+        self.menu_tick(force=True)
+
+    def menu_tick(self, *, force: bool = False) -> None:
+        if not self._enabled:
+            return
+        lock = _AutoWorkerLock(self._data_root / ".savesync-auto.lock")
+        if not lock.acquire():
+            return
+        try:
+            if self._sessions.active_layout_ids(self._policy):
+                return
+            if not force and not self._menu_pull_due():
+                return
+
+            def is_group_active(group_id: str) -> bool:
+                layouts = {group.group_id: group.layout_id for group in self._service.get_state().groups}
+                return layouts.get(group_id) in self._sessions.active_layout_ids(self._policy)
+
+            def is_layout_active(layout_id: str) -> bool:
+                return layout_id in self._sessions.active_layout_ids(self._policy)
+
+            try:
+                self._service.quick_sync(
+                    is_group_active=is_group_active,
+                    is_layout_active=is_layout_active,
+                    exclude_layout_ids=frozenset({"xemu-hdd"}),
+                )
+            except Exception:  # noqa: BLE001 - menu pull is best-effort
+                log.warning("Periodic SaveSync quick pull deferred", exc_info=True)
+                return
+            self._write_menu_pull_timestamp(time.time())
+        finally:
+            lock.release()
+
+    def menu_loop(self) -> None:
+        if not self._enabled:
+            return
+        loop_lock = _AutoWorkerLock(self._data_root / ".savesync-menu-loop.lock")
+        if not loop_lock.acquire():
+            return
+        try:
+            self.menu_tick(force=True)
+            while True:
+                if self._sessions.active_layout_ids(self._policy):
+                    return
+                for _ in range(int(_MENU_PULL_INTERVAL_SECONDS)):
+                    if self._sessions.active_layout_ids(self._policy):
+                        return
+                    time.sleep(1.0)
+                self.menu_tick(force=False)
+        finally:
+            loop_lock.release()
+
+    def _menu_pull_due(self) -> bool:
+        last = self._read_menu_pull_timestamp()
+        if last is None:
+            return True
+        return (time.time() - last) >= _MENU_PULL_INTERVAL_SECONDS
+
+    def _read_menu_pull_timestamp(self) -> Optional[float]:
+        try:
+            payload = json.loads(self._menu_state_path.read_text(encoding="utf-8"))
+            value = payload.get("last_pull")
+            return float(value)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+
+    def _write_menu_pull_timestamp(self, value: float) -> None:
+        self._menu_state_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self._menu_state_path.with_name(
+            f".{self._menu_state_path.name}.{uuid.uuid4().hex}.tmp"
+        )
+        temporary.write_text(json.dumps({"last_pull": value}), encoding="utf-8")
+        temporary.replace(self._menu_state_path)
 
     def drain_pending(self) -> None:
         if not self._enabled:

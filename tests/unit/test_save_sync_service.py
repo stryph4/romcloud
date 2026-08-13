@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import errno
 import os
+import threading
 from pathlib import Path
 
 import pytest
 
-from romcloud.bootstrap.container import Container
 from romcloud.core.exceptions import (
     SaveSyncConnectivityError,
     SaveSyncError,
@@ -18,7 +18,7 @@ from romcloud.core.models.game import Game, GameAsset
 from romcloud.core.models.savesync import SaveChangeKind, SaveDiff
 from romcloud.core.save_ownership import ManagedSaveOwnershipPolicy
 from romcloud.core.storage import StorageProvider
-from romcloud.infrastructure import mount, save_transaction, save_tree
+from romcloud.infrastructure import mount, save_transaction, save_tree, savesync_journal
 from romcloud.infrastructure.config import (
     AppConfig,
     CacheConfig,
@@ -257,6 +257,8 @@ class TestWritableRemoteBoundary:
             lambda path, **kwargs: Path(path) == save_mount,
         )
 
+        from romcloud.bootstrap.container import Container
+
         service = Container(config).saves
         record = service.commit_upload(service.preview_upload())
 
@@ -287,6 +289,8 @@ class TestWritableRemoteBoundary:
         )
         _write(local_saves / "psx" / "Game.srm", b"must-not-land-locally")
         monkeypatch.setattr(mount, "is_target_mounted_cifs", lambda path, **kwargs: False)
+
+        from romcloud.bootstrap.container import Container
 
         service = Container(config).saves
         with pytest.raises(SaveSyncConnectivityError):
@@ -319,6 +323,8 @@ class TestWritableRemoteBoundary:
         monkeypatch.setattr(mount, "is_target_mounted_cifs", lambda path, **kwargs: False)
 
         with pytest.raises(SaveSyncConnectivityError):
+            from romcloud.bootstrap.container import Container
+
             Container(config).saves.preview_upload()
 
         assert list(remote_mount.iterdir()) == []
@@ -350,6 +356,8 @@ class TestWritableRemoteBoundary:
         monkeypatch.setattr(mount, "is_target_mounted_cifs", reject_wrong_share)
 
         with pytest.raises(SaveSyncConnectivityError):
+            from romcloud.bootstrap.container import Container
+
             Container(config).saves.preview_upload()
 
         assert observed == [
@@ -365,6 +373,8 @@ class TestWritableRemoteBoundary:
             data_path=str(tmp_path / "data"),
             saves=SavesConfig(local_path=str(tmp_path / "local-saves")),
         )
+        from romcloud.bootstrap.container import Container
+
         service = Container(config).saves
 
         assert service.is_remote_configured is False
@@ -1324,3 +1334,275 @@ class TestSaveSyncFinalizationSafety:
 
         assert [entry.relative_path for entry in plan.downloads] == ["psx/Game.srm"]
         assert plan.uploads == ()
+
+
+class TestQuickSyncAndJournal:
+    def test_full_sync_establishes_quick_sync_baseline(
+        self, tmp_path: Path, service: SaveSyncService
+    ):
+        _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
+
+        report = service.full_sync()
+
+        state = service.get_state()
+        assert report.uploaded == 1
+        assert state.quick_sync_ready is True
+        assert state.quick_sync_cursor_generation == 1
+
+    def test_failed_full_sync_does_not_establish_quick_sync_baseline(
+        self, tmp_path: Path, service: SaveSyncService, monkeypatch
+    ):
+        _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
+
+        monkeypatch.setattr(
+            service,
+            "reconcile",
+            lambda **kwargs: (_ for _ in ()).throw(SaveSyncVerificationError("boom")),
+        )
+
+        with pytest.raises(SaveSyncVerificationError):
+            service.full_sync()
+
+        state = service.get_state()
+        assert state.quick_sync_ready is False
+        assert state.quick_sync_cursor_generation is None
+
+    def test_quick_sync_unchanged_generation_skips_scans(
+        self, tmp_path: Path, service: SaveSyncService, monkeypatch
+    ):
+        _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
+        service.full_sync()
+        calls = {"local": 0, "remote": 0}
+
+        def fail_local(*args, **kwargs):
+            calls["local"] += 1
+            raise AssertionError("quick unchanged must not scan local")
+
+        def fail_remote(*args, **kwargs):
+            calls["remote"] += 1
+            raise AssertionError("quick unchanged must not scan remote")
+
+        monkeypatch.setattr(service, "_scan_automatic_local", fail_local)
+        monkeypatch.setattr(service, "_scan_automatic_remote", fail_remote)
+
+        result = service.quick_sync()
+
+        assert result.status == "unchanged"
+        assert calls == {"local": 0, "remote": 0}
+
+    def test_one_psx_group_journal_change_only_targets_that_group(
+        self, tmp_path: Path, service: SaveSyncService, monkeypatch
+    ):
+        _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
+        service.full_sync()
+        journal_path = savesync_journal.default_journal_path(tmp_path / "remote-saves")
+        savesync_journal.append_mutations(
+            journal_path,
+            device_id="peer",
+            revision="r2",
+            timestamp="2026-01-01T00:00:01+00:00",
+            mutations=[
+                {
+                    "system": "psx",
+                    "layout_id": "retroarch-root-psx",
+                    "group_id": "retroarch-root-psx:psx/Game",
+                    "object_id": "psx/Game.srm",
+                    "operation": "update",
+                }
+            ],
+        )
+        captured: dict[str, object] = {}
+
+        def reconcile_capture(**kwargs):
+            captured["selected_group_ids"] = kwargs.get("selected_group_ids")
+            captured["selected_layout_ids"] = kwargs.get("selected_layout_ids")
+            return None
+
+        monkeypatch.setattr(service, "_reconcile", reconcile_capture)
+        result = service.quick_sync()
+
+        assert result.status == "deferred"
+        assert captured["selected_group_ids"] is None
+        assert captured["selected_layout_ids"] == frozenset({"retroarch-root-psx"})
+
+    def test_multiple_unseen_generations_are_all_processed(
+        self, tmp_path: Path, service: SaveSyncService
+    ):
+        _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
+        service.full_sync()
+        journal_path = savesync_journal.default_journal_path(tmp_path / "remote-saves")
+        _write(tmp_path / "remote-saves" / "psx" / "Game.srm", b"v1")
+        savesync_journal.append_mutations(
+            journal_path,
+            device_id="peer",
+            revision="r2",
+            timestamp="2026-01-01T00:00:01+00:00",
+            mutations=[
+                {
+                    "system": "psx",
+                    "layout_id": "retroarch-root-psx",
+                    "group_id": "retroarch-root-psx:psx/Game",
+                    "object_id": "psx/Game.srm",
+                    "operation": "update",
+                }
+            ],
+        )
+        _write(tmp_path / "remote-saves" / "psx" / "Game.srm", b"v2")
+        savesync_journal.append_mutations(
+            journal_path,
+            device_id="peer",
+            revision="r3",
+            timestamp="2026-01-01T00:00:02+00:00",
+            mutations=[
+                {
+                    "system": "psx",
+                    "layout_id": "retroarch-root-psx",
+                    "group_id": "retroarch-root-psx:psx/Game",
+                    "object_id": "psx/Game.srm",
+                    "operation": "update",
+                }
+            ],
+        )
+
+        result = service.quick_sync()
+
+        assert result.status == "reconciled"
+        assert result.processed_entries == 2
+        assert service.get_state().quick_sync_cursor_generation == result.remote_generation
+
+    def test_bounded_history_gap_falls_back_to_full_sync(
+        self, tmp_path: Path, service: SaveSyncService
+    ):
+        _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
+        service.full_sync()
+        state = service.get_state()
+        from dataclasses import replace
+        from romcloud.infrastructure import savesync_state as durable_state
+
+        durable_state.write_state(
+            tmp_path / "data" / "savesync-state.json",
+            replace(state, quick_sync_cursor_generation=0, quick_sync_ready=True),
+        )
+        savesync_journal.save(
+            savesync_journal.default_journal_path(tmp_path / "remote-saves"),
+            {
+                "schema_version": 1,
+                "generation": 20,
+                "history": [
+                    {
+                        "generation": 20,
+                        "timestamp": "2026-01-01T00:00:20+00:00",
+                        "device_id": "peer",
+                        "revision": "r20",
+                        "system": "psx",
+                        "layout_id": "retroarch-root-psx",
+                        "group_id": "retroarch-root-psx:psx/Game",
+                        "object_id": "psx/Game.srm",
+                        "operation": "update",
+                    }
+                ],
+            },
+        )
+
+        result = service.quick_sync()
+
+        assert result.status == "requires-full-sync"
+        assert result.reason == "journal-gap"
+
+    def test_corrupt_journal_falls_back_to_full_sync(
+        self, tmp_path: Path, service: SaveSyncService
+    ):
+        _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
+        service.full_sync()
+        journal_path = savesync_journal.default_journal_path(tmp_path / "remote-saves")
+        journal_path.write_text("not json", encoding="utf-8")
+
+        result = service.quick_sync()
+
+        assert result.status == "requires-full-sync"
+        assert result.reason == "journal-untrustworthy"
+
+    def test_concurrent_remote_writers_do_not_lose_entries(self, tmp_path: Path):
+        journal_path = savesync_journal.default_journal_path(tmp_path / "remote-saves")
+        generations: list[int] = []
+
+        def writer(device: str) -> None:
+            generation = savesync_journal.append_mutations(
+                journal_path,
+                device_id=device,
+                revision=f"{device}-r1",
+                timestamp="2026-01-01T00:00:00+00:00",
+                mutations=[
+                    {
+                        "system": "psx",
+                        "layout_id": "retroarch-root-psx",
+                        "group_id": f"retroarch-root-psx:psx/{device}",
+                        "object_id": None,
+                        "operation": "update",
+                    }
+                ],
+            )
+            generations.append(generation)
+
+        threads = [threading.Thread(target=writer, args=(f"d{i}",)) for i in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        journal = savesync_journal.load(journal_path)
+        assert journal["generation"] == 6
+        assert len(journal["history"]) == 6
+        assert sorted(generations) == [1, 2, 3, 4, 5, 6]
+
+    def test_failed_transaction_does_not_publish_journal_change(
+        self, tmp_path: Path, service: SaveSyncService, monkeypatch
+    ):
+        _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
+        service.full_sync()
+        _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"next")
+        diff = service.preview_upload()
+        monkeypatch.setattr(
+            service,
+            "_advance_force_state",
+            lambda *args, **kwargs: (_ for _ in ()).throw(SaveSyncVerificationError("boom")),
+        )
+
+        with pytest.raises(SaveSyncVerificationError):
+            service.commit_upload(diff)
+
+        journal_path = savesync_journal.default_journal_path(tmp_path / "remote-saves")
+        assert savesync_journal.load(journal_path)["generation"] == 1
+
+    def test_cursor_advances_only_after_successful_quick_sync(
+        self, tmp_path: Path, service: SaveSyncService, monkeypatch
+    ):
+        _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
+        service.full_sync()
+        journal_path = savesync_journal.default_journal_path(tmp_path / "remote-saves")
+        savesync_journal.append_mutations(
+            journal_path,
+            device_id="peer",
+            revision="r2",
+            timestamp="2026-01-01T00:00:01+00:00",
+            mutations=[
+                {
+                    "system": "psx",
+                    "layout_id": "retroarch-root-psx",
+                    "group_id": "retroarch-root-psx:psx/Game",
+                    "object_id": "psx/Game.srm",
+                    "operation": "update",
+                }
+            ],
+        )
+        cursor_before = service.get_state().quick_sync_cursor_generation
+        monkeypatch.setattr(
+            service,
+            "_reconcile",
+            lambda **kwargs: (_ for _ in ()).throw(SaveSyncVerificationError("boom")),
+        )
+
+        with pytest.raises(SaveSyncVerificationError):
+            service.quick_sync()
+
+        assert service.get_state().quick_sync_cursor_generation == cursor_before

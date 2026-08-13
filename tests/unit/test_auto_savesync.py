@@ -547,3 +547,141 @@ def test_manual_and_background_reconcile_share_one_operation_boundary(
 
     assert maximum == 1
     assert not manual.is_alive() and not automatic.is_alive()
+
+
+def test_periodic_menu_tick_remote_only_change_auto_pulls(tmp_path: Path):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    local = tmp_path / "local" / "psx" / "Game.srm"
+    remote = tmp_path / "remote" / "psx" / "Game.srm"
+    _write(local, b"base")
+    service.full_sync()
+
+    _write(remote, b"remote-new")
+    service._append_remote_journal(  # type: ignore[attr-defined]
+        revision="peer-r1",
+        timestamp="2026-01-01T00:00:00+00:00",
+        mutations=[
+            {
+                "system": "psx",
+                "layout_id": "retroarch-root-psx",
+                "group_id": "retroarch-root-psx:psx/Game",
+                "object_id": "psx/Game.srm",
+                "operation": "update",
+            }
+        ],
+    )
+
+    coordinator.menu_tick(force=True)
+
+    assert local.read_bytes() == b"remote-new"
+
+
+def test_periodic_menu_tick_local_only_change_is_not_overwritten(tmp_path: Path):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    local = tmp_path / "local" / "psx" / "Game.srm"
+    _write(local, b"base")
+    service.full_sync()
+    _write(local, b"local-only")
+
+    coordinator.menu_tick(force=True)
+
+    assert local.read_bytes() == b"local-only"
+
+
+def test_periodic_menu_tick_both_changed_becomes_conflict(tmp_path: Path):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    local = tmp_path / "local" / "psx" / "Game.srm"
+    remote = tmp_path / "remote" / "psx" / "Game.srm"
+    _write(local, b"base")
+    service.full_sync()
+    _write(local, b"local")
+    _write(remote, b"remote")
+    service._append_remote_journal(  # type: ignore[attr-defined]
+        revision="peer-r2",
+        timestamp="2026-01-01T00:00:01+00:00",
+        mutations=[
+            {
+                "system": "psx",
+                "layout_id": "retroarch-root-psx",
+                "group_id": "retroarch-root-psx:psx/Game",
+                "object_id": "psx/Game.srm",
+                "operation": "update",
+            }
+        ],
+    )
+
+    coordinator.menu_tick(force=True)
+
+    assert service.get_state().groups[0].condition is SaveGroupCondition.CONFLICT
+    assert local.read_bytes() == b"local"
+    assert remote.read_bytes() == b"remote"
+
+
+def test_gameplay_suppresses_periodic_pull_entirely(tmp_path: Path, monkeypatch):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    calls = {"quick": 0}
+
+    def counted_quick_sync(**kwargs):
+        calls["quick"] += 1
+        return None
+
+    monkeypatch.setattr(service, "quick_sync", counted_quick_sync)
+    coordinator.game_start(system="psx", emulator="libretro", core="pcsx", rom="Game.chd")
+
+    coordinator.menu_tick(force=True)
+
+    assert calls["quick"] == 0
+
+
+def test_game_start_during_pull_marks_active_and_defers(tmp_path: Path, monkeypatch):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    observed = {"active_seen": False}
+
+    def quick_sync(**kwargs):
+        coordinator.game_start(system="psx", emulator="libretro", core="pcsx", rom="Game.chd")
+        observed["active_seen"] = kwargs["is_layout_active"]("retroarch-root-psx")
+        return None
+
+    monkeypatch.setattr(service, "quick_sync", quick_sync)
+
+    coordinator.menu_tick(force=True)
+
+    assert observed["active_seen"] is True
+
+
+def test_periodic_pull_never_auto_pulls_xemu(tmp_path: Path):
+    provider = _Provider()
+    service = _service(tmp_path, provider, xbox_enabled=True)
+    coordinator = _coordinator(tmp_path, service)
+    local = tmp_path / "local" / "xbox" / "xbox_hdd.qcow2"
+    remote = tmp_path / "remote" / "xbox" / "xbox_hdd.qcow2"
+    _write(local, b"local")
+    service.full_sync()
+    _write(remote, b"remote")
+    service._append_remote_journal(  # type: ignore[attr-defined]
+        revision="peer-rx",
+        timestamp="2026-01-01T00:00:03+00:00",
+        mutations=[
+            {
+                "system": "xbox",
+                "layout_id": "xemu-hdd",
+                "group_id": "xemu-hdd:xbox/xbox_hdd",
+                "object_id": "xbox/xbox_hdd.qcow2",
+                "operation": "update",
+            }
+        ],
+    )
+
+    coordinator.menu_tick(force=True)
+
+    assert local.read_bytes() == b"local"

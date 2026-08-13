@@ -69,6 +69,8 @@ def state_to_dict(state: SaveSyncState) -> dict[str, object]:
         "active_operation": _operation_to_dict(state.active_operation),
         "last_error": _error_to_dict(state.last_error),
         "last_completed_operation_id": state.last_completed_operation_id,
+        "quick_sync_cursor_generation": state.quick_sync_cursor_generation,
+        "quick_sync_ready": state.quick_sync_ready,
     }
 
 
@@ -129,6 +131,19 @@ def state_from_dict(payload: object) -> SaveSyncState:
             )
             if version == CURRENT_STATE_VERSION
             else None
+        ),
+        quick_sync_cursor_generation=(
+            _optional_nonnegative_int(
+                data.get("quick_sync_cursor_generation"),
+                "quick_sync_cursor_generation",
+            )
+            if version == CURRENT_STATE_VERSION
+            else None
+        ),
+        quick_sync_ready=(
+            bool(data.get("quick_sync_ready", False))
+            if version == CURRENT_STATE_VERSION
+            else False
         ),
     )
     if version == 1 and not state.shared_manifest:
@@ -631,6 +646,13 @@ def _validate_state(state: SaveSyncState) -> None:
         _nonempty_text(
             state.last_completed_operation_id, "last_completed_operation_id"
         )
+    if state.quick_sync_cursor_generation is not None:
+        _nonnegative_int(
+            state.quick_sync_cursor_generation,
+            "quick_sync_cursor_generation",
+        )
+    if not isinstance(state.quick_sync_ready, bool):
+        raise SaveSyncError("quick_sync_ready must be boolean")
     if (
         state.active_operation is not None
         and state.active_operation.operation_id == state.last_completed_operation_id
@@ -1207,6 +1229,12 @@ def _optional_text(value: object, label: str) -> Optional[str]:
     return None if value is None else _nonempty_text(value, label)
 
 
+def _optional_nonnegative_int(value: object, label: str) -> Optional[int]:
+    if value is None:
+        return None
+    return _nonnegative_int(value, label)
+
+
 def _nonnegative_int(value: object, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise SaveSyncError(f"{label} must be a non-negative integer")
@@ -1295,7 +1323,7 @@ def _lock_handle(handle) -> None:  # noqa: ANN001
         import msvcrt
 
         handle.seek(0)
-        if handle.read(1) == b"":
+        if handle.tell() == handle.seek(0, os.SEEK_END):
             handle.write(b"\0")
             handle.flush()
         handle.seek(0)
