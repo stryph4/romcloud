@@ -911,7 +911,7 @@ class TestHandleSavesyncEvent:
     def test_dashboard_confirm_on_back_item_leaves_screen(self):
         from ports_gfx import app as app_module
 
-        screen = self._screen(selected_index=3)  # "Back"
+        screen = self._screen(selected_index=5)  # "Back"
         cancelled = []
         screen.cancel_pending = lambda: cancelled.append(True)
         assert app_module._handle_savesync_event(InputEvent(action=Action.CONFIRM), screen) == "menu"
@@ -921,7 +921,7 @@ class TestHandleSavesyncEvent:
         from ports_gfx import app as app_module
         from ports_gfx.savesync_screen import SETTINGS
 
-        screen = self._screen(selected_index=2)
+        screen = self._screen(selected_index=4)
         assert app_module._handle_savesync_event(InputEvent(action=Action.CONFIRM), screen) == "savesync"
         assert screen.step == SETTINGS
 
@@ -1052,6 +1052,53 @@ class TestHandleSavesyncEvent:
         result = app_module._handle_savesync_event(InputEvent(action=Action.BACK), screen)
         assert result == "savesync"
         assert screen.step == PREVIEWING
+
+    def test_quick_sync_result_messages_cover_requires_full_and_no_change(self):
+        from ports_gfx import app as app_module
+        from ports_gfx.savesync_screen import RESULT
+
+        baseline_required = self._screen(
+            step=RESULT,
+            result_mode="quick-sync",
+            result={"status": "requires-full-sync", "reason": "quick-sync-baseline-missing"},
+        )
+        unchanged = self._screen(
+            step=RESULT,
+            result_mode="quick-sync",
+            result={"status": "unchanged"},
+        )
+
+        lines_required = app_module._savesync_body_lines(baseline_required)
+        lines_unchanged = app_module._savesync_body_lines(unchanged)
+
+        assert any("requires Full Sync" in line for line in lines_required)
+        assert any("no remote SaveSync changes" in line for line in lines_unchanged)
+
+    def test_quick_sync_and_full_sync_success_results_are_clear(self):
+        from ports_gfx import app as app_module
+        from ports_gfx.savesync_screen import RESULT
+
+        quick = self._screen(
+            step=RESULT,
+            result_mode="quick-sync",
+            result={"status": "reconciled", "cursor_after": 9, "processed_entries": 2},
+        )
+        full = self._screen(
+            step=RESULT,
+            result_mode="full-sync",
+            result={
+                "report": {"uploaded": 3, "downloaded": 1, "conflicts": 0},
+                "quick_sync_cursor_generation": 14,
+            },
+        )
+
+        quick_lines = app_module._savesync_body_lines(quick)
+        full_lines = app_module._savesync_body_lines(full)
+
+        assert any("generation 9" in line for line in quick_lines)
+        assert any("Journal entries processed: 2" in line for line in quick_lines)
+        assert any("Full Sync complete" in line for line in full_lines)
+        assert any("Quick Sync cursor: 14" in line for line in full_lines)
 
 
 class TestHandleControllerTestEvent:

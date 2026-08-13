@@ -33,6 +33,8 @@ REMOTE_AVAILABILITY_TIMEOUT = 6.0
 DASHBOARD_ITEMS: tuple[str, ...] = (
     "Upload All Saves",
     "Download All Saves",
+    "Quick Sync",
+    "Full Sync",
     "SaveSync Settings",
     "Back",
 )
@@ -43,8 +45,10 @@ SETTINGS_ITEMS: tuple[str, ...] = (
 )
 _UPLOAD_INDEX = 0
 _DOWNLOAD_INDEX = 1
-_SETTINGS_INDEX = 2
-_BACK_INDEX = 3
+_QUICK_SYNC_INDEX = 2
+_FULL_SYNC_INDEX = 3
+_SETTINGS_INDEX = 4
+_BACK_INDEX = 5
 
 PopenFunc = Callable[..., "object"]
 
@@ -65,6 +69,7 @@ class SaveSyncScreenState:
     diff: dict[str, Any] = field(default_factory=dict)
     preview_summary: dict[str, Any] = field(default_factory=dict)
     result: dict[str, Any] = field(default_factory=dict)
+    result_mode: str = ""
     confirm: HoldToConfirmState = field(default_factory=HoldToConfirmState)
     popen: Optional[PopenFunc] = None
     """Injected for tests; ``None`` uses the real subprocess default."""
@@ -105,7 +110,12 @@ class SaveSyncScreenState:
 
     def confirm_dashboard_selection(self) -> Optional[str]:
         """Returns ``"back"`` if the caller should leave this screen entirely."""
-        if self.selected_index in (_UPLOAD_INDEX, _DOWNLOAD_INDEX):
+        if self.selected_index in (
+            _UPLOAD_INDEX,
+            _DOWNLOAD_INDEX,
+            _QUICK_SYNC_INDEX,
+            _FULL_SYNC_INDEX,
+        ):
             if self.status.get("remote_configured") is False:
                 self.error = (
                     "Configure writable ROMCloud data storage before using SaveSync."
@@ -115,6 +125,10 @@ class SaveSyncScreenState:
             elif not self.remote_actions_available:
                 detail = f" {self.remote_detail}" if self.remote_detail else ""
                 self.error = f"Remote storage is unavailable.{detail}"
+            elif self.selected_index == _QUICK_SYNC_INDEX:
+                self.start_quick_sync()
+            elif self.selected_index == _FULL_SYNC_INDEX:
+                self.start_full_sync()
             else:
                 self.start_preview(
                     "upload" if self.selected_index == _UPLOAD_INDEX else "download"
@@ -131,7 +145,24 @@ class SaveSyncScreenState:
     def start_preview(self, direction: str) -> None:
         self.direction = direction
         self.error = ""
+        self.result_mode = ""
         self._start_operation("savesync-preview", {"direction": direction})
+        self.step = PREVIEWING
+
+    def start_quick_sync(self) -> None:
+        self.direction = "quick-sync"
+        self.error = ""
+        self.result = {}
+        self.result_mode = "quick-sync"
+        self._start_operation("savesync-quick-sync", {})
+        self.step = PREVIEWING
+
+    def start_full_sync(self) -> None:
+        self.direction = "full-sync"
+        self.error = ""
+        self.result = {}
+        self.result_mode = "full-sync"
+        self._start_operation("savesync-full-sync", {})
         self.step = PREVIEWING
 
     # -- confirm ---------------------------------------------------------
@@ -291,7 +322,14 @@ class SaveSyncScreenState:
         self._runner = None
 
         if self.step == PREVIEWING:
-            if result.ok:
+            if self.result_mode in ("quick-sync", "full-sync"):
+                if result.ok:
+                    self.result = result.data
+                    self.error = ""
+                else:
+                    self.error = result.error
+                self.step = RESULT
+            elif result.ok:
                 self.diff = result.data.get("diff", {})
                 self.preview_summary = result.data
                 self.step = PREVIEW

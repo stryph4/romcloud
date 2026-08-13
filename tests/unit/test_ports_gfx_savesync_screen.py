@@ -142,16 +142,70 @@ class TestDashboardSelection:
         state.select(-5)
         assert state.selected_index == 0
         state.select(999)
-        assert state.selected_index == 3
+        assert state.selected_index == 5
 
     def test_back_returns_sentinel(self):
-        state = SaveSyncScreenState(romcloud_bin="romcloud", selected_index=3)
+        state = SaveSyncScreenState(romcloud_bin="romcloud", selected_index=5)
         assert state.confirm_dashboard_selection() == "back"
 
     def test_settings_switches_step(self):
-        state = SaveSyncScreenState(romcloud_bin="romcloud", selected_index=2)
+        state = SaveSyncScreenState(romcloud_bin="romcloud", selected_index=4)
         state.confirm_dashboard_selection()
         assert state.step == SETTINGS
+
+    def test_quick_sync_starts_previewing_operation(self):
+        state = SaveSyncScreenState(
+            romcloud_bin="romcloud",
+            selected_index=2,
+            status={"remote_configured": True},
+            remote_availability=REMOTE_AVAILABLE,
+        )
+        state.popen = _fake_popen_returning(
+            {
+                "ok": True,
+                "status": "unchanged",
+                "remote_generation": 3,
+                "cursor_before": 3,
+                "cursor_after": 3,
+                "processed_entries": 0,
+                "processed_groups": [],
+                "reason": "",
+            }
+        )
+
+        state.confirm_dashboard_selection()
+        _drain(state)
+
+        assert state.step == RESULT
+        assert state.result_mode == "quick-sync"
+        assert state.result["status"] == "unchanged"
+
+    def test_full_sync_starts_previewing_operation(self):
+        state = SaveSyncScreenState(
+            romcloud_bin="romcloud",
+            selected_index=3,
+            status={"remote_configured": True},
+            remote_availability=REMOTE_AVAILABLE,
+        )
+        state.popen = _fake_popen_returning(
+            {
+                "ok": True,
+                "report": {
+                    "uploaded": 1,
+                    "downloaded": 0,
+                    "conflicts": 0,
+                },
+                "quick_sync_ready": True,
+                "quick_sync_cursor_generation": 12,
+            }
+        )
+
+        state.confirm_dashboard_selection()
+        _drain(state)
+
+        assert state.step == RESULT
+        assert state.result_mode == "full-sync"
+        assert state.result["quick_sync_cursor_generation"] == 12
 
     def test_upload_starts_preview(self):
         state = SaveSyncScreenState(

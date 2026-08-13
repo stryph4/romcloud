@@ -1896,6 +1896,10 @@ def _savesync_body_lines(savesync_screen: SaveSyncScreenState) -> list[str]:
             lines.append(f"SaveSync: {savesync_screen.error}")
         return [*lines, "", *DASHBOARD_ITEMS]
     if step == PREVIEWING:
+        if savesync_screen.result_mode == "quick-sync":
+            return ["Running Quick Sync..."]
+        if savesync_screen.result_mode == "full-sync":
+            return ["Running Full Sync..."]
         return ["Comparing local and remote saves..."]
     if step == PREVIEW:
         summary = savesync_screen.preview_summary
@@ -1923,6 +1927,46 @@ def _savesync_body_lines(savesync_screen: SaveSyncScreenState) -> list[str]:
         if savesync_screen.error:
             return [f"Failed: {savesync_screen.error}", "Press Confirm to return."]
         record = savesync_screen.result
+        if savesync_screen.result_mode == "quick-sync":
+            status = str(record.get("status", ""))
+            if status == "requires-full-sync":
+                reason = str(record.get("reason", "")).strip()
+                detail = f" ({reason})" if reason else ""
+                return [
+                    f"Quick Sync requires Full Sync first{detail}.",
+                    "Press Confirm to return.",
+                ]
+            if status == "unchanged":
+                return [
+                    "Quick Sync: no remote SaveSync changes detected.",
+                    "Press Confirm to return.",
+                ]
+            if status == "deferred":
+                return [
+                    "Quick Sync deferred: active gameplay data is protected.",
+                    "Press Confirm to return.",
+                ]
+            if status == "reconciled":
+                generation = record.get("cursor_after", "unknown")
+                processed = int(record.get("processed_entries", 0))
+                return [
+                    f"Quick Sync complete through generation {generation}.",
+                    f"Journal entries processed: {processed}",
+                    "Press Confirm to return.",
+                ]
+            return ["Quick Sync complete.", "Press Confirm to return."]
+        if savesync_screen.result_mode == "full-sync":
+            report = record.get("report", {})
+            uploaded = int(report.get("uploaded", 0))
+            downloaded = int(report.get("downloaded", 0))
+            conflicts = int(report.get("conflicts", 0))
+            cursor = record.get("quick_sync_cursor_generation", "unknown")
+            return [
+                "Full Sync complete.",
+                f"Uploaded: {uploaded}  Downloaded: {downloaded}  Conflicts: {conflicts}",
+                f"Quick Sync cursor: {cursor}",
+                "Press Confirm to return.",
+            ]
         return [
             f"Done. {record.get('artifact_count', 0)} artifact(s).",
             "Press Confirm to return.",
