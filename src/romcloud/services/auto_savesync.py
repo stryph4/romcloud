@@ -188,10 +188,14 @@ class AutoSaveSyncCoordinator:
                 return
             if not force and not self._menu_pull_due():
                 return
+            group_layouts = {
+                group.group_id: group.layout_id
+                for group in self._service.get_state().groups
+            }
 
             def is_group_active(group_id: str) -> bool:
-                layouts = {group.group_id: group.layout_id for group in self._service.get_state().groups}
-                return layouts.get(group_id) in self._sessions.active_layout_ids(self._policy)
+                layout_id = group_layouts.get(group_id)
+                return layout_id in self._sessions.active_layout_ids(self._policy)
 
             def is_layout_active(layout_id: str) -> bool:
                 return layout_id in self._sessions.active_layout_ids(self._policy)

@@ -1,29 +1,3 @@
-"""Versioned, authenticated encryption for persisted SMB credentials.
-
-Two protection levels, both represented explicitly in the envelope and
-never conflated in code, logs, or UI text:
-
-- **Hardware-bound**: the encryption key is derived from one or more DMI
-  hardware-binding identifiers (see :mod:`romcloud.infrastructure.hardware_identity`)
-  plus a per-installation random salt. Copying ROMCloud's persisted storage
-  alone does not carry the hardware-binding material, so it is normally
-  insufficient to decrypt the password.
-- **Degraded/basic protection**: used only when no usable hardware-binding
-  identifier exists on this machine. The key is derived from
-  ``/etc/machine-id`` plus the same per-install salt — both of which live on
-  the same persistent storage as the ciphertext on Batocera, so this does
-  **not** meaningfully protect against an attacker with a full copy of that
-  storage. It still avoids plaintext-at-rest exposure to casual inspection,
-  partial backups, and accidental disclosure.
-
-Neither mode claims any protection against an attacker with live root
-access to the *running* device the credential was encrypted on — that is
-explicitly out of scope, as is true for any local secret-at-rest scheme.
-
-Only the *type names* of the hardware identifiers used (e.g.
-``"product_uuid+board_serial"``) are ever persisted — never their values.
-"""
-
 from __future__ import annotations
 
 import base64

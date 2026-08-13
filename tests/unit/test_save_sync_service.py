@@ -15,7 +15,11 @@ from romcloud.core.exceptions import (
     SaveSyncVerificationError,
 )
 from romcloud.core.models.game import Game, GameAsset
-from romcloud.core.models.savesync import SaveChangeKind, SaveDiff
+from romcloud.core.models.savesync import (
+    SaveChangeKind,
+    SaveDiff,
+    SaveGroupCondition,
+)
 from romcloud.core.save_ownership import ManagedSaveOwnershipPolicy
 from romcloud.core.storage import StorageProvider
 from romcloud.infrastructure import mount, save_transaction, save_tree, savesync_journal
@@ -1387,6 +1391,143 @@ class TestQuickSyncAndJournal:
 
         assert result.status == "unchanged"
         assert calls == {"local": 0, "remote": 0}
+
+    def test_unchanged_generation_with_local_dirty_group_uploads_targeted_layout(
+        self, tmp_path: Path, service: SaveSyncService, monkeypatch
+    ):
+        local = (
+            tmp_path
+            / "local-saves"
+            / "duckstation"
+            / "memcards"
+            / "_usr_share_duckstation_1.mcd"
+        )
+        remote = (
+            tmp_path
+            / "remote-saves"
+            / "duckstation"
+            / "memcards"
+            / "_usr_share_duckstation_1.mcd"
+        )
+        service.full_sync()
+        _write(local, b"stable-final-card")
+        service.mark_local_dirty(
+            "duckstation/memcards/_usr_share_duckstation_1.mcd"
+        )
+        cursor_before = service.get_state().quick_sync_cursor_generation
+        assert cursor_before is not None
+        scanned: list[tuple[str, frozenset[str]]] = []
+        original_local = service._scan_local_layouts
+        original_remote = service._scan_remote_layouts
+
+        def scan_local(layout_ids):
+            scanned.append(("local", layout_ids))
+            return original_local(layout_ids)
+
+        def scan_remote(layout_ids):
+            scanned.append(("remote", layout_ids))
+            return original_remote(layout_ids)
+
+        monkeypatch.setattr(service, "_scan_local_layouts", scan_local)
+        monkeypatch.setattr(service, "_scan_remote_layouts", scan_remote)
+
+        result = service.quick_sync()
+
+        assert result.status == "reconciled"
+        assert result.processed_entries == 0
+        assert remote.read_bytes() == b"stable-final-card"
+        assert scanned
+        assert all(
+            layouts == frozenset({"duckstation-memory-cards"})
+            for _side, layouts in scanned
+        )
+        group = service.get_state().groups[0]
+        assert group.condition is SaveGroupCondition.CLEAN
+        assert group.dirty_path_hints == ()
+        assert result.cursor_after == service.get_state().quick_sync_cursor_generation
+        assert result.cursor_after > cursor_before
+
+    def test_unchanged_generation_with_remote_dirty_group_downloads(
+        self, tmp_path: Path, service: SaveSyncService
+    ):
+        from romcloud.infrastructure import savesync_state as durable_state
+
+        local = tmp_path / "local-saves" / "psx" / "Game.srm"
+        remote = tmp_path / "remote-saves" / "psx" / "Game.srm"
+        _write(local, b"base")
+        service.full_sync()
+        _write(remote, b"remote-final")
+        group = service.selection_policy.group_for_path("psx/Game.srm")
+        assert group is not None
+        durable_state.SaveSyncStateStore(
+            tmp_path / "data" / "savesync-state.json"
+        ).mark_remote_dirty(
+            group_id=group.group_id,
+            layout_id=group.layout_id,
+            paths=("psx/Game.srm",),
+        )
+
+        result = service.quick_sync()
+
+        assert result.status == "reconciled"
+        assert local.read_bytes() == b"remote-final"
+        assert service.get_state().groups[0].condition is SaveGroupCondition.CLEAN
+
+    def test_unchanged_generation_with_both_dirty_preserves_conflict(
+        self, tmp_path: Path, service: SaveSyncService
+    ):
+        from romcloud.infrastructure import savesync_state as durable_state
+
+        local = tmp_path / "local-saves" / "psx" / "Game.srm"
+        remote = tmp_path / "remote-saves" / "psx" / "Game.srm"
+        _write(local, b"base")
+        service.full_sync()
+        _write(local, b"local-change")
+        _write(remote, b"remote-change")
+        service.mark_local_dirty("psx/Game.srm")
+        group = service.selection_policy.group_for_path("psx/Game.srm")
+        assert group is not None
+        durable_state.SaveSyncStateStore(
+            tmp_path / "data" / "savesync-state.json"
+        ).mark_remote_dirty(
+            group_id=group.group_id,
+            layout_id=group.layout_id,
+            paths=("psx/Game.srm",),
+        )
+
+        result = service.quick_sync()
+
+        assert result.status == "reconciled"
+        assert local.read_bytes() == b"local-change"
+        assert remote.read_bytes() == b"remote-change"
+        state = service.get_state()
+        assert state.groups[0].condition is SaveGroupCondition.CONFLICT
+        assert len(tuple(item for item in state.conflicts if not item.resolved)) == 1
+
+    def test_failed_pending_quick_sync_keeps_dirty_state_and_cursor(
+        self, tmp_path: Path, service: SaveSyncService, monkeypatch
+    ):
+        local = tmp_path / "local-saves" / "psx" / "Game.srm"
+        _write(local, b"base")
+        service.full_sync()
+        _write(local, b"local-change")
+        service.mark_local_dirty("psx/Game.srm")
+        cursor_before = service.get_state().quick_sync_cursor_generation
+        monkeypatch.setattr(
+            service,
+            "_reconcile",
+            lambda **kwargs: (_ for _ in ()).throw(
+                SaveSyncVerificationError("staging changed")
+            ),
+        )
+
+        with pytest.raises(SaveSyncVerificationError):
+            service.quick_sync()
+
+        state = service.get_state()
+        assert state.quick_sync_cursor_generation == cursor_before
+        assert state.groups[0].condition is SaveGroupCondition.LOCAL_DIRTY
+        assert state.groups[0].dirty_path_hints == ("psx/Game.srm",)
 
     def test_one_psx_group_journal_change_only_targets_that_group(
         self, tmp_path: Path, service: SaveSyncService, monkeypatch

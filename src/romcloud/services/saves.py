@@ -578,10 +578,28 @@ class SaveSyncService:
                 f"Remote save location is not reachable: {self._connectivity_root}"
             )
 
+        excluded_layouts = exclude_layout_ids or frozenset()
         with self._operation_lock():
             state = self._get_state_unlocked()
             cursor = state.quick_sync_cursor_generation
             known_groups = {group.group_id for group in state.groups}
+            group_layouts = {
+                group.group_id: group.layout_id for group in state.groups
+            }
+            pending_groups = frozenset(
+                group.group_id
+                for group in state.groups
+                if group.layout_id not in excluded_layouts
+                and self._layout_enabled(group.layout_id)
+                and (
+                    group.condition
+                    in {
+                        SaveGroupCondition.LOCAL_DIRTY,
+                        SaveGroupCondition.REMOTE_DIRTY,
+                    }
+                    or bool(group.dirty_path_hints)
+                )
+            )
             if not state.quick_sync_ready or cursor is None:
                 return SaveQuickSyncResult(
                     status="requires-full-sync",
@@ -600,7 +618,8 @@ class SaveSyncService:
                     reason="journal-untrustworthy",
                 )
             remote_generation = int(journal["generation"])
-            if remote_generation == cursor:
+            generation_unchanged = remote_generation == cursor
+            if generation_unchanged and not pending_groups:
                 return SaveQuickSyncResult(
                     status="unchanged",
                     remote_generation=remote_generation,
@@ -608,34 +627,44 @@ class SaveSyncService:
                     cursor_after=cursor,
                 )
             history = list(journal["history"])
-            first_retained = (
-                int(history[0]["generation"]) if history else remote_generation + 1
-            )
-            if cursor < first_retained - _QUICK_SYNC_HISTORY_REQUIRED:
-                return SaveQuickSyncResult(
-                    status="requires-full-sync",
-                    remote_generation=remote_generation,
-                    cursor_before=cursor,
-                    cursor_after=cursor,
-                    reason="journal-gap",
+            if generation_unchanged:
+                unseen: list[dict[str, object]] = []
+            else:
+                first_retained = (
+                    int(history[0]["generation"])
+                    if history
+                    else remote_generation + 1
                 )
-            unseen = [
-                entry for entry in history if int(entry["generation"]) > cursor
-            ]
-            if not unseen and remote_generation > cursor:
-                return SaveQuickSyncResult(
-                    status="requires-full-sync",
-                    remote_generation=remote_generation,
-                    cursor_before=cursor,
-                    cursor_after=cursor,
-                    reason="journal-history-incomplete",
-                )
+                if cursor < first_retained - _QUICK_SYNC_HISTORY_REQUIRED:
+                    return SaveQuickSyncResult(
+                        status="requires-full-sync",
+                        remote_generation=remote_generation,
+                        cursor_before=cursor,
+                        cursor_after=cursor,
+                        reason="journal-gap",
+                    )
+                unseen = [
+                    entry for entry in history if int(entry["generation"]) > cursor
+                ]
+                if not unseen and remote_generation > cursor:
+                    return SaveQuickSyncResult(
+                        status="requires-full-sync",
+                        remote_generation=remote_generation,
+                        cursor_before=cursor,
+                        cursor_after=cursor,
+                        reason="journal-history-incomplete",
+                    )
 
-        selected_groups, selected_layouts, reason = self._quick_sync_scope(
-            unseen,
-            known_groups=known_groups,
-            exclude_layout_ids=(exclude_layout_ids or frozenset()),
-        )
+        if generation_unchanged:
+            selected_groups: Optional[frozenset[str]] = pending_groups
+            selected_layouts: Optional[frozenset[str]] = None
+            reason = None
+        else:
+            selected_groups, selected_layouts, reason = self._quick_sync_scope(
+                unseen,
+                known_groups=known_groups,
+                exclude_layout_ids=excluded_layouts,
+            )
         if reason is not None:
             return SaveQuickSyncResult(
                 status="requires-full-sync",
@@ -644,6 +673,25 @@ class SaveSyncService:
                 cursor_after=cursor,
                 reason=reason,
             )
+
+        if pending_groups:
+            if selected_layouts is None:
+                selected_groups = frozenset(selected_groups or ()).union(
+                    pending_groups
+                )
+            else:
+                # An unknown journal group already requires layout-scoped
+                # discovery. Keep the union bounded to only journal-affected
+                # and durable-pending registered layouts.
+                group_scope = frozenset(selected_groups or ()).union(
+                    pending_groups
+                )
+                selected_layouts = selected_layouts.union(
+                    group_layouts[group_id]
+                    for group_id in group_scope
+                    if group_id in group_layouts
+                )
+                selected_groups = None
 
         if selected_groups == frozenset() and selected_layouts is None:
             with self._operation_lock():
@@ -686,19 +734,23 @@ class SaveSyncService:
 
         with self._operation_lock():
             state = self._get_state_unlocked()
+            cursor_after = max(
+                remote_generation,
+                state.quick_sync_cursor_generation or remote_generation,
+            )
             _write_state(
                 self._state_path,
                 replace(
                     state,
                     quick_sync_ready=True,
-                    quick_sync_cursor_generation=remote_generation,
+                    quick_sync_cursor_generation=cursor_after,
                 ),
             )
         return SaveQuickSyncResult(
             status="reconciled",
             remote_generation=remote_generation,
             cursor_before=cursor,
-            cursor_after=remote_generation,
+            cursor_after=cursor_after,
             processed_entries=len(unseen),
             processed_groups=tuple(sorted(selected_groups or frozenset())),
             report=report,

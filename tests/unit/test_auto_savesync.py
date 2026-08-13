@@ -895,6 +895,61 @@ def test_menu_tick_unchanged_journal_performs_no_save_layout_scan(
     assert calls == {"local": 0, "remote": 0}
 
 
+def test_menu_tick_unchanged_journal_drains_durable_local_dirty_group(
+    tmp_path: Path,
+):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    local = (
+        tmp_path
+        / "local"
+        / "duckstation"
+        / "memcards"
+        / "_usr_share_duckstation_1.mcd"
+    )
+    remote = (
+        tmp_path
+        / "remote"
+        / "duckstation"
+        / "memcards"
+        / "_usr_share_duckstation_1.mcd"
+    )
+    service.full_sync()
+    _write(local, b"durable-pending-card")
+    service.mark_local_dirty(
+        "duckstation/memcards/_usr_share_duckstation_1.mcd"
+    )
+
+    coordinator.menu_tick(force=True)
+
+    assert remote.read_bytes() == b"durable-pending-card"
+    group = service.get_state().groups[0]
+    assert group.condition is SaveGroupCondition.CLEAN
+    assert group.dirty_path_hints == ()
+
+
+def test_menu_tick_unchanged_journal_keeps_xemu_dirty_group_manual(
+    tmp_path: Path,
+):
+    provider = _Provider()
+    service = _service(tmp_path, provider, xbox_enabled=True)
+    coordinator = _coordinator(tmp_path, service)
+    local = tmp_path / "local" / "xbox" / "xbox_hdd.qcow2"
+    remote = tmp_path / "remote" / "xbox" / "xbox_hdd.qcow2"
+    _write(local, b"base")
+    service.full_sync()
+    _write(local, b"local-change")
+    service.mark_local_dirty("xbox/xbox_hdd.qcow2")
+
+    coordinator.menu_tick(force=True)
+
+    assert remote.read_bytes() == b"base"
+    group = service.get_state().groups[0]
+    assert group.condition is SaveGroupCondition.LOCAL_DIRTY
+    assert group.dirty_path_hints == ("xbox/xbox_hdd.qcow2",)
+
+
 def test_periodic_menu_tick_local_only_change_is_not_overwritten(tmp_path: Path):
     provider = _Provider()
     service = _service(tmp_path, provider)
