@@ -9,8 +9,9 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
+from romcloud.core.exceptions import SaveSyncVerificationError
 from romcloud.core.models.savesync import SaveGroupCondition
 from romcloud.core.save_selection import SaveSelectionPolicy
 from romcloud.infrastructure.logging import get_logger
@@ -18,18 +19,8 @@ from romcloud.services.saves import SaveSyncService
 
 log = get_logger("auto-savesync")
 _MENU_PULL_INTERVAL_SECONDS = 300.0
-
-_DOLPHIN_LAYOUTS = {
-    "gamecube": frozenset(
-        {"dolphin-gc-memory-card-images", "dolphin-gc-gci-saves"}
-    ),
-    "wii": frozenset({"dolphin-wii-title-saves"}),
-}
-_SYSTEM_ALIASES = {
-    "ps2": frozenset({"ps2", "pcsx2"}),
-    "psp": frozenset({"psp", "ppsspp"}),
-    "switch": frozenset({"switch", "yuzu"}),
-}
+_DEFAULT_STABILITY_CHECKS = 4
+_DEFAULT_STAGING_RETRIES = 2
 
 
 @dataclass(frozen=True)
@@ -43,25 +34,16 @@ class GameSession:
 
 
 def layout_ids_for_session(
-    policy: SaveSelectionPolicy, system: str, emulator: str = ""
+    policy: SaveSelectionPolicy,
+    system: str,
+    emulator: str = "",
+    core: str = "",
 ) -> frozenset[str]:
-    """Map Batocera lifecycle identity to existing registry layouts only."""
-    system_key = system.strip().lower()
-    if system_key == "xbox":
-        return frozenset()
-    if system_key in _DOLPHIN_LAYOUTS:
-        candidates = _DOLPHIN_LAYOUTS[system_key]
-        return frozenset(
-            layout.layout_id for layout in policy.layouts if layout.layout_id in candidates
-        )
-    systems = set(_SYSTEM_ALIASES.get(system_key, frozenset({system_key})))
-    emulator_key = emulator.strip().lower()
-    if "duckstation" in emulator_key:
-        systems.add("duckstation")
-    return frozenset(
-        layout.layout_id
-        for layout in policy.layouts
-        if layout.system in systems and layout.layout_id != "xemu-hdd"
+    """Delegate Batocera lifecycle targeting to the positive registry."""
+    return policy.layout_ids_for_lifecycle(
+        system=system,
+        emulator=emulator,
+        core=core,
     )
 
 
@@ -98,22 +80,34 @@ class ActiveSessionStore:
         return session
 
     def active_layout_ids(self, policy: SaveSelectionPolicy) -> frozenset[str]:
-        if not self._root.is_dir() or self._root.is_symlink():
-            return frozenset()
         result: set[str] = set()
+        for session in self._active_sessions():
+            result.update(
+                layout_ids_for_session(
+                    policy, session.system, session.emulator, session.core
+                )
+            )
+        return frozenset(result)
+
+    def has_active_session(self) -> bool:
+        """Return whether any current Batocera gameplay marker exists."""
+        return next(iter(self._active_sessions()), None) is not None
+
+    def _active_sessions(self) -> tuple[GameSession, ...]:
+        if not self._root.is_dir() or self._root.is_symlink():
+            return ()
         try:
             entries = tuple(self._root.iterdir())
         except OSError:
-            return frozenset()
+            return ()
+        result: list[GameSession] = []
         for path in entries:
             if path.suffix != ".json" or path.is_symlink() or not path.is_file():
                 continue
             session = self._read(path)
             if session is not None:
-                result.update(
-                    layout_ids_for_session(policy, session.system, session.emulator)
-                )
-        return frozenset(result)
+                result.append(session)
+        return tuple(result)
 
     def _read(self, path: Path) -> Optional[GameSession]:
         try:
@@ -146,13 +140,22 @@ class AutoSaveSyncCoordinator:
         enabled: bool,
         policy: Optional[SaveSelectionPolicy] = None,
         quiet_seconds: float = 1.0,
+        stability_checks: int = _DEFAULT_STABILITY_CHECKS,
+        staging_retries: int = _DEFAULT_STAGING_RETRIES,
+        enabled_check: Optional[Callable[[], bool]] = None,
     ) -> None:
         self._service = service
         self._data_root = Path(data_root)
         self._policy = policy or (service.selection_policy if enabled else None)
         self._sessions = ActiveSessionStore(self._data_root)
-        self._quiet_seconds = max(0.0, quiet_seconds)
+        # ``quiet_seconds`` is retained as a compatibility-facing name, but is
+        # now the interval between concrete content observations rather than a
+        # blind post-exit delay.
+        self._stability_interval = max(0.0, quiet_seconds)
+        self._stability_checks = max(1, stability_checks)
+        self._staging_retries = max(0, staging_retries)
         self._enabled = enabled
+        self._enabled_check = enabled_check
         self._menu_state_path = self._data_root / "savesync-menu-pull.json"
 
     def game_start(self, *, system: str, emulator: str, core: str, rom: str) -> None:
@@ -164,9 +167,7 @@ class AutoSaveSyncCoordinator:
         if not self._enabled:
             return
         session = self._sessions.stop(system=system, rom=rom)
-        if self._quiet_seconds:
-            time.sleep(self._quiet_seconds)
-        layout_ids = layout_ids_for_session(self._policy, system, emulator)
+        layout_ids = layout_ids_for_session(self._policy, system, emulator, core)
         if not layout_ids:
             return
         changed_since = session.started_at if session is not None else time.time() - 5.0
@@ -183,7 +184,7 @@ class AutoSaveSyncCoordinator:
         if not lock.acquire():
             return
         try:
-            if self._sessions.active_layout_ids(self._policy):
+            if self._sessions.has_active_session():
                 return
             if not force and not self._menu_pull_due():
                 return
@@ -199,7 +200,7 @@ class AutoSaveSyncCoordinator:
                 self._service.quick_sync(
                     is_group_active=is_group_active,
                     is_layout_active=is_layout_active,
-                    exclude_layout_ids=frozenset({"xemu-hdd"}),
+                    exclude_layout_ids=self._policy.lifecycle_disabled_layout_ids(),
                 )
             except Exception:  # noqa: BLE001 - menu pull is best-effort
                 log.warning("Periodic SaveSync quick pull deferred", exc_info=True)
@@ -209,23 +210,40 @@ class AutoSaveSyncCoordinator:
             lock.release()
 
     def menu_loop(self) -> None:
-        if not self._enabled:
+        if not self._menu_loop_enabled():
             return
         loop_lock = _AutoWorkerLock(self._data_root / ".savesync-menu-loop.lock")
         if not loop_lock.acquire():
             return
         try:
+            log.info("Auto SaveSync periodic menu loop started")
             self.menu_tick(force=True)
             while True:
-                if self._sessions.active_layout_ids(self._policy):
-                    return
                 for _ in range(int(_MENU_PULL_INTERVAL_SECONDS)):
-                    if self._sessions.active_layout_ids(self._policy):
-                        return
                     time.sleep(1.0)
+                if not self._menu_loop_enabled():
+                    log.info(
+                        "Auto SaveSync periodic menu loop stopped: Auto Sync disabled"
+                    )
+                    return
                 self.menu_tick(force=False)
         finally:
             loop_lock.release()
+
+    def _menu_loop_enabled(self) -> bool:
+        if not self._enabled:
+            return False
+        if self._enabled_check is None:
+            return True
+        try:
+            return bool(self._enabled_check())
+        except Exception:  # noqa: BLE001 - fail closed for resident work
+            log.warning(
+                "Auto SaveSync periodic menu loop stopped: configuration "
+                "could not be refreshed",
+                exc_info=True,
+            )
+            return False
 
     def _menu_pull_due(self) -> bool:
         last = self._read_menu_pull_timestamp()
@@ -271,7 +289,7 @@ class AutoSaveSyncCoordinator:
                 pending = frozenset(
                     group.group_id
                     for group in state.groups
-                    if group.layout_id != "xemu-hdd"
+                    if self._policy.is_lifecycle_enabled(group.layout_id)
                     and (
                         group.condition is SaveGroupCondition.LOCAL_DIRTY
                         or bool(group.dirty_path_hints)
@@ -293,9 +311,36 @@ class AutoSaveSyncCoordinator:
 
                 before = pending
                 try:
-                    report = self._service.reconcile_pending_groups(
-                        pending, is_group_active=is_active
-                    )
+                    if not self._wait_until_stable(pending):
+                        log.warning(
+                            "Auto SaveSync deferred: local save data did not "
+                            "stabilize after %d bounded checks; durable dirty "
+                            "state retained",
+                            self._stability_checks,
+                        )
+                        return
+                    report = None
+                    for staging_attempt in range(self._staging_retries + 1):
+                        try:
+                            report = self._service.reconcile_pending_groups(
+                                pending, is_group_active=is_active
+                            )
+                            break
+                        except SaveSyncVerificationError:
+                            if staging_attempt >= self._staging_retries:
+                                raise
+                            log.warning(
+                                "Auto SaveSync detected save data changing during "
+                                "staging; waiting for stability before retry %d/%d",
+                                staging_attempt + 1,
+                                self._staging_retries,
+                            )
+                            if not self._wait_until_stable(pending):
+                                log.warning(
+                                    "Auto SaveSync deferred: local save data remained "
+                                    "unstable; durable dirty state retained"
+                                )
+                                return
                 except Exception:  # noqa: BLE001 - background work stays quiet
                     log.warning(
                         "Auto SaveSync pass deferred; durable dirty state retained",
@@ -308,7 +353,7 @@ class AutoSaveSyncCoordinator:
                 after = frozenset(
                     group.group_id
                     for group in after_state.groups
-                    if group.layout_id != "xemu-hdd"
+                    if self._policy.is_lifecycle_enabled(group.layout_id)
                     and (
                         group.condition is SaveGroupCondition.LOCAL_DIRTY
                         or bool(group.dirty_path_hints)
@@ -318,6 +363,25 @@ class AutoSaveSyncCoordinator:
                     return
         finally:
             lock.release()
+
+    def _wait_until_stable(self, group_ids: frozenset[str]) -> bool:
+        """Require two equal local hash/size observations within a bound."""
+        unavailable = object()
+        previous: object = unavailable
+        for observation in range(self._stability_checks + 1):
+            try:
+                current = self._service.observe_local_groups(group_ids)
+            except OSError:
+                # An emulator may atomically replace a save between discovery
+                # and hashing. Treat that bounded observation as unstable.
+                previous = unavailable
+            else:
+                if previous is not unavailable and current == previous:
+                    return True
+                previous = current
+            if observation < self._stability_checks and self._stability_interval:
+                time.sleep(self._stability_interval)
+        return False
 
 
 class _AutoWorkerLock:

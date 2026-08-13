@@ -7,6 +7,7 @@ from pathlib import Path
 import click
 
 from romcloud.cli.context import get_container
+from romcloud.infrastructure.config import load_config
 from romcloud.infrastructure.logging import get_logger
 from romcloud.services.auto_savesync import AutoSaveSyncCoordinator
 
@@ -31,6 +32,9 @@ def _coordinator(ctx: click.Context) -> AutoSaveSyncCoordinator:
         container.saves,
         data_root=Path(container.config.data_path),
         enabled=container.config.saves.auto_sync_enabled,
+        enabled_check=lambda: load_config(
+            ctx.obj["config_path"]
+        ).saves.auto_sync_enabled,
     )
 
 

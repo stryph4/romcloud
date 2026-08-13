@@ -116,6 +116,7 @@ def test_disabled_coordinator_is_an_immediate_filesystem_and_service_noop(
         system="psx", emulator="libretro", core="pcsx", rom="Game.chd"
     )
     coordinator.drain_pending()
+    coordinator.menu_loop()
 
     assert time.monotonic() - started < 0.1
     assert not (tmp_path / "data").exists()
@@ -208,6 +209,12 @@ def test_lifecycle_mapping_is_registry_bounded_and_xemu_is_never_automatic():
     assert layout_ids_for_session(policy, "wii") == frozenset(
         {"dolphin-wii-title-saves"}
     )
+    assert layout_ids_for_session(policy, "psx", "duckstation") == frozenset(
+        {"duckstation-memory-cards", "duckstation-root-sav"}
+    )
+    assert layout_ids_for_session(policy, "psx", "libretro", "pcsx-rearmed") == (
+        frozenset({"retroarch-root-psx"})
+    )
     assert layout_ids_for_session(policy, "xbox", "xemu") == frozenset()
     assert layout_ids_for_session(policy, "unknown-system") == frozenset()
 
@@ -225,6 +232,119 @@ def test_game_exit_detects_first_save_and_uploads_only_that_registry_group(tmp_p
 
     assert (tmp_path / "remote" / "psx" / "Game.srm").read_bytes() == b"new-save"
     assert all(not group.dirty_path_hints for group in service.get_state().groups)
+
+
+def test_game_exit_retries_after_duckstation_save_changes_during_staging(
+    tmp_path: Path, monkeypatch, caplog
+):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    local = (
+        tmp_path
+        / "local"
+        / "duckstation"
+        / "memcards"
+        / "_usr_share_duckstation_1.mcd"
+    )
+    remote = (
+        tmp_path
+        / "remote"
+        / "duckstation"
+        / "memcards"
+        / "_usr_share_duckstation_1.mcd"
+    )
+    _write(local, b"baseline")
+    service.reconcile()
+    coordinator.game_start(
+        system="psx", emulator="duckstation", core="duckstation", rom="Game.chd"
+    )
+    _write(local, b"first shutdown write")
+
+    original_prepare = save_transaction.prepare_transaction
+    prepare_calls = 0
+
+    def change_once_after_staging(*args, **kwargs):
+        nonlocal prepare_calls
+        transaction = original_prepare(*args, **kwargs)
+        prepare_calls += 1
+        if prepare_calls == 1:
+            _write(local, b"stable final bytes")
+        return transaction
+
+    monkeypatch.setattr(
+        save_transaction, "prepare_transaction", change_once_after_staging
+    )
+
+    coordinator.game_stop(
+        system="psx", emulator="duckstation", core="duckstation", rom="Game.chd"
+    )
+
+    assert prepare_calls == 2
+    assert local.read_bytes() == b"stable final bytes"
+    assert remote.read_bytes() == b"stable final bytes"
+    assert all(not group.dirty_path_hints for group in service.get_state().groups)
+    assert "save data changing during staging" in caplog.text
+
+
+def test_unstable_local_group_is_bounded_and_keeps_dirty_state(
+    tmp_path: Path, monkeypatch, caplog
+):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    path = tmp_path / "local" / "psx" / "Game.srm"
+    _write(path, b"base")
+    service.reconcile()
+    _write(path, b"changed")
+    service.mark_local_dirty("psx/Game.srm")
+    provider.reachability_checks = 0
+    observations = 0
+
+    def never_stable(group_ids):
+        nonlocal observations
+        observations += 1
+        return {"observation": observations}
+
+    monkeypatch.setattr(service, "observe_local_groups", never_stable)
+    coordinator = AutoSaveSyncCoordinator(
+        service,
+        data_root=tmp_path / "data",
+        enabled=True,
+        policy=DEFAULT_SAVE_SELECTION_POLICY,
+        quiet_seconds=0,
+        stability_checks=3,
+    )
+
+    coordinator.drain_pending()
+
+    assert observations == 4
+    assert provider.reachability_checks == 0
+    assert (tmp_path / "remote" / "psx" / "Game.srm").read_bytes() == b"base"
+    assert service.get_state().groups[0].dirty_path_hints == ("psx/Game.srm",)
+    assert "did not stabilize after 3 bounded checks" in caplog.text
+
+
+def test_auto_stability_and_verification_do_not_scan_unrelated_layouts(
+    tmp_path: Path, monkeypatch
+):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    local = tmp_path / "local" / "psx" / "Game.srm"
+    remote = tmp_path / "remote" / "psx" / "Game.srm"
+    _write(local, b"base")
+    service.reconcile()
+    _write(local, b"changed")
+    service.mark_local_dirty("psx/Game.srm")
+
+    def unexpected_full_scan():
+        raise AssertionError("targeted Auto SaveSync used an all-layout scan")
+
+    monkeypatch.setattr(service, "_scan_local", unexpected_full_scan)
+    monkeypatch.setattr(service, "_scan_remote", unexpected_full_scan)
+
+    _coordinator(tmp_path, service).drain_pending()
+
+    assert remote.read_bytes() == b"changed"
 
 
 def test_active_game_group_is_deferred_then_processed_after_exit(tmp_path: Path):
@@ -576,6 +696,203 @@ def test_periodic_menu_tick_remote_only_change_auto_pulls(tmp_path: Path):
     coordinator.menu_tick(force=True)
 
     assert local.read_bytes() == b"remote-new"
+
+
+def test_menu_loop_survives_multiple_polling_intervals(tmp_path: Path, monkeypatch):
+    from romcloud.services import auto_savesync as auto_savesync_service
+
+    class StopLoop(Exception):
+        pass
+
+    coordinator = _coordinator(tmp_path, _service(tmp_path, _Provider()))
+    ticks: list[bool] = []
+    sleeps = 0
+
+    monkeypatch.setattr(auto_savesync_service, "_MENU_PULL_INTERVAL_SECONDS", 2)
+    monkeypatch.setattr(
+        coordinator,
+        "menu_tick",
+        lambda *, force=False: ticks.append(force),
+    )
+
+    def bounded_sleep(_seconds):
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps == 5:
+            raise StopLoop
+
+    monkeypatch.setattr(auto_savesync_service.time, "sleep", bounded_sleep)
+
+    with pytest.raises(StopLoop):
+        coordinator.menu_loop()
+
+    assert ticks == [True, False, False]
+
+
+def test_only_one_menu_loop_holds_the_resident_lock(tmp_path: Path, monkeypatch):
+    from romcloud.services import auto_savesync as auto_savesync_service
+
+    class StopLoop(Exception):
+        pass
+
+    service = _service(tmp_path, _Provider())
+    first = _coordinator(tmp_path, service)
+    second = _coordinator(tmp_path, service)
+    sleeping = threading.Event()
+    release = threading.Event()
+    errors: list[BaseException] = []
+    first_ticks: list[bool] = []
+    second_ticks: list[bool] = []
+    monkeypatch.setattr(auto_savesync_service, "_MENU_PULL_INTERVAL_SECONDS", 1)
+    monkeypatch.setattr(
+        first, "menu_tick", lambda *, force=False: first_ticks.append(force)
+    )
+    monkeypatch.setattr(
+        second, "menu_tick", lambda *, force=False: second_ticks.append(force)
+    )
+
+    def blocking_sleep(_seconds):
+        sleeping.set()
+        if not release.wait(timeout=2):
+            raise AssertionError("resident loop test timed out")
+        raise StopLoop
+
+    monkeypatch.setattr(auto_savesync_service.time, "sleep", blocking_sleep)
+
+    def run_first():
+        try:
+            first.menu_loop()
+        except StopLoop:
+            pass
+        except BaseException as exc:  # pragma: no cover - assertion handoff
+            errors.append(exc)
+
+    thread = threading.Thread(target=run_first)
+    thread.start()
+    assert sleeping.wait(timeout=2)
+
+    second.menu_loop()
+    release.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert first_ticks == [True]
+    assert second_ticks == []
+
+
+def test_resident_menu_loop_exits_without_another_tick_when_disabled(
+    tmp_path: Path, monkeypatch
+):
+    from romcloud.services import auto_savesync as auto_savesync_service
+
+    service = _service(tmp_path, _Provider())
+    enabled = True
+    ticks: list[bool] = []
+    coordinator = AutoSaveSyncCoordinator(
+        service,
+        data_root=tmp_path / "data",
+        enabled=True,
+        policy=DEFAULT_SAVE_SELECTION_POLICY,
+        quiet_seconds=0,
+        enabled_check=lambda: enabled,
+    )
+    sleeps = 0
+    monkeypatch.setattr(auto_savesync_service, "_MENU_PULL_INTERVAL_SECONDS", 2)
+    monkeypatch.setattr(
+        coordinator,
+        "menu_tick",
+        lambda *, force=False: ticks.append(force),
+    )
+
+    def disable_during_interval(_seconds):
+        nonlocal enabled, sleeps
+        sleeps += 1
+        if sleeps == 2:
+            enabled = False
+
+    monkeypatch.setattr(
+        auto_savesync_service.time, "sleep", disable_during_interval
+    )
+
+    coordinator.menu_loop()
+
+    assert sleeps == 2
+    assert ticks == [True]
+
+
+def test_menu_loop_suppresses_gameplay_then_resumes_after_game_stop(
+    tmp_path: Path, monkeypatch
+):
+    from romcloud.services import auto_savesync as auto_savesync_service
+
+    class StopLoop(Exception):
+        pass
+
+    service = _service(tmp_path, _Provider())
+    coordinator = _coordinator(tmp_path, service)
+    quick_calls = 0
+    sleeps = 0
+    monkeypatch.setattr(auto_savesync_service, "_MENU_PULL_INTERVAL_SECONDS", 2)
+    monkeypatch.setattr(coordinator, "_menu_pull_due", lambda: True)
+
+    def counted_quick_sync(**kwargs):
+        nonlocal quick_calls
+        quick_calls += 1
+        return None
+
+    monkeypatch.setattr(service, "quick_sync", counted_quick_sync)
+    coordinator.game_start(
+        system="unknown-system", emulator="unknown", core="unknown", rom="Game.rom"
+    )
+
+    def lifecycle_sleep(_seconds):
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps == 3:
+            coordinator.game_stop(
+                system="unknown-system",
+                emulator="unknown",
+                core="unknown",
+                rom="Game.rom",
+            )
+        if sleeps == 5:
+            raise StopLoop
+
+    monkeypatch.setattr(auto_savesync_service.time, "sleep", lifecycle_sleep)
+
+    with pytest.raises(StopLoop):
+        coordinator.menu_loop()
+
+    # The initial and first interval ticks were suppressed during gameplay;
+    # the next interval after gameStop resumed the existing periodic pull.
+    assert quick_calls == 1
+
+
+def test_menu_tick_unchanged_journal_performs_no_save_layout_scan(
+    tmp_path: Path, monkeypatch
+):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    _write(tmp_path / "local" / "psx" / "Game.srm", b"base")
+    service.full_sync()
+    calls = {"local": 0, "remote": 0}
+
+    def fail_local(*args, **kwargs):
+        calls["local"] += 1
+        raise AssertionError("unchanged menu pull must not scan local layouts")
+
+    def fail_remote(*args, **kwargs):
+        calls["remote"] += 1
+        raise AssertionError("unchanged menu pull must not scan remote layouts")
+
+    monkeypatch.setattr(service, "_scan_automatic_local", fail_local)
+    monkeypatch.setattr(service, "_scan_automatic_remote", fail_remote)
+
+    coordinator.menu_tick(force=True)
+
+    assert calls == {"local": 0, "remote": 0}
 
 
 def test_periodic_menu_tick_local_only_change_is_not_overwritten(tmp_path: Path):

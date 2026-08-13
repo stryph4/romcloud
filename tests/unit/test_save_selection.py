@@ -7,6 +7,7 @@ from romcloud.core.save_selection import (
     XBOX_HDD_RELATIVE_PATH,
     XBOX_SYSTEM,
     YUZU_ACCOUNT_SAVE_GLOB,
+    SaveLayout,
     SaveSelectionPolicy,
     SaveSystemRule,
     RPCS3_INSTALLED_GAMES_GROUP,
@@ -430,6 +431,53 @@ class TestPositiveLayoutRegistry:
             layout.system == "ps3" and "/game" in layout.root_pattern
             for layout in layouts
         )
+
+    def test_lifecycle_identity_resolution_is_declarative_and_fail_closed(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+
+        assert policy.layout_ids_for_lifecycle(
+            system="psx", emulator="duckstation", core="duckstation"
+        ) == frozenset(
+            {"duckstation-memory-cards", "duckstation-root-sav"}
+        )
+        assert policy.layout_ids_for_lifecycle(
+            system="psx", emulator="libretro", core="pcsx-rearmed"
+        ) == frozenset({"retroarch-root-psx"})
+        assert policy.layout_ids_for_lifecycle(system="gamecube") == frozenset(
+            {"dolphin-gc-memory-card-images", "dolphin-gc-gci-saves"}
+        )
+        assert policy.layout_ids_for_lifecycle(
+            system="xbox", emulator="xemu"
+        ) == frozenset()
+        assert policy.layout_ids_for_lifecycle(
+            system="unknown", emulator="unknown", core="unknown"
+        ) == frozenset()
+
+    def test_new_emulator_target_requires_only_layout_registry_data(self):
+        layout = SaveLayout(
+            layout_id="example-emulator-saves",
+            system="example-storage",
+            root_pattern="profiles",
+            recursive=True,
+            eligible_files=("*.sav",),
+            lifecycle_systems=("example-console",),
+            lifecycle_emulators=("example-emulator",),
+            lifecycle_cores=("example-core",),
+        )
+        policy = SaveSelectionPolicy(layouts=(layout,))
+
+        expected = frozenset({"example-emulator-saves"})
+        assert policy.layout_ids_for_lifecycle(
+            system="example-console", emulator="example-emulator"
+        ) == expected
+        assert policy.layout_ids_for_lifecycle(
+            system="example-console", core="example-core"
+        ) == expected
+        assert policy.layout_ids_for_lifecycle(system="example-console") == frozenset()
+        assert policy.layout_ids_for_lifecycle(
+            system="other", emulator="example-emulator"
+        ) == frozenset()
+        assert policy.layout_ids_for_lifecycle(system="other") == frozenset()
 
     def test_stable_root_save_group_ignores_state_suffix(self):
         policy = DEFAULT_SAVE_SELECTION_POLICY

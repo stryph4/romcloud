@@ -233,7 +233,8 @@ class SaveSyncService:
         allowed_layouts = frozenset(
             layout_id
             for layout_id in layout_ids
-            if layout_id != "xemu-hdd" and self._layout_enabled(layout_id)
+            if self._policy.is_lifecycle_enabled(layout_id)
+            and self._layout_enabled(layout_id)
         )
         if not allowed_layouts:
             return self.get_state()
@@ -283,6 +284,35 @@ class SaveSyncService:
             if next_state != state:
                 _write_state(self._state_path, next_state)
             return next_state
+
+    def observe_local_groups(
+        self, group_ids: frozenset[str]
+    ) -> dict[str, SaveArtifact]:
+        """Hash only the registered local layouts containing ``group_ids``.
+
+        This is an advisory source-stability observation for the detached
+        Auto SaveSync worker. Reconciliation still performs its authoritative
+        preflight and post-staging verification under the operation lock.
+        No provider or remote path is accessed here.
+        """
+        if not group_ids:
+            return {}
+        state = self.get_state()
+        group_layouts = {
+            group.group_id: group.layout_id for group in state.groups
+        }
+        layout_ids = frozenset(
+            layout_id
+            for group_id in group_ids
+            for layout_id in [group_layouts.get(group_id)]
+            if layout_id is not None
+            and self._policy.is_lifecycle_enabled(layout_id)
+            and self._layout_enabled(layout_id)
+        )
+        if not layout_ids:
+            return {}
+        report = self._scan_local_layouts(layout_ids)
+        return _manifest_for_groups(report.artifacts, group_ids, self._policy)
 
     def acknowledge_conflict(self, conflict_id: str) -> SaveSyncState:
         """Record Review-Later acknowledgement without resolving a conflict."""
@@ -817,6 +847,7 @@ class SaveSyncService:
             )
             self._recover()
             state = self._get_state_unlocked()
+            verification_layout_ids: Optional[frozenset[str]] = None
             if selected_layout_ids is not None:
                 local_report = self._scan_local_layouts(selected_layout_ids)
                 remote_report = self._scan_remote_layouts(selected_layout_ids)
@@ -832,6 +863,7 @@ class SaveSyncService:
                     for layout_id in [group_layout_map.get(group_id)]
                     if layout_id is not None and self._layout_enabled(layout_id)
                 )
+                verification_layout_ids = scoped_layouts
                 if scoped_layouts:
                     local_report = self._automatic_report(
                         self._scan_local_layouts(scoped_layouts)
@@ -942,8 +974,16 @@ class SaveSyncService:
                     if selected_views
                     else None
                 )
-                current_local = self._scan_automatic_local()
-                current_remote = self._scan_automatic_remote()
+                if verification_layout_ids is None:
+                    current_local = self._scan_automatic_local()
+                    current_remote = self._scan_automatic_remote()
+                else:
+                    current_local = self._automatic_report(
+                        self._scan_local_layouts(verification_layout_ids)
+                    )
+                    current_remote = self._automatic_report(
+                        self._scan_remote_layouts(verification_layout_ids)
+                    )
                 if (
                     current_local.artifacts != complete_local
                     or current_remote.artifacts != complete_remote
@@ -967,8 +1007,16 @@ class SaveSyncService:
                     self._apply_selected_transaction(
                         transaction, tuple(destination_views)
                     )
-                final_local_report = self._scan_automatic_local()
-                final_remote_report = self._scan_automatic_remote()
+                if verification_layout_ids is None:
+                    final_local_report = self._scan_automatic_local()
+                    final_remote_report = self._scan_automatic_remote()
+                else:
+                    final_local_report = self._automatic_report(
+                        self._scan_local_layouts(verification_layout_ids)
+                    )
+                    final_remote_report = self._automatic_report(
+                        self._scan_remote_layouts(verification_layout_ids)
+                    )
                 if (
                     final_local_report.artifacts
                     != (

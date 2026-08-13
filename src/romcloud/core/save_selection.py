@@ -88,6 +88,10 @@ class SaveLayout:
     group_by: str = "root_stem"
     requires_opt_in: bool = False
     default_enabled: bool = True
+    lifecycle_systems: tuple[str, ...] = ()
+    lifecycle_emulators: tuple[str, ...] = ()
+    lifecycle_cores: tuple[str, ...] = ()
+    lifecycle_enabled: bool = True
     description: str = ""
 
 
@@ -177,20 +181,28 @@ def _layout(
     group_by: str = "root_stem",
     requires_opt_in: bool = False,
     default_enabled: bool = True,
+    lifecycle_systems: tuple[str, ...] = (),
+    lifecycle_emulators: tuple[str, ...] = (),
+    lifecycle_cores: tuple[str, ...] = (),
+    lifecycle_enabled: bool = True,
     description: str = "",
 ) -> SaveLayout:
     return SaveLayout(
-        layout_id,
-        system,
-        root,
-        recursive,
-        files,
-        exclusions,
-        shared,
-        group_by,
-        requires_opt_in,
-        default_enabled,
-        description,
+        layout_id=layout_id,
+        system=system,
+        root_pattern=root,
+        recursive=recursive,
+        eligible_files=files,
+        exclusions=exclusions,
+        shared=shared,
+        group_by=group_by,
+        requires_opt_in=requires_opt_in,
+        default_enabled=default_enabled,
+        lifecycle_systems=lifecycle_systems,
+        lifecycle_emulators=lifecycle_emulators,
+        lifecycle_cores=lifecycle_cores,
+        lifecycle_enabled=lifecycle_enabled,
+        description=description,
     )
 
 
@@ -237,29 +249,47 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
         exclusions=("*_resume.sav",),
         shared=True,
         group_by="layout",
+        lifecycle_systems=("psx",),
+        lifecycle_emulators=("duckstation",),
+        lifecycle_cores=("duckstation",),
     ),
-    _layout("duckstation-root-sav", "duckstation", files=("*.sav",), exclusions=("*_resume.sav",)),
+    _layout(
+        "duckstation-root-sav",
+        "duckstation",
+        files=("*.sav",),
+        exclusions=("*_resume.sav",),
+        lifecycle_systems=("psx",),
+        lifecycle_emulators=("duckstation",),
+        lifecycle_cores=("duckstation",),
+    ),
     _layout(
         "pcsx2-legacy-memory-cards", "pcsx2", files=("Mcd*.ps2",),
-        shared=True, group_by="layout",
+        shared=True, group_by="layout", lifecycle_systems=("ps2", "pcsx2"),
     ),
     _layout(
         "pcsx2-legacy-states", "pcsx2", root="sstates", recursive=True,
-        shared=True, group_by="layout",
+        shared=True, group_by="layout", lifecycle_systems=("ps2", "pcsx2"),
     ),
     _layout(
         "pcsx2-memory-cards", "ps2", root="pcsx2", files=("Mcd*.ps2",),
-        shared=True, group_by="layout",
+        shared=True, group_by="layout", lifecycle_systems=("ps2", "pcsx2"),
     ),
     _layout(
         "pcsx2-states", "ps2", root="pcsx2/sstates", recursive=True,
-        shared=True, group_by="layout",
+        shared=True, group_by="layout", lifecycle_systems=("ps2", "pcsx2"),
     ),
     _layout(
         "ppsspp-savedata", "ppsspp", root="PSP/SAVEDATA", recursive=True,
-        group_by="first_descendant",
+        group_by="first_descendant", lifecycle_systems=("psp", "ppsspp"),
     ),
-    _layout("ppsspp-states", "ppsspp", root="PPSSPP_STATE", recursive=True, group_by="root_stem"),
+    _layout(
+        "ppsspp-states",
+        "ppsspp",
+        root="PPSSPP_STATE",
+        recursive=True,
+        group_by="root_stem",
+        lifecycle_systems=("psp", "ppsspp"),
+    ),
     _layout(
         "rpcs3-savedata",
         "ps3",
@@ -305,6 +335,7 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
         root="0000000000000000/{hex32}/{hex16}",
         recursive=True,
         group_by="root",
+        lifecycle_systems=("switch", "yuzu"),
         description="Yuzu user/title saves; NAND, keys, cache, shaders and config omitted",
     ),
     _layout(
@@ -314,6 +345,7 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
         files=_DOLPHIN_GC_MEMORY_CARD_FILES,
         shared=True,
         group_by="root_stem",
+        lifecycle_systems=("gamecube",),
         description="Opaque Dolphin GameCube memory-card images",
     ),
     _layout(
@@ -322,6 +354,7 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
         root="GC/{dolphin_gc_region}/{dolphin_gc_card}",
         files=("*.gci",),
         group_by="root_file",
+        lifecycle_systems=("gamecube",),
         description="Dolphin GCI folder-card saves, one physical GCI per conflict unit",
     ),
     _layout(
@@ -330,6 +363,7 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
         root="Wii/title/{dolphin_wii_save_type}/{hex8}/data",
         recursive=True,
         group_by="root",
+        lifecycle_systems=("wii",),
         description="Per-title Dolphin Wii save data; other NAND content omitted",
     ),
     _layout(
@@ -340,6 +374,7 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
         group_by="layout",
         requires_opt_in=True,
         default_enabled=False,
+        lifecycle_enabled=False,
         description="Whole opaque xemu HDD image",
     ),
 )
@@ -497,6 +532,69 @@ class SaveSelectionPolicy:
 
     def layout(self, layout_id: str) -> SaveLayout:
         return self._by_id[layout_id]
+
+    def layout_ids_for_lifecycle(
+        self, *, system: str, emulator: str = "", core: str = ""
+    ) -> frozenset[str]:
+        """Resolve a Batocera lifecycle identity to registered layouts.
+
+        Emulator/core selectors are more specific than the system fallback.
+        Every returned ID still names a positive layout in this policy; an
+        unknown identity or a manual-only layout therefore fails closed.
+        """
+        system_key = system.strip().casefold()
+        emulator_key = emulator.strip().casefold()
+        core_key = core.strip().casefold()
+        layouts = tuple(
+            layout for layout in self._layouts if layout.lifecycle_enabled
+        )
+        specific = tuple(
+            layout
+            for layout in layouts
+            if (
+                not layout.lifecycle_systems
+                or system_key
+                in {value.casefold() for value in layout.lifecycle_systems}
+            )
+            and (
+                (
+                    emulator_key
+                    and emulator_key
+                    in {value.casefold() for value in layout.lifecycle_emulators}
+                )
+                or (
+                    core_key
+                    and core_key
+                    in {value.casefold() for value in layout.lifecycle_cores}
+                )
+            )
+        )
+        if specific:
+            return frozenset(layout.layout_id for layout in specific)
+        if not system_key:
+            return frozenset()
+        return frozenset(
+            layout.layout_id
+            for layout in layouts
+            if not layout.lifecycle_emulators
+            and not layout.lifecycle_cores
+            and system_key
+            in {
+                value.casefold()
+                for value in (layout.lifecycle_systems or (layout.system,))
+            }
+        )
+
+    def is_lifecycle_enabled(self, layout_id: str) -> bool:
+        layout = self._by_id.get(layout_id)
+        return layout is not None and layout.lifecycle_enabled
+
+    def lifecycle_disabled_layout_ids(self) -> frozenset[str]:
+        return frozenset(
+            layout.layout_id
+            for layout in self._layouts
+            if not layout.lifecycle_enabled
+        )
 
     def known_systems(self) -> frozenset[str]:
         return frozenset(layout.system for layout in self._layouts)
