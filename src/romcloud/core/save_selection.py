@@ -614,7 +614,10 @@ class SaveSelectionPolicy:
         namespace, currently used for Batocera's legacy RPCS3 ``dev_hdd0``.
         """
         root = Path(root)
-        if not root.is_dir() or root.is_symlink():
+        # A configured SaveSync root may be a symlink (for example a mounted
+        # remote-data indirection). Treat that root as valid while still
+        # refusing symlink traversal below it.
+        if not root.is_dir():
             return ()
         prefix = _segments(canonical_prefix)
         resolved: list[SaveWatchRoot] = []

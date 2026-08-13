@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import os
 from pathlib import Path
 
 import pytest
@@ -427,6 +428,51 @@ class TestPreviewAccuracy:
         assert diff.direction == "download"
         assert len(diff.added) == 1
         assert diff.added[0].relative_path == "psx/Game.srm"
+
+    def test_download_preview_rehashes_live_remote_when_roots_are_symlinks(
+        self, tmp_path, provider
+    ):
+        real_local = tmp_path / "real-local-saves"
+        real_remote = tmp_path / "real-remote-saves"
+        real_local.mkdir(parents=True)
+        real_remote.mkdir(parents=True)
+        local_root = tmp_path / "local-saves"
+        remote_root = tmp_path / "remote-saves"
+        try:
+            os.symlink(real_local, local_root, target_is_directory=True)
+            os.symlink(real_remote, remote_root, target_is_directory=True)
+        except (AttributeError, NotImplementedError, OSError):
+            pytest.skip("symlink creation is unavailable on this platform")
+
+        svc = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "remote-data"),
+            local_root=str(local_root),
+            remote_root=str(remote_root),
+            state_path=tmp_path / "data" / "savesync-state.json",
+            xbox_enabled=False,
+        )
+
+        relative = "duckstation/memcards/Pong - The Next Level (USA)_1.mcd"
+        local_file = real_local / relative
+        remote_file = real_remote / relative
+        _write(local_file, b"local-A")
+        svc.commit_upload(svc.preview_upload())
+
+        stale_hash = svc.get_state().groups[0].remote_observed.artifacts[0].content_hash
+        remote_file.write_bytes(b"remote-B")
+
+        preview = svc.preview_download()
+
+        assert [entry.relative_path for entry in preview.changed] == [relative]
+        assert preview.conflicts == ()
+        assert preview.unchanged == ()
+
+        svc.commit_download(preview)
+
+        assert local_file.read_bytes() == b"remote-B"
+        refreshed_hash = svc.get_state().groups[0].remote_observed.artifacts[0].content_hash
+        assert refreshed_hash != stale_hash
 
 
 class TestExclusions:
