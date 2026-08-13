@@ -182,10 +182,15 @@ def _detect_screen_size(pygame) -> tuple[int, int]:  # noqa: ANN001
 
 
 def _open_display(pygame, screen_w: int, screen_h: int):  # noqa: ANN001
+    # Match the main GUI path: prefer a desktop-sized borderless window
+    # to avoid unnecessary display-mode switches.
     try:
-        return pygame.display.set_mode((screen_w, screen_h), pygame.FULLSCREEN)
+        return pygame.display.set_mode((screen_w, screen_h), pygame.NOFRAME)
     except Exception:  # noqa: BLE001
-        return pygame.display.set_mode((screen_w, screen_h))
+        try:
+            return pygame.display.set_mode((screen_w, screen_h), pygame.FULLSCREEN)
+        except Exception:  # noqa: BLE001
+            return pygame.display.set_mode((screen_w, screen_h))
 
 
 def _run(pygame, state: LaunchProgressState) -> int:  # noqa: ANN001

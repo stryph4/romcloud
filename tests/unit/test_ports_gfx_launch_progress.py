@@ -8,6 +8,7 @@ import io
 
 from ports_gfx.launch_progress import (
     LaunchProgressState,
+    _open_display,
     main,
     parse_event,
     progress_fraction,
@@ -140,3 +141,55 @@ class TestMainHandlesMissingPygame:
         assert exit_code == 1
         captured = capsys.readouterr()
         assert "pygame is not available" in captured.err
+
+
+class _DisplaySurface:
+    def __init__(self, size=(1280, 720)) -> None:
+        self._size = size
+
+    def get_size(self):
+        return self._size
+
+
+class TestDisplayModeSelection:
+    def test_prefers_borderless_desktop_before_fullscreen(self):
+        class Display:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def set_mode(self, size, flags=None):
+                self.calls.append((size, flags))
+                return _DisplaySurface(size)
+
+        pygame = type(
+            "Pygame",
+            (),
+            {"NOFRAME": 2, "FULLSCREEN": 1, "display": Display()},
+        )()
+
+        surface = _open_display(pygame, 1280, 720)
+
+        assert surface.get_size() == (1280, 720)
+        assert pygame.display.calls == [((1280, 720), pygame.NOFRAME)]
+
+    def test_borderless_failure_falls_back_to_exclusive_fullscreen(self):
+        class Display:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def set_mode(self, size, flags=None):
+                self.calls.append((size, flags))
+                if flags == 2:
+                    raise RuntimeError("borderless unavailable")
+                return _DisplaySurface(size)
+
+        pygame = type(
+            "Pygame",
+            (),
+            {"NOFRAME": 2, "FULLSCREEN": 1, "display": Display()},
+        )()
+
+        surface = _open_display(pygame, 1280, 720)
+
+        assert surface.get_size() == (1280, 720)
+        assert pygame.display.calls == [((1280, 720), 2), ((1280, 720), 1)]
