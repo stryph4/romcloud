@@ -116,6 +116,28 @@ def spawn_menu_loop(
     return process.pid
 
 
+def spawn_remote_reconnect(
+    *,
+    python_executable: Optional[str] = None,
+    popen: Callable[..., subprocess.Popen] = subprocess.Popen,
+) -> int:
+    """Detach one reconnect trigger without provider or SaveSync work."""
+    process = popen(
+        [
+            python_executable or sys.executable,
+            "-m",
+            "romcloud.cli.main",
+            "_autosync",
+            "remote-reconnect",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return process.pid
+
+
 def _signal_owned_process(pid: int, sig: int) -> None:
     getpgid = getattr(os, "getpgid", None)
     killpg = getattr(os, "killpg", None)

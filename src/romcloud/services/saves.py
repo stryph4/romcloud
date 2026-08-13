@@ -837,13 +837,13 @@ class SaveSyncService:
         is_group_active: Optional[Callable[[str], bool]] = None,
         progress: ProgressSink = None,
     ) -> Optional[SaveReconcileReport]:
-        """Reconcile dirty groups without ever downloading into the live tree.
+        """Compatibility API for an explicit upload-only dirty-group pass.
 
-        This is the deliberately narrow game-exit API.  The durable group IDs
-        are only hints about the work to inspect: both sides are freshly
-        scanned and hashed under the normal global operation lock.  A group
-        which becomes active before promotion is deferred without state or
-        remote mutation.
+        Automatic triggers intentionally do not call this legacy surface;
+        gameStop, reconnect, and menu polling all use :meth:`quick_sync` for
+        normal bidirectional three-way reconciliation.  The durable group IDs
+        here remain only hints about the work to inspect, and a group which
+        becomes active before promotion is deferred without state or mutation.
         """
         if not group_ids:
             return None

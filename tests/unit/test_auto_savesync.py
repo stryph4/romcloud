@@ -221,6 +221,40 @@ def test_boot_menu_loop_launcher_is_detached_and_does_no_sync_work(
     }
 
 
+def test_remote_reconnect_launcher_is_detached_and_does_no_sync_work(
+    monkeypatch,
+):
+    calls = []
+
+    def fake_popen(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return type("Process", (), {"pid": 5151})()
+
+    pid = batocera_auto_savesync.spawn_remote_reconnect(
+        python_executable="/venv/bin/python",
+        popen=fake_popen,
+    )
+
+    assert pid == 5151
+    assert calls == [
+        (
+            [
+                "/venv/bin/python",
+                "-m",
+                "romcloud.cli.main",
+                "_autosync",
+                "remote-reconnect",
+            ],
+            {
+                "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+                "start_new_session": True,
+            },
+        )
+    ]
+
+
 def test_duplicate_boot_launcher_reuses_verified_resident_without_spawning(
     tmp_path: Path, monkeypatch
 ):
@@ -326,6 +360,7 @@ def test_game_exit_detects_first_save_and_uploads_only_that_registry_group(tmp_p
     provider = _Provider()
     service = _service(tmp_path, provider)
     coordinator = _coordinator(tmp_path, service)
+    service.full_sync()
     coordinator.game_start(system="psx", emulator="libretro", core="pcsx", rom="Game.chd")
     _write(tmp_path / "local" / "psx" / "Game.srm", b"new-save")
 
@@ -335,6 +370,102 @@ def test_game_exit_detects_first_save_and_uploads_only_that_registry_group(tmp_p
 
     assert (tmp_path / "remote" / "psx" / "Game.srm").read_bytes() == b"new-save"
     assert all(not group.dirty_path_hints for group in service.get_state().groups)
+
+
+def test_game_exit_remote_dirty_downloads_through_quick_sync(tmp_path: Path):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    local = tmp_path / "local" / "psx" / "Game.srm"
+    remote = tmp_path / "remote" / "psx" / "Game.srm"
+    _write(local, b"base")
+    service.full_sync()
+    coordinator.game_start(
+        system="psx", emulator="libretro", core="pcsx", rom="Game.chd"
+    )
+    _write(remote, b"peer-progress")
+    service._append_remote_journal(  # type: ignore[attr-defined]
+        revision="peer-game-stop",
+        timestamp="2026-01-01T00:00:00+00:00",
+        mutations=[
+            {
+                "system": "psx",
+                "layout_id": "retroarch-root-psx",
+                "group_id": "retroarch-root-psx:psx/Game",
+                "object_id": "psx/Game.srm",
+                "operation": "update",
+            }
+        ],
+    )
+
+    coordinator.game_stop(
+        system="psx", emulator="libretro", core="pcsx", rom="Game.chd"
+    )
+
+    assert local.read_bytes() == b"peer-progress"
+    assert remote.read_bytes() == b"peer-progress"
+    assert service.get_state().groups[0].condition is SaveGroupCondition.CLEAN
+
+
+def test_game_exit_both_dirty_preserves_conflict(tmp_path: Path):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    local = tmp_path / "local" / "psx" / "Game.srm"
+    remote = tmp_path / "remote" / "psx" / "Game.srm"
+    _write(local, b"base")
+    service.full_sync()
+    coordinator.game_start(
+        system="psx", emulator="libretro", core="pcsx", rom="Game.chd"
+    )
+    _write(local, b"local-progress")
+    _write(remote, b"peer-progress")
+    service._append_remote_journal(  # type: ignore[attr-defined]
+        revision="peer-conflict",
+        timestamp="2026-01-01T00:00:00+00:00",
+        mutations=[
+            {
+                "system": "psx",
+                "layout_id": "retroarch-root-psx",
+                "group_id": "retroarch-root-psx:psx/Game",
+                "object_id": "psx/Game.srm",
+                "operation": "update",
+            }
+        ],
+    )
+
+    coordinator.game_stop(
+        system="psx", emulator="libretro", core="pcsx", rom="Game.chd"
+    )
+
+    assert local.read_bytes() == b"local-progress"
+    assert remote.read_bytes() == b"peer-progress"
+    assert service.get_state().groups[0].condition is SaveGroupCondition.CONFLICT
+
+
+def test_game_exit_unchanged_uses_no_transaction(tmp_path: Path, monkeypatch):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    local = tmp_path / "local" / "psx" / "Game.srm"
+    _write(local, b"base")
+    service.full_sync()
+    coordinator.game_start(
+        system="psx", emulator="libretro", core="pcsx", rom="Game.chd"
+    )
+    monkeypatch.setattr(
+        save_transaction,
+        "prepare_transaction",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("unchanged gameStop must not stage a transaction")
+        ),
+    )
+
+    coordinator.game_stop(
+        system="psx", emulator="libretro", core="pcsx", rom="Game.chd"
+    )
+
+    assert local.read_bytes() == b"base"
 
 
 def test_game_exit_retries_after_duckstation_save_changes_during_staging(
@@ -358,7 +489,7 @@ def test_game_exit_retries_after_duckstation_save_changes_during_staging(
         / "_usr_share_duckstation_1.mcd"
     )
     _write(local, b"baseline")
-    service.reconcile()
+    service.full_sync()
     coordinator.game_start(
         system="psx", emulator="duckstation", core="duckstation", rom="Game.chd"
     )
@@ -397,7 +528,7 @@ def test_unstable_local_group_is_bounded_and_keeps_dirty_state(
     service = _service(tmp_path, provider)
     path = tmp_path / "local" / "psx" / "Game.srm"
     _write(path, b"base")
-    service.reconcile()
+    service.full_sync()
     _write(path, b"changed")
     service.mark_local_dirty("psx/Game.srm")
     provider.reachability_checks = 0
@@ -435,7 +566,7 @@ def test_auto_stability_and_verification_do_not_scan_unrelated_layouts(
     local = tmp_path / "local" / "psx" / "Game.srm"
     remote = tmp_path / "remote" / "psx" / "Game.srm"
     _write(local, b"base")
-    service.reconcile()
+    service.full_sync()
     _write(local, b"changed")
     service.mark_local_dirty("psx/Game.srm")
 
@@ -456,7 +587,7 @@ def test_active_game_group_is_deferred_then_processed_after_exit(tmp_path: Path)
     local = tmp_path / "local" / "psx" / "Game.srm"
     remote = tmp_path / "remote" / "psx" / "Game.srm"
     _write(local, b"base")
-    service.reconcile()
+    service.full_sync()
     _write(local, b"changed")
     service.mark_local_dirty("psx/Game.srm")
     coordinator = _coordinator(tmp_path, service)
@@ -478,7 +609,7 @@ def test_unavailable_remote_preserves_durable_dirty_state(tmp_path: Path):
     service = _service(tmp_path, provider)
     local = tmp_path / "local" / "psx" / "Game.srm"
     _write(local, b"base")
-    service.reconcile()
+    service.full_sync()
     _write(local, b"changed")
     service.mark_local_dirty("psx/Game.srm")
     provider.reachable = False
@@ -517,7 +648,7 @@ def test_verified_unchanged_hint_clears_without_transaction(
     service = _service(tmp_path, provider)
     path = tmp_path / "local" / "psx" / "Game.srm"
     _write(path, b"base")
-    service.reconcile()
+    service.full_sync()
     service.mark_local_dirty("psx/Game.srm")
 
     def unexpected_transaction(*args, **kwargs):
@@ -538,19 +669,19 @@ def test_repeated_dirty_hint_coalesces_to_one_group_and_one_pass(
     service = _service(tmp_path, provider)
     path = tmp_path / "local" / "psx" / "Game.srm"
     _write(path, b"base")
-    service.reconcile()
+    service.full_sync()
     _write(path, b"changed")
     service.mark_local_dirty("psx/Game.srm")
     service.mark_local_dirty("psx/Game.srm")
     calls = 0
-    original = service.reconcile_pending_groups
+    original = service.quick_sync
 
     def counted(*args, **kwargs):
         nonlocal calls
         calls += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(service, "reconcile_pending_groups", counted)
+    monkeypatch.setattr(service, "quick_sync", counted)
     _coordinator(tmp_path, service).drain_pending()
 
     assert calls == 1
@@ -567,7 +698,7 @@ def test_background_transaction_contains_only_pending_group(
     second = tmp_path / "local" / "psx" / "Second.srm"
     _write(first, b"base-1")
     _write(second, b"base-2")
-    service.reconcile()
+    service.full_sync()
     _write(first, b"changed-1")
     service.mark_local_dirty("psx/First.srm")
     captured: list[set[str]] = []
@@ -605,7 +736,7 @@ def test_both_sides_changed_creates_conflict_without_overwrite(tmp_path: Path):
     local = tmp_path / "local" / "psx" / "Game.srm"
     remote = tmp_path / "remote" / "psx" / "Game.srm"
     _write(local, b"base")
-    service.reconcile()
+    service.full_sync()
     _write(local, b"local")
     _write(remote, b"remote")
     service.mark_local_dirty("psx/Game.srm")
@@ -619,23 +750,23 @@ def test_both_sides_changed_creates_conflict_without_overwrite(tmp_path: Path):
     assert len(tuple(conflict for conflict in state.conflicts if not conflict.resolved)) == 1
 
 
-def test_remote_only_change_is_never_downloaded_by_game_exit(tmp_path: Path):
+def test_remote_only_change_is_downloaded_by_game_exit(tmp_path: Path):
     provider = _Provider()
     service = _service(tmp_path, provider)
     local = tmp_path / "local" / "psx" / "Game.srm"
     remote = tmp_path / "remote" / "psx" / "Game.srm"
     _write(local, b"base")
-    service.reconcile()
+    service.full_sync()
     _write(remote, b"remote")
-    # Advisory false-positive: the authoritative pass must discover that only
-    # the remote changed and must not promote it into the live save tree.
+    # Advisory false-positive: authoritative Quick Sync discovers that only
+    # the remote changed and safely promotes it after gameplay has stopped.
     service.mark_local_dirty("psx/Game.srm")
 
     _coordinator(tmp_path, service).drain_pending()
 
-    assert local.read_bytes() == b"base"
+    assert local.read_bytes() == b"remote"
     assert remote.read_bytes() == b"remote"
-    assert service.get_state().groups[0].condition is SaveGroupCondition.REMOTE_DIRTY
+    assert service.get_state().groups[0].condition is SaveGroupCondition.CLEAN
 
 
 def test_verified_local_deletion_removes_only_its_remote_group(tmp_path: Path):
@@ -645,7 +776,7 @@ def test_verified_local_deletion_removes_only_its_remote_group(tmp_path: Path):
     retained = tmp_path / "local" / "psx" / "Retained.srm"
     _write(removed, b"remove")
     _write(retained, b"retain")
-    service.reconcile()
+    service.full_sync()
     removed.unlink()
     service.mark_local_dirty("psx/Removed.srm")
 
@@ -664,10 +795,10 @@ def test_dirty_group_arriving_during_pass_is_processed_afterward(
     second = tmp_path / "local" / "psx" / "Second.srm"
     _write(first, b"base-1")
     _write(second, b"base-2")
-    service.reconcile()
+    service.full_sync()
     _write(first, b"next-1")
     service.mark_local_dirty("psx/First.srm")
-    original = service.reconcile_pending_groups
+    original = service.quick_sync
     injected = False
 
     def reconcile_then_dirty(*args, **kwargs):
@@ -679,7 +810,7 @@ def test_dirty_group_arriving_during_pass_is_processed_afterward(
             service.mark_local_dirty("psx/Second.srm")
         return report
 
-    monkeypatch.setattr(service, "reconcile_pending_groups", reconcile_then_dirty)
+    monkeypatch.setattr(service, "quick_sync", reconcile_then_dirty)
 
     _coordinator(tmp_path, service).drain_pending()
 
@@ -692,10 +823,10 @@ def test_rapid_workers_never_reconcile_concurrently(tmp_path: Path, monkeypatch)
     service = _service(tmp_path, provider)
     path = tmp_path / "local" / "psx" / "Game.srm"
     _write(path, b"base")
-    service.reconcile()
+    service.full_sync()
     _write(path, b"changed")
     service.mark_local_dirty("psx/Game.srm")
-    original = service.reconcile_pending_groups
+    original = service.quick_sync
     active = 0
     maximum = 0
     guard = threading.Lock()
@@ -712,7 +843,7 @@ def test_rapid_workers_never_reconcile_concurrently(tmp_path: Path, monkeypatch)
             with guard:
                 active -= 1
 
-    monkeypatch.setattr(service, "reconcile_pending_groups", slow_reconcile)
+    monkeypatch.setattr(service, "quick_sync", slow_reconcile)
     coordinators = [_coordinator(tmp_path, service), _coordinator(tmp_path, service)]
     threads = [threading.Thread(target=item.drain_pending) for item in coordinators]
     for thread in threads:
@@ -731,7 +862,7 @@ def test_manual_and_background_reconcile_share_one_operation_boundary(
     service = _service(tmp_path, provider)
     path = tmp_path / "local" / "psx" / "Game.srm"
     _write(path, b"base")
-    service.reconcile()
+    service.full_sync()
     _write(path, b"changed")
     preview = service.preview_upload()
     service.mark_local_dirty("psx/Game.srm")
@@ -968,8 +1099,8 @@ def test_menu_loop_suppresses_gameplay_then_resumes_after_game_stop(
         coordinator.menu_loop()
 
     # The initial and first interval ticks were suppressed during gameplay;
-    # the next interval after gameStop resumed the existing periodic pull.
-    assert quick_calls == 1
+    # gameStop reconciled immediately, then the forced-due test tick ran too.
+    assert quick_calls == 2
 
 
 def test_menu_tick_unchanged_journal_performs_no_save_layout_scan(
@@ -996,6 +1127,120 @@ def test_menu_tick_unchanged_journal_performs_no_save_layout_scan(
     coordinator.menu_tick(force=True)
 
     assert calls == {"local": 0, "remote": 0}
+
+
+def test_remote_reconnect_runs_one_quick_sync_when_ready(tmp_path: Path, monkeypatch):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    service.full_sync()
+    calls = 0
+    original = service.quick_sync
+
+    def counted(**kwargs):
+        nonlocal calls
+        calls += 1
+        return original(**kwargs)
+
+    monkeypatch.setattr(service, "quick_sync", counted)
+
+    coordinator.remote_reconnect()
+
+    assert calls == 1
+
+
+def test_remote_reconnect_quick_sync_failure_is_not_retried(
+    tmp_path: Path, monkeypatch
+):
+    service = _service(tmp_path, _Provider())
+    coordinator = _coordinator(tmp_path, service)
+    service.full_sync()
+    calls = 0
+
+    def fail_once(**kwargs):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("remote temporarily unavailable")
+
+    monkeypatch.setattr(service, "quick_sync", fail_once)
+
+    coordinator.remote_reconnect()
+
+    assert calls == 1
+
+
+def test_remote_reconnect_during_game_defers_until_game_stop(
+    tmp_path: Path, monkeypatch
+):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    _write(tmp_path / "local" / "psx" / "Game.srm", b"base")
+    service.full_sync()
+    calls = 0
+    original = service.quick_sync
+
+    def counted(**kwargs):
+        nonlocal calls
+        calls += 1
+        return original(**kwargs)
+
+    monkeypatch.setattr(service, "quick_sync", counted)
+    coordinator.game_start(
+        system="psx", emulator="libretro", core="pcsx", rom="Game.chd"
+    )
+
+    coordinator.remote_reconnect()
+    assert calls == 0
+
+    coordinator.game_stop(
+        system="psx", emulator="libretro", core="pcsx", rom="Game.chd"
+    )
+    assert calls == 1
+
+
+def test_remote_reconnect_without_baseline_does_no_provider_or_scan_work(
+    tmp_path: Path, monkeypatch
+):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    monkeypatch.setattr(
+        service,
+        "quick_sync",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("unready reconnect must not attempt Quick Sync")
+        ),
+    )
+
+    coordinator.remote_reconnect()
+
+    assert provider.reachability_checks == 0
+
+
+def test_remote_reconnect_unchanged_journal_scans_no_layouts(
+    tmp_path: Path, monkeypatch
+):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    service.full_sync()
+    monkeypatch.setattr(
+        service,
+        "_scan_automatic_local",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("unchanged reconnect scanned local layouts")
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "_scan_automatic_remote",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("unchanged reconnect scanned remote layouts")
+        ),
+    )
+
+    coordinator.remote_reconnect()
 
 
 def test_menu_tick_unchanged_journal_drains_durable_local_dirty_group(

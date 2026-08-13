@@ -217,7 +217,14 @@ def mount_worker_cmd(ctx: click.Context) -> None:
     previous_int = signal.signal(signal.SIGINT, request_stop)
     try:
         code = mount_worker.run_worker(
-            romcloud_home, config, stop_event=stop_event
+            romcloud_home,
+            config,
+            stop_event=stop_event,
+            on_remote_data_available=(
+                auto_savesync.spawn_remote_reconnect
+                if config.saves.auto_sync_enabled
+                else None
+            ),
         )
     finally:
         signal.signal(signal.SIGTERM, previous_term)

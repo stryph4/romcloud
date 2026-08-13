@@ -1369,6 +1369,22 @@ class TestQuickSyncAndJournal:
         assert state.quick_sync_ready is False
         assert state.quick_sync_cursor_generation is None
 
+    def test_interrupted_full_sync_does_not_establish_quick_sync_baseline(
+        self, service: SaveSyncService, monkeypatch
+    ):
+        monkeypatch.setattr(
+            service,
+            "reconcile",
+            lambda **kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+        )
+
+        with pytest.raises(KeyboardInterrupt):
+            service.full_sync()
+
+        state = service.get_state()
+        assert state.quick_sync_ready is False
+        assert state.quick_sync_cursor_generation is None
+
     def test_quick_sync_unchanged_generation_skips_scans(
         self, tmp_path: Path, service: SaveSyncService, monkeypatch
     ):

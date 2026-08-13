@@ -82,6 +82,18 @@ def menu_tick(ctx: click.Context, force: bool) -> None:
         log.warning("Periodic SaveSync quick pull tick failed", exc_info=True)
 
 
+@autosync_group.command("remote-reconnect", hidden=True)
+@click.pass_context
+def remote_reconnect(ctx: click.Context) -> None:
+    """Handle one detached unavailable-to-available remote-data edge."""
+    if not ctx.obj["config"].saves.auto_sync_enabled:
+        return
+    try:
+        _coordinator(ctx).remote_reconnect()
+    except Exception:  # noqa: BLE001 - detached best-effort background work
+        log.warning("Remote-data reconnect Quick Sync failed", exc_info=True)
+
+
 @autosync_group.command("menu-loop", hidden=True)
 @click.pass_context
 def menu_loop(ctx: click.Context) -> None:

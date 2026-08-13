@@ -111,6 +111,8 @@ class _Container:
         source_reachable=True,
         remote_reachable=True,
         remote_probe=None,
+        save_sync_calls=None,
+        full_sync_error=None,
     ):
         self.config = config
         self.provider = SimpleNamespace(
@@ -143,6 +145,20 @@ class _Container:
 
         self.catalog = SimpleNamespace(refresh=refresh)
         self.game_repo = SimpleNamespace(list_systems=lambda: ["psx", "snes"])
+        save_sync_state = SimpleNamespace(
+            quick_sync_ready=False,
+            quick_sync_cursor_generation=None,
+        )
+
+        def full_sync(progress=None):
+            if save_sync_calls is not None:
+                save_sync_calls.append("full-sync")
+            if full_sync_error is not None:
+                raise full_sync_error
+            save_sync_state.quick_sync_ready = True
+            save_sync_state.quick_sync_cursor_generation = 7
+            return SimpleNamespace()
+
         self.saves = SimpleNamespace(
             is_remote_reachable=lambda: remote_reachable,
             validate_remote_storage=lambda: remote_probe
@@ -153,6 +169,8 @@ class _Container:
                     cleanup_verified=remote_reachable,
                     detail="" if remote_reachable else "not writable",
                 ),
+            full_sync=full_sync,
+            get_state=lambda: save_sync_state,
         )
 
 
@@ -164,6 +182,8 @@ def _patch_apply_dependencies(
     source_reachable=True,
     remote_reachable=True,
     remote_probe=None,
+    save_sync_calls=None,
+    full_sync_error=None,
 ):
     monkeypatch.setattr(
         graphical_setup,
@@ -191,6 +211,8 @@ def _patch_apply_dependencies(
             source_reachable=source_reachable,
             remote_reachable=remote_reachable,
             remote_probe=remote_probe,
+            save_sync_calls=save_sync_calls,
+            full_sync_error=full_sync_error,
         ),
     )
     monkeypatch.setattr(graphical_setup.es_config, "install", lambda systems: None)
@@ -719,6 +741,57 @@ class TestApply:
         config = graphical_setup.load_config(str(config_path))
         assert config.remote_data == RemoteDataConfig("local", str(remote_root))
         assert remote_root.is_dir()
+
+    def test_writable_remote_data_initializes_quick_sync_baseline(
+        self, tmp_path, monkeypatch
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        remote_root = tmp_path / "remote-data"
+        calls = []
+        _patch_apply_dependencies(monkeypatch, save_sync_calls=calls)
+        events = []
+
+        result = graphical_setup.apply_setup(
+            config_path,
+            _payload(remote_data_type="local", remote_data_root=str(remote_root)),
+            progress=events.append,
+        )
+
+        assert calls == ["full-sync"]
+        assert result["save_sync_initialized"] is True
+        assert result["quick_sync_ready"] is True
+        assert result["quick_sync_cursor_generation"] == 7
+        assert [
+            event.status
+            for event in events
+            if event.stage == "savesync_initialize"
+        ] == ["running", "success"]
+
+    def test_failed_initial_full_sync_does_not_report_quick_sync_ready(
+        self, tmp_path, monkeypatch
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        remote_root = tmp_path / "remote-data"
+        calls = []
+        _patch_apply_dependencies(
+            monkeypatch,
+            save_sync_calls=calls,
+            full_sync_error=RuntimeError("initial sync interrupted"),
+        )
+
+        with pytest.raises(RuntimeError, match="initialize SaveSync"):
+            graphical_setup.apply_setup(
+                config_path,
+                _payload(
+                    remote_data_type="local", remote_data_root=str(remote_root)
+                ),
+            )
+
+        assert calls == ["full-sync"]
+        state = json.loads(
+            (config_path.parent / graphical_setup.SETUP_STATE_FILENAME).read_text()
+        )
+        assert state["failed_step"] == "initialize SaveSync"
 
     def test_unwritable_remote_data_fails_without_exposing_password(
         self, tmp_path, monkeypatch

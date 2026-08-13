@@ -1,4 +1,4 @@
-"""Minimal Batocera game-lifecycle trigger for targeted SaveSync work."""
+"""Minimal Batocera lifecycle triggers for authoritative Quick SaveSync."""
 
 from __future__ import annotations
 
@@ -168,49 +168,133 @@ class AutoSaveSyncCoordinator:
         if not self._enabled:
             return
         session = self._sessions.stop(system=system, rom=rom)
-        layout_ids = layout_ids_for_session(self._policy, system, emulator, core)
-        if not layout_ids:
+        if self._sessions.has_active_session():
             return
-        changed_since = session.started_at if session is not None else time.time() - 5.0
-        self._service.detect_and_mark_local_changes(
-            layout_ids, changed_since=changed_since
-        )
-        self.drain_pending()
-        self.menu_tick(force=True)
+        layout_ids = layout_ids_for_session(self._policy, system, emulator, core)
+        if layout_ids:
+            changed_since = (
+                session.started_at if session is not None else time.time() - 5.0
+            )
+            self._service.detect_and_mark_local_changes(
+                layout_ids, changed_since=changed_since
+            )
+        self._run_quick_sync(trigger="game stop", wait_for_handoff=True)
+
+    def remote_reconnect(self) -> None:
+        """Run one eligible Quick Sync after a detached reconnect edge."""
+        if not self._enabled:
+            return
+        state = self._service.get_state()
+        if (
+            not state.quick_sync_ready
+            or state.quick_sync_cursor_generation is None
+        ):
+            return
+        self._run_quick_sync(trigger="remote-data reconnect")
 
     def menu_tick(self, *, force: bool = False) -> None:
         if not self._enabled:
             return
-        lock = _AutoWorkerLock(self._data_root / ".savesync-auto.lock")
-        if not lock.acquire():
+        if not force and not self._menu_pull_due():
             return
+        self._run_quick_sync(trigger="periodic menu")
+
+    def _run_quick_sync(
+        self, *, trigger: str, wait_for_handoff: bool = False
+    ) -> None:
+        """Serialize every automatic trigger through ``SaveSyncService.quick_sync``.
+
+        Local-dirty groups receive the existing bounded settling observations
+        before Quick Sync.  Quick Sync itself remains the sole authority for
+        journal scoping and three-way upload/download/conflict decisions.
+        """
+        lock = _AutoWorkerLock(self._data_root / ".savesync-auto.lock")
+        attempts = 6 if wait_for_handoff else 1
+        for attempt in range(attempts):
+            if lock.acquire():
+                break
+            if attempt == attempts - 1:
+                return
+            # A just-finishing leader may have completed its final durable
+            # state read while gameStop was recording new work.
+            time.sleep(0.1)
         try:
             if self._sessions.has_active_session():
                 return
-            if not force and not self._menu_pull_due():
-                return
-            group_layouts = {
-                group.group_id: group.layout_id
-                for group in self._service.get_state().groups
-            }
-
-            def is_group_active(group_id: str) -> bool:
-                layout_id = group_layouts.get(group_id)
-                return layout_id in self._sessions.active_layout_ids(self._policy)
-
-            def is_layout_active(layout_id: str) -> bool:
-                return layout_id in self._sessions.active_layout_ids(self._policy)
-
-            try:
-                self._service.quick_sync(
-                    is_group_active=is_group_active,
-                    is_layout_active=is_layout_active,
-                    exclude_layout_ids=self._policy.lifecycle_disabled_layout_ids(),
+            for _ in range(32):
+                state = self._service.get_state()
+                group_layouts = {
+                    group.group_id: group.layout_id for group in state.groups
+                }
+                pending = frozenset(
+                    group.group_id
+                    for group in state.groups
+                    if self._policy.is_lifecycle_enabled(group.layout_id)
+                    and (
+                        group.condition is SaveGroupCondition.LOCAL_DIRTY
+                        or bool(group.dirty_path_hints)
+                    )
                 )
-            except Exception:  # noqa: BLE001 - menu pull is best-effort
-                log.warning("Periodic SaveSync quick pull deferred", exc_info=True)
-                return
-            self._write_menu_pull_timestamp(time.time())
+                if pending and not self._wait_until_stable(pending):
+                    log.warning(
+                        "Auto SaveSync deferred: local save data did not "
+                        "stabilize after %d bounded checks; durable dirty "
+                        "state retained",
+                        self._stability_checks,
+                    )
+                    return
+
+                def is_group_active(group_id: str) -> bool:
+                    return group_layouts.get(
+                        group_id
+                    ) in self._sessions.active_layout_ids(self._policy)
+
+                def is_layout_active(layout_id: str) -> bool:
+                    return layout_id in self._sessions.active_layout_ids(
+                        self._policy
+                    )
+
+                result = None
+                try:
+                    for staging_attempt in range(self._staging_retries + 1):
+                        try:
+                            result = self._service.quick_sync(
+                                is_group_active=is_group_active,
+                                is_layout_active=is_layout_active,
+                                exclude_layout_ids=(
+                                    self._policy.lifecycle_disabled_layout_ids()
+                                ),
+                            )
+                            break
+                        except SaveSyncVerificationError:
+                            if staging_attempt >= self._staging_retries:
+                                raise
+                            log.warning(
+                                "Auto SaveSync detected save data changing during "
+                                "staging; waiting for stability before retry %d/%d",
+                                staging_attempt + 1,
+                                self._staging_retries,
+                            )
+                            retry_pending = self._pending_local_groups()
+                            if retry_pending and not self._wait_until_stable(
+                                retry_pending
+                            ):
+                                log.warning(
+                                    "Auto SaveSync deferred: local save data remained "
+                                    "unstable; durable dirty state retained"
+                                )
+                                return
+                except Exception:  # noqa: BLE001 - detached work is best-effort
+                    log.warning(
+                        "Auto SaveSync %s Quick Sync deferred", trigger, exc_info=True
+                    )
+                    return
+                if result is None or result.status == "deferred":
+                    return
+                after = self._pending_local_groups()
+                if not after or after == pending:
+                    self._write_menu_pull_timestamp(time.time())
+                    return
         finally:
             lock.release()
 
@@ -275,101 +359,24 @@ class AutoSaveSyncCoordinator:
         temporary.replace(self._menu_state_path)
 
     def drain_pending(self) -> None:
+        """Compatibility entry point routed through authoritative Quick Sync."""
         if not self._enabled:
             return
-        lock = _AutoWorkerLock(self._data_root / ".savesync-auto.lock")
-        for attempt in range(6):
-            if lock.acquire():
-                break
-            # A just-finishing leader may have completed its final durable
-            # state read while this event was being recorded. A short bounded
-            # handoff retry closes that race without provider polling.
-            if attempt == 5:
-                return
-            time.sleep(0.1)
-        try:
-            # Re-read durable state after every pass so dirty groups recorded
-            # while a manual/background operation was running are handled next.
-            for _ in range(32):
-                state = self._service.get_state()
-                group_layouts = {group.group_id: group.layout_id for group in state.groups}
-                pending = frozenset(
-                    group.group_id
-                    for group in state.groups
-                    if self._policy.is_lifecycle_enabled(group.layout_id)
-                    and (
-                        group.condition is SaveGroupCondition.LOCAL_DIRTY
-                        or bool(group.dirty_path_hints)
-                    )
-                )
-                active_layouts = self._sessions.active_layout_ids(self._policy)
-                pending = frozenset(
-                    group_id
-                    for group_id in pending
-                    if group_layouts.get(group_id) not in active_layouts
-                )
-                if not pending:
-                    return
+        if not self._pending_local_groups():
+            return
+        self._run_quick_sync(trigger="pending work", wait_for_handoff=True)
 
-                def is_active(group_id: str) -> bool:
-                    return group_layouts.get(group_id) in self._sessions.active_layout_ids(
-                        self._policy
-                    )
-
-                before = pending
-                try:
-                    if not self._wait_until_stable(pending):
-                        log.warning(
-                            "Auto SaveSync deferred: local save data did not "
-                            "stabilize after %d bounded checks; durable dirty "
-                            "state retained",
-                            self._stability_checks,
-                        )
-                        return
-                    report = None
-                    for staging_attempt in range(self._staging_retries + 1):
-                        try:
-                            report = self._service.reconcile_pending_groups(
-                                pending, is_group_active=is_active
-                            )
-                            break
-                        except SaveSyncVerificationError:
-                            if staging_attempt >= self._staging_retries:
-                                raise
-                            log.warning(
-                                "Auto SaveSync detected save data changing during "
-                                "staging; waiting for stability before retry %d/%d",
-                                staging_attempt + 1,
-                                self._staging_retries,
-                            )
-                            if not self._wait_until_stable(pending):
-                                log.warning(
-                                    "Auto SaveSync deferred: local save data remained "
-                                    "unstable; durable dirty state retained"
-                                )
-                                return
-                except Exception:  # noqa: BLE001 - background work stays quiet
-                    log.warning(
-                        "Auto SaveSync pass deferred; durable dirty state retained",
-                        exc_info=True,
-                    )
-                    return
-                if report is None:
-                    return
-                after_state = self._service.get_state()
-                after = frozenset(
-                    group.group_id
-                    for group in after_state.groups
-                    if self._policy.is_lifecycle_enabled(group.layout_id)
-                    and (
-                        group.condition is SaveGroupCondition.LOCAL_DIRTY
-                        or bool(group.dirty_path_hints)
-                    )
-                )
-                if after == before:
-                    return
-        finally:
-            lock.release()
+    def _pending_local_groups(self) -> frozenset[str]:
+        state = self._service.get_state()
+        return frozenset(
+            group.group_id
+            for group in state.groups
+            if self._policy.is_lifecycle_enabled(group.layout_id)
+            and (
+                group.condition is SaveGroupCondition.LOCAL_DIRTY
+                or bool(group.dirty_path_hints)
+            )
+        )
 
     def _wait_until_stable(self, group_ids: frozenset[str]) -> bool:
         """Require two equal local hash/size observations within a bound."""

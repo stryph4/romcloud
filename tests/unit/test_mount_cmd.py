@@ -221,6 +221,26 @@ class TestWorkerCommand:
         result = _invoke(["worker"], _fake_config(smb=_fake_smb()))
         assert result.exit_code == 0
 
+    def test_enabled_worker_receives_only_detached_reconnect_callback(
+        self, monkeypatch
+    ):
+        config = _fake_config(smb=_fake_smb(), saves_mount="/mnt/saves-rw")
+        config.saves.auto_sync_enabled = True
+        captured = []
+
+        def run_worker(*args, **kwargs):
+            captured.append(kwargs)
+            return 0
+
+        monkeypatch.setattr(mount_cmd_module.mount_worker, "run_worker", run_worker)
+
+        result = _invoke(["worker"], config)
+
+        assert result.exit_code == 0
+        assert captured[0]["on_remote_data_available"] is (
+            mount_cmd_module.auto_savesync.spawn_remote_reconnect
+        )
+
     def test_worker_is_hidden_from_help(self):
         assert mount_group.commands["worker"].hidden is True
 

@@ -2330,6 +2330,8 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
                     "\u2713 Cleanup verified",
                 ]
             )
+        if wizard.applied_summary.get("save_sync_initialized"):
+            lines.append("\u2713 Initial Full Sync complete — Quick Sync ready")
         if wizard.game_access_mode == "smart_cache":
             lines.append(
                 f"Cache size: {wizard.applied_summary.get('max_size_gb', wizard.max_size_gb):g} GB"
