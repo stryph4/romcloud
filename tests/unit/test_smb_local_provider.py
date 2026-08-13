@@ -14,6 +14,8 @@ native `SMBProvider` stub is never selected through this path.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from romcloud.bootstrap.container import Container
@@ -61,6 +63,50 @@ class TestConfigureNeverSelectsSmbProvider:
         assert reloaded.source.provider == "local"
         assert reloaded.smb is not None
         assert reloaded.smb.server == "nas.local"
+
+    def test_shutdown_config_load_never_dereferences_cifs_mounts(
+        self, tmp_path, monkeypatch
+    ):
+        source_mount = (tmp_path / "source-mount").as_posix()
+        remote_mount = (tmp_path / "remote-mount").as_posix()
+        cfg_path = tmp_path / "romcloud.toml"
+        cfg_path.write_text(
+            "[source]\n"
+            'provider = "local"\n'
+            f'rom_root = "{source_mount}"\n\n'
+            "[smb]\n"
+            'server = "192.168.1.109"\n'
+            'share = "Roms"\n\n'
+            "[remote_data]\n"
+            'provider = "smb"\n'
+            f'root = "{remote_mount}"\n\n'
+            "[remote_data.smb]\n"
+            'server = "omnivault"\n'
+            'share = "Emulation"\n\n'
+            "[data]\n"
+            f'path = "{(tmp_path / "data").as_posix()}"\n',
+            encoding="utf-8",
+        )
+        forbidden = {str(Path(source_mount)), str(Path(remote_mount))}
+        for method_name in ("resolve", "stat", "exists", "is_dir", "iterdir"):
+            original = getattr(Path, method_name)
+
+            def guarded(
+                self, *args, _original=original, _name=method_name, **kwargs
+            ):
+                if str(self) in forbidden:
+                    raise AssertionError(
+                        f"shutdown called Path.{_name}() on CIFS mount {self}"
+                    )
+                return _original(self, *args, **kwargs)
+
+            monkeypatch.setattr(Path, method_name, guarded)
+
+        loaded = load_config(str(cfg_path), resolve_paths=False)
+
+        assert loaded.source.rom_root == source_mount
+        assert loaded.remote_data is not None
+        assert loaded.remote_data.root == remote_mount
 
 
 class TestContainerResolvesLocalProvider:

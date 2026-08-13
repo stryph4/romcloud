@@ -33,8 +33,9 @@ from pathlib import Path
 
 import click
 
-from romcloud.cli.context import get_container
 from romcloud.core.exceptions import ROMCloudError
+from romcloud.infrastructure.config import load_config
+from romcloud.infrastructure.logging import configure_logging
 from romcloud.infrastructure import mount, mount_worker
 from romcloud.integrations.batocera import mount_service
 from romcloud.services.connections import mount_connections, unmount_connections
@@ -45,10 +46,42 @@ def mount_group() -> None:
     """Manage SMB-backed ROM source and remote-data mounts."""
 
 
-def _require_mounts(ctx: click.Context):
-    container = get_container(ctx)
-    config = container.config
-    if not mount_worker.configured_mounts(config):
+def _get_mount_config(
+    ctx: click.Context,
+    *,
+    resolve_paths: bool = True,
+    local_logging_only: bool = False,
+):
+    """Load mount configuration only after the nested command is known."""
+    if "config" not in ctx.obj:
+        try:
+            config = load_config(
+                ctx.obj.get("config_path"), resolve_paths=resolve_paths
+            )
+        except ROMCloudError as exc:
+            click.echo(f"error: {exc}", err=True)
+            ctx.exit(1)
+            raise AssertionError("unreachable")
+        ctx.obj["config"] = config
+        configure_logging(
+            level="DEBUG" if ctx.obj.get("debug") else config.logging.level,
+            # Boot/shutdown lifecycle commands must not touch a configured
+            # log directory that could itself be remote or unavailable.
+            log_dir=None if local_logging_only else config.logging.path,
+            console=True,
+        )
+    return ctx.obj["config"]
+
+
+def _require_mounts(ctx: click.Context, *, resolve_paths: bool = True):
+    config = _get_mount_config(
+        ctx,
+        resolve_paths=resolve_paths,
+        local_logging_only=not resolve_paths,
+    )
+    if not mount_worker.configured_mounts(
+        config, resolve_paths=resolve_paths
+    ):
         click.echo(
             "No SMB-backed ROM source or remote-data location is configured — "
             "nothing to mount.",
@@ -126,16 +159,19 @@ def mount_boot_start_cmd(ctx: click.Context) -> None:
     immediately. Always exits 0 — "ROMCloud may fail; Batocera must not."
     """
     try:
-        container = get_container(ctx)
-        config = container.config
+        config = _get_mount_config(
+            ctx, resolve_paths=False, local_logging_only=True
+        )
 
-        if not mount_worker.configured_mounts(config):
+        if not mount_worker.configured_mounts(config, resolve_paths=False):
             click.echo("No SMB-backed locations configured — nothing to do.")
             return
 
         romcloud_home = _romcloud_home(config)
 
-        if mount_worker.all_configured_mounts_are_mounted(config):
+        if mount_worker.all_configured_mounts_are_mounted(
+            config, resolve_paths=False
+        ):
             click.echo("Already mounted.")
             return
 
@@ -158,8 +194,9 @@ def mount_worker_cmd(ctx: click.Context) -> None:
     Not for interactive use — spawned by ``romcloud mount boot-start`` as a
     detached background process.
     """
-    container = get_container(ctx)
-    config = container.config
+    config = _get_mount_config(
+        ctx, resolve_paths=False, local_logging_only=True
+    )
     romcloud_home = _romcloud_home(config)
     stop_event = threading.Event()
 
@@ -188,7 +225,7 @@ def mount_worker_cmd(ctx: click.Context) -> None:
 @click.pass_context
 def mount_stop_cmd(ctx: click.Context, shutdown: bool) -> None:
     """Stop the mount worker, then unmount every configured SMB location."""
-    config = _require_mounts(ctx)
+    config = _require_mounts(ctx, resolve_paths=not shutdown)
     try:
         result = unmount_connections(config, shutdown=shutdown)
     except ROMCloudError as exc:
@@ -215,8 +252,7 @@ def mount_install_cmd(ctx: click.Context) -> None:
 def mount_remove_cmd(ctx: click.Context) -> None:
     """Remove the Batocera boot-time mount service and ROMCloud's own
     runtime state (only ROMCloud-owned files; never touches other services)."""
-    container = get_container(ctx)
-    config = container.config
+    config = _get_mount_config(ctx)
     targets = mount_worker.configured_mounts(config)
     errors: list[str] = []
     if targets:

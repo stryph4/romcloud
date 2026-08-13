@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 import click
 
 from romcloud.infrastructure.config import load_config, default_config_path
@@ -41,7 +40,7 @@ def cli(ctx: click.Context, config_path: str | None, debug: bool) -> None:
     # Individual uidata actions load it when required; setup-status must be
     # available to the graphical first-run UI on a completely fresh install.
     if ctx.invoked_subcommand not in (
-        "configure", "update", "repair", "uninstall", "purge", "_reconcile-install", "uidata"
+        "configure", "update", "repair", "uninstall", "purge", "_reconcile-install", "uidata", "mount"
     ):
         try:
             config = load_config(config_path)

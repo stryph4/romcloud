@@ -9,6 +9,7 @@ Default installation path: ``/userdata/system/romcloud/config/romcloud.toml``
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -172,7 +173,9 @@ class AppConfig:
 # ── parsing ───────────────────────────────────────────────────────────────────
 
 
-def load_config(config_path: Optional[str] = None) -> AppConfig:
+def load_config(
+    config_path: Optional[str] = None, *, resolve_paths: bool = True
+) -> AppConfig:
     """Load and validate configuration from a TOML file."""
     path = Path(config_path) if config_path else default_config_path()
 
@@ -194,7 +197,7 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
     except Exception as exc:
         raise ConfigurationError(f"Failed to parse config {path}: {exc}") from exc
 
-    config = _parse(data, path)
+    config = _parse(data, path, resolve_paths=resolve_paths)
     migrate_legacy_smb_credentials(config.credentials_path)
     migrate_plaintext_credentials(config.credentials_path)
     return config
@@ -282,7 +285,9 @@ def _replace_exact_toml_string(line: str, key: str, old: str, new: str) -> str:
     return f'{match.group(1)}"{new}"{match.group(3)}{newline}'
 
 
-def _parse(data: dict, path: Path) -> AppConfig:  # noqa: C901
+def _parse(
+    data: dict, path: Path, *, resolve_paths: bool = True
+) -> AppConfig:  # noqa: C901
     try:
         src = data["source"]
         provider = src["provider"]
@@ -419,7 +424,9 @@ def _parse(data: dict, path: Path) -> AppConfig:  # noqa: C901
             f"{path}: game_access.mode must be \"smart_cache\" or \"direct_nas\"."
         )
     if game_access_mode == DIRECT_NAS_MODE and paths_overlap(
-        Path(source.rom_root), Path(local_roms_path)
+        Path(source.rom_root),
+        Path(local_roms_path),
+        resolve_paths=resolve_paths,
     ):
         raise ConfigurationError(
             f"{path}: Connected Mode source.rom_root must not overlap local_roms.path."
@@ -433,6 +440,7 @@ def _parse(data: dict, path: Path) -> AppConfig:  # noqa: C901
         local_saves_path=saves.local_path,
         remote_data=remote_data,
         context=str(path),
+        resolve_paths=resolve_paths,
     )
 
     return AppConfig(
@@ -591,6 +599,7 @@ def validate_remote_data_boundary(
     local_saves_path: str,
     remote_data: Optional[RemoteDataConfig],
     context: str,
+    resolve_paths: bool = True,
 ) -> None:
     """Keep user-controlled synchronized data outside ROM/runtime state.
 
@@ -624,16 +633,26 @@ def validate_remote_data_boundary(
         ("ROMCloud system home", _DEFAULT_ROMCLOUD_HOME),
         ("saves.local_path", Path(local_saves_path)),
     ):
-        if paths_overlap(remote_root, other):
+        if paths_overlap(remote_root, other, resolve_paths=resolve_paths):
             raise ConfigurationError(
                 f"{context}: remote_data.root must not overlap {label}."
             )
 
 
-def paths_overlap(first: Path, second: Path) -> bool:
-    try:
-        first = first.resolve(strict=False)
-        second = second.resolve(strict=False)
-    except OSError:
-        pass
+def paths_overlap(
+    first: Path, second: Path, *, resolve_paths: bool = True
+) -> bool:
+    if resolve_paths:
+        try:
+            first = first.resolve(strict=False)
+            second = second.resolve(strict=False)
+        except OSError:
+            pass
+    else:
+        # Boot/shutdown lifecycle commands must never dereference a
+        # potentially unresponsive CIFS mount. ``abspath`` is lexical and
+        # performs no filesystem metadata lookup; ordinary runtime
+        # validation continues to resolve symlinks.
+        first = Path(os.path.abspath(os.fspath(first)))
+        second = Path(os.path.abspath(os.fspath(second)))
     return first == second or first in second.parents or second in first.parents

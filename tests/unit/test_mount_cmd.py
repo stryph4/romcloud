@@ -17,6 +17,7 @@ from click.testing import CliRunner
 
 from romcloud.cli.main import cli
 import romcloud.cli.commands.mount as mount_cmd_module
+import romcloud.services.connections as connections_service
 from romcloud.core.exceptions import MountError
 from romcloud.cli.commands.mount import mount_group
 from romcloud.infrastructure.config import AppConfig, CacheConfig, SMBConfig, SourceConfig, write_config
@@ -36,6 +37,7 @@ def _fake_config(
         smb=smb,
         credentials_path=home / "config" / "credentials.toml",
         data_path=str(home / "data"),
+        logging=SimpleNamespace(level="INFO", path=None),
         remote_data=(
             SimpleNamespace(
                 provider="smb",
@@ -132,10 +134,10 @@ class TestBootStart:
         assert "warning" in result.output.lower()
 
     def test_never_raises_even_if_config_access_fails(self, monkeypatch):
-        def _boom(ctx):
+        def _boom(ctx, **kwargs):
             raise RuntimeError("container build failed")
 
-        monkeypatch.setattr(mount_cmd_module, "get_container", _boom)
+        monkeypatch.setattr(mount_cmd_module, "_get_mount_config", _boom)
 
         result = CliRunner().invoke(mount_group, ["boot-start"], obj={"config": _fake_config(smb=_fake_smb())})
 
@@ -154,6 +156,94 @@ class TestWorkerCommand:
 
 
 class TestStop:
+    def test_shutdown_selects_safe_config_parsing_before_container_build(
+        self, monkeypatch
+    ):
+        config = _fake_config(smb=_fake_smb())
+        loaded = []
+        monkeypatch.setattr(
+            mount_cmd_module,
+            "load_config",
+            lambda path, **kwargs: loaded.append((path, kwargs)) or config,
+        )
+        monkeypatch.setattr(
+            mount_cmd_module,
+            "configure_logging",
+            lambda **kwargs: None,
+        )
+        monkeypatch.setattr(
+            mount_cmd_module.mount_worker,
+            "configured_mounts",
+            lambda config, **kwargs: (object(),),
+        )
+        monkeypatch.setattr(
+            mount_cmd_module,
+            "unmount_connections",
+            lambda config, **kwargs: {"changed": False},
+        )
+
+        result = CliRunner().invoke(
+            cli,
+            ["--config", "/local/romcloud.toml", "mount", "stop", "--shutdown"],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert loaded == [
+            ("/local/romcloud.toml", {"resolve_paths": False})
+        ]
+
+    def test_boot_start_uses_safe_local_only_initialization(self, monkeypatch):
+        config = _fake_config(smb=_fake_smb())
+        config.logging.path = "/userdata/romcloud/source/logs"
+        loaded = []
+        logging_calls = []
+        target_calls = []
+        monkeypatch.setattr(
+            mount_cmd_module,
+            "load_config",
+            lambda path, **kwargs: loaded.append((path, kwargs)) or config,
+        )
+        monkeypatch.setattr(
+            mount_cmd_module,
+            "configure_logging",
+            lambda **kwargs: logging_calls.append(kwargs),
+        )
+        monkeypatch.setattr(
+            mount_cmd_module.mount_worker,
+            "configured_mounts",
+            lambda cfg, **kwargs: target_calls.append(kwargs) or (object(),),
+        )
+        monkeypatch.setattr(
+            mount_cmd_module.mount_worker,
+            "all_configured_mounts_are_mounted",
+            lambda cfg, **kwargs: target_calls.append(kwargs) or False,
+        )
+        monkeypatch.setattr(
+            mount_cmd_module.mount_worker,
+            "is_worker_running",
+            lambda home: None,
+        )
+        monkeypatch.setattr(
+            mount_cmd_module.mount_worker,
+            "spawn_worker",
+            lambda home: 4242,
+        )
+
+        result = CliRunner().invoke(
+            cli,
+            ["--config", "/local/romcloud.toml", "mount", "boot-start"],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert loaded == [
+            ("/local/romcloud.toml", {"resolve_paths": False})
+        ]
+        assert logging_calls[0]["log_dir"] is None
+        assert target_calls == [
+            {"resolve_paths": False},
+            {"resolve_paths": False},
+        ]
+
     def test_unmounts_savesync_before_catalog(self, monkeypatch):
         calls = []
         monkeypatch.setattr(mount_cmd_module.mount_worker, "stop_worker", lambda *a: None)
@@ -161,6 +251,11 @@ class TestStop:
             mount_cmd_module.mount,
             "unmount_cifs_source",
             lambda path: calls.append(path) or True,
+        )
+        monkeypatch.setattr(
+            connections_service,
+            "connection_status",
+            lambda config: {"state": "disconnected"},
         )
 
         result = _invoke(
@@ -177,6 +272,11 @@ class TestStop:
         monkeypatch.setattr(
             mount_cmd_module.mount, "unmount_cifs_source", lambda *a, **k: calls.append("unmount") or True
         )
+        monkeypatch.setattr(
+            connections_service,
+            "connection_status",
+            lambda config: {"state": "disconnected"},
+        )
 
         result = _invoke(["stop"], _fake_config(smb=_fake_smb()))
 
@@ -187,6 +287,11 @@ class TestStop:
     def test_not_mounted_reports_clearly(self, monkeypatch):
         monkeypatch.setattr(mount_cmd_module.mount_worker, "stop_worker", lambda *a, **k: False)
         monkeypatch.setattr(mount_cmd_module.mount, "unmount_cifs_source", lambda *a, **k: False)
+        monkeypatch.setattr(
+            connections_service,
+            "connection_status",
+            lambda config: {"state": "disconnected"},
+        )
 
         result = _invoke(["stop"], _fake_config(smb=_fake_smb()))
 

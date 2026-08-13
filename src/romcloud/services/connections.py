@@ -122,7 +122,9 @@ def unmount_connections(
     *,
     shutdown: bool = False,
 ) -> dict[str, object]:
-    targets = mount_worker.configured_mounts(config)
+    targets = mount_worker.configured_mounts(
+        config, resolve_paths=not shutdown
+    )
     if not targets:
         raise ConfigurationError("This configuration uses a local folder and does not need unmounting.")
     home = mount_worker.romcloud_home_from_config(config)
@@ -146,6 +148,14 @@ def unmount_connections(
                     target.mount_point,
                     lazy=True,
                     command_timeout=5.0,
+                    expected_server=(
+                        None if target.read_only else target.smb.server
+                    ),
+                    expected_share=target.smb.share,
+                    expected_read_only=target.read_only,
+                    expected_remote_path=getattr(
+                        target.smb, "remote_path", ""
+                    ),
                 )
             else:
                 unmounted = mount.unmount_cifs_source(target.mount_point)
@@ -169,7 +179,13 @@ def unmount_connections(
             errors.append(f"{target.label}: {exc}")
     if errors:
         raise ROMCloudError("; ".join(errors))
-    result = connection_status(config)
+    # Normal diagnostics intentionally retain their full validation behavior.
+    # Shutdown must not rebuild/resolve configured targets after detach.
+    result = (
+        {"state": "disconnected", "configured": True}
+        if shutdown
+        else connection_status(config)
+    )
     result["changed"] = changed
     return result
 

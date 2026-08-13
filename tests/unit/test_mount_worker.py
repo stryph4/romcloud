@@ -155,6 +155,31 @@ class TestOnlyOneWorkerRunsAtOnce:
 
 
 class TestRunWorker:
+    def test_worker_builds_targets_without_resolving_mount_paths(
+        self, tmp_path, monkeypatch
+    ):
+        calls = []
+        original = mw.configured_mounts
+
+        def record(config, **kwargs):
+            calls.append(kwargs)
+            return original(config, **kwargs)
+
+        monkeypatch.setattr(mw, "configured_mounts", record)
+        monkeypatch.setattr(
+            mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: True
+        )
+        config = _fake_config(
+            credentials_path=tmp_path / "credentials.toml",
+            smb=_fake_smb(),
+            saves_mount="/mnt/saves-rw",
+        )
+
+        code = mw.run_worker(tmp_path, config)
+
+        assert code == 0
+        assert calls == [{"resolve_paths": False}]
+
     def test_mounts_catalog_read_only_and_savesync_separately_read_write(
         self, tmp_path, monkeypatch
     ):

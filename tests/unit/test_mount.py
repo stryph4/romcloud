@@ -513,6 +513,141 @@ class TestUnmountCifsSource:
         assert result is True
         assert captured["argv"] == ["umount", "/mnt/roms"]
 
+    @pytest.mark.parametrize(
+        ("mount_line", "target", "identity"),
+        [
+            (
+                "//192.168.1.109/Roms /userdata/romcloud/source cifs ro,vers=3.1.1 0 0\n",
+                "/userdata/romcloud/source",
+                {
+                    "expected_server": None,
+                    "expected_share": "Roms",
+                    "expected_read_only": True,
+                    "expected_remote_path": "",
+                },
+            ),
+            (
+                "//omnivault/Emulation /userdata/romcloud/remote cifs rw,vers=3.1.1 0 0\n",
+                "/userdata/romcloud/remote",
+                {
+                    "expected_server": "omnivault",
+                    "expected_share": "Emulation",
+                    "expected_read_only": False,
+                    "expected_remote_path": "",
+                },
+            ),
+        ],
+    )
+    def test_shutdown_detaches_owned_mount_from_mount_table_only(
+        self, tmp_path, monkeypatch, mount_line, target, identity
+    ):
+        proc_mounts = tmp_path / "mounts"
+        proc_mounts.write_text(mount_line)
+        forbidden = str(Path(target))
+        for method_name in ("resolve", "stat", "exists", "is_dir", "iterdir"):
+            original = getattr(Path, method_name)
+
+            def guarded(
+                self, *args, _original=original, _name=method_name, **kwargs
+            ):
+                if str(self) == forbidden:
+                    raise AssertionError(
+                        f"shutdown called Path.{_name}() on CIFS mount {self}"
+                    )
+                return _original(self, *args, **kwargs)
+
+            monkeypatch.setattr(Path, method_name, guarded)
+        captured = {}
+
+        def fake_runner(argv, **kwargs):
+            captured["argv"] = argv
+            captured["timeout"] = kwargs["timeout"]
+            return _FakeCompletedProcess(0)
+
+        result = mount.unmount_cifs_source(
+            target,
+            runner=fake_runner,
+            proc_mounts_path=str(proc_mounts),
+            command_timeout=5.0,
+            lazy=True,
+            **identity,
+        )
+
+        assert result is True
+        assert captured == {"argv": ["umount", "-l", target], "timeout": 5.0}
+
+    @pytest.mark.parametrize(
+        ("mount_line", "target", "identity"),
+        [
+            (
+                "//other-nas/Other /userdata/romcloud/source cifs ro 0 0\n",
+                "/userdata/romcloud/source",
+                {
+                    "expected_server": None,
+                    "expected_share": "Roms",
+                    "expected_read_only": True,
+                    "expected_remote_path": "",
+                },
+            ),
+            (
+                "//other-nas/Other /userdata/romcloud/remote cifs rw 0 0\n",
+                "/userdata/romcloud/remote",
+                {
+                    "expected_server": "omnivault",
+                    "expected_share": "Emulation",
+                    "expected_read_only": False,
+                    "expected_remote_path": "",
+                },
+            ),
+            (
+                "/dev/sda1 /userdata/romcloud/remote ext4 rw 0 0\n",
+                "/userdata/romcloud/remote",
+                {
+                    "expected_server": "omnivault",
+                    "expected_share": "Emulation",
+                    "expected_read_only": False,
+                    "expected_remote_path": "",
+                },
+            ),
+        ],
+    )
+    def test_shutdown_refuses_foreign_mount_without_running_umount(
+        self, tmp_path, mount_line, target, identity
+    ):
+        proc_mounts = tmp_path / "mounts"
+        proc_mounts.write_text(mount_line)
+        called = []
+
+        with pytest.raises(MountError, match="foreign or unexpected"):
+            mount.unmount_cifs_source(
+                target,
+                runner=lambda *a, **k: called.append(a),
+                proc_mounts_path=str(proc_mounts),
+                lazy=True,
+                **identity,
+            )
+
+        assert called == []
+
+    def test_shutdown_already_unmounted_is_harmless(self, tmp_path):
+        proc_mounts = tmp_path / "mounts"
+        proc_mounts.write_text("")
+        called = []
+
+        result = mount.unmount_cifs_source(
+            "/userdata/romcloud/source",
+            runner=lambda *a, **k: called.append(a),
+            proc_mounts_path=str(proc_mounts),
+            lazy=True,
+            expected_server=None,
+            expected_share="Roms",
+            expected_read_only=True,
+            expected_remote_path="",
+        )
+
+        assert result is False
+        assert called == []
+
     def test_unmount_failure_raises_mount_error(self, tmp_path):
         proc_mounts = tmp_path / "mounts"
         proc_mounts.write_text("//nas/ROMs /mnt/roms cifs ro 0 0\n")
@@ -525,8 +660,9 @@ class TestUnmountCifsSource:
                 "/mnt/roms", runner=fake_runner, proc_mounts_path=str(proc_mounts)
             )
 
-    def test_shutdown_lazy_unmount_is_bounded(self, monkeypatch):
-        monkeypatch.setattr(mount, "is_target_mounted", lambda *a, **k: True)
+    def test_shutdown_lazy_unmount_is_bounded(self, tmp_path):
+        proc_mounts = tmp_path / "mounts"
+        proc_mounts.write_text("//nas/ROMs /mnt/roms cifs ro 0 0\n")
         captured = {}
 
         def timed_out(argv, **kwargs):
@@ -535,7 +671,11 @@ class TestUnmountCifsSource:
 
         with pytest.raises(MountError, match="Timed out"):
             mount.unmount_cifs_source(
-                "/mnt/roms", runner=timed_out, command_timeout=0.01, lazy=True
+                "/mnt/roms",
+                runner=timed_out,
+                proc_mounts_path=str(proc_mounts),
+                command_timeout=0.01,
+                lazy=True,
             )
 
         assert captured["argv"] == ["umount", "-l", "/mnt/roms"]

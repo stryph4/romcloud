@@ -91,7 +91,9 @@ class ConfiguredMount:
     credential_kind: str
 
 
-def configured_mounts(config) -> tuple[ConfiguredMount, ...]:
+def configured_mounts(
+    config, *, resolve_paths: bool = True
+) -> tuple[ConfiguredMount, ...]:
     """Return the intentional SMB mount views used by ROMCloud.
 
     The catalog/cache view stays read-only. General remote data gets its own
@@ -112,7 +114,9 @@ def configured_mounts(config) -> tuple[ConfiguredMount, ...]:
         remote_mount = Path(remote_data.root)
         if config.smb is not None:
             rom_mount = Path(config.source.rom_root)
-            if paths_overlap(remote_mount, rom_mount):
+            if paths_overlap(
+                remote_mount, rom_mount, resolve_paths=resolve_paths
+            ):
                 raise ConfigurationError(
                     "remote_data.root must be separate from source.rom_root so the "
                     "ROM catalog mount can remain read-only"
@@ -129,8 +133,10 @@ def configured_mounts(config) -> tuple[ConfiguredMount, ...]:
     return tuple(targets)
 
 
-def all_configured_mounts_are_mounted(config) -> bool:
-    targets = configured_mounts(config)
+def all_configured_mounts_are_mounted(
+    config, *, resolve_paths: bool = True
+) -> bool:
+    targets = configured_mounts(config, resolve_paths=resolve_paths)
     return bool(targets) and all(_configured_mount_is_ready(item) for item in targets)
 
 
@@ -517,7 +523,10 @@ def _run_worker_locked(
     stop_event: threading.Event | None,
 ) -> int:
     try:
-        targets = configured_mounts(config)
+        # The worker can be launched while an old/unresponsive CIFS mount is
+        # still present. Mount identity below comes exclusively from /proc;
+        # target construction must not dereference the mount point first.
+        targets = configured_mounts(config, resolve_paths=False)
         if not targets:
             _write_worker_status(romcloud_home, "failed", "no SMB mounts configured")
             log.warning("Mount worker started but no SMB mounts are configured — exiting.")

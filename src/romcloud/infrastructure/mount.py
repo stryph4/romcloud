@@ -26,6 +26,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import posixpath
 import socket
 import subprocess
 import sys
@@ -71,32 +72,34 @@ def _parse_mounted_targets(mounts_text: str) -> set[str]:
         if len(parts) < 2:
             continue
         # /proc/mounts escapes spaces etc. as octal (e.g. \040); undo it.
-        targets.add(parts[1].encode().decode("unicode_escape"))
+        targets.add(
+            posixpath.normpath(parts[1].encode().decode("unicode_escape"))
+        )
     return targets
 
 
 def _mount_options(target: str, mounts_text: str) -> Optional[set[str]]:
     """Return mount options for *target*, or ``None`` when it is not mounted."""
-    normalized = os.path.normpath(target)
+    normalized = posixpath.normpath(target)
     for line in mounts_text.splitlines():
         parts = line.split()
         if len(parts) < 4:
             continue
         mount_target = parts[1].encode().decode("unicode_escape")
-        if os.path.normpath(mount_target) == normalized:
+        if posixpath.normpath(mount_target) == normalized:
             return set(parts[3].split(","))
     return None
 
 
 def _mount_record(target: str, mounts_text: str) -> Optional[tuple[str, str, set[str]]]:
     """Return ``(source, filesystem_type, options)`` for a mounted target."""
-    normalized = os.path.normpath(target)
+    normalized = posixpath.normpath(target)
     for line in mounts_text.splitlines():
         parts = line.split()
         if len(parts) < 4:
             continue
         mount_target = parts[1].encode().decode("unicode_escape")
-        if os.path.normpath(mount_target) == normalized:
+        if posixpath.normpath(mount_target) == normalized:
             source = parts[0].encode().decode("unicode_escape")
             return source, parts[2].lower(), set(parts[3].split(","))
     return None
@@ -108,7 +111,7 @@ def is_mounted(target: str, mounts_text: str) -> bool:
     *mounts_text* is the raw content of `/proc/mounts` (or an equivalent),
     passed in explicitly so this is trivially unit-testable.
     """
-    normalized = os.path.normpath(target)
+    normalized = posixpath.normpath(target)
     return normalized in _parse_mounted_targets(mounts_text)
 
 
@@ -634,10 +637,30 @@ def unmount_cifs_source(
     proc_mounts_path: str = _DEFAULT_PROC_MOUNTS,
     command_timeout: float = 10.0,
     lazy: bool = False,
+    expected_server: Optional[str] = None,
+    expected_share: Optional[str] = None,
+    expected_read_only: Optional[bool] = None,
+    expected_remote_path: Optional[str] = None,
 ) -> bool:
     """Unmount *mount_point*. Returns False (no-op) if it wasn't mounted."""
-    if not is_target_mounted(mount_point, proc_mounts_path=proc_mounts_path):
+    try:
+        with open(proc_mounts_path, "r", encoding="utf-8") as fh:
+            mounts_text = fh.read()
+    except OSError as exc:
+        raise MountError(f"Cannot read {proc_mounts_path}: {exc}") from exc
+    if not is_mounted(mount_point, mounts_text):
         return False
+    if expected_share is not None and not is_mounted_cifs_target(
+        mount_point,
+        mounts_text,
+        server=expected_server,
+        share=expected_share,
+        read_only=expected_read_only,
+        remote_path=expected_remote_path,
+    ):
+        raise MountError(
+            f"Refusing to unmount foreign or unexpected filesystem at {mount_point}"
+        )
 
     argv = build_unmount_argv(mount_point)
     if lazy:
