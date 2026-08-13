@@ -43,7 +43,13 @@ from ports_gfx.client import BackendResult
 from ports_gfx.input_manager import InputEvent
 from ports_gfx.layout import compute_layout
 from ports_gfx.library_sync_screen import PREFLIGHT, LibrarySyncScreenState
-from ports_gfx.menu import CONTROLLER_TEST_ACTION, EXIT_ACTION, MenuItem, MenuState
+from ports_gfx.menu import (
+    CONTROLLER_TEST_ACTION,
+    EXIT_ACTION,
+    MenuItem,
+    MenuState,
+    NavigationState,
+)
 from ports_gfx.operation import OperationLine, OperationState
 from ports_gfx.operation_screen import OPERATION_SCREEN
 from ports_gfx.relaunch import GuiRelaunchCoordinator
@@ -637,6 +643,18 @@ class TestHandleMenuEvent:
     def _layout(self, state):
         return compute_layout(1920, 1080, len(state.items))
 
+    def _nav_state(self):
+        operating_state = {
+            "game_access_mode": "smart_cache",
+            "operating_mode": "cache",
+            "offline_mode": False,
+            "capabilities": {},
+        }
+        return NavigationState(
+            root_menu_items_for_state(operating_state),
+            menu_categories_for_state(operating_state),
+        )
+
     def test_confirm_on_exit_item_stops_running(self):
         state = self._state()
         layout = self._layout(state)
@@ -671,6 +689,101 @@ class TestHandleMenuEvent:
         )
         assert running is False
         assert operation is None
+
+    def test_confirm_on_root_category_enters_submenu_without_exiting(self):
+        for category in ("Library", "Storage", "Maintenance"):
+            state = self._nav_state()
+            layout = self._layout(state)
+            index = next(
+                i
+                for i, item in enumerate(state.items)
+                if item.action == f"category:{category}"
+            )
+            state.select(index)
+
+            running, screen, _message, _kind, operation = _handle_menu_event(
+                InputEvent(action=Action.CONFIRM),
+                state,
+                layout,
+                "/opt/romcloud/bin/romcloud",
+                True,
+                None,
+                "info",
+            )
+
+            assert running is True
+            assert screen == "menu"
+            assert operation is None
+            assert state.level == "category"
+            assert state.title == category
+
+    def test_back_from_submenu_returns_to_root_without_exiting(self):
+        state = self._nav_state()
+        layout = self._layout(state)
+        storage_index = next(
+            i for i, item in enumerate(state.items) if item.action == "category:Storage"
+        )
+        state.select(storage_index)
+        _handle_menu_event(
+            InputEvent(action=Action.CONFIRM),
+            state,
+            layout,
+            "/opt/romcloud/bin/romcloud",
+            True,
+            None,
+            "info",
+        )
+
+        running, screen, _message, _kind, operation = _handle_menu_event(
+            InputEvent(action=Action.BACK),
+            state,
+            layout,
+            "/opt/romcloud/bin/romcloud",
+            True,
+            None,
+            "info",
+        )
+
+        assert running is True
+        assert screen == "menu"
+        assert operation is None
+        assert state.level == "root"
+        assert state.selected_item.action == "category:Storage"
+
+    def test_back_at_root_only_exits_when_exit_item_is_selected(self):
+        state = self._nav_state()
+        layout = self._layout(state)
+
+        for action_name in (
+            "category:Library",
+            "category:Storage",
+            "category:Maintenance",
+            "savesync",
+        ):
+            state.select(next(i for i, item in enumerate(state.items) if item.action == action_name))
+            running, *_ = _handle_menu_event(
+                InputEvent(action=Action.BACK),
+                state,
+                layout,
+                "/opt/romcloud/bin/romcloud",
+                True,
+                None,
+                "info",
+            )
+            assert running is True
+
+        exit_index = next(i for i, item in enumerate(state.items) if item.action == EXIT_ACTION)
+        state.select(exit_index)
+        running, *_ = _handle_menu_event(
+            InputEvent(action=Action.BACK),
+            state,
+            layout,
+            "/opt/romcloud/bin/romcloud",
+            True,
+            None,
+            "info",
+        )
+        assert running is False
 
     def test_directional_action_moves_selection_via_layout(self):
         state = self._state()

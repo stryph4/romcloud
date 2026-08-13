@@ -1321,7 +1321,14 @@ def _handle_menu_event(
         return running, next_screen, message, message_kind, None
 
     if action == Action.BACK:
-        if not isinstance(state, NavigationState) or not state.back():
+        if not isinstance(state, NavigationState):
+            running = False
+            return running, next_screen, message, message_kind, None
+        if state.back():
+            return running, next_screen, message, message_kind, None
+        # Root-level Back should not terminate from arbitrary selections.
+        # Keep explicit exit ownership on the Exit item itself.
+        if state.selected_item.action == EXIT_ACTION:
             running = False
         return running, next_screen, message, message_kind, None
 
