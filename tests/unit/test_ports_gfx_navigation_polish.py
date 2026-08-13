@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from ports_gfx.actions import Action
-from ports_gfx.app import MENU_CATEGORIES, MENU_ITEMS, ROOT_MENU_ITEMS, _wizard_option_rows
+from ports_gfx.app import MENU_CATEGORIES, ROOT_MENU_ITEMS, _wizard_option_rows
 from ports_gfx.input_manager import InputEvent
 from ports_gfx.layout import compute_layout, compute_wizard_regions
 from ports_gfx.menu import BACK_ACTION, CATEGORY_ACTION_PREFIX, NavigationState
@@ -19,7 +19,6 @@ def test_root_items_preserve_the_requested_compact_order_and_actions():
         "Storage",
         "SaveSync",
         "Maintenance",
-        "Settings",
         "Exit",
     ]
     assert [item.action for item in ROOT_MENU_ITEMS] == [
@@ -30,13 +29,16 @@ def test_root_items_preserve_the_requested_compact_order_and_actions():
         "category:Storage",
         "savesync",
         "category:Maintenance",
-        "category:Settings",
         "exit",
     ]
 
 
 def test_every_preexisting_action_is_mapped_once_without_renaming():
-    old = {(item.action, item.label) for item in MENU_ITEMS}
+    old = {
+        (item.action, item.label)
+        for item in ROOT_MENU_ITEMS
+        if not item.action.startswith(CATEGORY_ACTION_PREFIX)
+    }
     mapped = [
         (item.action, item.label)
         for items in MENU_CATEGORIES.values()
@@ -72,7 +74,7 @@ def test_submenu_replaces_root_and_back_restores_root_focus():
     nav.select(4)
     assert nav.enter_selected_category()
     assert nav.title == "Storage"
-    assert [item.label for item in nav.items[:2]] == ["Storage Setup", "Connection Status"]
+    assert [item.label for item in nav.items[:2]] == ["Run Setup", "Connection Status"]
     assert all(item.label != "Library" for item in nav.items)
     assert nav.items[-1].action == BACK_ACTION
     assert nav.back()

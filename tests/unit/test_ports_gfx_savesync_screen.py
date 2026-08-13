@@ -156,7 +156,7 @@ class TestDashboardSelection:
     def test_quick_sync_starts_previewing_operation(self):
         state = SaveSyncScreenState(
             romcloud_bin="romcloud",
-            selected_index=2,
+            selected_index=0,
             status={"remote_configured": True},
             remote_availability=REMOTE_AVAILABLE,
         )
@@ -183,7 +183,7 @@ class TestDashboardSelection:
     def test_full_sync_starts_previewing_operation(self):
         state = SaveSyncScreenState(
             romcloud_bin="romcloud",
-            selected_index=3,
+            selected_index=1,
             status={"remote_configured": True},
             remote_availability=REMOTE_AVAILABLE,
         )
@@ -210,7 +210,7 @@ class TestDashboardSelection:
     def test_upload_starts_preview(self):
         state = SaveSyncScreenState(
             romcloud_bin="romcloud",
-            selected_index=0,
+            selected_index=2,
             status={"remote_configured": True},
             remote_availability=REMOTE_AVAILABLE,
         )
@@ -222,7 +222,7 @@ class TestDashboardSelection:
     def test_upload_is_unavailable_without_configured_remote_data(self):
         state = SaveSyncScreenState(
             romcloud_bin="romcloud",
-            selected_index=0,
+            selected_index=2,
             status={"remote_configured": False},
         )
 
@@ -235,7 +235,7 @@ class TestDashboardSelection:
     def test_upload_is_gated_while_remote_check_is_pending(self):
         state = SaveSyncScreenState(
             romcloud_bin="romcloud",
-            selected_index=0,
+            selected_index=2,
             status={"remote_configured": True},
             remote_availability=REMOTE_CHECKING,
         )
@@ -249,7 +249,7 @@ class TestDashboardSelection:
     def test_download_is_gated_when_remote_is_unavailable(self):
         state = SaveSyncScreenState(
             romcloud_bin="romcloud",
-            selected_index=1,
+            selected_index=3,
             status={"remote_configured": True},
             remote_availability=REMOTE_UNAVAILABLE,
             remote_detail="storage check timed out",

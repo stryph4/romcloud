@@ -180,9 +180,8 @@ class TestMenuItems:
         )
         assert [item.label for item in offline_roots] == [
             "Library", "Direct", "Cached Storage", "Offline",
-            "Storage", "Settings", "Exit"
+            "Storage", "Exit"
         ]
-        assert all(item.action != EXIT_ACTION for item in MENU_CATEGORIES["Settings"])
         assert offline_roots[-1].action == EXIT_ACTION
         assert all(
             item.action != "setup"

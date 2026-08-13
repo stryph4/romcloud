@@ -199,7 +199,6 @@ def root_menu_items_for_state(state: dict[str, object]) -> tuple[MenuItem, ...]:
         items.append(MenuItem("SaveSync", SAVESYNC_ACTION))
     if capabilities.get("update_network", True):
         items.append(MenuItem("Maintenance", f"{CATEGORY_ACTION_PREFIX}Maintenance"))
-    items.append(MenuItem("Settings", f"{CATEGORY_ACTION_PREFIX}Settings"))
     items.append(MenuItem("Exit", EXIT_ACTION))
     return tuple(items)
 

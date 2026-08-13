@@ -31,10 +31,10 @@ REMOTE_UNAVAILABLE = "unavailable"
 REMOTE_AVAILABILITY_TIMEOUT = 6.0
 
 DASHBOARD_ITEMS: tuple[str, ...] = (
-    "Upload All Saves",
-    "Download All Saves",
     "Quick Sync",
     "Full Sync",
+    "Upload All Saves",
+    "Download All Saves",
     "SaveSync Settings",
     "Back",
 )
@@ -43,10 +43,10 @@ SETTINGS_ITEMS: tuple[str, ...] = (
     "Original Xbox virtual drive",
     "Back",
 )
-_UPLOAD_INDEX = 0
-_DOWNLOAD_INDEX = 1
-_QUICK_SYNC_INDEX = 2
-_FULL_SYNC_INDEX = 3
+_QUICK_SYNC_INDEX = 0
+_FULL_SYNC_INDEX = 1
+_UPLOAD_INDEX = 2
+_DOWNLOAD_INDEX = 3
 _SETTINGS_INDEX = 4
 _BACK_INDEX = 5
 
