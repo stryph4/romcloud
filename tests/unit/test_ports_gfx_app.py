@@ -924,6 +924,24 @@ class TestHandleSavesyncEvent:
         assert app_module._handle_savesync_event(InputEvent(action=Action.CONFIRM), screen) == "savesync"
         assert screen.step == SETTINGS
 
+    def test_conflict_step_delegates_to_shared_resolver(self):
+        from ports_gfx import app as app_module
+        from ports_gfx.savesync_conflict_popup import ConflictPopupState, DISPLAYING
+        from ports_gfx.savesync_screen import CONFLICTS
+
+        resolver = ConflictPopupState("/opt/romcloud/bin/romcloud", source="manual")
+        resolver.step = DISPLAYING
+        resolver.conflict = {"conflict_id": "one"}
+        events = []
+        resolver.handle_event = events.append
+        screen = self._screen(step=CONFLICTS, resolver=resolver)
+        event = InputEvent(action=Action.DOWN)
+
+        result = app_module._handle_savesync_event(event, screen)
+
+        assert result == "savesync"
+        assert events == [event]
+
     def test_preview_confirm_begins_hold(self):
         from ports_gfx import app as app_module
         from ports_gfx.savesync_screen import CONFIRMING, PREVIEW

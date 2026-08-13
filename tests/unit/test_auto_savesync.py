@@ -15,6 +15,7 @@ from romcloud.core.models.savesync import SaveGroupCondition
 from romcloud.core.save_selection import DEFAULT_SAVE_SELECTION_POLICY
 from romcloud.core.storage import StorageProvider
 from romcloud.infrastructure import save_transaction
+from romcloud.infrastructure import savesync_prompts
 from romcloud.infrastructure.config import (
     AppConfig,
     CacheConfig,
@@ -169,15 +170,75 @@ def test_disabled_lifecycle_cli_does_not_construct_coordinator(
         assert result.exit_code == 0, result.output
 
 
-def test_batocera_hook_detaches_game_stop_but_keeps_start_marker_ordered(tmp_path: Path):
+def test_pending_conflict_launcher_is_short_lived_and_uses_focused_mode(
+    tmp_path: Path, monkeypatch
+):
+    from romcloud.cli.commands import autosync as autosync_commands
+
+    data_root = tmp_path / "romcloud" / "data"
+    launcher = tmp_path / "romcloud" / "bin" / "romcloud-ports"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("launcher", encoding="utf-8")
+    savesync_prompts.enqueue(data_root, ("conflict-id",))
+    calls = []
+    monkeypatch.delenv("ROMCLOUD_BIN", raising=False)
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return type("Result", (), {"returncode": 0})()
+
+    monkeypatch.setattr(autosync_commands.subprocess, "run", fake_run)
+
+    autosync_commands._launch_pending_conflict_popup(data_root)
+
+    assert calls[0][0] == [str(launcher), "--savesync-conflicts"]
+    assert calls[0][1]["check"] is False
+    assert "timeout" not in calls[0][1]
+    assert calls[0][1]["start_new_session"] is True
+    assert calls[0][1]["close_fds"] is True
+    assert calls[0][1]["cwd"] == str(data_root.parent)
+    assert calls[0][1]["env"]["ROMCLOUD_BIN"] == str(
+        launcher.with_name("romcloud")
+    )
+
+
+def test_popup_launch_failure_is_logged_and_queue_survives(
+    tmp_path: Path, monkeypatch, caplog
+):
+    from romcloud.cli.commands import autosync as autosync_commands
+
+    data_root = tmp_path / "romcloud" / "data"
+    launcher = tmp_path / "romcloud" / "bin" / "romcloud-ports"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("launcher", encoding="utf-8")
+    savesync_prompts.enqueue(data_root, ("conflict-id",))
+    monkeypatch.delenv("ROMCLOUD_BIN", raising=False)
+    monkeypatch.setattr(
+        autosync_commands.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("cannot exec")),
+    )
+
+    with caplog.at_level("WARNING"):
+        autosync_commands._launch_pending_conflict_popup(data_root)
+
+    assert "subprocess launch failed" in caplog.text
+    assert savesync_prompts.pending_ids(data_root) == ("conflict-id",)
+
+
+def test_batocera_hook_keeps_game_stop_display_handoff_ordered(tmp_path: Path):
     target = tmp_path / "scripts" / "romcloud-autosync"
     install_hook(tmp_path / "bin" / "romcloud", hook_path=target)
     content = target.read_text(encoding="utf-8")
 
     assert "gameStart" in content and "gameStop" in content
     assert "game-start" in content and "game-stop" in content
-    assert 'nohup "$ROMCLOUD_BIN" _autosync game-stop' in content
+    assert '"$ROMCLOUD_BIN" _autosync game-stop' in content
+    assert 'nohup "$ROMCLOUD_BIN" _autosync game-stop' not in content
     assert 'nohup "$ROMCLOUD_BIN" _autosync menu-loop' in content
+    assert "auto-savesync-lifecycle.log" in content
+    assert 'event="game_stop_handoff_start"' in content
+    assert 'event="game_stop_handoff_end"' in content
     assert "</dev/null &" in content
     assert '"$2" "$3" "$4" "$5"' in content
     if os.name != "nt":
@@ -321,9 +382,9 @@ def test_owned_menu_loop_stop_is_bounded_and_clears_restart_record(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Batocera hook is a POSIX shell script")
-def test_game_stop_hook_returns_without_waiting_for_background_worker(tmp_path: Path):
+def test_game_stop_hook_waits_for_worker_before_emulationstation_resumes(tmp_path: Path):
     binary = tmp_path / "romcloud"
-    binary.write_text("#!/bin/bash\nsleep 2\n", encoding="utf-8")
+    binary.write_text("#!/bin/bash\nsleep 0.15\n", encoding="utf-8")
     binary.chmod(0o755)
     hook = install_hook(binary, hook_path=tmp_path / "romcloud-autosync")
 
@@ -331,10 +392,10 @@ def test_game_stop_hook_returns_without_waiting_for_background_worker(tmp_path: 
     subprocess.run(
         [str(hook), "gameStop", "psx", "libretro", "pcsx", "Game.chd"],
         check=True,
-        timeout=1,
+        timeout=2,
     )
 
-    assert time.monotonic() - started < 0.5
+    assert time.monotonic() - started >= 0.1
 
 
 def test_lifecycle_mapping_is_registry_bounded_and_xemu_is_never_automatic():
@@ -434,13 +495,94 @@ def test_game_exit_both_dirty_preserves_conflict(tmp_path: Path):
         ],
     )
 
-    coordinator.game_stop(
+    new_conflicts = coordinator.game_stop(
         system="psx", emulator="libretro", core="pcsx", rom="Game.chd"
     )
 
     assert local.read_bytes() == b"local-progress"
     assert remote.read_bytes() == b"peer-progress"
     assert service.get_state().groups[0].condition is SaveGroupCondition.CONFLICT
+    assert new_conflicts == (service.get_state().active_conflicts[0].conflict_id,)
+    assert savesync_prompts.pending_ids(tmp_path / "data") == new_conflicts
+
+    # Re-observing the same authoritative fingerprint is not a new prompt.
+    assert coordinator.game_stop(
+        system="psx", emulator="libretro", core="pcsx", rom="Game.chd"
+    ) == ()
+    assert savesync_prompts.pending_ids(tmp_path / "data") == new_conflicts
+
+
+def test_only_game_stop_collects_new_conflict_ids(tmp_path: Path):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    local = tmp_path / "local" / "psx" / "Game.srm"
+    remote = tmp_path / "remote" / "psx" / "Game.srm"
+    _write(local, b"base")
+    service.full_sync()
+    _write(local, b"local-progress")
+    service.mark_local_dirty("psx/Game.srm")
+    _write(remote, b"remote-progress")
+    service._append_remote_journal(  # type: ignore[attr-defined]
+        revision="peer-menu-conflict",
+        timestamp="2026-01-01T00:00:00+00:00",
+        mutations=[
+            {
+                "system": "psx",
+                "layout_id": "retroarch-root-psx",
+                "group_id": "retroarch-root-psx:psx/Game",
+                "object_id": "psx/Game.srm",
+                "operation": "update",
+            }
+        ],
+    )
+
+    coordinator.menu_tick(force=True)
+
+    assert len(service.get_state().active_conflicts) == 1
+    assert savesync_prompts.pending_ids(tmp_path / "data") == ()
+
+
+def test_game_stop_queues_multiple_new_conflicts_by_exact_identity(tmp_path: Path):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    for name in ("Alpha", "Beta"):
+        _write(tmp_path / "local" / "psx" / f"{name}.srm", b"base")
+    service.full_sync()
+    coordinator.game_start(
+        system="psx", emulator="libretro", core="pcsx", rom="Collection.chd"
+    )
+    mutations = []
+    for name in ("Alpha", "Beta"):
+        path = f"psx/{name}.srm"
+        _write(tmp_path / "local" / path, f"local-{name}".encode())
+        _write(tmp_path / "remote" / path, f"remote-{name}".encode())
+        mutations.append(
+            {
+                "system": "psx",
+                "layout_id": "retroarch-root-psx",
+                "group_id": f"retroarch-root-psx:{name.lower()}",
+                "object_id": path,
+                "operation": "update",
+            }
+        )
+    service._append_remote_journal(  # type: ignore[attr-defined]
+        revision="peer-multiple-conflicts",
+        timestamp="2026-01-01T00:00:00+00:00",
+        mutations=mutations,
+    )
+
+    new_conflicts = coordinator.game_stop(
+        system="psx", emulator="libretro", core="pcsx", rom="Collection.chd"
+    )
+
+    active_ids = tuple(
+        sorted(item.conflict_id for item in service.get_state().active_conflicts)
+    )
+    assert len(active_ids) == 2
+    assert new_conflicts == active_ids
+    assert savesync_prompts.pending_ids(tmp_path / "data") == active_ids
 
 
 def test_game_exit_unchanged_uses_no_transaction(tmp_path: Path, monkeypatch):

@@ -185,17 +185,33 @@ def stop_menu_loop(
 
 def hook_content(romcloud_bin: Path) -> str:
     binary = str(romcloud_bin).replace('"', '\\"')
+    lifecycle_log = str(
+        Path(romcloud_bin).parent.parent / "logs" / "auto-savesync-lifecycle.log"
+    ).replace('"', '\\"')
     return (
         "#!/bin/bash\n"
-        f'ROMCLOUD_BIN="{binary}"\n'
+        f'export ROMCLOUD_BIN="{binary}"\n'
+        f'ROMCLOUD_AUTOSYNC_LOG="{lifecycle_log}"\n'
+        'mkdir -p "$(dirname "$ROMCLOUD_AUTOSYNC_LOG")" 2>/dev/null || true\n'
         'case "$1" in\n'
         "  gameStart)\n"
         '    "$ROMCLOUD_BIN" _autosync game-start "$2" "$3" "$4" "$5" '
         ">/dev/null 2>&1 || true\n"
         "    ;;\n"
         "  gameStop)\n"
-        '    nohup "$ROMCLOUD_BIN" _autosync game-stop "$2" "$3" "$4" "$5" '
-        ">/dev/null 2>&1 </dev/null &\n"
+        # Keep the lifecycle callback open through the bounded Quick Sync and
+        # any focused popup. Returning first lets EmulationStation reclaim the
+        # SDL display while the detached popup races behind it.
+        '    printf \'%s pid=%s event="game_stop_handoff_start"\\n\' '
+        '"$(date -Iseconds 2>/dev/null || date)" "$$" '
+        '>> "$ROMCLOUD_AUTOSYNC_LOG" 2>/dev/null || true\n'
+        "    ROMCLOUD_AUTOSYNC_STATUS=0\n"
+        '    "$ROMCLOUD_BIN" _autosync game-stop "$2" "$3" "$4" "$5" '
+        ">/dev/null 2>&1 </dev/null || ROMCLOUD_AUTOSYNC_STATUS=$?\n"
+        '    printf \'%s pid=%s event="game_stop_handoff_end" status=%s\\n\' '
+        '"$(date -Iseconds 2>/dev/null || date)" "$$" '
+        '"$ROMCLOUD_AUTOSYNC_STATUS" '
+        '>> "$ROMCLOUD_AUTOSYNC_LOG" 2>/dev/null || true\n'
         '    nohup "$ROMCLOUD_BIN" _autosync menu-loop '
         ">/dev/null 2>&1 </dev/null &\n"
         "    ;;\n"

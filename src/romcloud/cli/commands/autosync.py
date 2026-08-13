@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 from pathlib import Path
 
 import click
@@ -9,6 +11,7 @@ import click
 from romcloud.cli.context import get_container
 from romcloud.infrastructure.config import load_config
 from romcloud.infrastructure.logging import get_logger
+from romcloud.infrastructure import savesync_prompts
 from romcloud.services.auto_savesync import AutoSaveSyncCoordinator
 
 log = get_logger("auto-savesync-cli")
@@ -38,6 +41,97 @@ def _coordinator(ctx: click.Context) -> AutoSaveSyncCoordinator:
     )
 
 
+def _launch_pending_conflict_popup(data_root: Path) -> None:
+    """Run the focused system-Python UI after releasing every sync lock."""
+    pending = savesync_prompts.pending_ids(data_root)
+    if not pending:
+        log.info("SaveSync conflict popup launch skipped: durable queue is empty")
+        return
+    romcloud_bin = os.environ.get("ROMCLOUD_BIN")
+    launcher = (
+        Path(romcloud_bin).with_name("romcloud-ports")
+        if romcloud_bin
+        else data_root.parent / "bin" / "romcloud-ports"
+    )
+    if not launcher.is_file():
+        log.warning(
+            "SaveSync conflict popup launch skipped: launcher=%s is unavailable; "
+            "pending_ids=%s",
+            launcher,
+            ",".join(pending),
+        )
+        return
+    with savesync_prompts.popup_process_lock(data_root) as acquired:
+        if not acquired:
+            log.info(
+                "SaveSync conflict popup launch rejected by singleton; pending_ids=%s",
+                ",".join(pending),
+            )
+            return
+        environment = os.environ.copy()
+        environment["ROMCLOUD_BIN"] = romcloud_bin or str(
+            launcher.with_name("romcloud")
+        )
+        display_environment = {
+            key: environment.get(key, "")
+            for key in (
+                "DISPLAY",
+                "WAYLAND_DISPLAY",
+                "XDG_SESSION_TYPE",
+                "SDL_VIDEODRIVER",
+            )
+        }
+        process_log = data_root.parent / "logs" / "savesync-conflict-popup.log"
+        process_log.parent.mkdir(parents=True, exist_ok=True)
+        log.info(
+            "Launching focused SaveSync conflict popup: launcher=%s mode=%s "
+            "pending=%d cwd=%s display_environment=%s",
+            launcher,
+            "--savesync-conflicts",
+            len(pending),
+            data_root.parent,
+            display_environment,
+        )
+        try:
+            with process_log.open("a", encoding="utf-8") as output:
+                result = subprocess.run(
+                    [str(launcher), "--savesync-conflicts"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=output,
+                    stderr=output,
+                    check=False,
+                    close_fds=True,
+                    start_new_session=True,
+                    cwd=str(data_root.parent),
+                    env=environment,
+                )
+        except OSError:
+            log.warning(
+                "SaveSync conflict popup subprocess launch failed: launcher=%s log=%s",
+                launcher,
+                process_log,
+                exc_info=True,
+            )
+            return
+        remaining = savesync_prompts.pending_ids(data_root)
+        log.info(
+            "SaveSync conflict popup subprocess exited: returncode=%d remaining=%d "
+            "process_log=%s",
+            result.returncode,
+            len(remaining),
+            process_log,
+        )
+        if result.returncode != 0:
+            log.warning(
+                "SaveSync conflict prompt exited unsuccessfully; prompt remains pending"
+            )
+        elif remaining:
+            log.warning(
+                "SaveSync conflict popup exited with %d prompt(s) still pending",
+                len(remaining),
+            )
+
+
 @autosync_group.command("game-start", hidden=True)
 @_event_arguments
 @click.pass_context
@@ -63,11 +157,16 @@ def game_stop(
     if not ctx.obj["config"].saves.auto_sync_enabled:
         return
     try:
-        _coordinator(ctx).game_stop(
+        conflict_ids = _coordinator(ctx).game_stop(
             system=system, emulator=emulator, core=core, rom=rom
         )
-    except Exception:  # noqa: BLE001 - detached best-effort background work
-        log.warning("Background SaveSync game-exit pass failed", exc_info=True)
+        log.info(
+            "gameStop worker reached popup handoff: new_conflicts=%d",
+            len(conflict_ids),
+        )
+        _launch_pending_conflict_popup(Path(ctx.obj["config"].data_path))
+    except Exception:  # noqa: BLE001 - lifecycle integration must fail open
+        log.warning("SaveSync game-exit pass failed", exc_info=True)
 
 
 @autosync_group.command("menu-tick", hidden=True)

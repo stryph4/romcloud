@@ -15,6 +15,7 @@ from ports_gfx.savesync_screen import (
     APPLYING_SETTINGS,
     COMMITTING,
     CONFIRMING,
+    CONFLICTS,
     DASHBOARD,
     PREVIEW,
     PREVIEWING,
@@ -152,6 +153,43 @@ class TestDashboardSelection:
         state = SaveSyncScreenState(romcloud_bin="romcloud", selected_index=4)
         state.confirm_dashboard_selection()
         assert state.step == SETTINGS
+
+    def test_zero_conflicts_does_not_show_resolve_action(self):
+        state = SaveSyncScreenState(
+            romcloud_bin="romcloud", status={"active_conflicts": 0}
+        )
+
+        assert not any(
+            item.startswith("Resolve Conflicts") for item in state.dashboard_items
+        )
+
+    def test_active_conflict_count_exposes_actionable_resolver(self):
+        state = SaveSyncScreenState(
+            romcloud_bin="romcloud",
+            status={"active_conflicts": 2},
+            selected_index=5,
+            popen=_fake_popen_returning(
+                {
+                    "ok": True,
+                    "source": "manual",
+                    "conflicts": [
+                        {"conflict_id": "one"},
+                        {"conflict_id": "two"},
+                    ],
+                }
+            ),
+        )
+
+        assert state.dashboard_items[5] == "Resolve Conflicts (2)"
+        state.confirm_dashboard_selection()
+
+        assert state.step == CONFLICTS
+        assert state.resolver is not None
+        assert state.resolver.source == "manual"
+        state.update(0.0)
+        state.update(0.0)
+        assert state.resolver is not None
+        assert state.resolver.conflict["conflict_id"] == "one"
 
     def test_quick_sync_starts_previewing_operation(self):
         state = SaveSyncScreenState(
