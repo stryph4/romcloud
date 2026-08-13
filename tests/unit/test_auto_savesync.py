@@ -22,6 +22,7 @@ from romcloud.infrastructure.config import (
     SourceConfig,
     write_config,
 )
+from romcloud.integrations.batocera import auto_savesync as batocera_auto_savesync
 from romcloud.integrations.batocera.auto_savesync import hook_content, install_hook
 from romcloud.services.auto_savesync import (
     AutoSaveSyncCoordinator,
@@ -176,11 +177,113 @@ def test_batocera_hook_detaches_game_stop_but_keeps_start_marker_ordered(tmp_pat
     assert "gameStart" in content and "gameStop" in content
     assert "game-start" in content and "game-stop" in content
     assert 'nohup "$ROMCLOUD_BIN" _autosync game-stop' in content
+    assert 'nohup "$ROMCLOUD_BIN" _autosync menu-loop' in content
     assert "</dev/null &" in content
     assert '"$2" "$3" "$4" "$5"' in content
     if os.name != "nt":
         assert target.stat().st_mode & 0o111
     assert hook_content(tmp_path / "bin" / "romcloud") == content
+
+
+def test_boot_menu_loop_launcher_is_detached_and_does_no_sync_work(
+    tmp_path: Path, monkeypatch
+):
+    calls = []
+    monkeypatch.setattr(
+        batocera_auto_savesync,
+        "running_menu_loop_pid",
+        lambda data_root: None,
+    )
+
+    def fake_popen(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return type("Process", (), {"pid": 3131})()
+
+    pid = batocera_auto_savesync.spawn_menu_loop(
+        tmp_path / "data",
+        python_executable="/venv/bin/python",
+        popen=fake_popen,
+    )
+
+    assert pid == 3131
+    assert calls[0][0] == [
+        "/venv/bin/python",
+        "-m",
+        "romcloud.cli.main",
+        "_autosync",
+        "menu-loop",
+    ]
+    assert calls[0][1] == {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "start_new_session": True,
+    }
+
+
+def test_duplicate_boot_launcher_reuses_verified_resident_without_spawning(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(
+        batocera_auto_savesync,
+        "running_menu_loop_pid",
+        lambda data_root: 4242,
+    )
+
+    pid = batocera_auto_savesync.spawn_menu_loop(
+        tmp_path / "data",
+        popen=lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("duplicate boot invocation spawned another loop")
+        ),
+    )
+
+    assert pid == 4242
+
+
+def test_menu_loop_pid_identity_refuses_unrelated_process(
+    tmp_path: Path, monkeypatch
+):
+    data_root = tmp_path / "data"
+    batocera_auto_savesync.record_menu_loop_pid(data_root, 4242)
+    monkeypatch.setattr(batocera_auto_savesync, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(
+        batocera_auto_savesync,
+        "_menu_loop_cmdline_matches",
+        lambda pid, **kwargs: False,
+    )
+    monkeypatch.setattr(
+        batocera_auto_savesync,
+        "_signal_owned_process",
+        lambda *a: (_ for _ in ()).throw(
+            AssertionError("unrelated process was signalled")
+        ),
+    )
+
+    assert batocera_auto_savesync.stop_menu_loop(data_root) is False
+    assert not batocera_auto_savesync.menu_loop_pid_path(data_root).exists()
+
+
+def test_owned_menu_loop_stop_is_bounded_and_clears_restart_record(
+    tmp_path: Path, monkeypatch
+):
+    data_root = tmp_path / "data"
+    batocera_auto_savesync.record_menu_loop_pid(data_root, 4242)
+    signals = []
+    monkeypatch.setattr(
+        batocera_auto_savesync,
+        "running_menu_loop_pid",
+        lambda root: 4242,
+    )
+    monkeypatch.setattr(
+        batocera_auto_savesync,
+        "_signal_owned_process",
+        lambda pid, sig: signals.append((pid, sig)),
+    )
+    monkeypatch.setattr(batocera_auto_savesync, "_pid_alive", lambda pid: False)
+
+    assert batocera_auto_savesync.stop_menu_loop(data_root) is True
+    assert signals == [(4242, batocera_auto_savesync.signal.SIGTERM)]
+    assert not batocera_auto_savesync.menu_loop_pid_path(data_root).exists()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Batocera hook is a POSIX shell script")

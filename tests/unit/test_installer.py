@@ -261,12 +261,15 @@ class TestInstallPortsUi:
 
 
 class TestReconcileMountService:
-    def test_not_applicable_when_never_installed(self, tmp_path: Path, monkeypatch) -> None:
+    def test_installs_owned_boot_service_when_never_installed(self, tmp_path: Path, monkeypatch) -> None:
         from romcloud.integrations.batocera import mount_service
 
-        monkeypatch.setattr(mount_service, "SERVICE_SCRIPT_PATH", tmp_path / "services" / "romcloud_mount")
+        service_path = tmp_path / "services" / "romcloud_mount"
+        monkeypatch.setattr(mount_service, "SERVICE_SCRIPT_PATH", service_path)
 
-        assert inst.reconcile_mount_service(tmp_path / "bin") is None
+        assert inst.reconcile_mount_service(tmp_path / "bin") is True
+        assert service_path.is_file()
+        assert "mount boot-start" in service_path.read_text(encoding="utf-8")
 
     def test_restores_missing_override_from_existing_catalog(self, tmp_path: Path, monkeypatch) -> None:
         from romcloud.integrations.batocera import mount_service
@@ -463,7 +466,7 @@ class TestReconcileInstall:
         assert report.core.cli_wrapper.exists()
         assert report.core.launch_wrapper.exists()
         assert report.ports_ui.installed is True
-        assert report.mount_service is None
+        assert report.mount_service is True
         assert report.es_override is None
         assert report.ports_gamelist is True
         assert report.autosync_hook is True

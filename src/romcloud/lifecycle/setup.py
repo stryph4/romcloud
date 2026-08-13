@@ -576,8 +576,7 @@ def apply_setup(
         step = "install mount service"
         _write_state(state_path, {"status": "applying", "step": step})
         romcloud_bin = config_path.parent.parent / "bin" / "romcloud"
-        if mount_worker.configured_mounts(config):
-            mount_service.install_service(str(romcloud_bin))
+        mount_service.install_service(str(romcloud_bin))
 
         step = "mount and test storage"
         emit_progress(progress, "configure", "mount", "running", "Connecting storage…")

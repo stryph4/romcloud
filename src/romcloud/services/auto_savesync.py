@@ -15,6 +15,7 @@ from romcloud.core.exceptions import SaveSyncVerificationError
 from romcloud.core.models.savesync import SaveGroupCondition
 from romcloud.core.save_selection import SaveSelectionPolicy
 from romcloud.infrastructure.logging import get_logger
+from romcloud.integrations.batocera import auto_savesync as batocera_auto_savesync
 from romcloud.services.saves import SaveSyncService
 
 log = get_logger("auto-savesync")
@@ -220,6 +221,7 @@ class AutoSaveSyncCoordinator:
         if not loop_lock.acquire():
             return
         try:
+            batocera_auto_savesync.record_menu_loop_pid(self._data_root)
             log.info("Auto SaveSync periodic menu loop started")
             self.menu_tick(force=True)
             while True:
@@ -232,6 +234,7 @@ class AutoSaveSyncCoordinator:
                     return
                 self.menu_tick(force=False)
         finally:
+            batocera_auto_savesync.clear_menu_loop_pid(self._data_root)
             loop_lock.release()
 
     def _menu_loop_enabled(self) -> bool:

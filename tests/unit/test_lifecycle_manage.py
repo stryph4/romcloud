@@ -15,6 +15,7 @@ from romcloud.infrastructure.config import (
     CacheConfig,
     LoggingConfig,
     RemoteDataConfig,
+    SavesConfig,
     SMBConfig,
     SourceConfig,
     write_config,
@@ -77,6 +78,7 @@ def _catalogued_proxy(config: AppConfig, local_roms: Path) -> tuple[Path, str]:
 
 
 def _isolate_integrations(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(manage.auto_savesync, "stop_menu_loop", lambda data_root: False)
     monkeypatch.setattr(manage.mount_worker, "stop_worker", lambda home: False)
     monkeypatch.setattr(manage.mount_worker, "cleanup_runtime_state", lambda home: None)
     monkeypatch.setattr(manage.mount_service, "remove_service", lambda: False)
@@ -143,6 +145,11 @@ def test_uninstall_removes_active_artifacts_and_preserves_recoverable_state(
     )
     calls: list[str] = []
     _isolate_integrations(monkeypatch)
+    monkeypatch.setattr(
+        manage.auto_savesync,
+        "stop_menu_loop",
+        lambda data_root: calls.append("autosync-stop"),
+    )
     monkeypatch.setattr(manage.mount_worker, "stop_worker", lambda home: calls.append("worker-stop"))
     monkeypatch.setattr(manage.mount_worker, "cleanup_runtime_state", lambda home: calls.append("runtime-cleanup"))
     monkeypatch.setattr(manage.mount_service, "remove_service", lambda: calls.append("service"))
@@ -164,8 +171,8 @@ def test_uninstall_removes_active_artifacts_and_preserves_recoverable_state(
     assert "Other.sh" in (ports_dir / "gamelist.xml").read_text()
     assert "ROMCloud.sh" not in (ports_dir / "gamelist.xml").read_text()
     assert calls == [
-        "worker-stop", "service", "es", "runtime-cleanup",
-        "worker-stop", "service", "es", "runtime-cleanup",
+        "autosync-stop", "worker-stop", "service", "es", "runtime-cleanup",
+        "autosync-stop", "worker-stop", "service", "es", "runtime-cleanup",
     ]
 
 
@@ -196,6 +203,62 @@ def test_purge_removes_owned_state_and_signed_orphan_only(
     assert not cache.exists()
     assert not proxy.exists() and not signed_orphan.exists()
     assert foreign_proxy.exists() and real_rom.exists() and unrelated.exists()
+
+
+def test_install_boot_integration_then_purge_stops_and_removes_only_owned_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from romcloud.integrations.batocera import auto_savesync, mount_service
+
+    config, home, _local_roms, _cache = _config(tmp_path)
+    config = replace(
+        config,
+        saves=SavesConfig(auto_sync_enabled=True),
+    )
+    write_config(config, str(home / "config" / "romcloud.toml"))
+    service_path = tmp_path / "services" / "romcloud_mount"
+    legacy_service = tmp_path / "services" / "romcloud-mount"
+    hook_path = tmp_path / "scripts" / "romcloud-autosync"
+    unrelated_service = tmp_path / "services" / "unrelated_service"
+    unrelated_hook = tmp_path / "scripts" / "unrelated-hook"
+    unrelated_service.parent.mkdir(parents=True, exist_ok=True)
+    unrelated_hook.parent.mkdir(parents=True, exist_ok=True)
+    unrelated_service.write_text("user service", encoding="utf-8")
+    unrelated_hook.write_text("user hook", encoding="utf-8")
+    monkeypatch.setattr(mount_service, "SERVICE_SCRIPT_PATH", service_path)
+    monkeypatch.setattr(mount_service, "LEGACY_SERVICE_PATH", legacy_service)
+    monkeypatch.setattr(auto_savesync, "HOOK_PATH", hook_path)
+    original_remove_service = mount_service.remove_service
+    mount_service.install_service(str(home / "bin" / "romcloud"), service_path=service_path)
+    auto_savesync.install_hook(home / "bin" / "romcloud", hook_path=hook_path)
+    assert "mount boot-start" in service_path.read_text(encoding="utf-8")
+    assert "_autosync menu-loop" in hook_path.read_text(encoding="utf-8")
+
+    stopped = []
+    monkeypatch.setattr(
+        manage.auto_savesync,
+        "stop_menu_loop",
+        lambda data_root: stopped.append(data_root) or True,
+    )
+    monkeypatch.setattr(manage.mount_worker, "stop_worker", lambda home: False)
+    monkeypatch.setattr(
+        manage.mount_worker, "cleanup_runtime_state", lambda home: None
+    )
+    monkeypatch.setattr(
+        manage.mount_service,
+        "remove_service",
+        lambda: original_remove_service(service_path=service_path),
+    )
+    monkeypatch.setattr(manage.es_config, "remove", lambda: False)
+
+    manage.purge(config=config, romcloud_home=home, ports_dir=tmp_path / "ports")
+
+    assert stopped == [Path(config.data_path)]
+    assert not service_path.exists()
+    assert not hook_path.exists()
+    assert unrelated_service.read_text(encoding="utf-8") == "user service"
+    assert unrelated_hook.read_text(encoding="utf-8") == "user hook"
+    assert not home.exists()
 
 
 def test_purge_preserves_user_controlled_remote_data(

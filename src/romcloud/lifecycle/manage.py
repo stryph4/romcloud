@@ -284,6 +284,10 @@ def uninstall(
     ports_dir: Optional[Path] = None,
 ) -> LifecycleReport:
     resolved_ports_dir = ports_dir or install.DEFAULT_PORTS_DIR
+    # Stop the exact verified resident before removing its executable,
+    # startup service, hook, or durable state. This never uses broad process
+    # matching and cannot target an unrelated Batocera process.
+    auto_savesync.stop_menu_loop(Path(config.data_path))
     mount_worker.stop_worker(romcloud_home)
     unmount_errors: list[str] = []
     if mount_worker.configured_mounts(config):

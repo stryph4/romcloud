@@ -37,7 +37,7 @@ from romcloud.core.exceptions import ROMCloudError
 from romcloud.infrastructure.config import load_config
 from romcloud.infrastructure.logging import configure_logging
 from romcloud.infrastructure import mount, mount_worker
-from romcloud.integrations.batocera import mount_service
+from romcloud.integrations.batocera import auto_savesync, mount_service
 from romcloud.services.connections import mount_connections, unmount_connections
 
 
@@ -153,15 +153,25 @@ def mount_start_cmd(ctx: click.Context) -> None:
 def mount_boot_start_cmd(ctx: click.Context) -> None:
     """Non-blocking boot-time trigger, used by the Batocera service's `start`.
 
-    Never waits on DNS/network/Tailscale/CIFS. Checks whether the source is
-    already mounted or a worker is already running (both fast, local
-    checks); otherwise spawns a detached background worker and returns
-    immediately. Always exits 0 — "ROMCloud may fail; Batocera must not."
+    Never waits on DNS/network/Tailscale/CIFS. It detaches the Auto SaveSync
+    resident when enabled, then checks mount state and detaches the mount
+    worker when needed. All synchronous decisions use local config/runtime
+    state and ``/proc`` only. Always exits 0 — "ROMCloud may fail; Batocera
+    must not."
     """
     try:
         config = _get_mount_config(
             ctx, resolve_paths=False, local_logging_only=True
         )
+
+        if config.saves.auto_sync_enabled:
+            try:
+                auto_savesync.spawn_menu_loop(Path(config.data_path))
+            except Exception as exc:  # noqa: BLE001 - boot must always continue
+                click.echo(
+                    f"warning: could not start Auto SaveSync menu loop: {exc}",
+                    err=True,
+                )
 
         if not mount_worker.configured_mounts(config, resolve_paths=False):
             click.echo("No SMB-backed locations configured — nothing to do.")
@@ -225,7 +235,24 @@ def mount_worker_cmd(ctx: click.Context) -> None:
 @click.pass_context
 def mount_stop_cmd(ctx: click.Context, shutdown: bool) -> None:
     """Stop the mount worker, then unmount every configured SMB location."""
-    config = _require_mounts(ctx, resolve_paths=not shutdown)
+    if shutdown:
+        config = _get_mount_config(
+            ctx, resolve_paths=False, local_logging_only=True
+        )
+        try:
+            auto_savesync.stop_menu_loop(
+                Path(config.data_path), grace_period=1.0
+            )
+        except Exception as exc:  # noqa: BLE001 - shutdown must continue
+            click.echo(
+                f"warning: could not stop Auto SaveSync menu loop: {exc}",
+                err=True,
+            )
+        if not mount_worker.configured_mounts(config, resolve_paths=False):
+            click.echo("Was not mounted.")
+            return
+    else:
+        config = _require_mounts(ctx)
     try:
         result = unmount_connections(config, shutdown=shutdown)
     except ROMCloudError as exc:

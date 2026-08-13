@@ -38,6 +38,7 @@ def _fake_config(
         credentials_path=home / "config" / "credentials.toml",
         data_path=str(home / "data"),
         logging=SimpleNamespace(level="INFO", path=None),
+        saves=SimpleNamespace(auto_sync_enabled=False),
         remote_data=(
             SimpleNamespace(
                 provider="smb",
@@ -55,6 +56,75 @@ def _invoke(args, config):
 
 
 class TestBootStart:
+    def test_enabled_auto_sync_detaches_menu_loop_and_mount_worker(
+        self, monkeypatch
+    ):
+        config = _fake_config(smb=_fake_smb())
+        config.saves.auto_sync_enabled = True
+        calls = []
+        monkeypatch.setattr(
+            mount_cmd_module.auto_savesync,
+            "spawn_menu_loop",
+            lambda data_root: calls.append(("autosync", data_root)) or 3131,
+        )
+        monkeypatch.setattr(
+            mount_cmd_module.mount_worker,
+            "all_configured_mounts_are_mounted",
+            lambda *a, **k: False,
+        )
+        monkeypatch.setattr(
+            mount_cmd_module.mount_worker,
+            "is_worker_running",
+            lambda *a: None,
+        )
+        monkeypatch.setattr(
+            mount_cmd_module.mount_worker,
+            "spawn_worker",
+            lambda home: calls.append(("mount", home)) or 4242,
+        )
+
+        result = _invoke(["boot-start"], config)
+
+        assert result.exit_code == 0, result.output
+        assert calls == [
+            ("autosync", Path(config.data_path)),
+            ("mount", Path(config.data_path).parent),
+        ]
+
+    def test_disabled_auto_sync_never_launches_menu_loop(self, monkeypatch):
+        config = _fake_config(smb=_fake_smb())
+        monkeypatch.setattr(
+            mount_cmd_module.auto_savesync,
+            "spawn_menu_loop",
+            lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("disabled Auto Sync spawned a resident loop")
+            ),
+        )
+        monkeypatch.setattr(
+            mount_cmd_module.mount_worker,
+            "all_configured_mounts_are_mounted",
+            lambda *a, **k: True,
+        )
+
+        result = _invoke(["boot-start"], config)
+
+        assert result.exit_code == 0, result.output
+
+    def test_enabled_auto_sync_starts_without_any_smb_mount(self, monkeypatch):
+        config = _fake_config(smb=None)
+        config.saves.auto_sync_enabled = True
+        spawned = []
+        monkeypatch.setattr(
+            mount_cmd_module.auto_savesync,
+            "spawn_menu_loop",
+            lambda data_root: spawned.append(data_root) or 3131,
+        )
+
+        result = _invoke(["boot-start"], config)
+
+        assert result.exit_code == 0, result.output
+        assert spawned == [Path(config.data_path)]
+
     def test_catalog_mount_alone_does_not_hide_missing_savesync_mount(self, monkeypatch):
         monkeypatch.setattr(
             mount_cmd_module.mount,
@@ -156,6 +226,24 @@ class TestWorkerCommand:
 
 
 class TestStop:
+    def test_shutdown_stops_resident_even_when_no_mount_is_configured(
+        self, monkeypatch
+    ):
+        config = _fake_config(smb=None)
+        stopped = []
+        monkeypatch.setattr(
+            mount_cmd_module.auto_savesync,
+            "stop_menu_loop",
+            lambda data_root, **kwargs: stopped.append((data_root, kwargs)) or True,
+        )
+
+        result = _invoke(["stop", "--shutdown"], config)
+
+        assert result.exit_code == 0, result.output
+        assert stopped == [
+            (Path(config.data_path), {"grace_period": 1.0})
+        ]
+
     def test_shutdown_selects_safe_config_parsing_before_container_build(
         self, monkeypatch
     ):
@@ -194,10 +282,12 @@ class TestStop:
 
     def test_boot_start_uses_safe_local_only_initialization(self, monkeypatch):
         config = _fake_config(smb=_fake_smb())
+        config.saves.auto_sync_enabled = True
         config.logging.path = "/userdata/romcloud/source/logs"
         loaded = []
         logging_calls = []
         target_calls = []
+        autosync_spawns = []
         monkeypatch.setattr(
             mount_cmd_module,
             "load_config",
@@ -228,6 +318,18 @@ class TestStop:
             "spawn_worker",
             lambda home: 4242,
         )
+        monkeypatch.setattr(
+            mount_cmd_module.auto_savesync,
+            "spawn_menu_loop",
+            lambda data_root: autosync_spawns.append(data_root) or 3131,
+        )
+        monkeypatch.setattr(
+            mount_cmd_module.mount,
+            "wait_until_reachable",
+            lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("boot-start performed a reachability check")
+            ),
+        )
 
         result = CliRunner().invoke(
             cli,
@@ -239,6 +341,7 @@ class TestStop:
             ("/local/romcloud.toml", {"resolve_paths": False})
         ]
         assert logging_calls[0]["log_dir"] is None
+        assert autosync_spawns == [Path(config.data_path)]
         assert target_calls == [
             {"resolve_paths": False},
             {"resolve_paths": False},

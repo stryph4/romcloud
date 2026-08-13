@@ -4,8 +4,8 @@ Both the bootstrap installer (``scripts/install.sh``) and the self-updater
 (:func:`romcloud.lifecycle.update.perform_update`) need to write the
 exact same set of managed runtime artifacts: the ``romcloud``/``romcloud-run``
 wrappers, the optional graphical Ports UI payload (including its
-EmulationStation Ports ``gamelist.xml`` entry/icon), and — only if
-previously enabled — the Batocera mount service script and the
+EmulationStation Ports ``gamelist.xml`` entry/icon), the ROMCloud-owned
+Batocera boot service, and — only if previously enabled — the
 EmulationStation override. The small Batocera lifecycle hook used by Auto
 SaveSync is also refreshed best-effort. This module is the single, idempotent
 implementation of that logic so neither caller duplicates it, and so a fresh
@@ -19,9 +19,9 @@ Failure semantics ("ROMCloud may fail; Batocera must not")
   from :func:`write_core_wrappers` (and therefore from :func:`reconcile_install`)
   as a failed install/update.
 - Everything else — the graphical Ports UI (and its gamelist.xml entry),
-  the mount service script, and the EmulationStation override — is
-  best-effort. A missing/incompatible system Python, a never-configured
-  mount service, or a never-installed ES override are all normal states,
+  the boot service script, and the EmulationStation override — is
+  best-effort. A missing/incompatible system Python or a never-installed ES
+  override are normal states,
   not failures, and are reported back
   through the returned result objects rather than raised.
 """
@@ -243,19 +243,17 @@ def install_ports_ui(
 # ── previously-enabled Batocera integrations (best-effort, only if applicable) ──
 
 
-def reconcile_mount_service(bin_dir: Path) -> Optional[bool]:
-    """If the Batocera mount service script was already installed, refresh
-    its content to match the just-installed backend code.
+def reconcile_mount_service(bin_dir: Path) -> bool:
+    """Install or refresh ROMCloud's owned Batocera boot service.
 
-    Returns ``None`` if the service was never installed (not applicable —
-    nothing to reconcile), ``True`` if it was refreshed successfully, or
-    ``False`` if refreshing it failed (best-effort; never raises).
+    It also owns the reliable Auto SaveSync resident-loop handoff and is
+    therefore applicable even when no CIFS mount is configured.
+
+    Returns ``True`` on success or ``False`` on a best-effort failure.
     """
     from romcloud.integrations.batocera import mount_service
 
     service_path = mount_service.SERVICE_SCRIPT_PATH
-    if not service_path.exists():
-        return None
     try:
         mount_service.install_service(str(bin_dir / "romcloud"), service_path=service_path)
         return True

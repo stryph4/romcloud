@@ -1,11 +1,13 @@
-"""Batocera custom-service integration for the mounted SMB source.
+"""Batocera custom-service integration for ROMCloud boot lifecycle work.
 
 Batocera's "custom services" mechanism is the standard, long-documented
 extension point for running a script at boot: any executable script placed
 under ``/userdata/system/services/`` that responds to ``start``/``stop``/
 ``status`` arguments can be registered with ``batocera-services enable
 <name>``. This module generates and installs exactly one such script,
-``romcloud_mount``.
+``romcloud_mount``. The historical name is retained for compatibility; its
+local-only ``boot-start`` handoff now also detaches Auto SaveSync's resident
+menu loop when that persisted setting is enabled.
 
 Boot safety ("ROMCloud may fail; Batocera must not")
 Real Batocera 42 hardware testing showed that a service's ``start`` action
