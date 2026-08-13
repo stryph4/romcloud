@@ -142,7 +142,6 @@ class SavesConfig:
     auto_sync_enabled: bool = False
     xbox_enabled: bool = False
     rpcs3_installed_games_enabled: bool = False
-    include_local_games: bool = False
 
 
 @dataclass(frozen=True)
@@ -401,7 +400,6 @@ def _parse(data: dict, path: Path) -> AppConfig:  # noqa: C901
         rpcs3_installed_games_enabled=bool(
             saves_raw.get("rpcs3_installed_games_enabled", False)
         ),
-        include_local_games=bool(saves_raw.get("include_local_games", False)),
     )
 
     library_sync_raw = data.get("library_sync", {})
@@ -567,11 +565,9 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
         f'local_path = "{config.saves.local_path}"\n',
         f"auto_sync_enabled = {'true' if config.saves.auto_sync_enabled else 'false'}\n",
         f"xbox_enabled = {'true' if config.saves.xbox_enabled else 'false'}\n",
-        "# Compatibility keys: RPCS3 applications remain ineligible and eligible "
-        "local-game saves remain included regardless of these values.\n",
+        "# Compatibility key: RPCS3 applications remain ineligible.\n",
         "rpcs3_installed_games_enabled = "
         f"{'true' if config.saves.rpcs3_installed_games_enabled else 'false'}\n",
-        f"include_local_games = {'true' if config.saves.include_local_games else 'false'}\n",
         "\n",
         "[library_sync]\n",
         "# Opt-in metadata/media sync. Source gamelist.xml files are read-only.\n",

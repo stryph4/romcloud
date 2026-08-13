@@ -226,7 +226,6 @@ class Container:
                 rpcs3_installed_games_enabled=(
                     self._config.saves.rpcs3_installed_games_enabled
                 ),
-                include_local_games=self._config.saves.include_local_games,
                 legacy_rpcs3_root=(
                     str(legacy_rpcs3_root) if legacy_rpcs3_root is not None else None
                 ),

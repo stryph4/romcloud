@@ -361,10 +361,6 @@ class SaveSyncScreenState:
                         "rpcs3_installed_games_enabled",
                         self.status.get("rpcs3_installed_games_enabled", False),
                     ),
-                    "include_local_games": result.data.get(
-                        "include_local_games",
-                        self.status.get("include_local_games", False),
-                    ),
                 }
             else:
                 self.error = result.error

@@ -322,33 +322,3 @@ def saves_rpcs3_installed_games_disable(ctx: click.Context) -> None:
     """Exclude RPCS3 installed titles (the safe default)."""
     _set_rpcs3_installed_games_enabled(ctx, False)
     click.echo("RPCS3 installed-game synchronization disabled.")
-
-
-def _set_include_local_games(ctx: click.Context, enabled: bool) -> None:
-    config = get_container(ctx).config
-    write_config(
-        replace(
-            config,
-            saves=replace(config.saves, include_local_games=enabled),
-        ),
-        ctx.obj["config_path"],
-    )
-
-
-@saves_group.command("local-games-enable")
-@click.option("--yes", is_flag=True, help="Enable without prompting.")
-@click.pass_context
-def saves_local_games_enable(ctx: click.Context, yes: bool) -> None:
-    """Compatibility command; supported layouts already include local games."""
-    _set_include_local_games(ctx, True)
-    click.echo("Eligible ordinary local-game saves are included by default.")
-
-
-@saves_group.command("local-games-disable")
-@click.pass_context
-def saves_local_games_disable(ctx: click.Context) -> None:
-    """Compatibility command; catalog ownership is not an eligibility gate."""
-    raise click.ClickException(
-        "Eligible local-game saves cannot be disabled by catalog ownership; "
-        "SaveSync is controlled by the supported-layout allowlist."
-    )

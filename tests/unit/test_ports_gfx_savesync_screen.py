@@ -584,10 +584,14 @@ class TestSettings:
             status={"auto_sync_enabled": False, "xbox_enabled": False},
         )
         requested = []
-        state.set_auto_sync_enabled = requested.append
+        state._start_operation = lambda action, payload: requested.append(  # noqa: SLF001
+            (action, payload)
+        )
         state.confirm_settings_selection()
 
-        assert requested == [True]
+        assert requested == [
+            ("savesync-settings", {"auto_sync_enabled": True})
+        ]
 
     def test_return_to_dashboard_resets_selection(self):
         state = SaveSyncScreenState(romcloud_bin="romcloud", step=SETTINGS, selected_index=2)

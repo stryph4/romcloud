@@ -889,45 +889,43 @@ class TestAutomaticOwnershipBoundary:
         assert report.uploaded == 1
         assert (tmp_path / "remote-saves/psx/Local Game.srm").read_bytes() == b"local"
 
-    def test_local_game_opt_in_enables_eligible_automatic_sync(
+    def test_local_snes_save_is_eligible_without_catalog_or_flag(
         self, tmp_path, provider
     ):
         local = tmp_path / "local-saves"
-        _write(local / "psx/Local Game.srm", b"local")
+        _write(local / "snes/Local Game.srm", b"local")
         svc = SaveSyncService(
             provider=provider,
             connectivity_root=str(tmp_path / "remote-data"),
             local_root=str(local),
             remote_root=str(tmp_path / "remote-saves"),
             state_path=tmp_path / "data/savesync-state.json",
-            include_local_games=True,
         )
 
         report = svc.reconcile()
 
         assert report.scope == "all_eligible"
         assert report.uploaded == 1
-        assert (tmp_path / "remote-saves/psx/Local Game.srm").read_bytes() == b"local"
+        assert (tmp_path / "remote-saves/snes/Local Game.srm").read_bytes() == b"local"
 
-    def test_local_game_opt_in_does_not_enable_rpcs3_installed_games(
+    def test_unknown_local_root_remains_excluded_without_ownership_gate(
         self, tmp_path, provider
     ):
         local = tmp_path / "local-saves"
-        game = local / "ps3/rpcs3/dev_hdd0/game/BLUS1/USRDIR/EBOOT.BIN"
-        _write(game, b"installed-game")
+        _write(local / "unknown-emulator/nested/Game.srm", b"unsupported")
         svc = SaveSyncService(
             provider=provider,
             connectivity_root=str(tmp_path / "remote-data"),
             local_root=str(local),
             remote_root=str(tmp_path / "remote-saves"),
             state_path=tmp_path / "data/savesync-state.json",
-            include_local_games=True,
         )
 
         plan = svc.preview_reconciliation()
         report = svc.reconcile()
 
         assert plan.entries == ()
+        assert plan.excluded_files == 0
         assert plan.optional_groups == ()
         assert report.uploaded == 0
         assert not (tmp_path / "remote-saves").exists()

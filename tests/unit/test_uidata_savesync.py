@@ -79,7 +79,6 @@ class TestSavesyncStatus:
         assert payload["xbox_enabled"] is False
         assert payload["xbox_hdd_size_bytes"] is None
         assert payload["rpcs3_installed_games_enabled"] is False
-        assert payload["include_local_games"] is True
         assert payload["sync_status"] == "clean"
         assert payload["active_conflicts"] == 0
         assert payload["last_upload"] is None
@@ -263,34 +262,11 @@ class TestSavesyncSettings:
         status = json.loads(_invoke(cfg_path, ["savesync-status"]).output.strip())
         assert status["rpcs3_installed_games_enabled"] is False
 
-    def test_enable_local_games_persists_to_config(self, tmp_path):
-        cfg_path = _config_path(tmp_path)
-
-        result = _invoke(
-            cfg_path,
-            ["savesync-settings"],
-            input=json.dumps({"include_local_games": True}),
-        )
-
-        assert result.exit_code == 0, result.output
-        payload = json.loads(result.output.strip())
-        assert payload["include_local_games"] is True
-        status = json.loads(_invoke(cfg_path, ["savesync-status"]).output.strip())
-        assert status["include_local_games"] is True
-
-
 class TestSavesyncReconcile:
     def test_reconcile_endpoint_reports_preflight_and_result(self, tmp_path):
         cfg_path = _config_path(tmp_path)
         (tmp_path / "saves/psx").mkdir(parents=True)
         (tmp_path / "saves/psx/Game.srm").write_bytes(b"save")
-        enabled = _invoke(
-            cfg_path,
-            ["savesync-settings"],
-            input=json.dumps({"include_local_games": True}),
-        )
-        assert enabled.exit_code == 0, enabled.output
-
         result = _invoke(
             cfg_path,
             ["savesync-reconcile"],

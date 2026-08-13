@@ -585,11 +585,9 @@ def uidata_savesync_status(ctx: click.Context) -> None:
             "auto_sync_enabled": config.saves.auto_sync_enabled,
             "xbox_enabled": saves.xbox_enabled,
             "xbox_hdd_size_bytes": saves.xbox_hdd_size(),
-            # Compatibility-only settings. The graphical SaveSync screen no
-            # longer offers unsafe RPCS3 application-data inclusion or makes
-            # ordinary local games conditional on an opt-in.
+            # Compatibility-only setting. The graphical SaveSync screen no
+            # longer offers unsafe RPCS3 application-data inclusion.
             "rpcs3_installed_games_enabled": saves.rpcs3_installed_games_enabled,
-            "include_local_games": saves.include_local_games,
             "sync_status": state.effective_status.value,
             "quick_sync_ready": state.quick_sync_ready,
             "quick_sync_cursor_generation": state.quick_sync_cursor_generation,
@@ -762,11 +760,6 @@ def uidata_savesync_settings(ctx: click.Context) -> None:
                         config.saves.rpcs3_installed_games_enabled,
                     )
                 ),
-                include_local_games=bool(
-                    request.get(
-                        "include_local_games", config.saves.include_local_games
-                    )
-                ),
             ),
         )
         write_config(new_config, ctx.obj["config_path"])
@@ -783,7 +776,6 @@ def uidata_savesync_settings(ctx: click.Context) -> None:
             "rpcs3_installed_games_enabled": (
                 new_config.saves.rpcs3_installed_games_enabled
             ),
-            "include_local_games": new_config.saves.include_local_games,
         }
 
     _run_action(ctx, build)

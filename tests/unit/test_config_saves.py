@@ -41,7 +41,6 @@ class TestSavesConfigDefaults:
         assert loaded.saves.auto_sync_enabled is False
         assert loaded.saves.xbox_enabled is False
         assert loaded.saves.rpcs3_installed_games_enabled is False
-        assert loaded.saves.include_local_games is False
         assert loaded.remote_data is None
         assert loaded.library_sync.enabled is False
 
@@ -85,6 +84,23 @@ class TestSavesConfigDefaults:
         rewritten = config_path.read_text()
         assert "remote_mount_path" not in rewritten
         assert "remote_subdir" not in rewritten
+
+    def test_legacy_include_local_games_key_is_ignored_without_rewrite(
+        self, tmp_path: Path
+    ):
+        config_path = tmp_path / "romcloud.toml"
+        original = (
+            '[source]\nprovider = "local"\nrom_root = "/roms"\n\n'
+            '[cache]\npath = "/cache"\n\n'
+            '[saves]\nlocal_path = "/userdata/saves"\n'
+            'include_local_games = false\n'
+        )
+        config_path.write_text(original, encoding="utf-8")
+
+        loaded = load_config(str(config_path))
+
+        assert not hasattr(loaded.saves, "include_local_games")
+        assert config_path.read_text(encoding="utf-8") == original
 
 
 class TestSavesConfigRoundTrip:
@@ -174,18 +190,6 @@ class TestSavesConfigRoundTrip:
         loaded = load_config(str(path))
 
         assert loaded.saves.rpcs3_installed_games_enabled is True
-
-    def test_local_game_save_opt_in_round_trips(self, tmp_path: Path):
-        config = _base_config()
-        config = replace(
-            config,
-            saves=replace(config.saves, include_local_games=True),
-        )
-        path = tmp_path / "romcloud.toml"
-
-        write_config(config, str(path))
-
-        assert load_config(str(path)).saves.include_local_games is True
 
     def test_independent_smb_remote_data_round_trip(self, tmp_path: Path):
         config_path = tmp_path / "romcloud.toml"

@@ -80,7 +80,6 @@ class SaveSyncService:
         state_path: Path,
         xbox_enabled: bool = False,
         rpcs3_installed_games_enabled: bool = False,
-        include_local_games: bool = False,
         ownership_policy: object = None,
         legacy_rpcs3_root: Optional[str] = None,
         policy: SaveSelectionPolicy = DEFAULT_SAVE_SELECTION_POLICY,
@@ -93,12 +92,11 @@ class SaveSyncService:
         self._state_path = Path(state_path)
         self._xbox_enabled = xbox_enabled
         # Kept as accepted constructor arguments for configuration/API
-        # compatibility.  Eligibility is now defined solely by the positive
+        # compatibility. Eligibility is defined solely by the positive
         # save-layout registry: ordinary local games are always included, and
         # RPCS3 installed applications are never SaveSync content.
         _ = (
             rpcs3_installed_games_enabled,
-            include_local_games,
             ownership_policy,
         )
         self._legacy_rpcs3_root = (
@@ -144,10 +142,6 @@ class SaveSyncService:
     @property
     def rpcs3_installed_games_enabled(self) -> bool:
         return False
-
-    @property
-    def include_local_games(self) -> bool:
-        return True
 
     def xbox_hdd_size(self) -> Optional[int]:
         path = self._local_root / XBOX_SYSTEM / XBOX_HDD_RELATIVE_PATH
