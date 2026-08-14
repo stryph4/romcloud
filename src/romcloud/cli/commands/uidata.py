@@ -25,6 +25,8 @@ graphical UI, not a user-facing command surface.
 from __future__ import annotations
 
 import json
+import os
+import sys
 from pathlib import Path
 
 import click
@@ -370,6 +372,37 @@ def _run_library_sync(ctx: click.Context, *, full: bool) -> None:
 
         refresh_emulationstation(container.config, container.game_repo.list_systems())
         return report.as_dict()
+
+    _run_action(ctx, build)
+
+
+@uidata_group.command("manager-status")
+@click.pass_context
+def uidata_manager_status(ctx: click.Context) -> None:
+    """Return the supervised browser Library Manager state."""
+
+    def build() -> dict:
+        from romcloud.web.lifecycle import manager_status
+
+        config = _load_context_config(ctx)
+        return manager_status(config.data_path)
+
+    _run_action(ctx, build)
+
+
+@uidata_group.command("manager-start")
+@click.pass_context
+def uidata_manager_start(ctx: click.Context) -> None:
+    """Start or surface the existing ``romcloud manager`` service."""
+
+    def build() -> dict:
+        from romcloud.web.lifecycle import start_manager
+
+        config = _load_context_config(ctx)
+        romcloud_bin = os.environ.get("ROMCLOUD_BIN") or str(
+            Path(sys.executable).with_name("romcloud")
+        )
+        return start_manager(romcloud_bin, config.data_path)
 
     _run_action(ctx, build)
 

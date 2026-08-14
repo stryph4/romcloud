@@ -1,4 +1,5 @@
 from click.testing import CliRunner
+from types import SimpleNamespace
 
 from romcloud.cli.commands.manager import manager_cmd
 
@@ -10,3 +11,30 @@ def test_manager_help_exposes_secure_and_diagnostic_server_options() -> None:
     assert "--tls-cert" in result.output and "--tls-key" in result.output
     assert "--http" in result.output
     assert "Gamepad API" in result.output
+
+
+def test_foreground_manager_records_discoverable_runtime_state(tmp_path, monkeypatch) -> None:
+    import romcloud.cli.commands.manager as manager_module
+    from romcloud.web.lifecycle import read_manager_state
+
+    captured = {}
+    container = SimpleNamespace(
+        config=SimpleNamespace(data_path=str(tmp_path / "data")),
+        library_manager=object(),
+    )
+    monkeypatch.setattr(manager_module, "get_container", lambda ctx: container)
+
+    def serve(*args, **kwargs):
+        captured["state"] = read_manager_state(container.config.data_path)
+
+    monkeypatch.setattr("romcloud.web.server.serve_manager", serve)
+    result = CliRunner().invoke(
+        manager_cmd,
+        ["--http", "--host", "127.0.0.1", "--token", "shown-token"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["state"]["running"] is True
+    assert captured["state"]["token"] == "shown-token"
+    assert captured["state"]["url"] == "http://127.0.0.1:8765/"
+    assert read_manager_state(container.config.data_path) == {}

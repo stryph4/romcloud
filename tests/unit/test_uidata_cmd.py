@@ -54,6 +54,57 @@ class TestHiddenFromHelp:
         assert "uidata" not in result.output
 
 
+class TestManagerBridge:
+    def test_manager_status_surfaces_runtime_details(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "romcloud.cli.commands.uidata.load_config",
+            lambda path: type("Config", (), {"data_path": str(tmp_path / "data")})(),
+        )
+        monkeypatch.setattr(
+            "romcloud.web.lifecycle.manager_status",
+            lambda data_path: {
+                "running": True,
+                "url": "https://batocera.local:8765/",
+                "token": "token",
+            },
+        )
+        result = CliRunner().invoke(
+            cli,
+            ["--config", str(tmp_path / "config.toml"), "uidata", "manager-status"],
+        )
+        payload = json.loads(result.output)
+        assert result.exit_code == 0
+        assert payload["running"] is True
+        assert payload["token"] == "token"
+
+    def test_manager_start_reuses_existing_manager_lifecycle(self, tmp_path, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(
+            "romcloud.cli.commands.uidata.load_config",
+            lambda path: type("Config", (), {"data_path": str(tmp_path / "data")})(),
+        )
+
+        def start(binary, data_path):
+            captured.update(binary=str(binary), data_path=str(data_path))
+            return {
+                "running": True,
+                "url": "https://batocera.local:8765/",
+                "token": "token",
+                "started": True,
+            }
+
+        monkeypatch.setattr("romcloud.web.lifecycle.start_manager", start)
+        monkeypatch.setenv("ROMCLOUD_BIN", "/opt/romcloud/bin/romcloud")
+        result = CliRunner().invoke(
+            cli,
+            ["--config", str(tmp_path / "config.toml"), "uidata", "manager-start"],
+        )
+        payload = json.loads(result.output)
+        assert result.exit_code == 0
+        assert payload["running"] is True
+        assert captured["binary"] == "/opt/romcloud/bin/romcloud"
+
+
 class TestSetupBridge:
     def test_fresh_setup_status_works_without_config(self, tmp_path):
         cfg_path = tmp_path / "missing" / "romcloud.toml"

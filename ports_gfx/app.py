@@ -58,6 +58,7 @@ from ports_gfx.input_debug import InputDebugLogger
 from ports_gfx.input_manager import InputEvent, InputManager
 from ports_gfx.layout import (
     Layout,
+    MIN_CONTROL_HEIGHT_PX,
     Rect,
     compute_layout,
     compute_vertical_control_rects,
@@ -72,6 +73,7 @@ from ports_gfx.library_sync_screen import (
     RESULT as LIBRARY_RESULT,
     LibrarySyncScreenState,
 )
+from ports_gfx.library_manager_screen import LibraryManagerScreenState
 from ports_gfx.menu import (
     BACK_ACTION,
     CATEGORY_ACTION_PREFIX,
@@ -126,10 +128,16 @@ top-level menu entry, not a Settings submenu."""
 SETUP_ACTION = "setup"
 LIBRARY_QUICK_SYNC_ACTION = "library-sync-quick"
 LIBRARY_FULL_SYNC_ACTION = "library-sync-full"
+LIBRARY_MANAGER_ACTION = "library-manager"
 
 MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
     "Library": (
         MenuItem("Catalog Status", "status"),
+        MenuItem(
+            "Library Manager",
+            LIBRARY_MANAGER_ACTION,
+            "Open the browser library and cache manager on this network.",
+        ),
         MenuItem("Refresh Catalog", "refresh"),
         MenuItem("Cache Status", "cache-status"),
     ),
@@ -228,7 +236,14 @@ def menu_categories_for_state(
 ) -> dict[str, tuple[MenuItem, ...]]:
     capabilities = state.get("capabilities", {})
     capabilities = capabilities if isinstance(capabilities, dict) else {}
-    library: list[MenuItem] = [MenuItem("Catalog Status", "status")]
+    library: list[MenuItem] = [
+        MenuItem("Catalog Status", "status"),
+        MenuItem(
+            "Library Manager",
+            LIBRARY_MANAGER_ACTION,
+            "Open the browser library and cache manager on this network.",
+        ),
+    ]
     if capabilities.get("catalog_refresh", True):
         library.append(MenuItem("Refresh Catalog", "refresh"))
     library.append(MenuItem("Cache Status", "cache-status"))
@@ -847,6 +862,7 @@ def cancel_owned_background_work(
     wizard: WizardState | None,
     savesync_screen: SaveSyncScreenState | None,
     library_sync_screen: LibrarySyncScreenState | None,
+    library_manager_screen: LibraryManagerScreenState | None = None,
 ) -> None:
     """Cancel every subprocess still owned by this GUI session."""
     owners = (
@@ -855,6 +871,7 @@ def cancel_owned_background_work(
         (wizard, "cancel_pending"),
         (savesync_screen, "cancel_pending"),
         (library_sync_screen, "cancel_pending"),
+        (library_manager_screen, "cancel_pending"),
     )
     for owner, method_name in owners:
         if owner is None:
@@ -900,6 +917,7 @@ def _run(  # noqa: ANN001
     operation_screen: Optional[OperationScreenState] = None
     savesync_screen: Optional[SaveSyncScreenState] = None
     library_sync_screen: Optional[LibrarySyncScreenState] = None
+    library_manager_screen: Optional[LibraryManagerScreenState] = None
     update_check: UpdateCheckState | None = None
 
     try:
@@ -1010,6 +1028,8 @@ def _run(  # noqa: ANN001
                         rects = (layout.safe_area,)
                 elif current_screen == "library_sync":
                     rects = (layout.safe_area,)
+                elif current_screen == "library_manager":
+                    rects = (layout.safe_area,)
                 else:
                     rects = ()
                 ievent = input_manager.handle_event(
@@ -1062,6 +1082,15 @@ def _run(  # noqa: ANN001
                         current_screen = "savesync"
                     elif (
                         ievent.action == Action.CONFIRM
+                        and item.action == LIBRARY_MANAGER_ACTION
+                    ):
+                        library_manager_screen = LibraryManagerScreenState(
+                            romcloud_bin=romcloud_bin
+                        )
+                        library_manager_screen.start_or_refresh()
+                        current_screen = "library_manager"
+                    elif (
+                        ievent.action == Action.CONFIRM
                         and item.action
                         in (LIBRARY_QUICK_SYNC_ACTION, LIBRARY_FULL_SYNC_ACTION)
                     ):
@@ -1097,6 +1126,16 @@ def _run(  # noqa: ANN001
                     )
                     if current_screen == "menu":
                         library_sync_screen = None
+                elif (
+                    current_screen == "library_manager"
+                    and library_manager_screen is not None
+                ):
+                    current_screen = _handle_library_manager_event(
+                        ievent, library_manager_screen
+                    )
+                    if current_screen == "menu":
+                        library_manager_screen.cancel_pending()
+                        library_manager_screen = None
                 elif current_screen == "wizard" and wizard is not None:
                     if ievent.action == Action.BACK and wizard.step == WizardStep.WELCOME:
                         running = False
@@ -1219,6 +1258,12 @@ def _run(  # noqa: ANN001
                 for line in library_sync_screen.poll():
                     activity.ingest(line.text)
                 library_sync_screen.update_confirm(dt)
+            elif (
+                current_screen == "library_manager"
+                and library_manager_screen is not None
+            ):
+                for line in library_manager_screen.poll():
+                    activity.ingest(line.text)
             elif current_screen == "wizard" and wizard is not None:
                 for line in wizard.poll():
                     activity.ingest(line.text)
@@ -1289,6 +1334,13 @@ def _run(  # noqa: ANN001
                 _render_library_sync(
                     pygame, screen, fonts, layout, library_sync_screen, activity
                 )
+            elif (
+                current_screen == "library_manager"
+                and library_manager_screen is not None
+            ):
+                _render_library_manager(
+                    pygame, screen, fonts, layout, library_manager_screen
+                )
             elif current_screen == "wizard" and wizard is not None:
                 _render_wizard(
                     pygame, screen, fonts, layout, wizard, wizard.activity
@@ -1301,6 +1353,7 @@ def _run(  # noqa: ANN001
             wizard=wizard,
             savesync_screen=savesync_screen,
             library_sync_screen=library_sync_screen,
+            library_manager_screen=library_manager_screen,
         )
         if input_debug is not None:
             try:
@@ -1520,6 +1573,42 @@ def _handle_library_sync_event(
     return "library_sync"
 
 
+def _handle_library_manager_event(
+    ievent: InputEvent, screen: LibraryManagerScreenState
+) -> str:
+    if ievent.action == Action.BACK:
+        return "menu"
+    if ievent.action == Action.CONFIRM and screen.step != "starting":
+        screen.start_or_refresh()
+    return "library_manager"
+
+
+def _library_manager_body_lines(screen: LibraryManagerScreenState) -> list[str]:
+    if screen.step == "starting":
+        return [
+            "Starting or locating the ROMCloud Library Manager…",
+            "This normally takes only a few seconds.",
+        ]
+    if screen.error:
+        return [
+            "State: Not running",
+            f"Error: {screen.error}",
+            "Press Confirm to retry or Back to return.",
+        ]
+    return [
+        "State: Running",
+        "",
+        "HTTPS URL:",
+        str(screen.details.get("url", "")),
+        "",
+        "Access token:",
+        str(screen.details.get("token", "")),
+        "",
+        "Open the URL on a PC, phone, tablet, or this Batocera device.",
+        "The first visit may ask you to accept ROMCloud's certificate.",
+    ]
+
+
 def _render_menu(  # noqa: ANN001
     pygame,
     screen,
@@ -1561,7 +1650,8 @@ def _render_menu(  # noqa: ANN001
         )
         label = fonts["body"].render(item.label, True, _FG_COLOR)
         center_x, center_y = rect.center
-        label_center_y = center_y - (layout.fonts.hint // 2 if item.description else 0)
+        text_gap = max(4, layout.fonts.hint // 4)
+        label_center_y = center_y - ((layout.fonts.hint + text_gap) // 2 if item.description else 0)
         label_rect = label.get_rect(center=(center_x, label_center_y))
         screen.blit(label, label_rect)
         if item.description:
@@ -1570,7 +1660,7 @@ def _render_menu(  # noqa: ANN001
                 item.description[:max_chars], True, _HINT_COLOR
             )
             description_rect = description.get_rect(
-                center=(center_x, label_rect.bottom + layout.fonts.hint)
+                center=(center_x, label_rect.bottom + text_gap + layout.fonts.hint // 2)
             )
             screen.blit(description, description_rect)
 
@@ -2187,6 +2277,42 @@ def _render_library_sync(  # noqa: ANN001
     pygame.display.flip()
 
 
+def _render_library_manager(  # noqa: ANN001
+    pygame,
+    screen_surface,
+    fonts: dict,
+    layout: Layout,
+    state: LibraryManagerScreenState,
+) -> None:
+    screen_surface.fill(_BG_COLOR)
+    title = fonts["title"].render("Library Manager", True, _FG_COLOR)
+    screen_surface.blit(title, (layout.header_rect.x, layout.header_rect.y))
+
+    y = layout.navigation_rect.y
+    line_h = layout.fonts.body + max(8, layout.fonts.hint // 2)
+    max_chars = max(24, layout.navigation_rect.w // max(8, layout.fonts.body // 2))
+    for line in wrap_lines(_library_manager_body_lines(state), max_chars):
+        color = (
+            _ERROR_COLOR
+            if state.error and (line.startswith("State:") or line.startswith("Error:"))
+            else _SUCCESS_COLOR
+            if line == "State: Running"
+            else _FG_COLOR
+        )
+        text = fonts["body"].render(line, True, color)
+        screen_surface.blit(text, (layout.navigation_rect.x, y))
+        y += line_h
+
+    hint_text = (
+        "B/Esc back"
+        if state.step == "starting"
+        else "A/Enter refresh   B/Esc back"
+    )
+    hint = fonts["hint"].render(hint_text, True, _HINT_COLOR)
+    screen_surface.blit(hint, (layout.hint_rect.x, layout.hint_rect.y))
+    pygame.display.flip()
+
+
 def _render_savesync(  # noqa: ANN001
     pygame,
     screen,
@@ -2302,7 +2428,7 @@ def _wizard_option_rows(
         max(1, content.bottom - controls_top),
     )
     gap = max(6, int(controls.h * 0.012))
-    max_rows = max(1, (controls.h + gap) // (44 + gap))
+    max_rows = max(1, (controls.h + gap) // (MIN_CONTROL_HEIGHT_PX + gap))
     start = 0
     if ordinary_count > max_rows and wizard.selected_index < ordinary_count:
         start = max(

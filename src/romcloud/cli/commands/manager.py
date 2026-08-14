@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import secrets
+import os
 from pathlib import Path
 
 import click
@@ -21,6 +22,7 @@ from romcloud.cli.context import get_container
 @click.option("--http", "plain_http", is_flag=True, help="Use plain HTTP (Gamepad API is normally unavailable to remote browsers).")
 @click.option("--tls-cert", type=click.Path(exists=True, dir_okay=False, path_type=Path), help="Trusted PEM certificate to use instead of ROMCloud's certificate.")
 @click.option("--tls-key", type=click.Path(exists=True, dir_okay=False, path_type=Path), help="PEM private key for --tls-cert.")
+@click.option("--quiet", is_flag=True, hidden=True)
 @click.pass_context
 def manager_cmd(
     ctx: click.Context,
@@ -30,9 +32,15 @@ def manager_cmd(
     plain_http: bool,
     tls_cert: Path | None,
     tls_key: Path | None,
+    quiet: bool,
 ) -> None:
     """Serve the Library/Cache Manager for browsers on this network."""
     from romcloud.web.server import serve_manager
+    from romcloud.web.lifecycle import (
+        clear_manager_state,
+        manager_runtime_state,
+        write_manager_state,
+    )
 
     if bool(tls_cert) != bool(tls_key):
         raise click.UsageError("--tls-cert and --tls-key must be provided together.")
@@ -46,16 +54,25 @@ def manager_cmd(
     access_token = token or secrets.token_urlsafe(24)
     display_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
     scheme = "http" if plain_http else "https"
-    click.echo("ROMCloud Library Manager")
-    click.echo(f"Local URL: {scheme}://{display_host}:{port}/#token={access_token}")
-    if host in {"0.0.0.0", "::"}:
-        click.echo(
-            "For another device, replace 127.0.0.1 with this Batocera device's "
-            "LAN or Tailscale address. Keep the #token fragment."
-        )
-    click.echo("Press Ctrl+C to stop.")
-    if not plain_http and tls_cert and "manager-cert.pem" in tls_cert.name:
-        click.echo("The first browser visit may ask you to accept ROMCloud's self-signed certificate.")
+    if not quiet:
+        click.echo("ROMCloud Library Manager")
+        click.echo(f"Local URL: {scheme}://{display_host}:{port}/#token={access_token}")
+        if host in {"0.0.0.0", "::"}:
+            click.echo(
+                "For another device, replace 127.0.0.1 with this Batocera device's "
+                "LAN or Tailscale address. Keep the #token fragment."
+            )
+        click.echo("Press Ctrl+C to stop.")
+        if not plain_http and tls_cert and "manager-cert.pem" in tls_cert.name:
+            click.echo("The first browser visit may ask you to accept ROMCloud's self-signed certificate.")
+    runtime_state = manager_runtime_state(
+        host=host,
+        port=port,
+        token=access_token,
+        scheme=scheme,
+        pid=os.getpid(),
+    )
+    write_manager_state(container.config.data_path, runtime_state)
     try:
         serve_manager(
             container.library_manager,
@@ -66,4 +83,7 @@ def manager_cmd(
             tls_key=str(tls_key) if tls_key else None,
         )
     except KeyboardInterrupt:
-        click.echo("\nLibrary Manager stopped.")
+        if not quiet:
+            click.echo("\nLibrary Manager stopped.")
+    finally:
+        clear_manager_state(container.config.data_path, pid=os.getpid())

@@ -288,6 +288,13 @@ entries. Offline mode exposes only the local view. Search, state filters,
 sorting, multi-select pin/unpin, individual downloads, and local-copy
 removal are available without loading the full catalog into the browser.
 
+The same manager can be started without the CLI from **Library → Library
+Manager** in the native Ports interface. ROMCloud starts or reconnects to
+the existing `romcloud manager` process and shows its HTTPS URL, access
+token, and running state on screen. Runtime discovery state is stored with
+private permissions under the ROMCloud data directory; the browser server
+and authentication behavior remain the same as the CLI command.
+
 Controllers exposed by Chromium with the W3C `standard` mapping are
 supported directly. D-pad or left stick moves through systems, controls,
 and game rows; South/A confirms; East/B backs out or closes a dialog;

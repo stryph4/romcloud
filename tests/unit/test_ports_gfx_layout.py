@@ -139,6 +139,15 @@ class TestComputeLayoutIntegration:
         assert layout.hint_rect.y + layout.hint_rect.h <= h
         assert layout.message_rect.y + layout.message_rect.h <= h
 
+    @pytest.mark.parametrize("w,h", [(1280, 720), (1920, 1080)])
+    def test_menu_rows_fit_two_text_lines_with_vertical_padding(self, w, h):
+        layout = compute_layout(w, h, 8)
+        required = layout.fonts.body + layout.fonts.hint + max(20, layout.fonts.hint)
+        assert all(rect.h >= required for rect in layout.card_rects)
+        for current, following in zip(layout.card_rects, layout.card_rects[1:]):
+            assert current.bottom < following.y
+        assert layout.card_rects[-1].bottom <= layout.message_rect.y
+
 
 class TestFindNextFocusIndex:
     def _column_rects(self, count=5):

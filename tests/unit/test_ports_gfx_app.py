@@ -96,8 +96,9 @@ class TestMenuItems:
         )
 
         center_x, center_y = layout.card_rects[0].center
+        text_gap = max(4, layout.fonts.hint // 4)
         assert rendered[1].centers == [
-            (center_x, center_y - layout.fonts.hint // 2)
+            (center_x, center_y - (layout.fonts.hint + text_gap) // 2)
         ]
         assert rendered[2].centers[0][0] == center_x
 

@@ -44,8 +44,8 @@ _COMPACT_BREAKPOINT_PX = 960
 _ACTIVITY_MIN_WIDTH_PX = 320
 _PANE_GAP_FRACTION = 0.016
 _BUTTON_HEIGHT_FRACTION = 0.075
-_MIN_BUTTON_HEIGHT_PX = 44
-_MAX_BUTTON_HEIGHT_PX = 68
+MIN_CONTROL_HEIGHT_PX = 44
+_MAX_BUTTON_HEIGHT_PX = 84
 _OSK_HEIGHT_FRACTION = 0.42
 
 
@@ -182,23 +182,30 @@ def compute_card_rects(safe_area: Rect, item_count: int, columns: int) -> list[R
     return rects
 
 
-def compute_vertical_control_rects(area: Rect, item_count: int) -> list[Rect]:
-    """Compact single-column controls anchored at the top of *area*."""
+def compute_vertical_control_rects(
+    area: Rect,
+    item_count: int,
+    *,
+    content_height: int | None = None,
+) -> list[Rect]:
+    """Single-column controls with room for two text lines and padding."""
     if item_count <= 0:
         return []
     gap = int(_clamp(area.h * 0.012, 6, 14))
     button_h = int(
         _clamp(
             area.h * _BUTTON_HEIGHT_FRACTION,
-            _MIN_BUTTON_HEIGHT_PX,
+            MIN_CONTROL_HEIGHT_PX,
             _MAX_BUTTON_HEIGHT_PX,
         )
     )
+    if content_height is not None:
+        button_h = max(button_h, content_height)
     # If a long submenu needs more room, compress to the accessible minimum;
     # callers can scroll when it still does not fit.
     if item_count * button_h + (item_count - 1) * gap > area.h:
         button_h = max(
-            _MIN_BUTTON_HEIGHT_PX,
+            MIN_CONTROL_HEIGHT_PX,
             (area.h - (item_count - 1) * gap) // item_count,
         )
     return [
@@ -212,7 +219,7 @@ def compute_layout(screen_w: int, screen_h: int, item_count: int) -> Layout:
     fonts = compute_font_sizes(screen_h)
     gap = int(_clamp(min(screen_w, screen_h) * _PANE_GAP_FRACTION, 10, 28))
     header_h = max(fonts.title + 8, int(safe_area.h * 0.075))
-    hint_h = max(_MIN_BUTTON_HEIGHT_PX, fonts.hint + 18)
+    hint_h = max(MIN_CONTROL_HEIGHT_PX, fonts.hint + 18)
     header_rect = Rect(safe_area.x, safe_area.y, safe_area.w, header_h)
     footer_rect = Rect(
         safe_area.x,
@@ -259,7 +266,12 @@ def compute_layout(screen_w: int, screen_h: int, item_count: int) -> Layout:
         navigation_rect.w,
         max(1, message_rect.y - gap - navigation_rect.y),
     )
-    card_rects = compute_vertical_control_rects(controls_area, item_count)
+    two_line_height = fonts.body + fonts.hint + max(20, fonts.hint)
+    card_rects = compute_vertical_control_rects(
+        controls_area,
+        item_count,
+        content_height=two_line_height,
+    )
 
     wizard_content_rect = Rect(
         navigation_rect.x,
