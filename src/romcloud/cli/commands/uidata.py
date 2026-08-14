@@ -43,6 +43,7 @@ from romcloud.core.progress import ProgressEvent, emit_progress, redact_text
 from romcloud.infrastructure.config import load_config
 from romcloud.infrastructure.capabilities import capability_policy
 from romcloud.infrastructure.source_display import source_display_summary
+from romcloud.infrastructure import savesync_prompts
 from romcloud.services.connections import (
     connection_status,
     mount_connections,
@@ -569,6 +570,126 @@ def _record_dict(record) -> dict | None:
         "artifact_count": record.artifact_count,
         "total_bytes": record.total_bytes,
     }
+
+
+def _conflict_prompt_dict(conflict) -> dict:
+    artifacts = conflict.local.artifacts or conflict.remote.artifacts
+    group_label = conflict.group_id
+    if artifacts:
+        artifact_path = Path(artifacts[0].relative_path)
+        group_label = artifact_path.with_suffix("").as_posix()
+    return {
+        "conflict_id": conflict.conflict_id,
+        "group_id": conflict.group_id,
+        "group_label": group_label,
+        "layout_id": conflict.layout_id,
+        "detected_at": conflict.detected_at,
+        "local": {
+            "artifact_count": conflict.local.artifact_count,
+            "total_bytes": conflict.local.total_bytes,
+        },
+        "remote": {
+            "artifact_count": conflict.remote.artifact_count,
+            "total_bytes": conflict.remote.total_bytes,
+        },
+    }
+
+
+def _conflicts_for_prompt(saves, data_root: Path, source: str) -> list[dict]:  # noqa: ANN001
+    active = {item.conflict_id: item for item in saves.get_state().active_conflicts}
+    if source == "manual":
+        # Manual recovery deliberately includes conflicts whose one-time
+        # automatic prompt was previously dismissed.
+        return [
+            _conflict_prompt_dict(active[conflict_id])
+            for conflict_id in sorted(active)
+        ]
+    if source != "automatic":
+        raise ValueError("Conflict prompt source must be 'automatic' or 'manual'")
+
+    result = []
+    for conflict_id in savesync_prompts.pending_ids(data_root):
+        conflict = active.get(conflict_id)
+        if conflict is not None:
+            result.append(_conflict_prompt_dict(conflict))
+            continue
+        # Manual resolution may race an automatic queued prompt. Remove only
+        # the stale handoff; durable conflict history remains authoritative.
+        savesync_prompts.complete(data_root, conflict_id)
+    return result
+
+
+@uidata_group.command("savesync-conflicts")
+@click.pass_context
+def uidata_savesync_conflicts(ctx: click.Context) -> None:
+    """Return automatic queued or manual active conflicts for one resolver."""
+
+    def run(request, progress=None):
+        _ = progress
+        config = _load_context_config(ctx)
+        saves = get_container(ctx).saves
+        data_root = Path(config.data_path)
+        source = str(request.get("source", "automatic"))
+        conflicts = _conflicts_for_prompt(saves, data_root, source)
+        return {"source": source, "conflicts": conflicts}
+
+    _run_request_action(ctx, run)
+
+
+@uidata_group.command("savesync-conflict-action")
+@click.pass_context
+def uidata_savesync_conflict_action(ctx: click.Context) -> None:
+    """Apply or defer one queued game-stop conflict inside SaveSync."""
+
+    def run(request, progress=None):
+        from romcloud.core.models.savesync import SaveConflictResolution
+
+        conflict_id = str(request.get("conflict_id", ""))
+        action = request.get("action")
+        source = str(request.get("source", "automatic"))
+        if action not in ("upload-local", "download-remote", "resolve-later"):
+            raise ValueError("Unknown SaveSync conflict action")
+        if source not in ("automatic", "manual"):
+            raise ValueError("Unknown SaveSync conflict source")
+        config = _load_context_config(ctx)
+        data_root = Path(config.data_path)
+        if source == "automatic" and not savesync_prompts.contains(
+            data_root, conflict_id
+        ):
+            raise ValueError("This SaveSync conflict is not queued for this popup")
+        saves = get_container(ctx).saves
+        if not any(
+            item.conflict_id == conflict_id for item in saves.get_state().active_conflicts
+        ):
+            raise ValueError("This SaveSync conflict is no longer active")
+        if action == "resolve-later":
+            record = None
+        else:
+            resolution = (
+                SaveConflictResolution.KEEP_LOCAL
+                if action == "upload-local"
+                else SaveConflictResolution.KEEP_REMOTE
+            )
+            record = saves.resolve_conflict(
+                conflict_id,
+                resolution,
+                progress=progress,
+            )
+        # Resolve Later dismisses only the exact automatic event queue entry.
+        # It never acknowledges or resolves the authoritative conflict. A
+        # successful manual overwrite also removes a now-stale auto handoff.
+        if source == "automatic" or action != "resolve-later":
+            remaining = savesync_prompts.complete(data_root, conflict_id)
+        else:
+            remaining = savesync_prompts.pending_ids(data_root)
+        return {
+            "handled_conflict_id": conflict_id,
+            "source": source,
+            "remaining": len(remaining),
+            "record": _record_dict(record),
+        }
+
+    _run_request_action(ctx, run)
 
 
 @uidata_group.command("savesync-status")

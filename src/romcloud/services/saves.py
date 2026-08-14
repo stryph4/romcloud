@@ -24,6 +24,8 @@ from romcloud.core.exceptions import (
 from romcloud.core.models.savesync import (
     SaveArtifact,
     SaveChangeKind,
+    SaveConflictRecord,
+    SaveConflictResolution,
     SaveDiff,
     SaveDiffEntry,
     SaveReconcileAction,
@@ -32,7 +34,6 @@ from romcloud.core.models.savesync import (
     SaveReconcileReport,
     SaveSyncRecord,
     SaveSyncState,
-    SaveConflictResolution,
     SaveGroupCondition,
     SaveGroupSnapshot,
     SaveGroupState,
@@ -319,6 +320,265 @@ class SaveSyncService:
         return durable_state.SaveSyncStateStore(
             self._state_path
         ).acknowledge_conflict(conflict_id)
+
+    def resolve_conflict(
+        self,
+        conflict_id: str,
+        resolution: SaveConflictResolution,
+        *,
+        progress: ProgressSink = None,
+    ) -> SaveSyncRecord:
+        """Resolve one exact conflict with a verified, targeted transaction.
+
+        The conflict's stored local/remote snapshots are the user's reviewed
+        preflight. Both sides are rescanned under the operation lock before
+        staging and again before commit, so an old popup can never authorize
+        replacing newer content.
+        """
+        if resolution not in (
+            SaveConflictResolution.KEEP_LOCAL,
+            SaveConflictResolution.KEEP_REMOTE,
+        ):
+            raise SaveSyncVerificationError(
+                "Conflict resolution must select the local or remote save."
+            )
+        direction = (
+            "upload"
+            if resolution is SaveConflictResolution.KEEP_LOCAL
+            else "download"
+        )
+        self._capabilities.require(
+            Capability.SAVE_SYNC,
+            "Upload Local Save" if direction == "upload" else "Download Remote Save",
+        )
+        self._require_remote()
+        with self._operation_lock():
+            if not self.is_remote_reachable():
+                raise SaveSyncConnectivityError(
+                    f"Remote save location is not reachable: {self._connectivity_root}"
+                )
+            self._recover()
+            state = self._get_state_unlocked()
+            conflict = next(
+                (
+                    item
+                    for item in state.active_conflicts
+                    if item.conflict_id == conflict_id
+                ),
+                None,
+            )
+            if conflict is None:
+                raise SaveSyncVerificationError(
+                    "This SaveSync conflict is no longer active."
+                )
+            if (
+                not self._layout_enabled(conflict.layout_id)
+                or not self._policy.is_lifecycle_enabled(conflict.layout_id)
+            ):
+                raise SaveSyncVerificationError(
+                    "This save layout is manual-only and cannot be resolved by Auto SaveSync."
+                )
+
+            local, remote = self._scan_conflict_sides(conflict)
+            expected_local = {
+                artifact.relative_path: artifact for artifact in conflict.local.artifacts
+            }
+            expected_remote = {
+                artifact.relative_path: artifact for artifact in conflict.remote.artifacts
+            }
+            if local != expected_local or remote != expected_remote:
+                raise SaveSyncVerificationError(
+                    "Save data changed after this conflict was detected; leave it unresolved "
+                    "and run Quick Sync again."
+                )
+            desired, destination = (
+                (local, remote) if direction == "upload" else (remote, local)
+            )
+            source_path = self._local_path if direction == "upload" else self._remote_path
+            destination_views = (
+                (_DestinationView(self._remote_root),)
+                if direction == "upload"
+                else self._local_views()
+            )
+            emit_progress(
+                progress,
+                "savesync",
+                "stage",
+                "running",
+                f"Staging conflict {direction}",
+                metadata={
+                    "group_id": conflict.group_id,
+                    "files": len(desired),
+                    "bytes": sum(item.size_bytes for item in desired.values()),
+                },
+            )
+            operation_id = uuid.uuid4().hex
+            transaction = self._prepare_selected_transaction(
+                destination_views,
+                current=destination,
+                desired=desired,
+                source_for=lambda path, _artifact: source_path(path),
+                operation_id=operation_id,
+            )
+            try:
+                staged_local, staged_remote = self._scan_conflict_sides(conflict)
+                if staged_local != local or staged_remote != remote:
+                    raise SaveSyncVerificationError(
+                        "Save data changed while staging; no replacement was kept."
+                    )
+                if transaction is not None:
+                    self._apply_selected_transaction(transaction, destination_views)
+                final_local, final_remote = self._scan_conflict_sides(conflict)
+                if final_local != desired or final_remote != desired:
+                    raise SaveSyncVerificationError(
+                        "Resolved save group failed post-commit verification."
+                    )
+            except BaseException:
+                if transaction is not None:
+                    transaction.rollback()
+                raise
+
+            record = SaveSyncRecord(
+                revision=uuid.uuid4().hex,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                device_id=state.device_id,
+                manifest=tuple(desired[path] for path in sorted(desired)),
+            )
+            try:
+                self._advance_conflict_resolution_state(
+                    state,
+                    conflict,
+                    resolution,
+                    record,
+                    operation_id=operation_id,
+                )
+            except BaseException:
+                if transaction is not None:
+                    transaction.rollback()
+                raise
+            if direction == "upload":
+                mutations = self._journal_mutations_for_remote_transition(
+                    before=remote,
+                    after=desired,
+                )
+                if mutations:
+                    generation = self._append_remote_journal(
+                        revision=record.revision,
+                        timestamp=record.timestamp,
+                        mutations=mutations,
+                    )
+                    next_state = self._get_state_unlocked()
+                    if next_state.quick_sync_ready:
+                        _write_state(
+                            self._state_path,
+                            replace(
+                                next_state,
+                                quick_sync_cursor_generation=generation,
+                            ),
+                        )
+            if transaction is not None:
+                try:
+                    transaction.finalize()
+                except OSError:
+                    log.warning(
+                        "Could not clean completed conflict transaction %s",
+                        operation_id,
+                        exc_info=True,
+                    )
+            emit_progress(
+                progress,
+                "savesync",
+                "commit",
+                "success",
+                "SaveSync conflict resolved",
+                metadata={"group_id": conflict.group_id},
+            )
+            return record
+
+    def _scan_conflict_sides(
+        self, conflict: SaveConflictRecord
+    ) -> tuple[dict[str, SaveArtifact], dict[str, SaveArtifact]]:
+        group_ids = frozenset({conflict.group_id})
+        layout_ids = frozenset({conflict.layout_id})
+        local = _manifest_for_groups(
+            self._scan_local_layouts(layout_ids).artifacts,
+            group_ids,
+            self._policy,
+        )
+        remote = _manifest_for_groups(
+            self._scan_remote_layouts(layout_ids).artifacts,
+            group_ids,
+            self._policy,
+        )
+        return local, remote
+
+    def _advance_conflict_resolution_state(
+        self,
+        state: SaveSyncState,
+        conflict: SaveConflictRecord,
+        resolution: SaveConflictResolution,
+        record: SaveSyncRecord,
+        *,
+        operation_id: str,
+    ) -> None:
+        snapshot = SaveGroupSnapshot(
+            group_id=conflict.group_id,
+            layout_id=conflict.layout_id,
+            artifacts=record.manifest,
+            observed_at=record.timestamp,
+        )
+        clean_group = SaveGroupState(
+            group_id=conflict.group_id,
+            layout_id=conflict.layout_id,
+            condition=SaveGroupCondition.CLEAN,
+            baseline=snapshot,
+            local_observed=snapshot,
+            remote_observed=snapshot,
+            verified_at=record.timestamp,
+        )
+        groups_by_id = {
+            group.group_id: group
+            for group in state.groups
+            if group.group_id != conflict.group_id
+        }
+        groups_by_id[conflict.group_id] = clean_group
+        groups = tuple(groups_by_id[group_id] for group_id in sorted(groups_by_id))
+        shared = {
+            artifact.relative_path: artifact
+            for artifact in state.shared_manifest
+            if _group_id(self._policy, artifact.relative_path) != conflict.group_id
+        }
+        shared.update(
+            {artifact.relative_path: artifact for artifact in record.manifest}
+        )
+        resolved = durable_state.resolve_conflict(
+            state,
+            conflict.conflict_id,
+            resolution=resolution,
+            resolution_revision=record.revision,
+            resolved_at=record.timestamp,
+        )
+        _write_state(
+            self._state_path,
+            replace(
+                resolved,
+                last_upload=(
+                    record
+                    if resolution is SaveConflictResolution.KEEP_LOCAL
+                    else state.last_upload
+                ),
+                last_download=(
+                    record
+                    if resolution is SaveConflictResolution.KEEP_REMOTE
+                    else state.last_download
+                ),
+                shared_manifest=tuple(shared[path] for path in sorted(shared)),
+                groups=groups,
+                active_operation=None,
+                last_error=None,
+                last_completed_operation_id=operation_id,
+            ),
+        )
 
     def record_remote_observation(
         self, access: StorageAccessResult
@@ -837,13 +1097,13 @@ class SaveSyncService:
         is_group_active: Optional[Callable[[str], bool]] = None,
         progress: ProgressSink = None,
     ) -> Optional[SaveReconcileReport]:
-        """Reconcile dirty groups without ever downloading into the live tree.
+        """Compatibility API for an explicit upload-only dirty-group pass.
 
-        This is the deliberately narrow game-exit API.  The durable group IDs
-        are only hints about the work to inspect: both sides are freshly
-        scanned and hashed under the normal global operation lock.  A group
-        which becomes active before promotion is deferred without state or
-        remote mutation.
+        Automatic triggers intentionally do not call this legacy surface;
+        gameStop, reconnect, and menu polling all use :meth:`quick_sync` for
+        normal bidirectional three-way reconciliation.  The durable group IDs
+        here remain only hints about the work to inspect, and a group which
+        becomes active before promotion is deferred without state or mutation.
         """
         if not group_ids:
             return None

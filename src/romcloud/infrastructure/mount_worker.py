@@ -35,6 +35,7 @@ This module owns exactly these ROMCloud-specific files under
 - ``run/mount-worker.status.json``    — last known state, for diagnostics
 - ``run/mount-endpoint-cache.json``   — last resolved endpoint, a boot-time
   fast-path hint only (see :mod:`romcloud.infrastructure.mount_endpoint_cache`)
+- ``run/remote-data-availability.json`` — scoped reconnect edge observation
 - ``logs/mount-worker.log``           — the spawned worker's stdout/stderr
 """
 
@@ -227,6 +228,10 @@ def status_path(romcloud_home: Path) -> Path:
     return run_dir(romcloud_home) / "mount-worker.status.json"
 
 
+def remote_data_availability_path(romcloud_home: Path) -> Path:
+    return run_dir(romcloud_home) / "remote-data-availability.json"
+
+
 def worker_log_path(romcloud_home: Path) -> Path:
     return romcloud_home / "logs" / "mount-worker.log"
 
@@ -270,6 +275,48 @@ def _write_worker_status(romcloud_home: Path, state: str, detail: str = "") -> N
         # Diagnostics are best-effort; never let a status write failure
         # affect the worker's actual outcome.
         log.warning("Could not write worker status file at %s", path)
+
+
+def record_remote_data_availability(
+    romcloud_home: Path, target: ConfiguredMount, *, available: bool
+) -> bool:
+    """Persist one mount-local availability observation and return its edge.
+
+    Identity scopes the state to the configured writable mount.  A changed
+    server/share/path begins a fresh observation sequence instead of inheriting
+    an edge from an unrelated configuration.
+    """
+    path = remote_data_availability_path(romcloud_home)
+    identity = {
+        "server": target.smb.server,
+        "share": target.smb.share,
+        "remote_path": getattr(target.smb, "remote_path", ""),
+        "mount_point": target.mount_point,
+    }
+    previous = None
+    try:
+        previous = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, json.JSONDecodeError):
+        pass
+    transitioned = bool(
+        isinstance(previous, dict)
+        and previous.get("identity") == identity
+        and previous.get("available") is False
+        and available
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps({"identity": identity, "available": available}) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+    except OSError:
+        temporary.unlink(missing_ok=True)
+        log.warning("Could not persist remote-data availability at %s", path)
+        return False
+    return transitioned
 
 
 # ── single-instance lock, with stale-lock recovery ───────────────────────────
@@ -420,8 +467,7 @@ def _signal_worker_process_group(pid: int, sig: int) -> None:
 
 
 def cleanup_runtime_state(romcloud_home: Path) -> None:
-    """Remove ROMCloud's own transient runtime files (lock + status +
-    cached endpoint hint).
+    """Remove ROMCloud's transient lock, status, reconnect, and endpoint files.
 
     Deliberately does not remove the worker log file — it's useful
     diagnostic history, not live state, and keeping it costs nothing.
@@ -429,6 +475,7 @@ def cleanup_runtime_state(romcloud_home: Path) -> None:
     """
     lock_path(romcloud_home).unlink(missing_ok=True)
     status_path(romcloud_home).unlink(missing_ok=True)
+    remote_data_availability_path(romcloud_home).unlink(missing_ok=True)
     mount_endpoint_cache.endpoint_cache_path(romcloud_home).unlink(missing_ok=True)
 
 
@@ -481,6 +528,7 @@ def run_worker(
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
     stop_event: threading.Event | None = None,
+    on_remote_data_available: Optional[Callable[[], None]] = None,
 ) -> int:
     """Run the mount worker to completion — this call *blocks*, and is meant
     to execute only inside a detached background process (see
@@ -505,10 +553,12 @@ def run_worker(
                 sleep,
                 clock,
                 stop_event,
+                on_remote_data_available,
             )
     except WorkerAlreadyRunning:
         log.info("A mount worker is already running — exiting without doing anything.")
         return 0
+
 
 def _run_worker_locked(
     romcloud_home: Path,
@@ -521,6 +571,7 @@ def _run_worker_locked(
     sleep: Callable[[float], None],
     clock: Callable[[], float],
     stop_event: threading.Event | None,
+    on_remote_data_available: Optional[Callable[[], None]],
 ) -> int:
     try:
         # The worker can be launched while an old/unresponsive CIFS mount is
@@ -531,7 +582,30 @@ def _run_worker_locked(
             _write_worker_status(romcloud_home, "failed", "no SMB mounts configured")
             log.warning("Mount worker started but no SMB mounts are configured — exiting.")
             return 0
+        remote_target = next(
+            (
+                target
+                for target in targets
+                if target.credential_kind == "remote_data"
+            ),
+            None,
+        )
+        if remote_target is not None:
+            remote_ready = _configured_mount_is_ready(remote_target)
+            _observe_remote_data_availability(
+                romcloud_home,
+                remote_target,
+                available=remote_ready,
+                callback=on_remote_data_available,
+            )
         if all(_configured_mount_is_ready(item) for item in targets):
+            if remote_target is not None:
+                _observe_remote_data_availability(
+                    romcloud_home,
+                    remote_target,
+                    available=_configured_mount_is_ready(remote_target),
+                    callback=on_remote_data_available,
+                )
             _write_worker_status(romcloud_home, "success", "already mounted")
             log.info("All configured SMB mount views are already mounted — worker exiting.")
             return 0
@@ -543,6 +617,12 @@ def _run_worker_locked(
                     "Mount worker cancelled because system shutdown was requested"
                 )
             if _configured_mount_is_ready(target):
+                _observe_remote_data_availability(
+                    romcloud_home,
+                    target,
+                    available=True,
+                    callback=on_remote_data_available,
+                )
                 details.append(f"{target.label}: already mounted")
                 continue
             password = credentials_for_mount(config, target)
@@ -579,6 +659,12 @@ def _run_worker_locked(
                     clock=clock,
                     stop_event=stop_event,
                 )
+            _observe_remote_data_availability(
+                romcloud_home,
+                target,
+                available=True,
+                callback=on_remote_data_available,
+            )
             details.append(f"{target.label}: {outcome.detail}")
         detail = "; ".join(details)
         _write_worker_status(romcloud_home, "success", detail)
@@ -595,6 +681,35 @@ def _run_worker_locked(
         _write_worker_status(romcloud_home, "failed", f"unexpected error: {exc}")
         log.exception("Mount worker crashed unexpectedly")
         return 0
+
+
+def _notify_remote_data_available(
+    callback: Optional[Callable[[], None]],
+) -> None:
+    if callback is None:
+        return
+    try:
+        callback()
+    except Exception:  # noqa: BLE001 - mounting succeeded; trigger is best-effort
+        log.warning(
+            "Could not detach Auto SaveSync after remote-data reconnect",
+            exc_info=True,
+        )
+
+
+def _observe_remote_data_availability(
+    romcloud_home: Path,
+    target: ConfiguredMount,
+    *,
+    available: bool,
+    callback: Optional[Callable[[], None]],
+) -> None:
+    if target.credential_kind != "remote_data":
+        return
+    if record_remote_data_availability(
+        romcloud_home, target, available=available
+    ):
+        _notify_remote_data_available(callback)
 
 
 def _mount_with_cached_endpoint_fallback(

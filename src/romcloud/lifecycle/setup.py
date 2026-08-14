@@ -604,6 +604,7 @@ def apply_setup(
         emit_progress(progress, "configure", "read", "success", "ROM read access verified")
 
         remote_probe = None
+        save_sync_state = None
         if config.remote_data is not None:
             if config.remote_data.provider == "local":
                 Path(config.remote_data.root).mkdir(parents=True, exist_ok=True)
@@ -647,6 +648,33 @@ def apply_setup(
             "success",
             "EmulationStation entries prepared",
         )
+        if config.remote_data is not None:
+            step = "initialize SaveSync"
+            _write_state(state_path, {"status": "applying", "step": step})
+            emit_progress(
+                progress,
+                "configure",
+                "savesync_initialize",
+                "running",
+                "Initializing SaveSync with an Initial Full Sync…",
+            )
+            container.saves.full_sync(progress=progress)
+            save_sync_state = container.saves.get_state()
+            if (
+                not save_sync_state.quick_sync_ready
+                or save_sync_state.quick_sync_cursor_generation is None
+            ):
+                raise RuntimeError(
+                    "Initial Full Sync completed without establishing a trusted "
+                    "Quick Sync baseline"
+                )
+            emit_progress(
+                progress,
+                "configure",
+                "savesync_initialize",
+                "success",
+                "Initial Full Sync complete — Auto SaveSync baseline ready",
+            )
         emit_progress(progress, "configure", "complete", "success", "ROMCloud setup complete")
     except Exception as exc:
         from romcloud.infrastructure.mount import unmount_cifs_source
@@ -704,6 +732,15 @@ def apply_setup(
         "source_validation": source_probe.as_dict(),
         "remote_data_validation": (
             remote_probe.as_dict() if remote_probe is not None else None
+        ),
+        "save_sync_initialized": save_sync_state is not None,
+        "quick_sync_ready": (
+            save_sync_state.quick_sync_ready if save_sync_state is not None else False
+        ),
+        "quick_sync_cursor_generation": (
+            save_sync_state.quick_sync_cursor_generation
+            if save_sync_state is not None
+            else None
         ),
     }
 

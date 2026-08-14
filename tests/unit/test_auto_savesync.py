@@ -15,6 +15,7 @@ from romcloud.core.models.savesync import SaveGroupCondition
 from romcloud.core.save_selection import DEFAULT_SAVE_SELECTION_POLICY
 from romcloud.core.storage import StorageProvider
 from romcloud.infrastructure import save_transaction
+from romcloud.infrastructure import savesync_prompts
 from romcloud.infrastructure.config import (
     AppConfig,
     CacheConfig,
@@ -169,7 +170,329 @@ def test_disabled_lifecycle_cli_does_not_construct_coordinator(
         assert result.exit_code == 0, result.output
 
 
-def test_batocera_hook_detaches_game_stop_but_keeps_start_marker_ordered(tmp_path: Path):
+def test_game_stop_worker_skips_popup_when_quick_sync_finds_no_new_conflict(
+    tmp_path: Path, monkeypatch
+):
+    from romcloud.cli.commands import autosync as autosync_commands
+    from romcloud.cli.main import cli
+
+    config_path = tmp_path / "romcloud.toml"
+    write_config(
+        AppConfig(
+            source=SourceConfig("local", (tmp_path / "roms").as_posix()),
+            cache=CacheConfig((tmp_path / "cache").as_posix()),
+            local_roms_path=(tmp_path / "local-roms").as_posix(),
+            data_path=(tmp_path / "data").as_posix(),
+            saves=SavesConfig(
+                local_path=(tmp_path / "saves").as_posix(),
+                auto_sync_enabled=True,
+            ),
+        ),
+        str(config_path),
+    )
+    coordinator = type("Coordinator", (), {"game_stop": lambda self, **_kwargs: ()})()
+    monkeypatch.setattr(autosync_commands, "_coordinator", lambda _ctx: coordinator)
+    monkeypatch.setattr(
+        autosync_commands,
+        "_launch_pending_conflict_popup",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("no-conflict worker must not launch a popup")
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config",
+            str(config_path),
+            "_autosync",
+            "game-stop",
+            "psx",
+            "libretro",
+            "pcsx",
+            "Game.chd",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+
+
+def test_game_stop_worker_passes_exact_caller_to_one_popup_launch(
+    tmp_path: Path, monkeypatch
+):
+    from romcloud.cli.commands import autosync as autosync_commands
+    from romcloud.cli.main import cli
+
+    config_path = tmp_path / "romcloud.toml"
+    write_config(
+        AppConfig(
+            source=SourceConfig("local", (tmp_path / "roms").as_posix()),
+            cache=CacheConfig((tmp_path / "cache").as_posix()),
+            local_roms_path=(tmp_path / "local-roms").as_posix(),
+            data_path=(tmp_path / "data").as_posix(),
+            saves=SavesConfig(
+                local_path=(tmp_path / "saves").as_posix(),
+                auto_sync_enabled=True,
+            ),
+        ),
+        str(config_path),
+    )
+    coordinator = type(
+        "Coordinator",
+        (),
+        {"game_stop": lambda self, **_kwargs: ("new-conflict-id",)},
+    )()
+    launches = []
+    monkeypatch.setenv("ROMCLOUD_AUTOSYNC_CALLER_PID", "4242")
+    monkeypatch.setattr(autosync_commands, "_coordinator", lambda _ctx: coordinator)
+    monkeypatch.setattr(
+        autosync_commands,
+        "_launch_pending_conflict_popup",
+        lambda root, **kwargs: launches.append((root, kwargs)),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config",
+            str(config_path),
+            "_autosync",
+            "game-stop",
+            "psx",
+            "libretro",
+            "pcsx",
+            "Game.chd",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert launches == [
+        (
+            tmp_path / "data",
+            {"lifecycle_caller_pid": 4242},
+        )
+    ]
+
+
+def test_pending_conflict_launcher_is_short_lived_and_uses_focused_mode(
+    tmp_path: Path, monkeypatch
+):
+    from romcloud.cli.commands import autosync as autosync_commands
+
+    data_root = tmp_path / "romcloud" / "data"
+    launcher = tmp_path / "romcloud" / "bin" / "romcloud-ports"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("launcher", encoding="utf-8")
+    savesync_prompts.enqueue(data_root, ("conflict-id",))
+    calls = []
+    monkeypatch.delenv("ROMCLOUD_BIN", raising=False)
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return type("Result", (), {"returncode": 0})()
+
+    monkeypatch.setattr(
+        batocera_auto_savesync,
+        "wait_for_emulationstation_display",
+        lambda _pid: batocera_auto_savesync.EmulationStationReadiness(
+            ready=True,
+            signal="x11-active-es",
+            detail="x11-active-es",
+            elapsed_seconds=0.1,
+            attempts=2,
+        ),
+    )
+    monkeypatch.setattr(autosync_commands.subprocess, "run", fake_run)
+
+    autosync_commands._launch_pending_conflict_popup(
+        data_root, lifecycle_caller_pid=4242
+    )
+
+    assert calls[0][0] == [str(launcher), "--savesync-conflicts"]
+    assert calls[0][1]["check"] is False
+    assert "timeout" not in calls[0][1]
+    assert calls[0][1]["start_new_session"] is True
+    assert calls[0][1]["close_fds"] is True
+    assert calls[0][1]["cwd"] == str(data_root.parent)
+    assert calls[0][1]["env"]["ROMCLOUD_BIN"] == str(
+        launcher.with_name("romcloud")
+    )
+
+
+def test_popup_launch_failure_is_logged_and_queue_survives(
+    tmp_path: Path, monkeypatch, caplog
+):
+    from romcloud.cli.commands import autosync as autosync_commands
+
+    data_root = tmp_path / "romcloud" / "data"
+    launcher = tmp_path / "romcloud" / "bin" / "romcloud-ports"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("launcher", encoding="utf-8")
+    savesync_prompts.enqueue(data_root, ("conflict-id",))
+    monkeypatch.delenv("ROMCLOUD_BIN", raising=False)
+    monkeypatch.setattr(
+        batocera_auto_savesync,
+        "wait_for_emulationstation_display",
+        lambda _pid: batocera_auto_savesync.EmulationStationReadiness(
+            ready=True,
+            signal="wayland-active-es",
+            detail="wayland-active-es",
+            elapsed_seconds=0.1,
+            attempts=2,
+        ),
+    )
+    monkeypatch.setattr(
+        autosync_commands.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("cannot exec")),
+    )
+
+    with caplog.at_level("WARNING"):
+        autosync_commands._launch_pending_conflict_popup(data_root)
+
+    assert "subprocess launch failed" in caplog.text
+    assert savesync_prompts.pending_ids(data_root) == ("conflict-id",)
+
+
+def test_popup_readiness_timeout_preserves_queue_and_does_not_launch(
+    tmp_path: Path, monkeypatch, caplog
+):
+    from romcloud.cli.commands import autosync as autosync_commands
+
+    data_root = tmp_path / "romcloud" / "data"
+    launcher = tmp_path / "romcloud" / "bin" / "romcloud-ports"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("launcher", encoding="utf-8")
+    savesync_prompts.enqueue(data_root, ("conflict-id",))
+    monkeypatch.setattr(
+        batocera_auto_savesync,
+        "wait_for_emulationstation_display",
+        lambda _pid: batocera_auto_savesync.EmulationStationReadiness(
+            ready=False,
+            signal="display-not-ready",
+            detail="xdotool found no active EmulationStation window",
+            elapsed_seconds=5.0,
+            attempts=14,
+        ),
+    )
+    monkeypatch.setattr(
+        autosync_commands.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("readiness timeout must not launch popup")
+        ),
+    )
+
+    with caplog.at_level("WARNING"):
+        autosync_commands._launch_pending_conflict_popup(
+            data_root, lifecycle_caller_pid=4242
+        )
+
+    assert "readiness wait timed out" in caplog.text
+    assert savesync_prompts.pending_ids(data_root) == ("conflict-id",)
+
+
+def test_duplicate_workers_cannot_wait_or_launch_two_popups(
+    tmp_path: Path, monkeypatch
+):
+    from romcloud.cli.commands import autosync as autosync_commands
+
+    data_root = tmp_path / "romcloud" / "data"
+    launcher = tmp_path / "romcloud" / "bin" / "romcloud-ports"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("launcher", encoding="utf-8")
+    savesync_prompts.enqueue(data_root, ("conflict-id",))
+    readiness_entered = threading.Event()
+    release_readiness = threading.Event()
+    launches = []
+
+    def wait_for_readiness(_pid):
+        readiness_entered.set()
+        assert release_readiness.wait(timeout=2)
+        return batocera_auto_savesync.EmulationStationReadiness(
+            ready=True,
+            signal="x11-active-es",
+            detail="x11-active-es",
+            elapsed_seconds=0.1,
+            attempts=2,
+        )
+
+    monkeypatch.setattr(
+        batocera_auto_savesync,
+        "wait_for_emulationstation_display",
+        wait_for_readiness,
+    )
+    monkeypatch.setattr(
+        autosync_commands.subprocess,
+        "run",
+        lambda argv, **kwargs: launches.append((argv, kwargs))
+        or type("Result", (), {"returncode": 0})(),
+    )
+
+    first = threading.Thread(
+        target=autosync_commands._launch_pending_conflict_popup,
+        args=(data_root,),
+        kwargs={"lifecycle_caller_pid": 111},
+    )
+    second = threading.Thread(
+        target=autosync_commands._launch_pending_conflict_popup,
+        args=(data_root,),
+        kwargs={"lifecycle_caller_pid": 222},
+    )
+    first.start()
+    assert readiness_entered.wait(timeout=2)
+    second.start()
+    second.join(timeout=2)
+    assert not second.is_alive()
+    release_readiness.set()
+    first.join(timeout=2)
+
+    assert not first.is_alive()
+    assert len(launches) == 1
+
+
+def test_manual_resolution_during_readiness_skips_stale_queued_popup(
+    tmp_path: Path, monkeypatch
+):
+    from romcloud.cli.commands import autosync as autosync_commands
+
+    data_root = tmp_path / "romcloud" / "data"
+    launcher = tmp_path / "romcloud" / "bin" / "romcloud-ports"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("launcher", encoding="utf-8")
+    savesync_prompts.enqueue(data_root, ("conflict-id",))
+
+    def resolve_while_waiting(_pid):
+        savesync_prompts.complete(data_root, "conflict-id")
+        return batocera_auto_savesync.EmulationStationReadiness(
+            ready=True,
+            signal="wayland-active-es",
+            detail="wayland-active-es",
+            elapsed_seconds=0.1,
+            attempts=2,
+        )
+
+    monkeypatch.setattr(
+        batocera_auto_savesync,
+        "wait_for_emulationstation_display",
+        resolve_while_waiting,
+    )
+    monkeypatch.setattr(
+        autosync_commands.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("resolved queue must not launch popup")
+        ),
+    )
+
+    autosync_commands._launch_pending_conflict_popup(
+        data_root, lifecycle_caller_pid=4242
+    )
+
+    assert savesync_prompts.pending_ids(data_root) == ()
+
+
+def test_batocera_hook_detaches_game_stop_and_records_handoff(tmp_path: Path):
     target = tmp_path / "scripts" / "romcloud-autosync"
     install_hook(tmp_path / "bin" / "romcloud", hook_path=target)
     content = target.read_text(encoding="utf-8")
@@ -177,7 +500,13 @@ def test_batocera_hook_detaches_game_stop_but_keeps_start_marker_ordered(tmp_pat
     assert "gameStart" in content and "gameStop" in content
     assert "game-start" in content and "game-stop" in content
     assert 'nohup "$ROMCLOUD_BIN" _autosync game-stop' in content
+    assert 'ROMCLOUD_AUTOSYNC_CALLER_PID="$PPID"' in content
     assert 'nohup "$ROMCLOUD_BIN" _autosync menu-loop' in content
+    assert "auto-savesync-lifecycle.log" in content
+    assert 'event="game_stop_hook_entered"' in content
+    assert 'event="game_stop_handoff_started"' in content
+    assert 'event="game_stop_handoff_failed"' in content
+    assert 'event="game_stop_hook_returned"' in content
     assert "</dev/null &" in content
     assert '"$2" "$3" "$4" "$5"' in content
     if os.name != "nt":
@@ -219,6 +548,40 @@ def test_boot_menu_loop_launcher_is_detached_and_does_no_sync_work(
         "stderr": subprocess.DEVNULL,
         "start_new_session": True,
     }
+
+
+def test_remote_reconnect_launcher_is_detached_and_does_no_sync_work(
+    monkeypatch,
+):
+    calls = []
+
+    def fake_popen(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return type("Process", (), {"pid": 5151})()
+
+    pid = batocera_auto_savesync.spawn_remote_reconnect(
+        python_executable="/venv/bin/python",
+        popen=fake_popen,
+    )
+
+    assert pid == 5151
+    assert calls == [
+        (
+            [
+                "/venv/bin/python",
+                "-m",
+                "romcloud.cli.main",
+                "_autosync",
+                "remote-reconnect",
+            ],
+            {
+                "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+                "start_new_session": True,
+            },
+        )
+    ]
 
 
 def test_duplicate_boot_launcher_reuses_verified_resident_without_spawning(
@@ -287,9 +650,9 @@ def test_owned_menu_loop_stop_is_bounded_and_clears_restart_record(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Batocera hook is a POSIX shell script")
-def test_game_stop_hook_returns_without_waiting_for_background_worker(tmp_path: Path):
+def test_game_stop_hook_returns_while_worker_continues(tmp_path: Path):
     binary = tmp_path / "romcloud"
-    binary.write_text("#!/bin/bash\nsleep 2\n", encoding="utf-8")
+    binary.write_text("#!/bin/bash\nsleep 0.4\n", encoding="utf-8")
     binary.chmod(0o755)
     hook = install_hook(binary, hook_path=tmp_path / "romcloud-autosync")
 
@@ -297,10 +660,170 @@ def test_game_stop_hook_returns_without_waiting_for_background_worker(tmp_path: 
     subprocess.run(
         [str(hook), "gameStop", "psx", "libretro", "pcsx", "Game.chd"],
         check=True,
-        timeout=1,
+        timeout=2,
     )
 
-    assert time.monotonic() - started < 0.5
+    assert time.monotonic() - started < 0.2
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Batocera hook is a POSIX shell script")
+def test_game_stop_hook_logs_missing_worker_binary(tmp_path: Path):
+    binary = tmp_path / "missing-romcloud"
+    hook = install_hook(binary, hook_path=tmp_path / "romcloud-autosync")
+
+    subprocess.run(
+        [str(hook), "gameStop", "psx", "libretro", "pcsx", "Game.chd"],
+        check=True,
+        timeout=2,
+    )
+
+    lifecycle_log = tmp_path.parent / "logs" / "auto-savesync-lifecycle.log"
+    assert 'event="game_stop_handoff_failed"' in lifecycle_log.read_text(
+        encoding="utf-8"
+    )
+    assert 'reason="romcloud_bin_unavailable"' in lifecycle_log.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_lifecycle_caller_pid_accepts_only_a_positive_exact_value():
+    assert (
+        batocera_auto_savesync.lifecycle_caller_pid(
+            {"ROMCLOUD_AUTOSYNC_CALLER_PID": "4242"}
+        )
+        == 4242
+    )
+    assert (
+        batocera_auto_savesync.lifecycle_caller_pid(
+            {"ROMCLOUD_AUTOSYNC_CALLER_PID": "not-a-pid"}
+        )
+        is None
+    )
+    assert batocera_auto_savesync.lifecycle_caller_pid({}) is None
+
+
+def test_readiness_waits_for_caller_exit_and_two_active_es_observations(
+    tmp_path: Path,
+):
+    proc_root = tmp_path / "proc"
+    caller = proc_root / "4242"
+    caller.mkdir(parents=True)
+    (caller / "cmdline").write_bytes(
+        b"/usr/bin/python3\0/usr/bin/emulatorlauncher\0"
+    )
+    now = 0.0
+    probe_calls = 0
+    sleep_calls = 0
+
+    def clock():
+        return now
+
+    def sleep(seconds):
+        nonlocal now, sleep_calls
+        now += seconds
+        sleep_calls += 1
+        if sleep_calls == 1:
+            (caller / "cmdline").unlink()
+
+    def probe():
+        nonlocal probe_calls
+        probe_calls += 1
+        return True, "x11-active-es (pid 99)"
+
+    result = batocera_auto_savesync.wait_for_emulationstation_display(
+        4242,
+        timeout=1.0,
+        proc_root=proc_root,
+        clock=clock,
+        sleep=sleep,
+        probe=probe,
+    )
+
+    assert result.ready is True
+    assert result.signal == "x11-active-es (pid 99)"
+    assert probe_calls == 2
+    assert sleep_calls == 2
+
+
+def test_readiness_timeout_is_bounded_without_a_display_signal():
+    now = 0.0
+    sleeps: list[float] = []
+
+    def clock():
+        return now
+
+    def sleep(seconds):
+        nonlocal now
+        sleeps.append(seconds)
+        now += seconds
+
+    result = batocera_auto_savesync.wait_for_emulationstation_display(
+        None,
+        timeout=0.3,
+        poll_interval=0.05,
+        clock=clock,
+        sleep=sleep,
+        probe=lambda: (False, "no active ES window"),
+    )
+
+    assert result.ready is False
+    assert result.detail == "no active ES window"
+    assert result.elapsed_seconds == pytest.approx(0.3)
+    assert sum(sleeps) == pytest.approx(0.3)
+    assert result.attempts < 10
+
+
+def test_x11_readiness_probe_requires_active_window_to_belong_to_es(
+    tmp_path: Path,
+):
+    proc_root = tmp_path / "proc"
+    es = proc_root / "99"
+    es.mkdir(parents=True)
+    (es / "comm").write_text("emulationstation\n", encoding="utf-8")
+    commands = []
+
+    def run(argv, **kwargs):
+        commands.append((argv, kwargs))
+        return type("Result", (), {"returncode": 0, "stdout": "1234\n99\n"})()
+
+    ready, detail = batocera_auto_savesync.probe_emulationstation_display(
+        environment={"DISPLAY": ":0"},
+        proc_root=proc_root,
+        which=lambda name: "/usr/bin/xdotool" if name == "xdotool" else None,
+        run=run,
+    )
+
+    assert ready is True
+    assert detail == "x11-active-es (pid 99)"
+    assert commands[0][0] == [
+        "/usr/bin/xdotool",
+        "getactivewindow",
+        "getwindowpid",
+    ]
+
+
+def test_wayland_readiness_probe_requires_active_es_toplevel():
+    commands = []
+
+    def run(argv, **kwargs):
+        commands.append((argv, kwargs))
+        return type("Result", (), {"returncode": 0})()
+
+    ready, detail = batocera_auto_savesync.probe_emulationstation_display(
+        environment={"WAYLAND_DISPLAY": "wayland-0"},
+        which=lambda name: "/usr/bin/wlrctl" if name == "wlrctl" else None,
+        run=run,
+    )
+
+    assert ready is True
+    assert detail == "wayland-active-es (app_id:emulationstation)"
+    assert commands[0][0] == [
+        "/usr/bin/wlrctl",
+        "toplevel",
+        "find",
+        "app_id:emulationstation",
+        "state:active",
+    ]
 
 
 def test_lifecycle_mapping_is_registry_bounded_and_xemu_is_never_automatic():
@@ -326,6 +849,7 @@ def test_game_exit_detects_first_save_and_uploads_only_that_registry_group(tmp_p
     provider = _Provider()
     service = _service(tmp_path, provider)
     coordinator = _coordinator(tmp_path, service)
+    service.full_sync()
     coordinator.game_start(system="psx", emulator="libretro", core="pcsx", rom="Game.chd")
     _write(tmp_path / "local" / "psx" / "Game.srm", b"new-save")
 
@@ -335,6 +859,183 @@ def test_game_exit_detects_first_save_and_uploads_only_that_registry_group(tmp_p
 
     assert (tmp_path / "remote" / "psx" / "Game.srm").read_bytes() == b"new-save"
     assert all(not group.dirty_path_hints for group in service.get_state().groups)
+
+
+def test_game_exit_remote_dirty_downloads_through_quick_sync(tmp_path: Path):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    local = tmp_path / "local" / "psx" / "Game.srm"
+    remote = tmp_path / "remote" / "psx" / "Game.srm"
+    _write(local, b"base")
+    service.full_sync()
+    coordinator.game_start(
+        system="psx", emulator="libretro", core="pcsx", rom="Game.chd"
+    )
+    _write(remote, b"peer-progress")
+    service._append_remote_journal(  # type: ignore[attr-defined]
+        revision="peer-game-stop",
+        timestamp="2026-01-01T00:00:00+00:00",
+        mutations=[
+            {
+                "system": "psx",
+                "layout_id": "retroarch-root-psx",
+                "group_id": "retroarch-root-psx:psx/Game",
+                "object_id": "psx/Game.srm",
+                "operation": "update",
+            }
+        ],
+    )
+
+    coordinator.game_stop(
+        system="psx", emulator="libretro", core="pcsx", rom="Game.chd"
+    )
+
+    assert local.read_bytes() == b"peer-progress"
+    assert remote.read_bytes() == b"peer-progress"
+    assert service.get_state().groups[0].condition is SaveGroupCondition.CLEAN
+
+
+def test_game_exit_both_dirty_preserves_conflict(tmp_path: Path):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    local = tmp_path / "local" / "psx" / "Game.srm"
+    remote = tmp_path / "remote" / "psx" / "Game.srm"
+    _write(local, b"base")
+    service.full_sync()
+    coordinator.game_start(
+        system="psx", emulator="libretro", core="pcsx", rom="Game.chd"
+    )
+    _write(local, b"local-progress")
+    _write(remote, b"peer-progress")
+    service._append_remote_journal(  # type: ignore[attr-defined]
+        revision="peer-conflict",
+        timestamp="2026-01-01T00:00:00+00:00",
+        mutations=[
+            {
+                "system": "psx",
+                "layout_id": "retroarch-root-psx",
+                "group_id": "retroarch-root-psx:psx/Game",
+                "object_id": "psx/Game.srm",
+                "operation": "update",
+            }
+        ],
+    )
+
+    new_conflicts = coordinator.game_stop(
+        system="psx", emulator="libretro", core="pcsx", rom="Game.chd"
+    )
+
+    assert local.read_bytes() == b"local-progress"
+    assert remote.read_bytes() == b"peer-progress"
+    assert service.get_state().groups[0].condition is SaveGroupCondition.CONFLICT
+    assert new_conflicts == (service.get_state().active_conflicts[0].conflict_id,)
+    assert savesync_prompts.pending_ids(tmp_path / "data") == new_conflicts
+
+    # Re-observing the same authoritative fingerprint is not a new prompt.
+    assert coordinator.game_stop(
+        system="psx", emulator="libretro", core="pcsx", rom="Game.chd"
+    ) == ()
+    assert savesync_prompts.pending_ids(tmp_path / "data") == new_conflicts
+
+
+def test_only_game_stop_collects_new_conflict_ids(tmp_path: Path):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    local = tmp_path / "local" / "psx" / "Game.srm"
+    remote = tmp_path / "remote" / "psx" / "Game.srm"
+    _write(local, b"base")
+    service.full_sync()
+    _write(local, b"local-progress")
+    service.mark_local_dirty("psx/Game.srm")
+    _write(remote, b"remote-progress")
+    service._append_remote_journal(  # type: ignore[attr-defined]
+        revision="peer-menu-conflict",
+        timestamp="2026-01-01T00:00:00+00:00",
+        mutations=[
+            {
+                "system": "psx",
+                "layout_id": "retroarch-root-psx",
+                "group_id": "retroarch-root-psx:psx/Game",
+                "object_id": "psx/Game.srm",
+                "operation": "update",
+            }
+        ],
+    )
+
+    coordinator.menu_tick(force=True)
+
+    assert len(service.get_state().active_conflicts) == 1
+    assert savesync_prompts.pending_ids(tmp_path / "data") == ()
+
+
+def test_game_stop_queues_multiple_new_conflicts_by_exact_identity(tmp_path: Path):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    for name in ("Alpha", "Beta"):
+        _write(tmp_path / "local" / "psx" / f"{name}.srm", b"base")
+    service.full_sync()
+    coordinator.game_start(
+        system="psx", emulator="libretro", core="pcsx", rom="Collection.chd"
+    )
+    mutations = []
+    for name in ("Alpha", "Beta"):
+        path = f"psx/{name}.srm"
+        _write(tmp_path / "local" / path, f"local-{name}".encode())
+        _write(tmp_path / "remote" / path, f"remote-{name}".encode())
+        mutations.append(
+            {
+                "system": "psx",
+                "layout_id": "retroarch-root-psx",
+                "group_id": f"retroarch-root-psx:{name.lower()}",
+                "object_id": path,
+                "operation": "update",
+            }
+        )
+    service._append_remote_journal(  # type: ignore[attr-defined]
+        revision="peer-multiple-conflicts",
+        timestamp="2026-01-01T00:00:00+00:00",
+        mutations=mutations,
+    )
+
+    new_conflicts = coordinator.game_stop(
+        system="psx", emulator="libretro", core="pcsx", rom="Collection.chd"
+    )
+
+    active_ids = tuple(
+        sorted(item.conflict_id for item in service.get_state().active_conflicts)
+    )
+    assert len(active_ids) == 2
+    assert new_conflicts == active_ids
+    assert savesync_prompts.pending_ids(tmp_path / "data") == active_ids
+
+
+def test_game_exit_unchanged_uses_no_transaction(tmp_path: Path, monkeypatch):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    local = tmp_path / "local" / "psx" / "Game.srm"
+    _write(local, b"base")
+    service.full_sync()
+    coordinator.game_start(
+        system="psx", emulator="libretro", core="pcsx", rom="Game.chd"
+    )
+    monkeypatch.setattr(
+        save_transaction,
+        "prepare_transaction",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("unchanged gameStop must not stage a transaction")
+        ),
+    )
+
+    coordinator.game_stop(
+        system="psx", emulator="libretro", core="pcsx", rom="Game.chd"
+    )
+
+    assert local.read_bytes() == b"base"
 
 
 def test_game_exit_retries_after_duckstation_save_changes_during_staging(
@@ -358,7 +1059,7 @@ def test_game_exit_retries_after_duckstation_save_changes_during_staging(
         / "_usr_share_duckstation_1.mcd"
     )
     _write(local, b"baseline")
-    service.reconcile()
+    service.full_sync()
     coordinator.game_start(
         system="psx", emulator="duckstation", core="duckstation", rom="Game.chd"
     )
@@ -397,7 +1098,7 @@ def test_unstable_local_group_is_bounded_and_keeps_dirty_state(
     service = _service(tmp_path, provider)
     path = tmp_path / "local" / "psx" / "Game.srm"
     _write(path, b"base")
-    service.reconcile()
+    service.full_sync()
     _write(path, b"changed")
     service.mark_local_dirty("psx/Game.srm")
     provider.reachability_checks = 0
@@ -435,7 +1136,7 @@ def test_auto_stability_and_verification_do_not_scan_unrelated_layouts(
     local = tmp_path / "local" / "psx" / "Game.srm"
     remote = tmp_path / "remote" / "psx" / "Game.srm"
     _write(local, b"base")
-    service.reconcile()
+    service.full_sync()
     _write(local, b"changed")
     service.mark_local_dirty("psx/Game.srm")
 
@@ -456,7 +1157,7 @@ def test_active_game_group_is_deferred_then_processed_after_exit(tmp_path: Path)
     local = tmp_path / "local" / "psx" / "Game.srm"
     remote = tmp_path / "remote" / "psx" / "Game.srm"
     _write(local, b"base")
-    service.reconcile()
+    service.full_sync()
     _write(local, b"changed")
     service.mark_local_dirty("psx/Game.srm")
     coordinator = _coordinator(tmp_path, service)
@@ -478,7 +1179,7 @@ def test_unavailable_remote_preserves_durable_dirty_state(tmp_path: Path):
     service = _service(tmp_path, provider)
     local = tmp_path / "local" / "psx" / "Game.srm"
     _write(local, b"base")
-    service.reconcile()
+    service.full_sync()
     _write(local, b"changed")
     service.mark_local_dirty("psx/Game.srm")
     provider.reachable = False
@@ -517,7 +1218,7 @@ def test_verified_unchanged_hint_clears_without_transaction(
     service = _service(tmp_path, provider)
     path = tmp_path / "local" / "psx" / "Game.srm"
     _write(path, b"base")
-    service.reconcile()
+    service.full_sync()
     service.mark_local_dirty("psx/Game.srm")
 
     def unexpected_transaction(*args, **kwargs):
@@ -538,19 +1239,19 @@ def test_repeated_dirty_hint_coalesces_to_one_group_and_one_pass(
     service = _service(tmp_path, provider)
     path = tmp_path / "local" / "psx" / "Game.srm"
     _write(path, b"base")
-    service.reconcile()
+    service.full_sync()
     _write(path, b"changed")
     service.mark_local_dirty("psx/Game.srm")
     service.mark_local_dirty("psx/Game.srm")
     calls = 0
-    original = service.reconcile_pending_groups
+    original = service.quick_sync
 
     def counted(*args, **kwargs):
         nonlocal calls
         calls += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(service, "reconcile_pending_groups", counted)
+    monkeypatch.setattr(service, "quick_sync", counted)
     _coordinator(tmp_path, service).drain_pending()
 
     assert calls == 1
@@ -567,7 +1268,7 @@ def test_background_transaction_contains_only_pending_group(
     second = tmp_path / "local" / "psx" / "Second.srm"
     _write(first, b"base-1")
     _write(second, b"base-2")
-    service.reconcile()
+    service.full_sync()
     _write(first, b"changed-1")
     service.mark_local_dirty("psx/First.srm")
     captured: list[set[str]] = []
@@ -605,7 +1306,7 @@ def test_both_sides_changed_creates_conflict_without_overwrite(tmp_path: Path):
     local = tmp_path / "local" / "psx" / "Game.srm"
     remote = tmp_path / "remote" / "psx" / "Game.srm"
     _write(local, b"base")
-    service.reconcile()
+    service.full_sync()
     _write(local, b"local")
     _write(remote, b"remote")
     service.mark_local_dirty("psx/Game.srm")
@@ -619,23 +1320,23 @@ def test_both_sides_changed_creates_conflict_without_overwrite(tmp_path: Path):
     assert len(tuple(conflict for conflict in state.conflicts if not conflict.resolved)) == 1
 
 
-def test_remote_only_change_is_never_downloaded_by_game_exit(tmp_path: Path):
+def test_remote_only_change_is_downloaded_by_game_exit(tmp_path: Path):
     provider = _Provider()
     service = _service(tmp_path, provider)
     local = tmp_path / "local" / "psx" / "Game.srm"
     remote = tmp_path / "remote" / "psx" / "Game.srm"
     _write(local, b"base")
-    service.reconcile()
+    service.full_sync()
     _write(remote, b"remote")
-    # Advisory false-positive: the authoritative pass must discover that only
-    # the remote changed and must not promote it into the live save tree.
+    # Advisory false-positive: authoritative Quick Sync discovers that only
+    # the remote changed and safely promotes it after gameplay has stopped.
     service.mark_local_dirty("psx/Game.srm")
 
     _coordinator(tmp_path, service).drain_pending()
 
-    assert local.read_bytes() == b"base"
+    assert local.read_bytes() == b"remote"
     assert remote.read_bytes() == b"remote"
-    assert service.get_state().groups[0].condition is SaveGroupCondition.REMOTE_DIRTY
+    assert service.get_state().groups[0].condition is SaveGroupCondition.CLEAN
 
 
 def test_verified_local_deletion_removes_only_its_remote_group(tmp_path: Path):
@@ -645,7 +1346,7 @@ def test_verified_local_deletion_removes_only_its_remote_group(tmp_path: Path):
     retained = tmp_path / "local" / "psx" / "Retained.srm"
     _write(removed, b"remove")
     _write(retained, b"retain")
-    service.reconcile()
+    service.full_sync()
     removed.unlink()
     service.mark_local_dirty("psx/Removed.srm")
 
@@ -664,10 +1365,10 @@ def test_dirty_group_arriving_during_pass_is_processed_afterward(
     second = tmp_path / "local" / "psx" / "Second.srm"
     _write(first, b"base-1")
     _write(second, b"base-2")
-    service.reconcile()
+    service.full_sync()
     _write(first, b"next-1")
     service.mark_local_dirty("psx/First.srm")
-    original = service.reconcile_pending_groups
+    original = service.quick_sync
     injected = False
 
     def reconcile_then_dirty(*args, **kwargs):
@@ -679,7 +1380,7 @@ def test_dirty_group_arriving_during_pass_is_processed_afterward(
             service.mark_local_dirty("psx/Second.srm")
         return report
 
-    monkeypatch.setattr(service, "reconcile_pending_groups", reconcile_then_dirty)
+    monkeypatch.setattr(service, "quick_sync", reconcile_then_dirty)
 
     _coordinator(tmp_path, service).drain_pending()
 
@@ -692,10 +1393,10 @@ def test_rapid_workers_never_reconcile_concurrently(tmp_path: Path, monkeypatch)
     service = _service(tmp_path, provider)
     path = tmp_path / "local" / "psx" / "Game.srm"
     _write(path, b"base")
-    service.reconcile()
+    service.full_sync()
     _write(path, b"changed")
     service.mark_local_dirty("psx/Game.srm")
-    original = service.reconcile_pending_groups
+    original = service.quick_sync
     active = 0
     maximum = 0
     guard = threading.Lock()
@@ -712,7 +1413,7 @@ def test_rapid_workers_never_reconcile_concurrently(tmp_path: Path, monkeypatch)
             with guard:
                 active -= 1
 
-    monkeypatch.setattr(service, "reconcile_pending_groups", slow_reconcile)
+    monkeypatch.setattr(service, "quick_sync", slow_reconcile)
     coordinators = [_coordinator(tmp_path, service), _coordinator(tmp_path, service)]
     threads = [threading.Thread(target=item.drain_pending) for item in coordinators]
     for thread in threads:
@@ -731,7 +1432,7 @@ def test_manual_and_background_reconcile_share_one_operation_boundary(
     service = _service(tmp_path, provider)
     path = tmp_path / "local" / "psx" / "Game.srm"
     _write(path, b"base")
-    service.reconcile()
+    service.full_sync()
     _write(path, b"changed")
     preview = service.preview_upload()
     service.mark_local_dirty("psx/Game.srm")
@@ -968,8 +1669,8 @@ def test_menu_loop_suppresses_gameplay_then_resumes_after_game_stop(
         coordinator.menu_loop()
 
     # The initial and first interval ticks were suppressed during gameplay;
-    # the next interval after gameStop resumed the existing periodic pull.
-    assert quick_calls == 1
+    # gameStop reconciled immediately, then the forced-due test tick ran too.
+    assert quick_calls == 2
 
 
 def test_menu_tick_unchanged_journal_performs_no_save_layout_scan(
@@ -996,6 +1697,120 @@ def test_menu_tick_unchanged_journal_performs_no_save_layout_scan(
     coordinator.menu_tick(force=True)
 
     assert calls == {"local": 0, "remote": 0}
+
+
+def test_remote_reconnect_runs_one_quick_sync_when_ready(tmp_path: Path, monkeypatch):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    service.full_sync()
+    calls = 0
+    original = service.quick_sync
+
+    def counted(**kwargs):
+        nonlocal calls
+        calls += 1
+        return original(**kwargs)
+
+    monkeypatch.setattr(service, "quick_sync", counted)
+
+    coordinator.remote_reconnect()
+
+    assert calls == 1
+
+
+def test_remote_reconnect_quick_sync_failure_is_not_retried(
+    tmp_path: Path, monkeypatch
+):
+    service = _service(tmp_path, _Provider())
+    coordinator = _coordinator(tmp_path, service)
+    service.full_sync()
+    calls = 0
+
+    def fail_once(**kwargs):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("remote temporarily unavailable")
+
+    monkeypatch.setattr(service, "quick_sync", fail_once)
+
+    coordinator.remote_reconnect()
+
+    assert calls == 1
+
+
+def test_remote_reconnect_during_game_defers_until_game_stop(
+    tmp_path: Path, monkeypatch
+):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    _write(tmp_path / "local" / "psx" / "Game.srm", b"base")
+    service.full_sync()
+    calls = 0
+    original = service.quick_sync
+
+    def counted(**kwargs):
+        nonlocal calls
+        calls += 1
+        return original(**kwargs)
+
+    monkeypatch.setattr(service, "quick_sync", counted)
+    coordinator.game_start(
+        system="psx", emulator="libretro", core="pcsx", rom="Game.chd"
+    )
+
+    coordinator.remote_reconnect()
+    assert calls == 0
+
+    coordinator.game_stop(
+        system="psx", emulator="libretro", core="pcsx", rom="Game.chd"
+    )
+    assert calls == 1
+
+
+def test_remote_reconnect_without_baseline_does_no_provider_or_scan_work(
+    tmp_path: Path, monkeypatch
+):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    monkeypatch.setattr(
+        service,
+        "quick_sync",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("unready reconnect must not attempt Quick Sync")
+        ),
+    )
+
+    coordinator.remote_reconnect()
+
+    assert provider.reachability_checks == 0
+
+
+def test_remote_reconnect_unchanged_journal_scans_no_layouts(
+    tmp_path: Path, monkeypatch
+):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    service.full_sync()
+    monkeypatch.setattr(
+        service,
+        "_scan_automatic_local",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("unchanged reconnect scanned local layouts")
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "_scan_automatic_remote",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("unchanged reconnect scanned remote layouts")
+        ),
+    )
+
+    coordinator.remote_reconnect()
 
 
 def test_menu_tick_unchanged_journal_drains_durable_local_dirty_group(

@@ -14,6 +14,8 @@ from romcloud.infrastructure.config import (
     SourceConfig,
     write_config,
 )
+from romcloud.infrastructure import savesync_prompts
+from romcloud.infrastructure.savesync_state import load_state
 
 
 def _build_config(tmp_path):
@@ -204,6 +206,130 @@ class TestSavesyncCommit:
 
         status = json.loads(_invoke(cfg_path, ["savesync-status"]).output.strip())
         assert status["last_upload"] is not None
+
+
+class TestGameStopConflictPopupBridge:
+    def _queued_conflict(self, tmp_path):
+        cfg_path = _config_path(tmp_path)
+        local = tmp_path / "saves" / "psx" / "Game.srm"
+        remote = tmp_path / "remote-data" / "saves" / "psx" / "Game.srm"
+        local.parent.mkdir(parents=True)
+        local.write_bytes(b"base")
+        result = _invoke(cfg_path, ["savesync-full-sync"], input="{}")
+        assert result.exit_code == 0, result.output
+        local.write_bytes(b"local-progress")
+        remote.write_bytes(b"remote-progress")
+        result = _invoke(cfg_path, ["savesync-reconcile"], input="{}")
+        assert result.exit_code == 0, result.output
+        state_path = tmp_path / "data" / "savesync-state.json"
+        conflict = load_state(state_path).active_conflicts[0]
+        savesync_prompts.enqueue(tmp_path / "data", (conflict.conflict_id,))
+        return cfg_path, state_path, conflict.conflict_id, local, remote
+
+    def test_auto_list_returns_queued_id_and_later_dismisses_prompt(
+        self, tmp_path
+    ):
+        cfg_path, state_path, conflict_id, local, remote = self._queued_conflict(tmp_path)
+
+        pending = _invoke(
+            cfg_path,
+            ["savesync-conflicts"],
+            input=json.dumps({"source": "automatic"}),
+        )
+        payload = json.loads(pending.output)
+        assert payload["conflicts"][0]["conflict_id"] == conflict_id
+        assert payload["conflicts"][0]["group_label"] == "psx/Game"
+
+        deferred = _invoke(
+            cfg_path,
+            ["savesync-conflict-action"],
+            input=json.dumps(
+                {
+                    "conflict_id": conflict_id,
+                    "action": "resolve-later",
+                    "source": "automatic",
+                }
+            ),
+        )
+
+        assert deferred.exit_code == 0, deferred.output
+        conflict = load_state(state_path).active_conflicts[0]
+        assert conflict.acknowledged is False
+        assert conflict.resolved is False
+        assert local.read_bytes() == b"local-progress"
+        assert remote.read_bytes() == b"remote-progress"
+        assert savesync_prompts.pending_ids(tmp_path / "data") == ()
+
+        manual = _invoke(
+            cfg_path,
+            ["savesync-conflicts"],
+            input=json.dumps({"source": "manual"}),
+        )
+        manual_payload = json.loads(manual.output)
+        assert [item["conflict_id"] for item in manual_payload["conflicts"]] == [
+            conflict_id
+        ]
+
+    def test_manual_list_includes_all_active_conflicts_without_auto_queue(self, tmp_path):
+        cfg_path, state_path, conflict_id, _local, _remote = self._queued_conflict(
+            tmp_path
+        )
+        savesync_prompts.complete(tmp_path / "data", conflict_id)
+
+        result = _invoke(
+            cfg_path,
+            ["savesync-conflicts"],
+            input=json.dumps({"source": "manual"}),
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["source"] == "manual"
+        assert [item["conflict_id"] for item in payload["conflicts"]] == [
+            conflict_id
+        ]
+        assert load_state(state_path).active_conflicts[0].conflict_id == conflict_id
+
+    def test_manual_resolve_later_changes_neither_conflict_nor_auto_queue(self, tmp_path):
+        cfg_path, state_path, conflict_id, local, remote = self._queued_conflict(tmp_path)
+
+        result = _invoke(
+            cfg_path,
+            ["savesync-conflict-action"],
+            input=json.dumps(
+                {
+                    "conflict_id": conflict_id,
+                    "action": "resolve-later",
+                    "source": "manual",
+                }
+            ),
+        )
+
+        assert result.exit_code == 0, result.output
+        conflict = load_state(state_path).active_conflicts[0]
+        assert conflict.conflict_id == conflict_id
+        assert conflict.acknowledged is False
+        assert local.read_bytes() == b"local-progress"
+        assert remote.read_bytes() == b"remote-progress"
+        assert savesync_prompts.pending_ids(tmp_path / "data") == (conflict_id,)
+
+    def test_failed_resolution_remains_unresolved_and_queued(self, tmp_path):
+        cfg_path, state_path, conflict_id, local, remote = self._queued_conflict(tmp_path)
+        local.write_bytes(b"changed-after-prompt")
+
+        result = _invoke(
+            cfg_path,
+            ["savesync-conflict-action"],
+            input=json.dumps(
+                {"conflict_id": conflict_id, "action": "upload-local"}
+            ),
+        )
+
+        assert result.exit_code == 1
+        assert "changed after" in json.loads(result.output)["error"]
+        assert load_state(state_path).active_conflicts[0].conflict_id == conflict_id
+        assert remote.read_bytes() == b"remote-progress"
+        assert savesync_prompts.pending_ids(tmp_path / "data") == (conflict_id,)
 
 
 class TestSavesyncSettings:

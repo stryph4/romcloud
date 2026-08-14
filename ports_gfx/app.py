@@ -86,8 +86,8 @@ from ports_gfx.savesync_screen import (
     APPLYING_SETTINGS,
     COMMITTING,
     CONFIRMING,
+    CONFLICTS,
     DASHBOARD,
-    DASHBOARD_ITEMS,
     PREVIEW,
     PREVIEWING,
     REMOTE_AVAILABLE,
@@ -95,6 +95,10 @@ from ports_gfx.savesync_screen import (
     RESULT,
     SETTINGS,
     SaveSyncScreenState,
+)
+from ports_gfx.savesync_conflict_popup import (
+    action_rects as conflict_action_rects,
+    render_conflict_resolver,
 )
 from ports_gfx.splash import SplashRenderer
 from ports_gfx.update_state import UpdateCheckState
@@ -952,7 +956,13 @@ def _run(  # noqa: ANN001
                     # dismissing it once finished (see handle_operation_event).
                     rects = (layout.safe_area,)
                 elif current_screen == "savesync":
-                    rects = (layout.safe_area,)
+                    if (
+                        savesync_screen is not None
+                        and savesync_screen.step == CONFLICTS
+                    ):
+                        rects = conflict_action_rects(layout)
+                    else:
+                        rects = (layout.safe_area,)
                 elif current_screen == "library_sync":
                     rects = (layout.safe_area,)
                 else:
@@ -1148,7 +1158,7 @@ def _run(  # noqa: ANN001
             elif current_screen == "savesync" and savesync_screen is not None:
                 for line in savesync_screen.poll():
                     activity.ingest(line.text)
-                savesync_screen.update_confirm(dt)
+                savesync_screen.update(dt)
             elif current_screen == "library_sync" and library_sync_screen is not None:
                 for line in library_sync_screen.poll():
                     activity.ingest(line.text)
@@ -1375,6 +1385,10 @@ def _handle_savesync_event(ievent: InputEvent, savesync_screen: SaveSyncScreenSt
     non-interruptible here.
     """
     step = savesync_screen.step
+
+    if step == CONFLICTS:
+        savesync_screen.handle_conflict_event(ievent)
+        return "savesync"
 
     if step == DASHBOARD:
         if ievent.action in ACTION_DIRECTIONS:
@@ -1893,7 +1907,7 @@ def _savesync_body_lines(savesync_screen: SaveSyncScreenState) -> list[str]:
             lines.append(f"Local status unavailable: {savesync_screen.status_error}")
         if savesync_screen.error:
             lines.append(f"SaveSync: {savesync_screen.error}")
-        return [*lines, "", *DASHBOARD_ITEMS]
+        return [*lines, "", *savesync_screen.dashboard_items]
     if step == PREVIEWING:
         if savesync_screen.result_mode == "quick-sync":
             return ["Running Quick Sync..."]
@@ -2112,6 +2126,27 @@ def _render_savesync(  # noqa: ANN001
     savesync_screen: SaveSyncScreenState,
     activity: ActivityLog,
 ) -> None:
+    if savesync_screen.step == CONFLICTS and savesync_screen.resolver is not None:
+        render_conflict_resolver(
+            pygame,
+            screen,
+            fonts,
+            layout,
+            savesync_screen.resolver,
+            conflict_action_rects(layout),
+            colors={
+                "bg": _BG_COLOR,
+                "card": _CARD_BG,
+                "error": _ERROR_COLOR,
+                "fg": _FG_COLOR,
+                "hint": _HINT_COLOR,
+                "selected": _SELECTED_BG,
+                "success": _SUCCESS_COLOR,
+            },
+            draw_progress=_draw_progress_bar,
+        )
+        return
+
     screen.fill(_BG_COLOR)
 
     title = fonts["title"].render("SaveSync", True, _FG_COLOR)
@@ -2122,8 +2157,9 @@ def _render_savesync(  # noqa: ANN001
     for i, line in enumerate(_savesync_body_lines(savesync_screen)):
         is_selected_item = (
             savesync_screen.step == DASHBOARD
-            and line in DASHBOARD_ITEMS
-            and DASHBOARD_ITEMS.index(line) == savesync_screen.selected_index
+            and line in savesync_screen.dashboard_items
+            and savesync_screen.dashboard_items.index(line)
+            == savesync_screen.selected_index
         )
         is_selected_item = is_selected_item or (
             savesync_screen.step == SETTINGS
@@ -2330,6 +2366,8 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
                     "\u2713 Cleanup verified",
                 ]
             )
+        if wizard.applied_summary.get("save_sync_initialized"):
+            lines.append("\u2713 Initial Full Sync complete — Quick Sync ready")
         if wizard.game_access_mode == "smart_cache":
             lines.append(
                 f"Cache size: {wizard.applied_summary.get('max_size_gb', wizard.max_size_gb):g} GB"

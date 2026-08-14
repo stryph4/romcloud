@@ -69,7 +69,7 @@ def test_running_wizard_progress_is_indeterminate_until_a_total_is_reported():
 
     assert wizard.progress is not None
     assert wizard.progress.fraction is None
-    assert wizard.progress.message == "Saving configuration…"
+    assert wizard.progress.message == "Saving configuration and initializing SaveSync…"
 
 
 def test_wizard_progress_tracks_phase_totals_without_finishing_early():

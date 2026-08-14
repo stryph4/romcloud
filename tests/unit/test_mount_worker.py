@@ -85,6 +85,36 @@ class TestWorkerStatusPersistence:
         assert mw.read_worker_status(tmp_path) is None
 
 
+class TestRemoteDataReconnectEdge:
+    def test_unavailable_to_available_is_one_persisted_edge(self, tmp_path):
+        target = mw.ConfiguredMount(
+            "ROMCloud remote data",
+            "/mnt/remote",
+            False,
+            _fake_smb(server="data-nas.local", share="ROMCloud"),
+            "remote_data",
+        )
+
+        assert not mw.record_remote_data_availability(
+            tmp_path, target, available=False
+        )
+        assert mw.record_remote_data_availability(
+            tmp_path, target, available=True
+        )
+        assert not mw.record_remote_data_availability(
+            tmp_path, target, available=True
+        )
+
+    def test_cleanup_removes_owned_edge_state(self, tmp_path):
+        path = mw.remote_data_availability_path(tmp_path)
+        path.parent.mkdir(parents=True)
+        path.write_text("{}")
+
+        mw.cleanup_runtime_state(tmp_path)
+
+        assert not path.exists()
+
+
 class TestIsWorkerRunning:
     def test_no_lock_file_returns_none(self, tmp_path):
         assert mw.is_worker_running(tmp_path) is None
@@ -232,6 +262,35 @@ class TestRunWorker:
         assert attempts[0]["share"] == "ROMCloud"
         assert attempts[0]["mount_point"] == "/mnt/remote-rw"
         assert attempts[0]["read_only"] is False
+
+    def test_remote_mount_success_notifies_once_after_persisting_edge(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: False
+        )
+        monkeypatch.setattr(
+            mw, "load_remote_data_smb_password", lambda *a, **k: "sync-secret"
+        )
+        monkeypatch.setattr(
+            mw.mountlib,
+            "mount_cifs_source",
+            lambda **kwargs: mw.mountlib.MountOutcome(True, False, "mounted"),
+        )
+        calls = []
+
+        code = mw.run_worker(
+            tmp_path,
+            _fake_config(
+                credentials_path=tmp_path / "credentials.toml",
+                smb=None,
+                saves_mount="/mnt/remote-rw",
+            ),
+            on_remote_data_available=lambda: calls.append("quick-sync"),
+        )
+
+        assert code == 0
+        assert calls == ["quick-sync"]
 
     def test_already_mounted_records_success_and_skips_mount(self, tmp_path, monkeypatch):
         monkeypatch.setattr(mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: True)

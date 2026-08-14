@@ -16,6 +16,8 @@ from typing import Optional, Sequence
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
+    conflict_mode = "--savesync-conflicts" in args
+    args = [arg for arg in args if arg != "--savesync-conflicts"]
     romcloud_bin = os.environ.get("ROMCLOUD_BIN") or (args[0] if args else None)
     if not romcloud_bin:
         print(
@@ -23,6 +25,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             file=sys.stderr,
         )
         return 1
+
+    if conflict_mode:
+        from ports_gfx.savesync_conflict_popup import run_conflict_popup
+
+        return run_conflict_popup(romcloud_bin)
 
     from ports_gfx.app import run_app
 

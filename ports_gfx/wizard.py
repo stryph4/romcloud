@@ -215,7 +215,7 @@ STEP_CONTEXT: dict[WizardStep, WizardStepContext] = {
     ),
     WizardStep.APPLY: WizardStepContext(
         "ROMCloud is configuring and testing this device.",
-        "Keep this window open while it scans the library and prepares EmulationStation.",
+        "Writable shared storage is initialized with a Full Sync before Auto SaveSync is ready.",
     ),
     WizardStep.DONE: WizardStepContext(
         "ROMCloud setup is complete.",
@@ -232,7 +232,7 @@ _RUNNING_MESSAGES = {
     WizardStep.REMOTE_DISCOVER: "Connecting to shared data storage…",
     WizardStep.REMOTE_BROWSE: "Opening the shared-data folder…",
     WizardStep.REMOTE_VALIDATE: "Testing access to shared data storage…",
-    WizardStep.APPLY: "Saving configuration…",
+    WizardStep.APPLY: "Saving configuration and initializing SaveSync…",
 }
 
 

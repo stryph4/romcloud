@@ -15,6 +15,10 @@ from ports_gfx.client import operation_result, start_backend_operation
 from ports_gfx.hold_confirm import HoldToConfirmState, handle_hold_to_confirm_event
 from ports_gfx.input_manager import InputEvent
 from ports_gfx.operation import OperationRunner
+from ports_gfx.savesync_conflict_popup import (
+    DONE as CONFLICTS_DONE,
+    ConflictPopupState,
+)
 
 DASHBOARD = "dashboard"
 PREVIEWING = "previewing"
@@ -24,20 +28,21 @@ COMMITTING = "committing"
 RESULT = "result"
 SETTINGS = "settings"
 APPLYING_SETTINGS = "applying_settings"
+CONFLICTS = "conflicts"
 
 REMOTE_CHECKING = "checking"
 REMOTE_AVAILABLE = "available"
 REMOTE_UNAVAILABLE = "unavailable"
 REMOTE_AVAILABILITY_TIMEOUT = 6.0
 
-DASHBOARD_ITEMS: tuple[str, ...] = (
+_DASHBOARD_ACTIONS: tuple[str, ...] = (
     "Quick Sync",
     "Full Sync",
     "Upload All Saves",
     "Download All Saves",
     "SaveSync Settings",
-    "Back",
 )
+DASHBOARD_ITEMS: tuple[str, ...] = (*_DASHBOARD_ACTIONS, "Back")
 SETTINGS_ITEMS: tuple[str, ...] = (
     "Auto Sync Saves",
     "Original Xbox virtual drive",
@@ -48,7 +53,6 @@ _FULL_SYNC_INDEX = 1
 _UPLOAD_INDEX = 2
 _DOWNLOAD_INDEX = 3
 _SETTINGS_INDEX = 4
-_BACK_INDEX = 5
 
 PopenFunc = Callable[..., "object"]
 
@@ -71,6 +75,7 @@ class SaveSyncScreenState:
     result: dict[str, Any] = field(default_factory=dict)
     result_mode: str = ""
     confirm: HoldToConfirmState = field(default_factory=HoldToConfirmState)
+    resolver: Optional[ConflictPopupState] = None
     popen: Optional[PopenFunc] = None
     """Injected for tests; ``None`` uses the real subprocess default."""
     clock: Optional[Callable[[], float]] = None
@@ -105,11 +110,18 @@ class SaveSyncScreenState:
             and self.remote_availability == REMOTE_AVAILABLE
         )
 
+    @property
+    def dashboard_items(self) -> tuple[str, ...]:
+        conflicts = int(self.status.get("active_conflicts", 0))
+        resolve = (f"Resolve Conflicts ({conflicts})",) if conflicts > 0 else ()
+        return (*_DASHBOARD_ACTIONS, *resolve, "Back")
+
     def select(self, index: int) -> None:
-        self.selected_index = max(0, min(index, len(DASHBOARD_ITEMS) - 1))
+        self.selected_index = max(0, min(index, len(self.dashboard_items) - 1))
 
     def confirm_dashboard_selection(self) -> Optional[str]:
         """Returns ``"back"`` if the caller should leave this screen entirely."""
+        selected = self.dashboard_items[self.selected_index]
         if self.selected_index in (
             _UPLOAD_INDEX,
             _DOWNLOAD_INDEX,
@@ -136,7 +148,17 @@ class SaveSyncScreenState:
         elif self.selected_index == _SETTINGS_INDEX:
             self.error = ""
             self.step = SETTINGS
-        elif self.selected_index == _BACK_INDEX:
+        elif selected.startswith("Resolve Conflicts"):
+            self.error = ""
+            self.resolver = ConflictPopupState(
+                self.romcloud_bin,
+                source="manual",
+                popen=self.popen,
+                clock=self.clock,
+            )
+            self.resolver.start()
+            self.step = CONFLICTS
+        elif selected == "Back":
             return "back"
         return None
 
@@ -186,6 +208,21 @@ class SaveSyncScreenState:
                 {"direction": self.direction, "diff": self.diff},
             )
             self.step = COMMITTING
+
+    def update(self, dt: float) -> None:
+        if self.step != CONFLICTS or self.resolver is None:
+            self.update_confirm(dt)
+            return
+        self.resolver.update(dt)
+        if self.resolver.step == CONFLICTS_DONE:
+            self.resolver = None
+            self.step = DASHBOARD
+            self.selected_index = 0
+            self.start_loading()
+
+    def handle_conflict_event(self, event: InputEvent) -> None:
+        if self.step == CONFLICTS and self.resolver is not None:
+            self.resolver.handle_event(event)
 
     # -- settings --------------------------------------------------------
 
@@ -369,6 +406,9 @@ class SaveSyncScreenState:
 
     def cancel_pending(self) -> None:
         """Boundedly cancel every subprocess owned by this screen."""
+        if self.resolver is not None:
+            self.resolver.cancel_pending()
+            self.resolver = None
         self._cancel_runner("_runner")
         self._cancel_background_checks()
 

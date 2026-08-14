@@ -87,6 +87,8 @@ class InputManager:
             save_mapping=make_saver(romcloud_bin),
         )
         self._pointer_debouncer = PointerDebouncer()
+        self._held_keyboard: set[int] = set()
+        self._held_pointers: set[tuple[str, int]] = set()
         self.last_input_mode = "keyboard"
 
     def handle_event(
@@ -103,12 +105,14 @@ class InputManager:
         event_type = event.type
 
         if event_type == pygame.KEYDOWN:
+            self._held_keyboard.add(event.key)
             action = action_for_key(pygame, event.key, text_mode=text_mode)
             if action is not None:
                 self.last_input_mode = "keyboard"
             return InputEvent(action=action, source="keyboard")
 
         if event_type == getattr(pygame, "KEYUP", object()):
+            self._held_keyboard.discard(event.key)
             action = action_for_key_up(pygame, event.key)
             return InputEvent(action=action, source="keyboard") if action is not None else _NONE_EVENT
 
@@ -120,12 +124,14 @@ class InputManager:
             return InputEvent(action=Action.TEXT_INPUT, text=text, source="keyboard")
 
         if event_type == getattr(pygame, "MOUSEBUTTONDOWN", object()):
+            self._held_pointers.add(("mouse", int(getattr(event, "button", 1))))
             if not self._pointer_debouncer.should_handle(now):
                 return _NONE_EVENT
             index = resolve_hit(rects, point_from_mouse_event(event))
             return self._touch_result(index, source="mouse")
 
         if event_type == getattr(pygame, "FINGERDOWN", object()):
+            self._held_pointers.add(("finger", int(getattr(event, "finger_id", 0))))
             if not self._pointer_debouncer.should_handle(now):
                 return _NONE_EVENT
             index = resolve_hit(rects, point_from_finger_event(event, screen_w, screen_h))
@@ -135,6 +141,10 @@ class InputManager:
             getattr(pygame, "MOUSEBUTTONUP", object()),
             getattr(pygame, "FINGERUP", object()),
         }:
+            if event_type == getattr(pygame, "MOUSEBUTTONUP", object()):
+                self._held_pointers.discard(("mouse", int(getattr(event, "button", 1))))
+            else:
+                self._held_pointers.discard(("finger", int(getattr(event, "finger_id", 0))))
             self.last_input_mode = "touch"
             source = "mouse" if event_type == getattr(pygame, "MOUSEBUTTONUP", object()) else "touch"
             return InputEvent(action=Action.CONFIRM_RELEASED, source=source)
@@ -158,3 +168,21 @@ class InputManager:
         if actions:
             self.last_input_mode = "controller"
         return actions
+
+    def all_controls_released(self) -> bool:
+        """Return whether popup-relevant controller/key/pointer state is neutral."""
+        if self._held_keyboard or self._held_pointers:
+            return False
+        if not self.controllers.all_controls_released():
+            return False
+        try:
+            if any(self._pygame.key.get_pressed()):
+                return False
+        except (AttributeError, TypeError):
+            pass
+        try:
+            if any(self._pygame.mouse.get_pressed()):
+                return False
+        except (AttributeError, TypeError):
+            pass
+        return True
