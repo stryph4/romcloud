@@ -42,6 +42,7 @@ class LibraryImportPreview:
 @dataclass
 class LibrarySyncReport:
     direction: str
+    reconciliation: str = "quick"
     metadata_added: int = 0
     metadata_updated: int = 0
     media_added: int = 0
@@ -51,6 +52,8 @@ class LibrarySyncReport:
     media_hashed: int = 0
     media_bytes_hashed: int = 0
     media_bytes_transferred: int = 0
+    media_presence_checks: int = 0
+    media_directories_listed: int = 0
     unchanged: int = 0
     rendered: int = 0
     conflicts: list[str] = field(default_factory=list)
@@ -63,6 +66,7 @@ class LibrarySyncReport:
     def as_dict(self) -> dict[str, object]:
         return {
             "direction": self.direction,
+            "reconciliation": self.reconciliation,
             "metadata_added": self.metadata_added,
             "metadata_updated": self.metadata_updated,
             "media_added": self.media_added,
@@ -72,6 +76,8 @@ class LibrarySyncReport:
             "media_hashed": self.media_hashed,
             "media_bytes_hashed": self.media_bytes_hashed,
             "media_bytes_transferred": self.media_bytes_transferred,
+            "media_presence_checks": self.media_presence_checks,
+            "media_directories_listed": self.media_directories_listed,
             "unchanged": self.unchanged,
             "rendered": self.rendered,
             "conflicts": list(self.conflicts),

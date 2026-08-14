@@ -316,8 +316,16 @@ Canonical data lives under the configured writable ROMCloud data target:
 ```
 
 ROMCloud uses stable game identity independent of the local mount root
-or current access mode. Media is content-addressed and unchanged media
-can be skipped on later synchronization passes.
+or current access mode. Media is content-addressed. Routine `pull`,
+`push`, and `sync` operations use Quick reconciliation: missing payloads
+are copied, while an existing ordinary destination is skipped without
+comparing its size, timestamps, hash, or contents. Canonical metadata is
+still merged and updated on every operation.
+
+Pass `--full` to `pull`, `push`, or `sync` for the explicit expensive
+repair path. Full reconciliation validates existing payloads and can
+replace a corrupt file or changed media stored under an existing logical
+source path.
 
 The merge policy is additive and conservative: missing information may
 be filled; blank values do not delete canonical data; conflicting
@@ -334,6 +342,7 @@ romcloud library-sync disable
 romcloud library-sync pull
 romcloud library-sync push
 romcloud library-sync sync
+romcloud library-sync sync --full
 romcloud library-sync remove-local
 ```
 

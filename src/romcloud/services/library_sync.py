@@ -57,6 +57,41 @@ MEDIA_TAGS = frozenset(
 )
 
 
+class _DirectoryFileIndex:
+    """Cache ordinary-file membership with one listing per parent directory."""
+
+    def __init__(self, report: LibrarySyncReport) -> None:
+        self._report = report
+        self._files_by_directory: dict[Path, set[str]] = {}
+
+    def contains(self, path: Path) -> bool:
+        self._report.media_presence_checks += 1
+        directory = path.parent
+        files = self._files_by_directory.get(directory)
+        if files is None:
+            self._report.media_directories_listed += 1
+            try:
+                with os.scandir(directory) as entries:
+                    files = {
+                        entry.name
+                        for entry in entries
+                        if entry.is_file(follow_symlinks=False)
+                    }
+            except (FileNotFoundError, NotADirectoryError):
+                files = set()
+            except OSError as exc:
+                raise LibrarySyncError(
+                    f"Cannot enumerate media directory {directory}: {exc}"
+                ) from exc
+            self._files_by_directory[directory] = files
+        return path.name in files
+
+    def add(self, path: Path) -> None:
+        files = self._files_by_directory.get(path.parent)
+        if files is not None:
+            files.add(path.name)
+
+
 def library_id_for_game(game: Game) -> str:
     """Cross-device identity independent of mount root and presentation path."""
     primary = game.primary_asset
@@ -181,14 +216,19 @@ class LibrarySyncService:
             "last_report": state.get("report"),
         }
 
-    def pull(self) -> LibrarySyncReport:
-        return self._run("pull", write_remote=False)
+    def pull(self, *, full: bool = False) -> LibrarySyncReport:
+        """Pull metadata; copy missing payloads or explicitly repair all."""
+        return self._run("pull", write_remote=False, full=full)
 
-    def push(self) -> LibrarySyncReport:
-        return self._run("push", write_remote=True)
+    def push(self, *, full: bool = False) -> LibrarySyncReport:
+        """Push metadata; copy missing payloads or explicitly repair all."""
+        return self._run("push", write_remote=True, full=full)
 
-    def sync(self, progress: ProgressSink = None) -> LibrarySyncReport:
-        return self._run("sync", write_remote=True, progress=progress)
+    def sync(
+        self, progress: ProgressSink = None, *, full: bool = False
+    ) -> LibrarySyncReport:
+        """Merge both ways using Quick presence checks unless ``full``."""
+        return self._run("sync", write_remote=True, progress=progress, full=full)
 
     def preview_source_import(self) -> LibraryImportPreview:
         """Inspect XML only; never resolve, hash, or copy referenced media."""
@@ -245,7 +285,7 @@ class LibrarySyncService:
         """
         if not self.enabled:
             raise LibrarySyncError("Library Sync is disabled; enable it in configuration first.")
-        report = LibrarySyncReport(direction="render")
+        report = LibrarySyncReport(direction="render", reconciliation="local")
         validation = self._read_media_validation()
         report.rendered = self._render_local(
             _read_dataset(self._local_root / CANONICAL_FILENAME),
@@ -300,11 +340,16 @@ class LibrarySyncService:
         *,
         write_remote: bool,
         progress: ProgressSink = None,
+        full: bool = False,
     ) -> LibrarySyncReport:
         self._require_available()
         assert self._remote_root is not None
-        report = LibrarySyncReport(direction=direction)
+        report = LibrarySyncReport(
+            direction=direction,
+            reconciliation="full" if full else "quick",
+        )
         media_validation = self._read_media_validation()
+        media_presence = _DirectoryFileIndex(report)
         remote_path = self._remote_root / CANONICAL_FILENAME
         local_path = self._local_root / CANONICAL_FILENAME
         lock = _exclusive_lock(self._remote_root / ".library-sync.lock") if write_remote else nullcontext()
@@ -327,7 +372,14 @@ class LibrarySyncService:
             self._merge(merged, imported, report, "gamelist import")
             self._seed_catalog_records(merged, report)
             if write_remote:
-                self._materialize_remote_media(merged, origins, report, progress)
+                self._materialize_remote_media(
+                    merged,
+                    origins,
+                    report,
+                    progress,
+                    verify_existing=full,
+                    media_presence=media_presence,
+                )
                 _write_dataset(remote_path, merged)
         _write_dataset(local_path, merged)
         report.rendered = self._render_local(
@@ -335,6 +387,8 @@ class LibrarySyncService:
             report,
             progress,
             media_validation=media_validation,
+            verify_existing=full,
+            media_presence=media_presence,
         )
         self._write_state(report, media_validation)
         emit_progress(
@@ -545,8 +599,12 @@ class LibrarySyncService:
         origins: dict[tuple[str, str], Path],
         report: LibrarySyncReport,
         progress: ProgressSink = None,
+        *,
+        verify_existing: bool = False,
+        media_presence: Optional[_DirectoryFileIndex] = None,
     ) -> None:
         assert self._remote_root is not None
+        media_presence = media_presence or _DirectoryFileIndex(report)
         emit_progress(
             progress,
             "library_sync",
@@ -583,6 +641,58 @@ class LibrarySyncService:
             descriptor = media.setdefault(tag, {})
             expected_digest = descriptor.get("sha256")
             expected_size = descriptor.get("size")
+            expected_suffix = descriptor.get("suffix")
+            persisted_blob = descriptor.get("blob")
+            safe_persisted_blob = (
+                _safe_relative(persisted_blob)
+                if isinstance(persisted_blob, str)
+                else None
+            )
+            persisted_destination = (
+                self._remote_root / safe_persisted_blob
+                if safe_persisted_blob is not None
+                else None
+            )
+            if (
+                not verify_existing
+                and _valid_sha256(expected_digest)
+                and isinstance(expected_size, int)
+                and expected_size >= 0
+                and isinstance(expected_suffix, str)
+                and expected_suffix in ("", Path("x" + expected_suffix).suffix)
+                and "/" not in expected_suffix
+                and "\\" not in expected_suffix
+                and safe_persisted_blob == (
+                    f"media/sha256/{str(expected_digest)[:2]}/"
+                    f"{expected_digest}{expected_suffix}"
+                )
+                and persisted_destination is not None
+                and _within(persisted_destination, self._remote_root)
+                and media_presence.contains(persisted_destination)
+            ):
+                # Quick reconciliation is deliberately presence-only.  The
+                # canonical descriptor already identifies the content-addressed
+                # target, so an existing ordinary destination is sufficient;
+                # do not stat, sample, hash, or open either payload.
+                report.media_skipped += 1
+                report.unchanged += 1
+                outcome = "skipped present"
+                emit_progress(
+                    progress,
+                    "library_sync",
+                    "media",
+                    "running",
+                    f"{system}: media file {index:,} / {len(origins):,} â€” {outcome}",
+                    detail=_media_progress_detail(report),
+                    current=index,
+                    total=len(origins),
+                    metadata={
+                        **_media_progress_metadata(report),
+                        "system": system,
+                        "media_tag": tag,
+                    },
+                )
+                continue
             source_unchanged = (
                 _valid_sha256(expected_digest)
                 and isinstance(expected_size, int)
@@ -630,22 +740,30 @@ class LibrarySyncService:
                     }
                 )
                 destination = self._remote_root / str(descriptor["blob"])
-                blob_unchanged = _fingerprint_matches(
-                    destination,
-                    descriptor.get("blob_fingerprint"),
-                    expected_size=size,
+                blob_unchanged = (
+                    media_presence.contains(destination)
+                    if not verify_existing
+                    else _fingerprint_matches(
+                        destination,
+                        descriptor.get("blob_fingerprint"),
+                        expected_size=size,
+                    )
                 )
                 if blob_unchanged:
                     report.media_skipped += 1
                     report.unchanged += 1
                     outcome = (
-                        "skipped unchanged"
-                        if source_unchanged
-                        else "destination skipped unchanged"
+                        "skipped present"
+                        if not verify_existing
+                        else (
+                            "skipped unchanged"
+                            if source_unchanged
+                            else "destination skipped unchanged"
+                        )
                     )
                 else:
                     destination_matches = False
-                    if destination.is_file():
+                    if verify_existing and destination.is_file():
                         destination_digest, destination_size = _hash_file(destination)
                         _record_media_hash(report, destination_size)
                         destination_matches = (destination_digest, destination_size) == (
@@ -659,10 +777,12 @@ class LibrarySyncService:
                         _copy_verified(origin, destination, digest, size)
                         _record_media_hash(report, size)  # temporary verification
                         _record_media_copy(report, size)
+                        media_presence.add(destination)
                         outcome = "copied and verified"
-                    descriptor["blob_fingerprint"] = _capture_fingerprint(
-                        destination, expected_size=size
-                    )
+                    if verify_existing:
+                        descriptor["blob_fingerprint"] = _capture_fingerprint(
+                            destination, expected_size=size
+                        )
 
             emit_progress(
                 progress,
@@ -688,8 +808,11 @@ class LibrarySyncService:
         *,
         media_validation: Optional[dict[str, dict]] = None,
         materialize_media: bool = True,
+        verify_existing: bool = False,
+        media_presence: Optional[_DirectoryFileIndex] = None,
     ) -> int:
         media_validation = media_validation if media_validation is not None else {}
+        media_presence = media_presence or _DirectoryFileIndex(report)
         rendered = 0
         by_system: dict[str, list[tuple[Game, str, dict]]] = {}
         for game in self._games.list_all():
@@ -725,6 +848,8 @@ class LibrarySyncService:
                 total=total,
                 media_validation=media_validation,
                 materialize_media=materialize_media,
+                verify_existing=verify_existing,
+                media_presence=media_presence,
                 proxies_by_id=proxies_by_id,
             )
             emit_progress(
@@ -750,9 +875,12 @@ class LibrarySyncService:
         total: int = 0,
         media_validation: Optional[dict[str, dict]] = None,
         materialize_media: bool = True,
+        verify_existing: bool = False,
+        media_presence: Optional[_DirectoryFileIndex] = None,
         proxies_by_id: Optional[dict[str, ProxyRecord]] = None,
     ) -> int:
         media_validation = media_validation if media_validation is not None else {}
+        media_presence = media_presence or _DirectoryFileIndex(report)
         system_root = self._local_roms_root / system
         path = system_root / "gamelist.xml"
         if path.is_symlink():
@@ -824,6 +952,8 @@ class LibrarySyncService:
                         report,
                         media_validation,
                         materialize=materialize_media,
+                        verify_existing=verify_existing,
+                        media_presence=media_presence,
                     )
                 except (LibrarySyncError, OSError) as exc:
                     # One unreadable/corrupt/missing remote blob must never
@@ -890,6 +1020,8 @@ class LibrarySyncService:
         media_validation: dict[str, dict],
         *,
         materialize: bool = True,
+        verify_existing: bool = False,
+        media_presence: Optional[_DirectoryFileIndex] = None,
     ) -> Optional[str]:
         source_path = descriptor.get("source_path")
         safe_source_path = _safe_relative(source_path) if isinstance(source_path, str) else None
@@ -914,6 +1046,7 @@ class LibrarySyncService:
             return None
         relative = PurePosixPath(LOCAL_MEDIA_DIR, digest[:2], digest + suffix)
         destination = system_root / relative
+        media_presence = media_presence or _DirectoryFileIndex(report)
         validation_key = f"{system_root.name}/{relative.as_posix()}"
         validation = media_validation.get(validation_key)
         report.media_examined += 1
@@ -922,7 +1055,7 @@ class LibrarySyncService:
             # existing ordinary file is safe to reference without opening it;
             # a missing file is optional artwork, not a reason to reach into
             # canonical remote storage or fail the mode transition.
-            if not destination.is_symlink() and destination.is_file():
+            if media_presence.contains(destination):
                 report.media_skipped += 1
                 report.unchanged += 1
                 return f"./{relative.as_posix()}"
@@ -932,8 +1065,12 @@ class LibrarySyncService:
         source = self._remote_root / safe_blob
         if not _within(source, self._remote_root):
             return None
-        if (
-            isinstance(validation, dict)
+        if not verify_existing and media_presence.contains(destination):
+            report.media_skipped += 1
+            report.unchanged += 1
+        elif (
+            verify_existing
+            and isinstance(validation, dict)
             and validation.get("sha256") == digest
             and validation.get("size") == size
             and _fingerprint_matches(
@@ -946,7 +1083,7 @@ class LibrarySyncService:
             report.unchanged += 1
         else:
             destination_matches = False
-            if destination.is_file():
+            if verify_existing and destination.is_file():
                 destination_digest, destination_size = _hash_file(destination)
                 _record_media_hash(report, destination_size)
                 destination_matches = (destination_digest, destination_size) == (
@@ -959,13 +1096,15 @@ class LibrarySyncService:
                 _copy_verified(source, destination, digest, size)
                 _record_media_hash(report, size)  # temporary verification
                 _record_media_copy(report, size)
-            media_validation[validation_key] = {
-                "sha256": digest,
-                "size": size,
-                "fingerprint": _capture_fingerprint(
-                    destination, expected_size=size
-                ),
-            }
+                media_presence.add(destination)
+            if verify_existing:
+                media_validation[validation_key] = {
+                    "sha256": digest,
+                    "size": size,
+                    "fingerprint": _capture_fingerprint(
+                        destination, expected_size=size
+                    ),
+                }
         return f"./{relative.as_posix()}"
 
     def _read_state_payload(self) -> dict:
@@ -991,6 +1130,10 @@ class LibrarySyncService:
     def _write_state(
         self, report: LibrarySyncReport, media_validation: dict[str, dict]
     ) -> None:
+        # A partial/failed pass must not replace the last known successful
+        # operation or establish validation state that was never completed.
+        if not report.ok:
+            return
         atomic_write_text(
             self._state_path,
             json.dumps(
@@ -1173,6 +1316,8 @@ def _media_progress_metadata(report: LibrarySyncReport) -> dict[str, int]:
         "media_skipped": report.media_skipped,
         "media_hashed": report.media_hashed,
         "media_copied": report.media_transferred,
+        "presence_checks": report.media_presence_checks,
+        "directories_listed": report.media_directories_listed,
         "bytes_hashed": report.media_bytes_hashed,
         "bytes_transferred": report.media_bytes_transferred,
     }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -122,6 +123,15 @@ def _setup(tmp_path: Path, *, enabled: bool = True, mode: str = "smart_cache"):
     return config, container, source_xml
 
 
+def _remove_unsafe_manual(source_xml: Path) -> None:
+    source_xml.write_text(
+        source_xml.read_text(encoding="utf-8").replace(
+            "    <manual>../../outside.pdf</manual>\n", ""
+        ),
+        encoding="utf-8",
+    )
+
+
 def _managed(local_xml: Path) -> ET.Element:
     root = ET.parse(local_xml).getroot()
     return next(item for item in root.findall("game") if item.findtext(OWNERSHIP_TAG))
@@ -214,7 +224,7 @@ def test_offline_mode_blocks_remote_sync_without_changing_canonical(tmp_path: Pa
     write_offline_library_state(config, True)
     offline = Container(config)
 
-    with pytest.raises(CapabilityUnavailableError, match="Offline Mode"):
+    with pytest.raises(CapabilityUnavailableError, match="Offline"):
         offline.library_sync.sync()
 
     assert _canonical(config).read_bytes() == before
@@ -255,6 +265,42 @@ def test_cli_refreshes_es_only_after_successful_local_merge(monkeypatch):
     assert calls == ["refreshed"]
 
 
+def test_cli_full_flag_selects_expensive_repair_path(monkeypatch):
+    import romcloud.cli.commands.library_sync as command
+
+    calls: list[bool] = []
+
+    class Service:
+        def sync(self, *, full: bool = False) -> LibrarySyncReport:
+            calls.append(full)
+            return LibrarySyncReport(
+                direction="sync",
+                reconciliation="full" if full else "quick",
+            )
+
+    container = type(
+        "Container",
+        (),
+        {
+            "library_sync": Service(),
+            "config": object(),
+            "game_repo": type("Repo", (), {"list_systems": lambda self: ["ps2"]})(),
+        },
+    )()
+    monkeypatch.setattr(command, "get_container", lambda ctx: container)
+    monkeypatch.setattr(
+        "romcloud.integrations.batocera.presentation.refresh_emulationstation",
+        lambda *_args: None,
+    )
+
+    result = CliRunner().invoke(
+        command.library_sync_group, ["sync", "--full"], obj={}
+    )
+
+    assert result.exit_code == 0
+    assert calls == [True]
+
+
 def test_import_sync_and_smart_cache_render_are_safe_and_idempotent(tmp_path: Path):
     config, container, source_xml = _setup(tmp_path)
     source_before = source_xml.read_bytes()
@@ -292,7 +338,7 @@ def test_import_sync_and_smart_cache_render_are_safe_and_idempotent(tmp_path: Pa
     assert source_xml.read_bytes() == source_before
 
 
-def test_second_unchanged_import_uses_fingerprints_without_full_file_hashes(
+def test_quick_sync_skips_existing_payloads_without_opening_or_comparing_them(
     tmp_path: Path, monkeypatch
 ):
     config, container, _ = _setup(tmp_path)
@@ -301,14 +347,22 @@ def test_second_unchanged_import_uses_fingerprints_without_full_file_hashes(
     assert image.stat().st_size > 3 * 64 * 1024
     first = container.library_sync.sync()
     descriptor = _media_record(config)
-    state = json.loads(
-        (Path(config.data_path) / "library-sync-state.json").read_text()
-    )
+    blob = Path(config.remote_data.root) / "library" / descriptor["blob"]
+    rendered = _rendered_media(config)
+    canonical_before = _canonical(config).read_bytes()
 
     assert descriptor["source_fingerprint"]["sample_sha256"]
-    assert descriptor["blob_fingerprint"]["sample_sha256"]
-    assert state["media_validation"]
     assert first.media_bytes_transferred == image.stat().st_size * 2
+
+    # Quick is presence-only even when the existing destinations have both a
+    # different size and mtime. Repairing these files belongs to Full.
+    blob.write_bytes(b"remote-present-but-different-size")
+    rendered.write_bytes(b"local-present-but-different-size")
+    image.write_bytes(b"changed-source-under-the-same-path")
+    remote_mtime = blob.stat().st_mtime_ns + 10_000_000
+    local_mtime = rendered.stat().st_mtime_ns + 20_000_000
+    os.utime(blob, ns=(remote_mtime, remote_mtime))
+    os.utime(rendered, ns=(local_mtime, local_mtime))
 
     monkeypatch.setattr(
         "romcloud.services.library_sync._hash_file",
@@ -316,16 +370,28 @@ def test_second_unchanged_import_uses_fingerprints_without_full_file_hashes(
             AssertionError(f"unchanged media was fully hashed: {path}")
         ),
     )
+    monkeypatch.setattr(
+        "romcloud.services.library_sync._sample_file_hash",
+        lambda path, size: (_ for _ in ()).throw(
+            AssertionError(f"present media contents were sampled: {path}")
+        ),
+    )
     second = container.library_sync.sync()
 
+    assert second.reconciliation == "quick"
     assert second.media_transferred == 0
     assert second.media_bytes_transferred == 0
     assert second.media_hashed == 0
     assert second.media_examined == 2  # source/blob plus local rendered copy
     assert second.media_skipped == 2
+    assert blob.read_bytes() == b"remote-present-but-different-size"
+    assert rendered.read_bytes() == b"local-present-but-different-size"
+    assert _canonical(config).read_bytes() == canonical_before
 
 
-def test_unchanged_media_survives_cifs_style_ctime_drift(tmp_path: Path, monkeypatch):
+def test_quick_sync_does_not_inspect_stat_metadata_for_present_payloads(
+    tmp_path: Path, monkeypatch
+):
     """Real hardware over CIFS: the same unmodified file's reported ctime can
     differ across independent stat() calls even though content/mtime/size are
     unchanged (server-side attribute synthesis, not local-filesystem
@@ -341,16 +407,13 @@ def test_unchanged_media_survives_cifs_style_ctime_drift(tmp_path: Path, monkeyp
     image.write_bytes(b"large-media" * 100_000)
     container.library_sync.sync()
 
-    real_stat_fields = library_sync_module._stat_fields
-    drift_counter = {"n": 0}
-
-    def drifting_stat_fields(path):
-        fields = real_stat_fields(path)
-        drift_counter["n"] += 1
-        fields["ctime_ns"] += drift_counter["n"]
-        return fields
-
-    monkeypatch.setattr(library_sync_module, "_stat_fields", drifting_stat_fields)
+    monkeypatch.setattr(
+        library_sync_module,
+        "_stat_fields",
+        lambda path: (_ for _ in ()).throw(
+            AssertionError(f"present media metadata was compared: {path}")
+        ),
+    )
     monkeypatch.setattr(
         library_sync_module,
         "_hash_file",
@@ -378,13 +441,15 @@ def test_second_unchanged_import_of_a_large_library_does_not_scale_with_media_by
     config, container, _ = _setup(tmp_path)
     system_root = Path(config.source.rom_root) / "ps2"
     game_count = 40
-    media_size = 32 * 1024  # smaller than the sample window (per-file, not full-file, cost)
+    media_size = 32 * 1024
     entries = []
     for index in range(game_count):
         rom = system_root / f"Game{index}.chd"
         image = system_root / "images" / f"Game{index}.png"
         rom.write_bytes(f"rom-{index}".encode())
-        image.write_bytes(bytes([index % 256]) * media_size)
+        # Shared content keeps every content-addressed target in one directory,
+        # making the directory-listing bound deterministic.
+        image.write_bytes(b"x" * media_size)
         entries.append(
             f"<game><path>./Game{index}.chd</path><name>Game {index}</name>"
             f"<image>./images/Game{index}.png</image></game>"
@@ -413,6 +478,8 @@ def test_second_unchanged_import_of_a_large_library_does_not_scale_with_media_by
     assert second.media_bytes_hashed == 0
     assert second.media_transferred == 0
     assert second.media_bytes_transferred == 0
+    assert second.media_presence_checks == game_count * 2
+    assert second.media_directories_listed == 2
     # Sanity: the unchanged library really is that large; a full re-hash
     # would have read at least this many bytes per file, twice (source+blob).
     assert total_media_bytes > 0
@@ -428,7 +495,7 @@ def test_changed_source_media_is_rehashed_copied_and_fully_verified(tmp_path: Pa
     assert len(replacement) == image.stat().st_size
 
     image.write_bytes(replacement)
-    report = container.library_sync.sync()
+    report = container.library_sync.sync(full=True)
     after = _media_record(config)
     new_blob = Path(config.remote_data.root) / "library" / after["blob"]
 
@@ -445,10 +512,13 @@ def test_changed_media_copy_verification_failure_preserves_canonical(
 ):
     import romcloud.services.library_sync as library_sync_module
 
-    config, container, _ = _setup(tmp_path)
+    config, container, source_xml = _setup(tmp_path)
+    _remove_unsafe_manual(source_xml)
     image = Path(config.source.rom_root) / "ps2" / "images" / "Game.png"
     container.library_sync.sync()
     canonical_before = _canonical(config).read_bytes()
+    state_path = Path(config.data_path) / "library-sync-state.json"
+    state_before = state_path.read_bytes()
     image.write_bytes(b"new-media")
 
     def corrupt_copy(source: Path, destination: Path):
@@ -457,12 +527,31 @@ def test_changed_media_copy_verification_failure_preserves_canonical(
     monkeypatch.setattr(library_sync_module.shutil, "copyfile", corrupt_copy)
 
     with pytest.raises(LibrarySyncError, match="verification failed"):
-        container.library_sync.sync()
+        container.library_sync.sync(full=True)
 
     assert _canonical(config).read_bytes() == canonical_before
+    assert state_path.read_bytes() == state_before
     assert not list(
         (Path(config.remote_data.root) / "library" / "media").rglob("*.partial")
     )
+
+
+def test_failed_partial_sync_does_not_replace_last_successful_state(tmp_path: Path):
+    config, container, source_xml = _setup(tmp_path)
+    _remove_unsafe_manual(source_xml)
+    baseline = container.library_sync.sync(full=True)
+    assert baseline.ok
+    state_path = Path(config.data_path) / "library-sync-state.json"
+    state_before = state_path.read_bytes()
+
+    descriptor = _media_record(config)
+    (Path(config.remote_data.root) / "library" / descriptor["blob"]).unlink()
+    _rendered_media(config).unlink()
+
+    failed = container.library_sync.pull()
+
+    assert not failed.ok
+    assert state_path.read_bytes() == state_before
 
 
 def test_missing_remote_blob_is_rebuilt_without_rehashing_unchanged_source(
@@ -473,7 +562,7 @@ def test_missing_remote_blob_is_rebuilt_without_rehashing_unchanged_source(
     config, container, _ = _setup(tmp_path)
     image = Path(config.source.rom_root) / "ps2" / "images" / "Game.png"
     expected = image.read_bytes()
-    container.library_sync.sync()
+    container.library_sync.sync(full=True)
     descriptor = _media_record(config)
     blob = Path(config.remote_data.root) / "library" / descriptor["blob"]
     blob.unlink()
@@ -498,9 +587,10 @@ def test_source_fingerprint_mismatch_falls_back_to_full_sha256(
 ):
     import romcloud.services.library_sync as library_sync_module
 
-    config, container, _ = _setup(tmp_path)
+    config, container, source_xml = _setup(tmp_path)
+    _remove_unsafe_manual(source_xml)
     image = Path(config.source.rom_root) / "ps2" / "images" / "Game.png"
-    container.library_sync.sync()
+    container.library_sync.sync(full=True)
     payload = json.loads(_canonical(config).read_text())
     descriptor = next(iter(payload["records"].values()))["media"]["image"]
     descriptor["source_fingerprint"]["mtime_ns"] = -1
@@ -513,7 +603,7 @@ def test_source_fingerprint_mismatch_falls_back_to_full_sha256(
         return real_hash(path)
 
     monkeypatch.setattr(library_sync_module, "_hash_file", recording_hash)
-    report = container.library_sync.sync()
+    report = container.library_sync.sync(full=True)
 
     assert image in hashed
     assert report.media_hashed == 1
@@ -528,7 +618,7 @@ def test_corrupt_same_size_remote_blob_is_detected_and_rebuilt(
     config, container, _ = _setup(tmp_path)
     image = Path(config.source.rom_root) / "ps2" / "images" / "Game.png"
     expected = image.read_bytes()
-    container.library_sync.sync()
+    container.library_sync.sync(full=True)
     descriptor = _media_record(config)
     blob = Path(config.remote_data.root) / "library" / descriptor["blob"]
     blob.write_bytes(b"x" * len(expected))
@@ -540,13 +630,28 @@ def test_corrupt_same_size_remote_blob_is_detected_and_rebuilt(
         return real_hash(path)
 
     monkeypatch.setattr(library_sync_module, "_hash_file", recording_hash)
-    report = container.library_sync.sync()
+    report = container.library_sync.sync(full=True)
 
     assert image not in hashed
     assert blob in hashed
     assert blob.read_bytes() == expected
     assert report.media_transferred == 1
     assert report.media_hashed >= 2  # corrupt blob plus verified temporary
+
+
+def test_full_pull_repairs_an_existing_local_payload(tmp_path: Path):
+    config, container, source_xml = _setup(tmp_path)
+    _remove_unsafe_manual(source_xml)
+    container.library_sync.sync(full=True)
+    rendered = _rendered_media(config)
+    expected = rendered.read_bytes()
+    rendered.write_bytes(b"corrupt-local-payload")
+
+    report = container.library_sync.pull(full=True)
+
+    assert report.reconciliation == "full"
+    assert report.media_transferred == 1
+    assert rendered.read_bytes() == expected
 
 
 def test_local_gamelist_generation_uses_atomic_writer(tmp_path: Path, monkeypatch):
@@ -584,6 +689,7 @@ def test_additive_local_scrape_blank_and_conflict_policy(tmp_path: Path):
     assert record["metadata"]["publisher"] == "New Publisher"
     assert record["metadata"]["name"] == "Scraped Game"
     assert any("name" in conflict for conflict in report.conflicts)
+    assert report.media_transferred == 0
     rendered = _managed(_local_root(config))
     assert rendered.findtext("name") == "Scraped Game"
     assert rendered.findtext("publisher") == "New Publisher"
@@ -635,6 +741,8 @@ def test_second_device_pull_uses_same_identity_and_does_not_write_remote(tmp_pat
 
     report = second.library_sync.pull()
 
+    assert report.reconciliation == "quick"
+    assert report.media_transferred == 1
     assert report.rendered == 1
     assert _managed(Path(device_b.local_roms_path) / "ps2" / "gamelist.xml").findtext("name") == "Scraped Game"
     assert _canonical(config).read_bytes() == remote_before

@@ -71,11 +71,12 @@ def library_sync_disable(ctx: click.Context) -> None:
     click.echo("Library Sync disabled. Canonical and local metadata were preserved.")
 
 
-def _run(ctx: click.Context, direction: str) -> None:
+def _run(ctx: click.Context, direction: str, *, full: bool = False) -> None:
     container = get_container(ctx)
     service = container.library_sync
     try:
-        report = getattr(service, direction)()
+        operation = getattr(service, direction)
+        report = operation(full=True) if full else operation()
         from romcloud.integrations.batocera.presentation import refresh_emulationstation
 
         refresh_emulationstation(container.config, container.game_repo.list_systems())
@@ -94,24 +95,39 @@ def _run(ctx: click.Context, direction: str) -> None:
 
 
 @library_sync_group.command("pull")
+@click.option(
+    "--full",
+    is_flag=True,
+    help="Verify and repair existing payload files (expensive).",
+)
 @click.pass_context
-def library_sync_pull(ctx: click.Context) -> None:
+def library_sync_pull(ctx: click.Context, full: bool) -> None:
     """Pull canonical metadata and render this device's gamelists."""
-    _run(ctx, "pull")
+    _run(ctx, "pull", full=full)
 
 
 @library_sync_group.command("push")
+@click.option(
+    "--full",
+    is_flag=True,
+    help="Verify and repair existing payload files (expensive).",
+)
 @click.pass_context
-def library_sync_push(ctx: click.Context) -> None:
+def library_sync_push(ctx: click.Context, full: bool) -> None:
     """Add local/source metadata to the canonical remote library."""
-    _run(ctx, "push")
+    _run(ctx, "push", full=full)
 
 
 @library_sync_group.command("sync")
+@click.option(
+    "--full",
+    is_flag=True,
+    help="Verify and repair existing payload files (expensive).",
+)
 @click.pass_context
-def library_sync_sync(ctx: click.Context) -> None:
+def library_sync_sync(ctx: click.Context, full: bool) -> None:
     """Perform a safe additive bidirectional synchronization."""
-    _run(ctx, "sync")
+    _run(ctx, "sync", full=full)
 
 
 @library_sync_group.command("remove-local")
