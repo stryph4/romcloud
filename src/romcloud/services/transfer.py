@@ -64,6 +64,14 @@ class TransferService:
         # and does not track later source-path reconfiguration/migration.
         self._source_root = source_root
 
+    @property
+    def provider(self) -> StorageProvider:
+        return self._provider
+
+    @property
+    def source_root(self) -> Optional[str]:
+        return self._source_root
+
     # ── public API ────────────────────────────────────────────────────────────
 
     def transfer(

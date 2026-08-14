@@ -46,8 +46,20 @@ CREATE TABLE IF NOT EXISTS cache_entries (
     cached_at      TEXT NOT NULL,
     last_accessed  TEXT NOT NULL,
     size_bytes     INTEGER NOT NULL DEFAULT 0,
-    is_pinned      INTEGER NOT NULL DEFAULT 0
+    is_pinned      INTEGER NOT NULL DEFAULT 0,
+    membership_resolved INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS cache_members (
+    game_id        TEXT NOT NULL REFERENCES cache_entries(game_id) ON DELETE CASCADE,
+    relative_path  TEXT NOT NULL,
+    expected_size  INTEGER,
+    size_bytes     INTEGER NOT NULL DEFAULT 0,
+    is_primary     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (game_id, relative_path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cache_members_path ON cache_members(relative_path);
 
 CREATE TABLE IF NOT EXISTS proxy_records (
     game_id     TEXT PRIMARY KEY REFERENCES games(id) ON DELETE CASCADE,
@@ -58,7 +70,7 @@ CREATE TABLE IF NOT EXISTS proxy_records (
 CREATE INDEX IF NOT EXISTS idx_proxy_records_path ON proxy_records(proxy_path);
 """
 
-_CURRENT_SCHEMA_VERSION = 2
+_CURRENT_SCHEMA_VERSION = 3
 
 
 class Database:
@@ -102,7 +114,10 @@ class Database:
                     "INSERT INTO schema_version (version) VALUES (?)",
                     (_CURRENT_SCHEMA_VERSION,),
                 )
-            elif int(version_row["version"]) < 2:
+                return
+
+            version = int(version_row["version"])
+            if version < 2:
                 columns = {
                     row["name"]
                     for row in conn.execute("PRAGMA table_info(games)").fetchall()
@@ -114,4 +129,85 @@ class Database:
                         "ALTER TABLE games ADD COLUMN "
                         "is_eligible INTEGER NOT NULL DEFAULT 1"
                     )
-                conn.execute("UPDATE schema_version SET version = 2")
+                version = 2
+            if version < 3:
+                columns = {
+                    row["name"]
+                    for row in conn.execute(
+                        "PRAGMA table_info(cache_entries)"
+                    ).fetchall()
+                }
+                if "membership_resolved" not in columns:
+                    conn.execute(
+                        "ALTER TABLE cache_entries ADD COLUMN "
+                        "membership_resolved INTEGER NOT NULL DEFAULT 0"
+                    )
+                self._migrate_cache_membership(conn)
+                version = 3
+            conn.execute("UPDATE schema_version SET version = ?", (version,))
+
+    @staticmethod
+    def _migrate_cache_membership(conn: sqlite3.Connection) -> None:
+        """Snapshot safe legacy ownership without reading the remote source."""
+        from romcloud.core.dependency_resolvers import DESCRIPTOR_EXTENSIONS
+        from romcloud.core.models.cache import CacheStatus
+
+        entries = conn.execute(
+            "SELECT game_id, status, size_bytes FROM cache_entries"
+        ).fetchall()
+        for entry in entries:
+            game_id = entry["game_id"]
+            if conn.execute(
+                "SELECT 1 FROM cache_members WHERE game_id = ? LIMIT 1",
+                (game_id,),
+            ).fetchone() is not None:
+                continue
+            assets = conn.execute(
+                """
+                SELECT relative_path, filename, size_bytes, is_primary
+                FROM game_assets WHERE game_id = ?
+                ORDER BY is_primary DESC, filename
+                """,
+                (game_id,),
+            ).fetchall()
+            if not assets:
+                if entry["status"] == CacheStatus.COMPLETE.value:
+                    conn.execute(
+                        "UPDATE cache_entries SET status = ? WHERE game_id = ?",
+                        (CacheStatus.INCOMPLETE.value, game_id),
+                    )
+                continue
+            for asset in assets:
+                actual_size = asset["size_bytes"]
+                if actual_size is None and len(assets) == 1:
+                    actual_size = entry["size_bytes"]
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO cache_members
+                        (game_id, relative_path, expected_size, size_bytes, is_primary)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        game_id,
+                        asset["relative_path"],
+                        asset["size_bytes"],
+                        int(actual_size or 0),
+                        asset["is_primary"],
+                    ),
+                )
+            primary = next(
+                (asset for asset in assets if asset["is_primary"]), assets[0]
+            )
+            descriptor = (
+                Path(primary["filename"]).suffix.lower()
+                in DESCRIPTOR_EXTENSIONS
+            )
+            conn.execute(
+                "UPDATE cache_entries SET membership_resolved = ? WHERE game_id = ?",
+                (0 if descriptor else 1, game_id),
+            )
+            if descriptor and entry["status"] == CacheStatus.COMPLETE.value:
+                conn.execute(
+                    "UPDATE cache_entries SET status = ? WHERE game_id = ?",
+                    (CacheStatus.INCOMPLETE.value, game_id),
+                )

@@ -52,7 +52,7 @@ class TestDatabase:
         with db.connect() as conn:
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(games)")}
             assert "is_eligible" in columns
-            assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 2
+            assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 3
             assert conn.execute(
                 "SELECT is_eligible FROM games WHERE id = 'legacy'"
             ).fetchone()[0] == 1
@@ -144,7 +144,7 @@ class TestGameRepository:
 
         preserved_entry = cache_repo.get(game.id)
         assert preserved_entry is not None
-        assert preserved_entry.status == CacheStatus.COMPLETE
+        assert preserved_entry.status == CacheStatus.INCOMPLETE
         assert preserved_entry.is_pinned is True
 
         assert proxy_repo.get(game.id) is not None
@@ -203,7 +203,20 @@ class TestGameRepository:
 
 class TestCacheRepository:
     def _add_game(self, game_repo, system="ps2", title="Test"):
-        game = Game.create(system, title, "local", "/roms", [])
+        filename = f"{title}.iso"
+        game = Game.create(
+            system,
+            title,
+            "local",
+            "/roms",
+            [
+                GameAsset(
+                    filename,
+                    f"{system}/{filename}",
+                    is_primary=True,
+                )
+            ],
+        )
         game_repo.save(game)
         return game
 

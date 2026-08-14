@@ -35,8 +35,8 @@ class TestCacheServiceIsNotCached:
         entry.status = CacheStatus.COMPLETE
         cache_repo.save(entry)
         assert cache_service.is_cached(game_with_file.id) is False
-        # Entry should be cleaned up
-        assert cache_repo.get(game_with_file.id) is None
+        # Durable cache history/membership is retained for repair.
+        assert cache_repo.get(game_with_file.id) is not None
 
 
 class TestCanonicalLaunchPath:
@@ -609,9 +609,20 @@ class TestMultiAssetCueBinCache:
     def _make_cue_game(tmp_path, game_repo, num_tracks=2):
         source_root = tmp_path / "source"
         (source_root / "psx").mkdir(parents=True)
-        (source_root / "psx" / "Game.cue").write_bytes(b"cue_data")
+        cue_lines = "".join(
+            f'FILE "Track {i}.bin" BINARY\n' for i in range(1, num_tracks + 1)
+        )
+        cue_path = source_root / "psx" / "Game.cue"
+        cue_path.write_text(cue_lines)
 
-        assets = [GameAsset("Game.cue", "psx/Game.cue", size_bytes=8, is_primary=True)]
+        assets = [
+            GameAsset(
+                "Game.cue",
+                "psx/Game.cue",
+                size_bytes=cue_path.stat().st_size,
+                is_primary=True,
+            )
+        ]
         for i in range(1, num_tracks + 1):
             name = f"Track {i}.bin"
             content = bytes([i]) * 100
@@ -737,6 +748,9 @@ class TestMultiAssetCueBinCache:
         cache_service.cache_game(game.id)
 
         entry = cache_repo.get(game.id)
-        expected_total = sum(a.size_bytes for a in game.assets)
+        expected_total = sum(
+            member.expected_size
+            for member in cache_repo.list_members(game.id)
+        )
         assert entry.size_bytes == expected_total
         assert cache_repo.total_size() == expected_total

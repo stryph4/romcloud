@@ -81,6 +81,10 @@ class GamePinnedError(CacheError):
     """Cannot remove a pinned game without unpinning first."""
 
 
+class DependencyResolutionError(CacheError):
+    """A game descriptor has an unsafe, invalid, or missing dependency."""
+
+
 # ── Transfer ──────────────────────────────────────────────────────────────────
 
 

@@ -86,10 +86,10 @@ def _write_proxy_file(proxy_repo, local_roms_dir, game: Game) -> Path:
     return proxy_path
 
 
-class TestLegacySingleAssetCacheBecomesIncompleteAfterRefresh:
-    """Steps 1-4 of the required reproduction, via `romcloud refresh`."""
+class TestLegacySingleAssetCacheIsResolvedOnDemand:
+    """Phase B resolves legacy descriptor-only catalog rows at cache time."""
 
-    def test_stale_entry_is_not_a_hit_after_refresh(
+    def test_cache_request_resolves_dependencies_before_refresh(
         self, provider, game_repo, proxy_repo, local_roms_dir, cache_service, legacy_cue_source
     ):
         root = legacy_cue_source
@@ -98,7 +98,8 @@ class TestLegacySingleAssetCacheBecomesIncompleteAfterRefresh:
         # Step 2: pre-0.8.0 behaviour — only the primary (.cue) gets cached.
         cache_service.cache_game(legacy_game.id)
         assert cache_service.is_cached(legacy_game.id) is True
-        assert not (Path(cache_service._cache_root) / "psx" / "Game (Track 1).bin").exists()
+        assert (Path(cache_service._cache_root) / "psx" / "Game (Track 1).bin").exists()
+        assert (Path(cache_service._cache_root) / "psx" / "Game (Track 2).bin").exists()
 
         # Step 3: upgrade + refresh.
         catalog_svc = CatalogService(
@@ -115,8 +116,9 @@ class TestLegacySingleAssetCacheBecomesIncompleteAfterRefresh:
         updated_game = game_repo.get(legacy_game.id)
         assert len(updated_game.assets) == 3  # cue + 2 tracks now known
 
-        # Step 4: must NOT be a cache hit anymore.
-        assert cache_service.is_cached(legacy_game.id) is False
+        # Refresh may enrich catalog presentation, but the cache-time ownership
+        # snapshot remains complete and authoritative.
+        assert cache_service.is_cached(legacy_game.id) is True
 
 
 class TestLegacyLaunchWithoutRefreshSelfHeals:
@@ -153,7 +155,8 @@ class TestLegacyLaunchWithoutRefreshSelfHeals:
         assert resolved.id == legacy_game.id
         assert len(game_repo.get(legacy_game.id).assets) == 3
 
-        assert cache_service.is_cached(resolved.id) is False
+        # The cache-time dependency closure was already complete.
+        assert cache_service.is_cached(resolved.id) is True
 
     def test_repair_fetches_only_missing_companions_and_launches_cue(
         self, provider, game_repo, proxy_repo, local_roms_dir, cache_service, legacy_cue_source
@@ -171,9 +174,11 @@ class TestLegacyLaunchWithoutRefreshSelfHeals:
             source_root=str(root),
         )
         resolved = catalog_svc.resolve_proxy(str(proxy_path))
+        cache_root = Path(cache_service._cache_root)
+        for track in ("Game (Track 1).bin", "Game (Track 2).bin"):
+            (cache_root / "psx" / track).unlink()
         assert cache_service.is_cached(resolved.id) is False
 
-        cache_root = Path(cache_service._cache_root)
         # The already-cached .cue must be left alone by the repair (prove it
         # by corrupting the source and confirming the cached copy is unchanged).
         original_cue_bytes = (cache_root / "psx" / "Game.cue").read_bytes()
@@ -291,6 +296,12 @@ class TestStaleIndependentTrackDoesNotInterfere:
         root = legacy_cue_source
         legacy_cue_game = _seed_legacy_single_asset_game(game_repo, root)
         cache_service.cache_game(legacy_cue_game.id)
+
+        # Reproduce an old descriptor-only cache. Track 1 is restored below by
+        # the independently owned legacy game; Track 2 remains absent.
+        cache_root = Path(cache_service._cache_root)
+        (cache_root / "psx" / "Game (Track 1).bin").unlink()
+        (cache_root / "psx" / "Game (Track 2).bin").unlink()
 
         # A second, independently-catalogued (and cached) legacy game for one track.
         track_asset = GameAsset(

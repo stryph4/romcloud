@@ -7,7 +7,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
-from romcloud.core.models.cache import CacheEntry, CacheStatus
+from romcloud.core.dependency_resolvers import DESCRIPTOR_EXTENSIONS
+from romcloud.core.models.cache import CacheEntry, CacheMember, CacheStatus
+from romcloud.core.models.game import GameAsset
 from romcloud.infrastructure.database import Database
 
 
@@ -45,10 +47,17 @@ class CacheRepository:
         with self._db.connect() as conn:
             conn.execute(
                 """
-                INSERT OR REPLACE INTO cache_entries
+                INSERT INTO cache_entries
                     (game_id, cache_path, status, cached_at, last_accessed,
                      size_bytes, is_pinned)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(game_id) DO UPDATE SET
+                    cache_path = excluded.cache_path,
+                    status = excluded.status,
+                    cached_at = excluded.cached_at,
+                    last_accessed = excluded.last_accessed,
+                    size_bytes = excluded.size_bytes,
+                    is_pinned = excluded.is_pinned
                 """,
                 (
                     entry.game_id,
@@ -59,6 +68,128 @@ class CacheRepository:
                     entry.size_bytes,
                     1 if entry.is_pinned else 0,
                 ),
+            )
+            if entry.status is CacheStatus.COMPLETE:
+                self._seed_legacy_membership(conn, entry)
+
+    @staticmethod
+    def _seed_legacy_membership(conn, entry: CacheEntry) -> None:  # type: ignore[no-untyped-def]
+        if conn.execute(
+            "SELECT 1 FROM cache_members WHERE game_id = ? LIMIT 1",
+            (entry.game_id,),
+        ).fetchone() is not None:
+            return
+        assets = conn.execute(
+            """
+            SELECT relative_path, filename, size_bytes, is_primary
+            FROM game_assets WHERE game_id = ?
+            ORDER BY is_primary DESC, filename
+            """,
+            (entry.game_id,),
+        ).fetchall()
+        if not assets:
+            conn.execute(
+                "UPDATE cache_entries SET status = ? WHERE game_id = ?",
+                (CacheStatus.INCOMPLETE.value, entry.game_id),
+            )
+            return
+        for asset in assets:
+            size = asset["size_bytes"]
+            if size is None and len(assets) == 1:
+                size = entry.size_bytes
+            conn.execute(
+                """
+                INSERT INTO cache_members
+                    (game_id, relative_path, expected_size, size_bytes, is_primary)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    entry.game_id,
+                    asset["relative_path"],
+                    asset["size_bytes"],
+                    int(size or 0),
+                    asset["is_primary"],
+                ),
+            )
+        primary = next((asset for asset in assets if asset["is_primary"]), assets[0])
+        resolved = Path(primary["filename"]).suffix.lower() not in DESCRIPTOR_EXTENSIONS
+        conn.execute(
+            "UPDATE cache_entries SET membership_resolved = ? WHERE game_id = ?",
+            (1 if resolved else 0, entry.game_id),
+        )
+        if not resolved:
+            conn.execute(
+                "UPDATE cache_entries SET status = ? WHERE game_id = ?",
+                (CacheStatus.INCOMPLETE.value, entry.game_id),
+            )
+
+    def replace_membership(
+        self,
+        game_id: str,
+        assets: list[GameAsset],
+        actual_sizes: dict[str, int],
+    ) -> None:
+        """Atomically persist the resolved ownership snapshot for one game."""
+        with self._db.connect() as conn:
+            conn.execute("DELETE FROM cache_members WHERE game_id = ?", (game_id,))
+            conn.executemany(
+                """
+                INSERT INTO cache_members
+                    (game_id, relative_path, expected_size, size_bytes, is_primary)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        game_id,
+                        asset.relative_path,
+                        asset.size_bytes,
+                        int(actual_sizes.get(asset.relative_path, 0)),
+                        1 if asset.is_primary else 0,
+                    )
+                    for asset in assets
+                ],
+            )
+            conn.execute(
+                "UPDATE cache_entries SET membership_resolved = 1 WHERE game_id = ?",
+                (game_id,),
+            )
+
+    def update_member_sizes(self, game_id: str, sizes: dict[str, int]) -> None:
+        with self._db.connect() as conn:
+            conn.executemany(
+                """
+                UPDATE cache_members SET size_bytes = ?
+                WHERE game_id = ? AND relative_path = ?
+                """,
+                [(size, game_id, path) for path, size in sizes.items()],
+            )
+
+    def membership_resolved(self, game_id: str) -> bool:
+        with self._db.connect() as conn:
+            row = conn.execute(
+                "SELECT membership_resolved FROM cache_entries WHERE game_id = ?",
+                (game_id,),
+            ).fetchone()
+            return bool(row[0]) if row is not None else False
+
+    def list_members(self, game_id: str) -> list[CacheMember]:
+        with self._db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM cache_members WHERE game_id = ?
+                ORDER BY is_primary DESC, relative_path
+                """,
+                (game_id,),
+            ).fetchall()
+            return [self._row_to_member(row) for row in rows]
+
+    def owner_count(self, relative_path: str) -> int:
+        with self._db.connect() as conn:
+            return int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM cache_members WHERE relative_path = ?",
+                    (relative_path,),
+                ).fetchone()[0]
             )
 
     def update_status(self, game_id: str, status: CacheStatus) -> None:
@@ -130,6 +261,15 @@ class CacheRepository:
                 "UPDATE cache_entries SET size_bytes = ? WHERE game_id = ?",
                 (size_bytes, game_id),
             )
+            members = conn.execute(
+                "SELECT relative_path FROM cache_members WHERE game_id = ?",
+                (game_id,),
+            ).fetchall()
+            if len(members) == 1:
+                conn.execute(
+                    "UPDATE cache_members SET size_bytes = ? WHERE game_id = ?",
+                    (size_bytes, game_id),
+                )
 
     def update_last_accessed(self, game_id: str, dt: datetime) -> None:
         with self._db.connect() as conn:
@@ -178,24 +318,28 @@ class CacheRepository:
             return [self._row_to_entry(r) for r in rows]
 
     def list_evictable_lru(self) -> list[CacheEntry]:
-        """Return complete, unpinned entries ordered oldest-accessed first."""
+        """Return non-transferring, unpinned entries in LRU order."""
         with self._db.connect() as conn:
             rows = conn.execute(
                 """
                 SELECT * FROM cache_entries
-                WHERE status = ? AND is_pinned = 0
+                WHERE status != ? AND is_pinned = 0
                 ORDER BY last_accessed ASC
                 """,
-                (CacheStatus.COMPLETE.value,),
+                (CacheStatus.TRANSFERRING.value,),
             ).fetchall()
             return [self._row_to_entry(r) for r in rows]
 
     def total_size(self) -> int:
-        """Return the sum of size_bytes for all complete cache entries."""
+        """Return physical membership bytes, counting shared paths once."""
         with self._db.connect() as conn:
             result = conn.execute(
-                "SELECT COALESCE(SUM(size_bytes), 0) FROM cache_entries WHERE status = ?",
-                (CacheStatus.COMPLETE.value,),
+                """
+                SELECT COALESCE(SUM(size_bytes), 0) FROM (
+                    SELECT relative_path, MAX(size_bytes) AS size_bytes
+                    FROM cache_members GROUP BY relative_path
+                )
+                """
             ).fetchone()
             return int(result[0])
 
@@ -214,6 +358,16 @@ class CacheRepository:
             last_accessed=_parse_dt(row["last_accessed"]) or datetime.now(timezone.utc),
             size_bytes=row["size_bytes"],
             is_pinned=bool(row["is_pinned"]),
+        )
+
+    @staticmethod
+    def _row_to_member(row) -> CacheMember:  # type: ignore[no-untyped-def]
+        return CacheMember(
+            game_id=row["game_id"],
+            relative_path=row["relative_path"],
+            expected_size=row["expected_size"],
+            size_bytes=row["size_bytes"],
+            is_primary=bool(row["is_primary"]),
         )
 
 

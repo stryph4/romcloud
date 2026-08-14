@@ -19,14 +19,17 @@ class CacheStatus(str, Enum):
     FAILED = "failed"
     """Transfer failed; partial data may exist."""
 
+    INCOMPLETE = "incomplete"
+    """Persisted bytes do not yet have a complete dependency closure."""
+
 
 @dataclass
 class CacheEntry:
     """Represents a game's presence in the local cache.
 
-    ``cache_path`` is the *container directory* for the game inside the
-    cache root, e.g. ``/userdata/romcloud/cache/ps2/<game_id>/``.
-    Individual asset files live inside that directory.
+    ``cache_path`` records the primary launch asset. Legacy rows may instead
+    point at a per-game container directory; cache path resolution supports
+    both layouts.
     """
 
     game_id: str
@@ -46,7 +49,7 @@ class CacheEntry:
     @property
     def is_evictable(self) -> bool:
         """True when the entry may be removed by automatic eviction policy."""
-        return self.is_complete and not self.is_pinned
+        return self.status is not CacheStatus.TRANSFERRING and not self.is_pinned
 
     # ── factory ───────────────────────────────────────────────────────────────
 
@@ -62,6 +65,17 @@ class CacheEntry:
             size_bytes=0,
             is_pinned=False,
         )
+
+
+@dataclass(frozen=True)
+class CacheMember:
+    """One persisted source-relative member owned by a logical cache entry."""
+
+    game_id: str
+    relative_path: str
+    expected_size: int | None
+    size_bytes: int
+    is_primary: bool = False
 
 
 @dataclass(frozen=True)

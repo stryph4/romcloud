@@ -648,6 +648,50 @@ def test_known_ineligible_cached_row_stays_hidden_in_cache_and_offline(
     assert retained_cache.status is CacheStatus.COMPLETE
 
 
+def test_offline_hides_migrated_descriptor_without_resolved_membership(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    marker = Path(config.source.rom_root) / "snes" / "Collection.m3u"
+    marker.write_text("Missing Disc.chd\n")
+    game = Game.create(
+        "snes",
+        "Collection",
+        "local",
+        config.source.rom_root,
+        [
+            GameAsset(
+                marker.name,
+                "snes/Collection.m3u",
+                marker.stat().st_size,
+                True,
+            )
+        ],
+    )
+    container = Container(config)
+    container.game_repo.save(game)
+    cached_marker = Path(config.cache.path) / "snes" / "Collection.m3u"
+    cached_marker.parent.mkdir(parents=True)
+    cached_marker.write_bytes(marker.read_bytes())
+    entry = CacheEntry.create(game.id, str(cached_marker))
+    entry.status = CacheStatus.COMPLETE
+    entry.is_pinned = True
+    container.cache_repo.save(entry)
+    proxy = Path(config.local_roms_path) / "snes" / "Collection.romcloud"
+    container.proxy_repo.save(ProxyRecord.create(game.id, str(proxy)))
+    restore_owned_proxies(config)
+    assert proxy.is_file()
+
+    report = reconcile_library_presentation(config, offline=True)
+
+    assert report.visible == 0
+    assert not proxy.exists()
+    retained = Container(config).cache_repo.get(game.id)
+    assert retained is not None and retained.is_pinned
+    assert retained.status is CacheStatus.INCOMPLETE
+    assert cached_marker.is_file()
+
+
 def test_offline_exposes_directory_container_cached_game_with_no_proxy_record(
     tmp_path: Path,
 ) -> None:

@@ -61,7 +61,7 @@ def cache_status(ctx: click.Context, game_id: str | None) -> None:
         game = container.game_repo.get(game_id)
         title = game.title if game else game_id
         click.echo(f"  title:        {title}")
-        click.echo(f"  status:       {entry.status.value}")
+        click.echo(f"  status:       {container.cache.effective_status(entry).value}")
         click.echo(f"  pinned:       {'yes' if entry.is_pinned else 'no'}")
         click.echo(f"  size:         {_fmt_bytes(entry.size_bytes)}")
         click.echo(f"  cached_at:    {entry.cached_at.isoformat()}")
@@ -69,19 +69,25 @@ def cache_status(ctx: click.Context, game_id: str | None) -> None:
         click.echo(f"  path:         {entry.cache_path}")
         return
 
-    entries = container.cache_repo.list_complete()
+    entries = container.cache_repo.list_all()
     if not entries:
         click.echo("Cache is empty.")
         return
 
-    click.echo(f"\n{'Title':<45} {'System':<12} {'Size':>8}  {'Pinned'}")
+    click.echo(
+        f"\n{'Title':<38} {'System':<12} {'Status':<11} {'Size':>8}  {'Pinned'}"
+    )
     click.echo("─" * 80)
     for entry in entries:
         game = container.game_repo.get(entry.game_id)
-        title = (game.title if game else entry.game_id)[:44]
+        title = (game.title if game else entry.game_id)[:37]
         system = (game.system if game else "?")[:11]
+        status = container.cache.effective_status(entry).value
         pinned = "✓" if entry.is_pinned else ""
-        click.echo(f"  {title:<44} {system:<12} {_fmt_bytes(entry.size_bytes):>8}  {pinned}")
+        click.echo(
+            f"  {title:<37} {system:<12} {status:<11} "
+            f"{_fmt_bytes(entry.size_bytes):>8}  {pinned}"
+        )
     click.echo()
 
 

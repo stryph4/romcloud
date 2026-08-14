@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from romcloud.core.cache_paths import resolve_cache_path
+from romcloud.core.dependency_resolvers import DESCRIPTOR_EXTENSIONS
 from romcloud.core.exceptions import (
     CacheError,
     GameNotFoundError,
@@ -28,12 +29,13 @@ from romcloud.core.exceptions import (
     InsufficientSpaceError,
 )
 from romcloud.core.capabilities import Capability, CapabilityPolicy
-from romcloud.core.models.cache import CacheEntry, CachePolicy, CacheStatus
+from romcloud.core.models.cache import CacheEntry, CacheMember, CachePolicy, CacheStatus
 from romcloud.core.models.game import Game, GameAsset
 from romcloud.services.transfer import TransferService
 from romcloud.infrastructure.logging import get_logger
 from romcloud.infrastructure.repositories.cache import CacheRepository
 from romcloud.infrastructure.repositories.game import GameRepository
+from romcloud.services.dependencies import DependencyResolverRegistry
 
 log = get_logger("cache")
 
@@ -49,6 +51,7 @@ class CacheService:
         cache_root: str,
         policy: CachePolicy,
         capability_policy: Optional[CapabilityPolicy] = None,
+        dependency_resolver: Optional[DependencyResolverRegistry] = None,
     ) -> None:
         self._cache_repo = cache_repo
         self._game_repo = game_repo
@@ -56,6 +59,12 @@ class CacheService:
         self._cache_root = Path(cache_root)
         self._policy = policy
         self._capabilities = capability_policy or CapabilityPolicy("smart_cache")
+        self._dependencies = dependency_resolver
+        if self._dependencies is None and hasattr(transfer_service, "provider"):
+            self._dependencies = DependencyResolverRegistry(
+                transfer_service.provider,
+                source_root=transfer_service.source_root,
+            )
         # In-memory set of game_ids currently being launched.
         # Eviction must not remove these.  Does not persist across restarts.
         self._active_launches: set[str] = set()
@@ -71,29 +80,8 @@ class CacheService:
         missing track is treated as incomplete, never as a full hit.
         """
         entry = self._cache_repo.get(game_id)
-        if entry is None:
-            return False
         game = self._game_repo.get(game_id)
-        launch_path = self._launch_asset_path(entry, game)
-        if launch_path is None or not launch_path.exists():
-            log.warning(
-                "Cache entry for %s has no cached primary asset at %s — invalidating",
-                game_id,
-                launch_path,
-            )
-            self._cache_repo.delete(game_id)
-            return False
-        if not entry.is_complete:
-            return False
-
-        if game is not None and not self._all_assets_present(entry, game):
-            log.warning(
-                "Cache entry for %s is missing one or more required companion "
-                "assets — treating as incomplete",
-                game_id,
-            )
-            return False
-        return True
+        return self.is_valid_cached_entry(entry, game)
 
     def has_valid_cached_assets(self, game_id: str) -> bool:
         """Read-only validity check for cached-library presentation.
@@ -109,33 +97,40 @@ class CacheService:
         self, entry: Optional[CacheEntry], game: Optional[Game]
     ) -> bool:
         """Same canonical validity rule as :meth:`has_valid_cached_assets`,
-        but taking an already-loaded entry/game so bulk callers (e.g. mode
-        presentation over the whole library) never issue a per-game
-        database query. A complete cache entry whose resolved launch asset
-        (and every companion asset) actually exists on disk is playable —
-        this is the single source of truth for local-playability."""
+        but taking an already-loaded entry/game. A complete cache entry whose
+        persisted membership closure actually exists on disk is playable."""
         if entry is None or not entry.is_complete or game is None:
             return False
-        launch_path = self._launch_asset_path(entry, game)
-        if launch_path is None or not launch_path.exists():
+        if not self._cache_repo.membership_resolved(entry.game_id):
             return False
-        return self._all_assets_present(entry, game)
+        return self._all_members_present(
+            entry, game, self._cache_repo.list_members(entry.game_id)
+        )
 
-    def _all_assets_present(self, entry: CacheEntry, game: Game) -> bool:
-        """True if every asset of *game* is present at its final cache path
-        (and size-correct, where the expected size is known)."""
-        for asset in game.assets:
-            path = self._cached_asset_path(entry, game, asset)
-            if path is None or not path.exists():
+    def _all_members_present(
+        self, entry: CacheEntry, game: Game, members: list[CacheMember]
+    ) -> bool:
+        """Validate the persisted closure without consulting the source."""
+        if not members or not any(member.is_primary for member in members):
+            return False
+        for member in members:
+            path = self._cached_member_path(entry, game, member)
+            if not path.exists() or path.is_symlink():
                 return False
-            if asset.size_bytes is not None:
+            if member.expected_size is not None:
                 actual = _dir_size(path)
-                if actual != asset.size_bytes:
+                if actual != member.expected_size:
                     return False
         return True
 
     def get_entry(self, game_id: str) -> Optional[CacheEntry]:
         return self._cache_repo.get(game_id)
+
+    def effective_status(self, entry: CacheEntry) -> CacheStatus:
+        """Return dependency-aware status without changing durable history."""
+        if entry.status is CacheStatus.COMPLETE and not self.is_cached(entry.game_id):
+            return CacheStatus.INCOMPLETE
+        return entry.status
 
     def get_launch_path(self, game_id: str) -> Optional[str]:
         """Return the local path of the primary ROM asset for launching.
@@ -153,9 +148,31 @@ class CacheService:
     def _launch_asset_path(
         self, entry: CacheEntry, game: Optional[Game]
     ) -> Optional[Path]:
-        if game is None or game.primary_asset is None:
+        if game is None:
             return None
-        return self._cached_asset_path(entry, game, game.primary_asset)
+        primary = next(
+            (
+                member
+                for member in self._cache_repo.list_members(entry.game_id)
+                if member.is_primary
+            ),
+            None,
+        )
+        return self._cached_member_path(entry, game, primary) if primary else None
+
+    def _cached_member_path(
+        self, entry: CacheEntry, game: Game, member: CacheMember
+    ) -> Path:
+        return self._cached_asset_path(
+            entry,
+            game,
+            GameAsset(
+                filename=Path(member.relative_path).name,
+                relative_path=member.relative_path,
+                size_bytes=member.expected_size,
+                is_primary=member.is_primary,
+            ),
+        )
 
     def _cached_asset_path(
         self, entry: CacheEntry, game: Game, asset: GameAsset
@@ -192,7 +209,13 @@ class CacheService:
         free = _free_bytes(str(self._cache_root))
         return {
             "total_entries": len(entries),
-            "complete": sum(1 for e in entries if e.is_complete),
+            "complete": sum(
+                1
+                for entry in entries
+                if self.is_valid_cached_entry(
+                    entry, self._game_repo.get(entry.game_id)
+                )
+            ),
             "pinned": sum(1 for e in entries if e.is_pinned),
             "total_bytes": total_bytes,
             "free_bytes": free,
@@ -237,40 +260,78 @@ class CacheService:
         if primary is None:
             raise CacheError(f"Game {game_id!r} has no cacheable assets")
 
-        # Directory packages remain unsized during catalog discovery so a
-        # refresh stays O(entries), without a second recursive walk per
-        # package.  Size them once here, when quota preflight actually needs
-        # the number.
-        needed = (
-            game.total_size_bytes
-            if game.total_size_bytes is not None
-            else self._transfer.estimate_size(game)
+        existing = self._cache_repo.get(game_id)
+        existing_members = self._cache_repo.list_members(game_id)
+        if (
+            existing is not None
+            and self._cache_repo.membership_resolved(game_id)
+            and existing_members
+        ):
+            resolved_game = self._game_from_membership(game, existing_members)
+        elif self._dependencies is not None:
+            resolved_game = self._dependencies.resolve(game)
+        else:
+            if Path(primary.filename).suffix.lower() in DESCRIPTOR_EXTENSIONS:
+                raise CacheError(
+                    "Dependency resolution is unavailable for descriptor game "
+                    f"{game_id!r}"
+                )
+            resolved_game = game
+        actual_before = self._existing_member_sizes(existing, resolved_game)
+        needed = sum(
+            asset.size_bytes or 0
+            for asset in resolved_game.assets
+            if asset.relative_path not in actual_before
         )
+        if any(
+            asset.size_bytes is None
+            and asset.relative_path not in actual_before
+            for asset in resolved_game.assets
+        ):
+            needed = max(
+                needed,
+                self._transfer.estimate_size(resolved_game)
+                - sum(actual_before.values()),
+            )
         self._ensure_space(needed, protected_game_id=game_id)
 
         # cache_path is fully determined by (system, primary asset's relative
         # path) — see romcloud.core.cache_paths — so it is already correct
         # even before the transfer completes.
-        cache_path = str(resolve_cache_path(self._cache_root, game.system, primary.relative_path))
+        cache_path = str(
+            resolve_cache_path(
+                self._cache_root, resolved_game.system, primary.relative_path
+            )
+        )
 
         # Create or update the entry to TRANSFERRING.
-        existing = self._cache_repo.get(game_id)
         if existing is None:
             entry = CacheEntry.create(game_id=game_id, cache_path=cache_path)
             self._cache_repo.save(entry)
         else:
             self._cache_repo.update_status(game_id, CacheStatus.TRANSFERRING)
+        self._cache_repo.replace_membership(
+            game_id, resolved_game.assets, actual_before
+        )
 
         try:
-            final_path = self._transfer.transfer(game, on_progress)
+            final_path = self._transfer.transfer(resolved_game, on_progress)
             # Size recorded against the quota must cover *every* asset of
             # the logical game (e.g. .cue + all .bin tracks), never just
-            # the primary/launch asset — otherwise multi-asset games would
-            # silently under-count against the cache quota.
-            actual_size = sum(
-                _dir_size(resolve_cache_path(self._cache_root, game.system, a.relative_path))
-                for a in game.assets
-            )
+            # the primary/launch asset. Entry size remains a logical-game
+            # figure; quota uses distinct persisted membership paths.
+            actual_sizes = {
+                asset.relative_path: _dir_size(
+                    resolve_cache_path(
+                        self._cache_root,
+                        resolved_game.system,
+                        asset.relative_path,
+                    )
+                )
+                for asset in resolved_game.assets
+            }
+            actual_size = sum(actual_sizes.values())
+            self._cache_repo.update_member_sizes(game_id, actual_sizes)
             self._cache_repo.update_cache_path(game_id, final_path)
             self._cache_repo.update_status(game_id, CacheStatus.COMPLETE)
             self._cache_repo.update_size(game_id, actual_size)
@@ -278,7 +339,7 @@ class CacheService:
 
             updated_entry = self._cache_repo.get(game_id)
             assert updated_entry is not None
-            launch_path = self._launch_asset_path(updated_entry, game)
+            launch_path = self._launch_asset_path(updated_entry, resolved_game)
             if launch_path is None or not launch_path.exists():
                 raise CacheError(
                     f"Cache completed but the primary launch asset could not be resolved for {game_id}"
@@ -388,6 +449,45 @@ class CacheService:
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
+    def _existing_member_sizes(
+        self, entry: Optional[CacheEntry], game: Game
+    ) -> dict[str, int]:
+        """Return valid existing bytes that can be adopted by this snapshot."""
+        sizes: dict[str, int] = {}
+        for asset in game.assets:
+            direct = resolve_cache_path(
+                self._cache_root, game.system, asset.relative_path
+            )
+            path = (
+                self._cached_asset_path(entry, game, asset)
+                if entry is not None
+                else direct
+            )
+            if not path.exists() or path.is_symlink():
+                continue
+            actual = _dir_size(path)
+            if asset.size_bytes is None or actual == asset.size_bytes:
+                sizes[asset.relative_path] = actual
+        return sizes
+
+    @staticmethod
+    def _game_from_membership(game: Game, members: list[CacheMember]) -> Game:
+        """Rebuild a transfer view from the persisted, source-independent snapshot."""
+        from dataclasses import replace
+
+        return replace(
+            game,
+            assets=[
+                GameAsset(
+                    filename=Path(member.relative_path).name,
+                    relative_path=member.relative_path,
+                    size_bytes=member.expected_size,
+                    is_primary=member.is_primary,
+                )
+                for member in members
+            ],
+        )
+
     def _has_space_for(
         self,
         total_cache_bytes: int,
@@ -440,17 +540,18 @@ class CacheService:
         self._cache_repo.update_last_accessed(game_id, datetime.now(timezone.utc))
 
     def _remove_files(self, entry: CacheEntry, game: Optional[Game]) -> None:
-        """Remove every on-disk asset belonging to this cache entry.
-
-        For a multi-asset logical game, every asset's exact path is removed
-        (never just the recorded primary/launch-asset path) so no companion
-        track is ever orphaned on disk. Falls back to the recorded
-        ``cache_path`` alone if the game record is unavailable.
-        """
-        if game is not None and game.assets:
-            for asset in game.assets:
-                p = resolve_cache_path(self._cache_root, game.system, asset.relative_path)
-                if p.exists():
+        """Remove persisted members only when this is their last owner."""
+        members = self._cache_repo.list_members(entry.game_id)
+        if game is not None and members:
+            for member in members:
+                if self._cache_repo.owner_count(member.relative_path) > 1:
+                    continue
+                p = self._cached_member_path(entry, game, member)
+                if (
+                    p.exists()
+                    and not p.is_symlink()
+                    and _is_within(p, self._cache_root)
+                ):
                     if p.is_dir():
                         shutil.rmtree(p)
                     else:
@@ -458,7 +559,7 @@ class CacheService:
             return
 
         p = Path(entry.cache_path)
-        if p.exists():
+        if p.exists() and not p.is_symlink() and _is_within(p, self._cache_root):
             if p.is_dir():
                 shutil.rmtree(p)
             else:
@@ -469,6 +570,8 @@ def _free_bytes(path: str) -> int:
     try:
         stat = os.statvfs(path)
         return stat.f_bavail * stat.f_frsize
+    except AttributeError:
+        return shutil.disk_usage(path).free
     except OSError:
         return 0
 
@@ -477,3 +580,11 @@ def _dir_size(path: Path) -> int:
     if path.is_file():
         return path.stat().st_size
     return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        return False
+    return True
