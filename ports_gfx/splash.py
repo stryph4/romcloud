@@ -4,13 +4,23 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ports_gfx.theme import (
+    ACCENT,
+    BACKGROUND,
+    MUTED_TEXT,
+    PROGRESS_TRACK,
+    SURFACE,
+    TEXT,
+    system_font,
+)
 
-_BACKGROUND = (3, 6, 20)
-_PANEL = (5, 9, 28)
-_TEXT = (238, 242, 255)
-_MUTED = (170, 185, 215)
-_TRACK = (35, 46, 78)
-_PROGRESS = (30, 190, 245)
+
+_BACKGROUND = BACKGROUND
+_PANEL = SURFACE
+_TEXT = TEXT
+_MUTED = MUTED_TEXT
+_TRACK = PROGRESS_TRACK
+_PROGRESS = ACCENT
 _SPLASH_ASSET = Path(__file__).resolve().parent / "assets" / "splash.png"
 
 
@@ -45,8 +55,8 @@ class SplashRenderer:
         pygame.draw.rect(screen, _PANEL, (0, panel_y, width, panel_h))
 
         margin = max(24, round(width * 0.06))
-        title_font = pygame.font.SysFont(None, max(30, round(height * 0.045)))
-        status_font = pygame.font.SysFont(None, max(22, round(height * 0.032)))
+        title_font = system_font(pygame, max(30, round(height * 0.045)), strong=True)
+        status_font = system_font(pygame, max(22, round(height * 0.032)))
         title_surface = title_font.render(title, True, _TEXT)
         status_surface = status_font.render(status, True, _MUTED)
         screen.blit(title_surface, (margin, panel_y + round(panel_h * 0.15)))

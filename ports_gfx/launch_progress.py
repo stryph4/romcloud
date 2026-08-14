@@ -36,15 +36,25 @@ from dataclasses import dataclass, field
 from typing import IO, Optional
 
 from ports_gfx.layout import Layout, compute_layout
+from ports_gfx.theme import (
+    ACCENT,
+    BACKGROUND,
+    ERROR,
+    MUTED_TEXT,
+    PROGRESS_TRACK,
+    SUCCESS,
+    TEXT,
+    system_font,
+)
 
 _FALLBACK_SIZE = (1280, 720)
 _MIN_SANE_DIMENSION = 240
 
-_BG_COLOR = (18, 18, 24)
-_FG_COLOR = (230, 230, 230)
-_ERROR_COLOR = (220, 90, 90)
-_SUCCESS_COLOR = (90, 200, 120)
-_HINT_COLOR = (150, 150, 150)
+_BG_COLOR = BACKGROUND
+_FG_COLOR = TEXT
+_ERROR_COLOR = ERROR
+_SUCCESS_COLOR = SUCCESS
+_HINT_COLOR = MUTED_TEXT
 
 _LAUNCHING_DISPLAY_SECONDS = 0.6
 _ERROR_AUTO_DISMISS_SECONDS = 15.0
@@ -202,9 +212,9 @@ def _run(pygame, state: LaunchProgressState) -> int:  # noqa: ANN001
         screen = _open_display(pygame, screen_w, screen_h)
         pygame.display.set_caption("ROMCloud")
         layout = compute_layout(screen_w, screen_h, 0)
-        font_title = pygame.font.SysFont(None, layout.fonts.title)
-        font_body = pygame.font.SysFont(None, layout.fonts.body)
-        font_hint = pygame.font.SysFont(None, layout.fonts.hint)
+        font_title = system_font(pygame, layout.fonts.title, strong=True)
+        font_body = system_font(pygame, layout.fonts.body)
+        font_hint = system_font(pygame, layout.fonts.hint)
         clock = pygame.time.Clock()
 
         launching_since: Optional[float] = None
@@ -269,10 +279,10 @@ def _render(pygame, screen, layout: Layout, font_title, font_body, font_hint, st
     bar_y = safe_area.y + safe_area.h // 2
     bar_w = safe_area.w
     bar_h = max(18, layout.fonts.body)
-    pygame.draw.rect(screen, (60, 60, 70), (safe_area.x, bar_y, bar_w, bar_h), border_radius=4)
+    pygame.draw.rect(screen, PROGRESS_TRACK, (safe_area.x, bar_y, bar_w, bar_h), border_radius=4)
     fraction = progress_fraction(state)
     if fraction > 0:
-        pygame.draw.rect(screen, (90, 140, 220), (safe_area.x, bar_y, int(bar_w * fraction), bar_h), border_radius=4)
+        pygame.draw.rect(screen, ACCENT, (safe_area.x, bar_y, int(bar_w * fraction), bar_h), border_radius=4)
 
     bytes_line = f"{_fmt_bytes(state.bytes_done)} / {_fmt_bytes(state.bytes_total)}" if state.bytes_total else _fmt_bytes(state.bytes_done)
     bytes_text = font_body.render(bytes_line, True, _FG_COLOR)

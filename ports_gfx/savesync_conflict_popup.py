@@ -243,7 +243,9 @@ def run_conflict_popup(romcloud_bin: str) -> int:
         import pygame
 
         from ports_gfx.app import (
+            _ACCENT_COLOR,
             _BG_COLOR,
+            _BORDER_COLOR,
             _CARD_BG,
             _ERROR_COLOR,
             _FG_COLOR,
@@ -401,8 +403,10 @@ def run_conflict_popup(romcloud_bin: str) -> int:
                 colors={
                     "bg": _BG_COLOR,
                     "card": _CARD_BG,
+                    "border": _BORDER_COLOR,
                     "error": _ERROR_COLOR,
                     "fg": _FG_COLOR,
+                    "focus": _ACCENT_COLOR,
                     "hint": _HINT_COLOR,
                     "selected": _SELECTED_BG,
                     "success": _SUCCESS_COLOR,
@@ -734,6 +738,17 @@ def render_conflict_resolver(  # noqa: ANN001
     for index, (label, rect) in enumerate(zip(ACTION_LABELS, rects)):
         color = colors["selected"] if index == state.selected_index else colors["card"]
         pygame.draw.rect(screen, color, (rect.x, rect.y, rect.w, rect.h), border_radius=6)
+        pygame.draw.rect(
+            screen,
+            (
+                colors.get("focus", colors["fg"])
+                if index == state.selected_index
+                else colors.get("border", colors["card"])
+            ),
+            (rect.x, rect.y, rect.w, rect.h),
+            width=4 if index == state.selected_index else 1,
+            border_radius=6,
+        )
         text = fonts["body"].render(label, True, colors["fg"])
         screen.blit(text, (rect.x + 16, rect.y + max(0, (rect.h - text.get_height()) // 2)))
 

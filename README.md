@@ -479,6 +479,21 @@ status/refresh, cache controls, storage configuration, SaveSync, Library
 Sync, health checks, controller diagnostics/remapping, updates, and
 maintenance operations.
 
+The native interface and browser manager share a restrained ROMCloud
+design language derived from the bundled icon and splash: midnight-navy
+backgrounds, layered blue surfaces, electric-cyan focus, limited violet
+accents, silver-white primary text, and consistent green/amber/red status
+semantics. Controller focus uses a dedicated high-contrast cyan border and
+is intentionally stronger than hover or selected state.
+
+Typography uses the same deliberate UI stack on both surfaces: Inter,
+Noto Sans, DejaVu Sans, Liberation Sans/Segoe UI, then Arial and the
+platform sans-serif fallback. Headings use the same family at a stronger
+weight while metadata and status text retain readable sizes and contrast.
+ROMCloud does not currently redistribute a font binary; Pygame and the
+browser resolve the first installed family so installation remains clean
+across Batocera architectures.
+
 Long-running backend operations are executed outside the graphical event
 loop so the UI can continue processing controller, keyboard, and touch
 input.

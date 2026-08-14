@@ -35,6 +35,21 @@ from pathlib import Path
 from typing import Optional
 
 from ports_gfx.actions import ACTION_DIRECTIONS, Action
+from ports_gfx.theme import (
+    ACCENT,
+    BACKGROUND,
+    BORDER,
+    ERROR,
+    MUTED_TEXT,
+    PROGRESS_TRACK,
+    SUCCESS,
+    SURFACE_RAISED,
+    TEXT,
+    WARNING,
+    FOCUS_FILL,
+    draw_card,
+    system_font,
+)
 from ports_gfx.activity import ActivityLog
 from ports_gfx.catalog_progress import CatalogRefreshProgress
 from ports_gfx.client import BackendResult, call_backend, operation_result
@@ -306,14 +321,16 @@ _MODE_TRANSITION_ACTIONS = frozenset(
     {"library-connected", "library-cache", "library-offline"}
 )
 
-_BG_COLOR = (18, 18, 24)
-_CARD_BG = (40, 40, 50)
-_FG_COLOR = (230, 230, 230)
-_SELECTED_BG = (60, 90, 160)
-_SUCCESS_COLOR = (90, 200, 120)
-_WARNING_COLOR = (230, 180, 60)
-_ERROR_COLOR = (220, 90, 90)
-_HINT_COLOR = (150, 150, 150)
+_BG_COLOR = BACKGROUND
+_CARD_BG = SURFACE_RAISED
+_FG_COLOR = TEXT
+_SELECTED_BG = FOCUS_FILL
+_SUCCESS_COLOR = SUCCESS
+_WARNING_COLOR = WARNING
+_ERROR_COLOR = ERROR
+_HINT_COLOR = MUTED_TEXT
+_ACCENT_COLOR = ACCENT
+_BORDER_COLOR = BORDER
 _MESSAGE_COLORS = {
     "success": _SUCCESS_COLOR,
     "warning": _WARNING_COLOR,
@@ -780,9 +797,9 @@ def _load_startup_backend_state(  # noqa: ANN001
 
 def _build_fonts(pygame, layout: Layout):  # noqa: ANN001
     return {
-        "title": pygame.font.SysFont(None, layout.fonts.title),
-        "body": pygame.font.SysFont(None, layout.fonts.body),
-        "hint": pygame.font.SysFont(None, layout.fonts.hint),
+        "title": system_font(pygame, layout.fonts.title, strong=True),
+        "body": system_font(pygame, layout.fonts.body),
+        "hint": system_font(pygame, layout.fonts.hint),
     }
 
 
@@ -1535,22 +1552,13 @@ def _render_menu(  # noqa: ANN001
         screen.blit(banner, banner_rect)
 
     for i, (item, rect) in enumerate(zip(state.items, layout.card_rects)):
-        color = (
-            _SELECTED_BG
-            if i == state.selected_index
-            else (45, 75, 55)
-            if item.active
-            else _CARD_BG
+        draw_card(
+            pygame,
+            screen,
+            rect,
+            focused=i == state.selected_index,
+            active=item.active,
         )
-        pygame.draw.rect(screen, color, (rect.x, rect.y, rect.w, rect.h), border_radius=6)
-        if item.active:
-            pygame.draw.rect(
-                screen,
-                _SUCCESS_COLOR,
-                (rect.x, rect.y, rect.w, rect.h),
-                width=3,
-                border_radius=6,
-            )
         label = fonts["body"].render(item.label, True, _FG_COLOR)
         center_x, center_y = rect.center
         label_center_y = center_y - (layout.fonts.hint // 2 if item.description else 0)
@@ -1680,7 +1688,8 @@ def _render_controller_test(  # noqa: ANN001
         is_awaiting = controller_test.remap_instance_id is not None and is_selected
         color = _SELECTED_BG if is_selected else _CARD_BG
         suffix = "  (press a button...)" if is_awaiting else ""
-        pygame.draw.rect(screen, color, (layout.safe_area.x, y, 260, line_h), border_radius=4)
+        row_rect = Rect(layout.safe_area.x, y, min(420, layout.safe_area.w), line_h)
+        draw_card(pygame, screen, row_rect, focused=is_selected, radius=6)
         label = fonts["body"].render(f"{_CONTROLLER_ACTION_LABELS[action]}{suffix}", True, _FG_COLOR)
         screen.blit(label, (layout.safe_area.x + 8, y))
         y += line_h + 4
@@ -1781,7 +1790,7 @@ def _draw_progress_bar(  # noqa: ANN001
     *,
     failed: bool = False,
 ) -> None:
-    pygame.draw.rect(screen, _CARD_BG, (rect.x, rect.y, rect.w, rect.h), border_radius=4)
+    pygame.draw.rect(screen, PROGRESS_TRACK, (rect.x, rect.y, rect.w, rect.h), border_radius=4)
     if fraction is None:
         # Animate a short segment for work whose duration cannot be measured,
         # without claiming a fabricated percentage.
@@ -1804,7 +1813,7 @@ def _draw_progress_bar(  # noqa: ANN001
     if fill_w:
         pygame.draw.rect(
             screen,
-            _ERROR_COLOR if failed else _SUCCESS_COLOR,
+            _ERROR_COLOR if failed else ACCENT,
             (rect.x, rect.y, fill_w, rect.h),
             border_radius=4,
         )
@@ -2197,8 +2206,10 @@ def _render_savesync(  # noqa: ANN001
             colors={
                 "bg": _BG_COLOR,
                 "card": _CARD_BG,
+                "border": _BORDER_COLOR,
                 "error": _ERROR_COLOR,
                 "fg": _FG_COLOR,
+                "focus": _ACCENT_COLOR,
                 "hint": _HINT_COLOR,
                 "selected": _SELECTED_BG,
                 "success": _SUCCESS_COLOR,
@@ -2227,8 +2238,9 @@ def _render_savesync(  # noqa: ANN001
             and savesync_screen.settings_items.index(line)
             == savesync_screen.settings_selected_index
         )
-        color = _SELECTED_BG if is_selected_item else _FG_COLOR
-        text = fonts["body"].render(line, True, color)
+        color = ACCENT if is_selected_item else _FG_COLOR
+        display_line = f"›  {line}" if is_selected_item else f"   {line}"
+        text = fonts["body"].render(display_line, True, color)
         screen.blit(text, (layout.navigation_rect.x, y))
         y += line_h
 
@@ -2237,12 +2249,12 @@ def _render_savesync(  # noqa: ANN001
         bar_y = y + line_h // 2
         bar_w = max(1, min(layout.navigation_rect.w, 560))
         bar_h = max(8, layout.fonts.body // 2)
-        pygame.draw.rect(screen, _CARD_BG, (bar_x, bar_y, bar_w, bar_h), border_radius=4)
+        pygame.draw.rect(screen, PROGRESS_TRACK, (bar_x, bar_y, bar_w, bar_h), border_radius=4)
         fill_w = int(bar_w * savesync_screen.confirm.progress)
         if fill_w > 0:
             pygame.draw.rect(
                 screen,
-                _SUCCESS_COLOR,
+                ACCENT,
                 (bar_x, bar_y, fill_w, bar_h),
                 border_radius=4,
             )
@@ -2500,8 +2512,13 @@ def _render_wizard(  # noqa: ANN001
         value = fonts["body"].render(display_value[-max_chars:], True, _FG_COLOR)
         screen.blit(value, (text_rect.x + 12, text_rect.y + max(4, (text_rect.h - value.get_height()) // 2)))
         for index, (key, rect) in enumerate(zip(wizard.osk.keys, _wizard_rects(layout, wizard))):
-            color = _SELECTED_BG if index == wizard.osk.selected_index else _CARD_BG
-            pygame.draw.rect(screen, color, (rect.x, rect.y, rect.w, rect.h), border_radius=5)
+            draw_card(
+                pygame,
+                screen,
+                rect,
+                focused=index == wizard.osk.selected_index,
+                radius=6,
+            )
             label = fonts["body"].render(wizard.osk.key_label(key), True, _FG_COLOR)
             screen.blit(label, label.get_rect(center=rect.center))
     else:
@@ -2520,8 +2537,12 @@ def _render_wizard(  # noqa: ANN001
                 y += line_h
 
         for index, label_text, rect in _wizard_option_rows(layout, wizard):
-            color = _SELECTED_BG if index == wizard.selected_index else _CARD_BG
-            pygame.draw.rect(screen, color, (rect.x, rect.y, rect.w, rect.h), border_radius=6)
+            draw_card(
+                pygame,
+                screen,
+                rect,
+                focused=index == wizard.selected_index,
+            )
             max_label_chars = max(1, rect.w // max(8, layout.fonts.body // 2))
             label = fonts["body"].render(label_text[:max_label_chars], True, _FG_COLOR)
             screen.blit(label, label.get_rect(center=rect.center))
