@@ -170,6 +170,110 @@ def test_disabled_lifecycle_cli_does_not_construct_coordinator(
         assert result.exit_code == 0, result.output
 
 
+def test_game_stop_worker_skips_popup_when_quick_sync_finds_no_new_conflict(
+    tmp_path: Path, monkeypatch
+):
+    from romcloud.cli.commands import autosync as autosync_commands
+    from romcloud.cli.main import cli
+
+    config_path = tmp_path / "romcloud.toml"
+    write_config(
+        AppConfig(
+            source=SourceConfig("local", (tmp_path / "roms").as_posix()),
+            cache=CacheConfig((tmp_path / "cache").as_posix()),
+            local_roms_path=(tmp_path / "local-roms").as_posix(),
+            data_path=(tmp_path / "data").as_posix(),
+            saves=SavesConfig(
+                local_path=(tmp_path / "saves").as_posix(),
+                auto_sync_enabled=True,
+            ),
+        ),
+        str(config_path),
+    )
+    coordinator = type("Coordinator", (), {"game_stop": lambda self, **_kwargs: ()})()
+    monkeypatch.setattr(autosync_commands, "_coordinator", lambda _ctx: coordinator)
+    monkeypatch.setattr(
+        autosync_commands,
+        "_launch_pending_conflict_popup",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("no-conflict worker must not launch a popup")
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config",
+            str(config_path),
+            "_autosync",
+            "game-stop",
+            "psx",
+            "libretro",
+            "pcsx",
+            "Game.chd",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+
+
+def test_game_stop_worker_passes_exact_caller_to_one_popup_launch(
+    tmp_path: Path, monkeypatch
+):
+    from romcloud.cli.commands import autosync as autosync_commands
+    from romcloud.cli.main import cli
+
+    config_path = tmp_path / "romcloud.toml"
+    write_config(
+        AppConfig(
+            source=SourceConfig("local", (tmp_path / "roms").as_posix()),
+            cache=CacheConfig((tmp_path / "cache").as_posix()),
+            local_roms_path=(tmp_path / "local-roms").as_posix(),
+            data_path=(tmp_path / "data").as_posix(),
+            saves=SavesConfig(
+                local_path=(tmp_path / "saves").as_posix(),
+                auto_sync_enabled=True,
+            ),
+        ),
+        str(config_path),
+    )
+    coordinator = type(
+        "Coordinator",
+        (),
+        {"game_stop": lambda self, **_kwargs: ("new-conflict-id",)},
+    )()
+    launches = []
+    monkeypatch.setenv("ROMCLOUD_AUTOSYNC_CALLER_PID", "4242")
+    monkeypatch.setattr(autosync_commands, "_coordinator", lambda _ctx: coordinator)
+    monkeypatch.setattr(
+        autosync_commands,
+        "_launch_pending_conflict_popup",
+        lambda root, **kwargs: launches.append((root, kwargs)),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config",
+            str(config_path),
+            "_autosync",
+            "game-stop",
+            "psx",
+            "libretro",
+            "pcsx",
+            "Game.chd",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert launches == [
+        (
+            tmp_path / "data",
+            {"lifecycle_caller_pid": 4242},
+        )
+    ]
+
+
 def test_pending_conflict_launcher_is_short_lived_and_uses_focused_mode(
     tmp_path: Path, monkeypatch
 ):
@@ -187,9 +291,22 @@ def test_pending_conflict_launcher_is_short_lived_and_uses_focused_mode(
         calls.append((argv, kwargs))
         return type("Result", (), {"returncode": 0})()
 
+    monkeypatch.setattr(
+        batocera_auto_savesync,
+        "wait_for_emulationstation_display",
+        lambda _pid: batocera_auto_savesync.EmulationStationReadiness(
+            ready=True,
+            signal="x11-active-es",
+            detail="x11-active-es",
+            elapsed_seconds=0.1,
+            attempts=2,
+        ),
+    )
     monkeypatch.setattr(autosync_commands.subprocess, "run", fake_run)
 
-    autosync_commands._launch_pending_conflict_popup(data_root)
+    autosync_commands._launch_pending_conflict_popup(
+        data_root, lifecycle_caller_pid=4242
+    )
 
     assert calls[0][0] == [str(launcher), "--savesync-conflicts"]
     assert calls[0][1]["check"] is False
@@ -214,6 +331,17 @@ def test_popup_launch_failure_is_logged_and_queue_survives(
     savesync_prompts.enqueue(data_root, ("conflict-id",))
     monkeypatch.delenv("ROMCLOUD_BIN", raising=False)
     monkeypatch.setattr(
+        batocera_auto_savesync,
+        "wait_for_emulationstation_display",
+        lambda _pid: batocera_auto_savesync.EmulationStationReadiness(
+            ready=True,
+            signal="wayland-active-es",
+            detail="wayland-active-es",
+            elapsed_seconds=0.1,
+            attempts=2,
+        ),
+    )
+    monkeypatch.setattr(
         autosync_commands.subprocess,
         "run",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("cannot exec")),
@@ -226,19 +354,159 @@ def test_popup_launch_failure_is_logged_and_queue_survives(
     assert savesync_prompts.pending_ids(data_root) == ("conflict-id",)
 
 
-def test_batocera_hook_keeps_game_stop_display_handoff_ordered(tmp_path: Path):
+def test_popup_readiness_timeout_preserves_queue_and_does_not_launch(
+    tmp_path: Path, monkeypatch, caplog
+):
+    from romcloud.cli.commands import autosync as autosync_commands
+
+    data_root = tmp_path / "romcloud" / "data"
+    launcher = tmp_path / "romcloud" / "bin" / "romcloud-ports"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("launcher", encoding="utf-8")
+    savesync_prompts.enqueue(data_root, ("conflict-id",))
+    monkeypatch.setattr(
+        batocera_auto_savesync,
+        "wait_for_emulationstation_display",
+        lambda _pid: batocera_auto_savesync.EmulationStationReadiness(
+            ready=False,
+            signal="display-not-ready",
+            detail="xdotool found no active EmulationStation window",
+            elapsed_seconds=5.0,
+            attempts=14,
+        ),
+    )
+    monkeypatch.setattr(
+        autosync_commands.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("readiness timeout must not launch popup")
+        ),
+    )
+
+    with caplog.at_level("WARNING"):
+        autosync_commands._launch_pending_conflict_popup(
+            data_root, lifecycle_caller_pid=4242
+        )
+
+    assert "readiness wait timed out" in caplog.text
+    assert savesync_prompts.pending_ids(data_root) == ("conflict-id",)
+
+
+def test_duplicate_workers_cannot_wait_or_launch_two_popups(
+    tmp_path: Path, monkeypatch
+):
+    from romcloud.cli.commands import autosync as autosync_commands
+
+    data_root = tmp_path / "romcloud" / "data"
+    launcher = tmp_path / "romcloud" / "bin" / "romcloud-ports"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("launcher", encoding="utf-8")
+    savesync_prompts.enqueue(data_root, ("conflict-id",))
+    readiness_entered = threading.Event()
+    release_readiness = threading.Event()
+    launches = []
+
+    def wait_for_readiness(_pid):
+        readiness_entered.set()
+        assert release_readiness.wait(timeout=2)
+        return batocera_auto_savesync.EmulationStationReadiness(
+            ready=True,
+            signal="x11-active-es",
+            detail="x11-active-es",
+            elapsed_seconds=0.1,
+            attempts=2,
+        )
+
+    monkeypatch.setattr(
+        batocera_auto_savesync,
+        "wait_for_emulationstation_display",
+        wait_for_readiness,
+    )
+    monkeypatch.setattr(
+        autosync_commands.subprocess,
+        "run",
+        lambda argv, **kwargs: launches.append((argv, kwargs))
+        or type("Result", (), {"returncode": 0})(),
+    )
+
+    first = threading.Thread(
+        target=autosync_commands._launch_pending_conflict_popup,
+        args=(data_root,),
+        kwargs={"lifecycle_caller_pid": 111},
+    )
+    second = threading.Thread(
+        target=autosync_commands._launch_pending_conflict_popup,
+        args=(data_root,),
+        kwargs={"lifecycle_caller_pid": 222},
+    )
+    first.start()
+    assert readiness_entered.wait(timeout=2)
+    second.start()
+    second.join(timeout=2)
+    assert not second.is_alive()
+    release_readiness.set()
+    first.join(timeout=2)
+
+    assert not first.is_alive()
+    assert len(launches) == 1
+
+
+def test_manual_resolution_during_readiness_skips_stale_queued_popup(
+    tmp_path: Path, monkeypatch
+):
+    from romcloud.cli.commands import autosync as autosync_commands
+
+    data_root = tmp_path / "romcloud" / "data"
+    launcher = tmp_path / "romcloud" / "bin" / "romcloud-ports"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("launcher", encoding="utf-8")
+    savesync_prompts.enqueue(data_root, ("conflict-id",))
+
+    def resolve_while_waiting(_pid):
+        savesync_prompts.complete(data_root, "conflict-id")
+        return batocera_auto_savesync.EmulationStationReadiness(
+            ready=True,
+            signal="wayland-active-es",
+            detail="wayland-active-es",
+            elapsed_seconds=0.1,
+            attempts=2,
+        )
+
+    monkeypatch.setattr(
+        batocera_auto_savesync,
+        "wait_for_emulationstation_display",
+        resolve_while_waiting,
+    )
+    monkeypatch.setattr(
+        autosync_commands.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("resolved queue must not launch popup")
+        ),
+    )
+
+    autosync_commands._launch_pending_conflict_popup(
+        data_root, lifecycle_caller_pid=4242
+    )
+
+    assert savesync_prompts.pending_ids(data_root) == ()
+
+
+def test_batocera_hook_detaches_game_stop_and_records_handoff(tmp_path: Path):
     target = tmp_path / "scripts" / "romcloud-autosync"
     install_hook(tmp_path / "bin" / "romcloud", hook_path=target)
     content = target.read_text(encoding="utf-8")
 
     assert "gameStart" in content and "gameStop" in content
     assert "game-start" in content and "game-stop" in content
-    assert '"$ROMCLOUD_BIN" _autosync game-stop' in content
-    assert 'nohup "$ROMCLOUD_BIN" _autosync game-stop' not in content
+    assert 'nohup "$ROMCLOUD_BIN" _autosync game-stop' in content
+    assert 'ROMCLOUD_AUTOSYNC_CALLER_PID="$PPID"' in content
     assert 'nohup "$ROMCLOUD_BIN" _autosync menu-loop' in content
     assert "auto-savesync-lifecycle.log" in content
-    assert 'event="game_stop_handoff_start"' in content
-    assert 'event="game_stop_handoff_end"' in content
+    assert 'event="game_stop_hook_entered"' in content
+    assert 'event="game_stop_handoff_started"' in content
+    assert 'event="game_stop_handoff_failed"' in content
+    assert 'event="game_stop_hook_returned"' in content
     assert "</dev/null &" in content
     assert '"$2" "$3" "$4" "$5"' in content
     if os.name != "nt":
@@ -382,9 +650,9 @@ def test_owned_menu_loop_stop_is_bounded_and_clears_restart_record(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Batocera hook is a POSIX shell script")
-def test_game_stop_hook_waits_for_worker_before_emulationstation_resumes(tmp_path: Path):
+def test_game_stop_hook_returns_while_worker_continues(tmp_path: Path):
     binary = tmp_path / "romcloud"
-    binary.write_text("#!/bin/bash\nsleep 0.15\n", encoding="utf-8")
+    binary.write_text("#!/bin/bash\nsleep 0.4\n", encoding="utf-8")
     binary.chmod(0o755)
     hook = install_hook(binary, hook_path=tmp_path / "romcloud-autosync")
 
@@ -395,7 +663,167 @@ def test_game_stop_hook_waits_for_worker_before_emulationstation_resumes(tmp_pat
         timeout=2,
     )
 
-    assert time.monotonic() - started >= 0.1
+    assert time.monotonic() - started < 0.2
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Batocera hook is a POSIX shell script")
+def test_game_stop_hook_logs_missing_worker_binary(tmp_path: Path):
+    binary = tmp_path / "missing-romcloud"
+    hook = install_hook(binary, hook_path=tmp_path / "romcloud-autosync")
+
+    subprocess.run(
+        [str(hook), "gameStop", "psx", "libretro", "pcsx", "Game.chd"],
+        check=True,
+        timeout=2,
+    )
+
+    lifecycle_log = tmp_path.parent / "logs" / "auto-savesync-lifecycle.log"
+    assert 'event="game_stop_handoff_failed"' in lifecycle_log.read_text(
+        encoding="utf-8"
+    )
+    assert 'reason="romcloud_bin_unavailable"' in lifecycle_log.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_lifecycle_caller_pid_accepts_only_a_positive_exact_value():
+    assert (
+        batocera_auto_savesync.lifecycle_caller_pid(
+            {"ROMCLOUD_AUTOSYNC_CALLER_PID": "4242"}
+        )
+        == 4242
+    )
+    assert (
+        batocera_auto_savesync.lifecycle_caller_pid(
+            {"ROMCLOUD_AUTOSYNC_CALLER_PID": "not-a-pid"}
+        )
+        is None
+    )
+    assert batocera_auto_savesync.lifecycle_caller_pid({}) is None
+
+
+def test_readiness_waits_for_caller_exit_and_two_active_es_observations(
+    tmp_path: Path,
+):
+    proc_root = tmp_path / "proc"
+    caller = proc_root / "4242"
+    caller.mkdir(parents=True)
+    (caller / "cmdline").write_bytes(
+        b"/usr/bin/python3\0/usr/bin/emulatorlauncher\0"
+    )
+    now = 0.0
+    probe_calls = 0
+    sleep_calls = 0
+
+    def clock():
+        return now
+
+    def sleep(seconds):
+        nonlocal now, sleep_calls
+        now += seconds
+        sleep_calls += 1
+        if sleep_calls == 1:
+            (caller / "cmdline").unlink()
+
+    def probe():
+        nonlocal probe_calls
+        probe_calls += 1
+        return True, "x11-active-es (pid 99)"
+
+    result = batocera_auto_savesync.wait_for_emulationstation_display(
+        4242,
+        timeout=1.0,
+        proc_root=proc_root,
+        clock=clock,
+        sleep=sleep,
+        probe=probe,
+    )
+
+    assert result.ready is True
+    assert result.signal == "x11-active-es (pid 99)"
+    assert probe_calls == 2
+    assert sleep_calls == 2
+
+
+def test_readiness_timeout_is_bounded_without_a_display_signal():
+    now = 0.0
+    sleeps: list[float] = []
+
+    def clock():
+        return now
+
+    def sleep(seconds):
+        nonlocal now
+        sleeps.append(seconds)
+        now += seconds
+
+    result = batocera_auto_savesync.wait_for_emulationstation_display(
+        None,
+        timeout=0.3,
+        poll_interval=0.05,
+        clock=clock,
+        sleep=sleep,
+        probe=lambda: (False, "no active ES window"),
+    )
+
+    assert result.ready is False
+    assert result.detail == "no active ES window"
+    assert result.elapsed_seconds == pytest.approx(0.3)
+    assert sum(sleeps) == pytest.approx(0.3)
+    assert result.attempts < 10
+
+
+def test_x11_readiness_probe_requires_active_window_to_belong_to_es(
+    tmp_path: Path,
+):
+    proc_root = tmp_path / "proc"
+    es = proc_root / "99"
+    es.mkdir(parents=True)
+    (es / "comm").write_text("emulationstation\n", encoding="utf-8")
+    commands = []
+
+    def run(argv, **kwargs):
+        commands.append((argv, kwargs))
+        return type("Result", (), {"returncode": 0, "stdout": "1234\n99\n"})()
+
+    ready, detail = batocera_auto_savesync.probe_emulationstation_display(
+        environment={"DISPLAY": ":0"},
+        proc_root=proc_root,
+        which=lambda name: "/usr/bin/xdotool" if name == "xdotool" else None,
+        run=run,
+    )
+
+    assert ready is True
+    assert detail == "x11-active-es (pid 99)"
+    assert commands[0][0] == [
+        "/usr/bin/xdotool",
+        "getactivewindow",
+        "getwindowpid",
+    ]
+
+
+def test_wayland_readiness_probe_requires_active_es_toplevel():
+    commands = []
+
+    def run(argv, **kwargs):
+        commands.append((argv, kwargs))
+        return type("Result", (), {"returncode": 0})()
+
+    ready, detail = batocera_auto_savesync.probe_emulationstation_display(
+        environment={"WAYLAND_DISPLAY": "wayland-0"},
+        which=lambda name: "/usr/bin/wlrctl" if name == "wlrctl" else None,
+        run=run,
+    )
+
+    assert ready is True
+    assert detail == "wayland-active-es (app_id:emulationstation)"
+    assert commands[0][0] == [
+        "/usr/bin/wlrctl",
+        "toplevel",
+        "find",
+        "app_id:emulationstation",
+        "state:active",
+    ]
 
 
 def test_lifecycle_mapping_is_registry_bounded_and_xemu_is_never_automatic():

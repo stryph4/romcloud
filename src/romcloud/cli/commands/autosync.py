@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from pathlib import Path
 
 import click
 
 from romcloud.cli.context import get_container
+from romcloud.infrastructure import savesync_prompts
 from romcloud.infrastructure.config import load_config
 from romcloud.infrastructure.logging import get_logger
-from romcloud.infrastructure import savesync_prompts
+from romcloud.integrations.batocera import auto_savesync as batocera_auto_savesync
 from romcloud.services.auto_savesync import AutoSaveSyncCoordinator
 
 log = get_logger("auto-savesync-cli")
@@ -41,7 +43,9 @@ def _coordinator(ctx: click.Context) -> AutoSaveSyncCoordinator:
     )
 
 
-def _launch_pending_conflict_popup(data_root: Path) -> None:
+def _launch_pending_conflict_popup(
+    data_root: Path, *, lifecycle_caller_pid: int | None = None
+) -> None:
     """Run the focused system-Python UI after releasing every sync lock."""
     pending = savesync_prompts.pending_ids(data_root)
     if not pending:
@@ -66,6 +70,40 @@ def _launch_pending_conflict_popup(data_root: Path) -> None:
             log.info(
                 "SaveSync conflict popup launch rejected by singleton; pending_ids=%s",
                 ",".join(pending),
+            )
+            return
+        log.info(
+            "EmulationStation readiness wait started: caller_pid=%s timeout=%.1fs",
+            lifecycle_caller_pid or "unknown",
+            batocera_auto_savesync.ES_READINESS_TIMEOUT_SECONDS,
+        )
+        readiness = batocera_auto_savesync.wait_for_emulationstation_display(
+            lifecycle_caller_pid
+        )
+        if not readiness.ready:
+            log.warning(
+                "EmulationStation readiness wait timed out: elapsed=%.3fs "
+                "attempts=%d signal=%s detail=%s; conflict prompt remains queued "
+                "for manual resolution",
+                readiness.elapsed_seconds,
+                readiness.attempts,
+                readiness.signal,
+                readiness.detail,
+            )
+            return
+        log.info(
+            "EmulationStation readiness condition satisfied: elapsed=%.3fs "
+            "attempts=%d signal=%s detail=%s",
+            readiness.elapsed_seconds,
+            readiness.attempts,
+            readiness.signal,
+            readiness.detail,
+        )
+        pending = savesync_prompts.pending_ids(data_root)
+        if not pending:
+            log.info(
+                "SaveSync conflict popup launch skipped after readiness: "
+                "queued conflicts were already resolved or dismissed"
             )
             return
         environment = os.environ.copy()
@@ -156,17 +194,52 @@ def game_stop(
 ) -> None:
     if not ctx.obj["config"].saves.auto_sync_enabled:
         return
+    worker_pid = os.getpid()
+    caller_pid = batocera_auto_savesync.lifecycle_caller_pid()
+    log.info(
+        "gameStop detached worker started: pid=%d lifecycle_caller_pid=%s",
+        worker_pid,
+        caller_pid or "unknown",
+    )
     try:
-        conflict_ids = _coordinator(ctx).game_stop(
-            system=system, emulator=emulator, core=core, rom=rom
-        )
+        quick_sync_started = time.monotonic()
+        log.info("gameStop Quick Sync started: worker_pid=%d", worker_pid)
+        try:
+            conflict_ids = _coordinator(ctx).game_stop(
+                system=system, emulator=emulator, core=core, rom=rom
+            )
+        except Exception:
+            log.warning(
+                "gameStop Quick Sync ended: worker_pid=%d status=failed "
+                "elapsed=%.3fs",
+                worker_pid,
+                time.monotonic() - quick_sync_started,
+            )
+            raise
         log.info(
-            "gameStop worker reached popup handoff: new_conflicts=%d",
+            "gameStop Quick Sync ended: worker_pid=%d status=complete "
+            "elapsed=%.3fs new_conflicts=%d ids=%s",
+            worker_pid,
+            time.monotonic() - quick_sync_started,
             len(conflict_ids),
+            ",".join(conflict_ids) or "none",
         )
-        _launch_pending_conflict_popup(Path(ctx.obj["config"].data_path))
+        if conflict_ids:
+            log.info(
+                "gameStop new conflict IDs detected: count=%d ids=%s",
+                len(conflict_ids),
+                ",".join(conflict_ids),
+            )
+            _launch_pending_conflict_popup(
+                Path(ctx.obj["config"].data_path),
+                lifecycle_caller_pid=caller_pid,
+            )
+        else:
+            log.info("gameStop popup handoff skipped: no new conflict IDs")
     except Exception:  # noqa: BLE001 - lifecycle integration must fail open
         log.warning("SaveSync game-exit pass failed", exc_info=True)
+    finally:
+        log.info("gameStop detached worker exited: pid=%d", worker_pid)
 
 
 @autosync_group.command("menu-tick", hidden=True)

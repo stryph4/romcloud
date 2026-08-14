@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +13,7 @@ from ports_gfx.savesync_conflict_popup import (
     ConflictPopupState,
     DISPLAYING,
     LOADING,
+    _acquire_popup_focus,
 )
 from romcloud.core.exceptions import SaveSyncVerificationError
 from romcloud.core.models.savesync import SaveConflictResolution
@@ -222,6 +224,67 @@ def test_focused_entrypoint_does_not_launch_main_gui(monkeypatch):
 
     assert entrypoint.main(["--savesync-conflicts"]) == 0
     assert calls == ["/installed/bin/romcloud"]
+
+
+def test_popup_focus_wait_raises_until_keyboard_focus_is_observed():
+    now = 0.0
+    focus_values = iter((False, False, True))
+    requests = []
+    records = []
+    pygame = SimpleNamespace(
+        event=SimpleNamespace(pump=lambda: None),
+        key=SimpleNamespace(get_focused=lambda: next(focus_values)),
+        display=SimpleNamespace(get_active=lambda: True),
+    )
+
+    def clock():
+        return now
+
+    def sleep(seconds):
+        nonlocal now
+        now += seconds
+
+    assert _acquire_popup_focus(
+        pygame,
+        lambda event, **fields: records.append((event, fields)),
+        timeout=1.0,
+        clock=clock,
+        sleep=sleep,
+        request_focus=lambda: requests.append(True) or "requested",
+    )
+    assert len(requests) == 2
+    assert records[0][0] == "conflict_focus_wait_started"
+    assert records[-1][0] == "conflict_focus_acquired"
+
+
+def test_popup_focus_timeout_is_bounded_and_reported():
+    now = 0.0
+    requests = []
+    records = []
+    pygame = SimpleNamespace(
+        event=SimpleNamespace(pump=lambda: None),
+        key=SimpleNamespace(get_focused=lambda: False),
+        display=SimpleNamespace(get_active=lambda: True),
+    )
+
+    def clock():
+        return now
+
+    def sleep(seconds):
+        nonlocal now
+        now += seconds
+
+    assert not _acquire_popup_focus(
+        pygame,
+        lambda event, **fields: records.append((event, fields)),
+        timeout=0.2,
+        clock=clock,
+        sleep=sleep,
+        request_focus=lambda: requests.append(True) or "requested",
+    )
+    assert 0 < len(requests) < 10
+    assert records[-1][0] == "conflict_focus_timed_out"
+    assert records[-1][1]["elapsed"] == pytest.approx(0.2)
 
 
 def test_successful_action_loads_next_conflict_in_same_window(monkeypatch):

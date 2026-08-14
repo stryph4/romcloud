@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -21,6 +24,8 @@ ACTION_LABELS = (
 _ACTION_NAMES = ("upload-local", "download-remote", "resolve-later")
 _DESTRUCTIVE = frozenset({0, 1})
 _OPERATION_TIMEOUT = 120.0
+_FOCUS_TIMEOUT_SECONDS = 1.5
+_FOCUS_COMMAND_TIMEOUT_SECONDS = 0.75
 
 LOADING = "loading"
 DISPLAYING = "displaying"
@@ -248,12 +253,30 @@ def run_conflict_popup(romcloud_bin: str) -> int:
         pygame.init()
         diagnostics.record("conflict_pygame_initialized")
         screen_w, screen_h = _detect_screen_size(pygame, diagnostics)
+        # Set the unique title before SDL maps the window so X11/Wayland focus
+        # helpers can identify it immediately.
+        pygame.display.set_caption("ROMCloud Save Conflict")
         screen = _open_display(pygame, screen_w, screen_h, diagnostics)
         diagnostics.record(
             "conflict_display_ready",
             surface_size=list(screen.get_size()),
             **_focus_state(pygame),
         )
+        try:
+            pygame.event.set_grab(True)
+        except Exception as exc:  # noqa: BLE001 - focus is verified separately
+            diagnostics.record("conflict_input_grab_failed", error=str(exc))
+        if not _acquire_popup_focus(pygame, diagnostics.record):
+            diagnostics.record(
+                "conflict_popup_failed",
+                reason="keyboard_focus_timeout",
+                queue_preserved=True,
+            )
+            print(
+                "error: SaveSync conflict popup could not acquire keyboard focus; "
+                "the conflict remains available for manual resolution"
+            )
+            return 1
         layout = compute_layout(screen_w, screen_h, len(ACTION_LABELS))
         fonts = _build_fonts(pygame, layout)
         inputs = InputManager(pygame, romcloud_bin)
@@ -263,11 +286,6 @@ def run_conflict_popup(romcloud_bin: str) -> int:
             record=diagnostics.record,
         )
         state.start()
-        pygame.display.set_caption("ROMCloud Save Conflict")
-        try:
-            pygame.event.set_grab(True)
-        except Exception as exc:  # noqa: BLE001 - record, but keep keyboard UI usable
-            diagnostics.record("conflict_input_grab_failed", error=str(exc))
         clock = pygame.time.Clock()
         running = True
         rendered = False
@@ -340,6 +358,121 @@ def run_conflict_popup(romcloud_bin: str) -> int:
             except Exception:  # noqa: BLE001 - cleanup is best effort
                 pass
             pygame.quit()
+
+
+def _acquire_popup_focus(
+    pygame,  # noqa: ANN001
+    record: Callable[..., None],
+    *,
+    timeout: float = _FOCUS_TIMEOUT_SECONDS,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    request_focus: Optional[Callable[[], str]] = None,
+) -> bool:
+    """Boundedly raise the popup and prove that it owns keyboard input."""
+    started = clock()
+    deadline = started + max(0.0, timeout)
+    delay = 0.05
+    attempts = 0
+    last_request = "not-requested"
+    focus_request = request_focus or (lambda: _request_popup_focus(pygame))
+    record("conflict_focus_wait_started", timeout=timeout)
+
+    while True:
+        try:
+            pygame.event.pump()
+        except Exception:  # noqa: BLE001 - get_focused remains authoritative
+            pass
+        try:
+            focused = bool(pygame.key.get_focused())
+        except Exception:  # noqa: BLE001 - a missing focus signal must fail safe
+            focused = False
+        if focused:
+            record(
+                "conflict_focus_acquired",
+                attempts=attempts,
+                elapsed=round(max(0.0, clock() - started), 6),
+                request=last_request,
+                **_focus_state(pygame),
+            )
+            return True
+
+        now = clock()
+        if now >= deadline:
+            record(
+                "conflict_focus_timed_out",
+                attempts=attempts,
+                elapsed=round(max(0.0, now - started), 6),
+                request=last_request,
+                **_focus_state(pygame),
+            )
+            return False
+        attempts += 1
+        last_request = focus_request()
+        sleep(min(delay, max(0.0, deadline - now)))
+        delay = min(0.25, delay * 1.5)
+
+
+def _request_popup_focus(pygame) -> str:  # noqa: ANN001
+    """Request focus through SDL plus the active Batocera compositor path."""
+    results: list[str] = []
+    try:
+        from pygame._sdl2.video import Window
+
+        Window.from_display_module().focus()
+        results.append("sdl-window-focus")
+    except Exception as exc:  # noqa: BLE001 - external helpers remain available
+        results.append(f"sdl-window-focus-failed:{exc}")
+
+    environment = os.environ.copy()
+    if environment.get("WAYLAND_DISPLAY"):
+        wlrctl = shutil.which("wlrctl")
+        if wlrctl:
+            try:
+                result = subprocess.run(
+                    [
+                        wlrctl,
+                        "toplevel",
+                        "focus",
+                        "title:ROMCloud Save Conflict",
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=_FOCUS_COMMAND_TIMEOUT_SECONDS,
+                    env=environment,
+                )
+                results.append(f"wlrctl-focus:{result.returncode}")
+            except (OSError, subprocess.SubprocessError) as exc:
+                results.append(f"wlrctl-focus-failed:{exc}")
+
+    if environment.get("DISPLAY"):
+        xdotool = shutil.which("xdotool")
+        try:
+            window_id = int(pygame.display.get_wm_info().get("window", 0))
+        except (AttributeError, TypeError, ValueError):
+            window_id = 0
+        if xdotool and window_id > 0:
+            for action in (
+                [xdotool, "windowraise", str(window_id)],
+                [xdotool, "windowactivate", "--sync", str(window_id)],
+            ):
+                try:
+                    result = subprocess.run(
+                        action,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                        timeout=_FOCUS_COMMAND_TIMEOUT_SECONDS,
+                        env=environment,
+                    )
+                    results.append(f"xdotool-{action[1]}:{result.returncode}")
+                except (OSError, subprocess.SubprocessError) as exc:
+                    results.append(f"xdotool-{action[1]}-failed:{exc}")
+
+    return ",".join(results) or "no-focus-helper"
 
 
 def _focus_state(pygame) -> dict[str, object]:  # noqa: ANN001
