@@ -28,6 +28,8 @@ class Action(Enum):
     screen simply never reacts to it."""
     BACK = "back"
     MENU = "menu"
+    PREVIOUS_PAGE = "previous_page"
+    NEXT_PAGE = "next_page"
 
     # Text-entry actions — emitted while an on-screen/physical keyboard is
     # directed at a text field (see ports_gfx.osk). ``TEXT_INPUT`` carries

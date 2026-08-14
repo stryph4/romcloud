@@ -288,11 +288,24 @@ entries. Offline mode exposes only the local view. Search, state filters,
 sorting, multi-select pin/unpin, individual downloads, and local-copy
 removal are available without loading the full catalog into the browser.
 
-Standard-mapped controllers are supported directly in Chromium. D-pad
-or left stick moves through systems, controls, and game rows; South/A
-activates; East/B backs out or closes a dialog; LB/RB moves by one
+Controllers exposed by Chromium with the W3C `standard` mapping are
+supported directly. D-pad or left stick moves through systems, controls,
+and game rows; South/A confirms; East/B backs out or closes a dialog;
+Start/Menu returns focus to the system navigation; and LB/RB moves by one
 50-game server page. Holding a bumper accelerates to two and then five
 pages per repeat, and releasing it stops repetition immediately.
+
+The native Ports UI and browser use the same ROMCloud logical actions
+(`up`, `down`, `left`, `right`, `confirm`, `back`, `previous_page`,
+`next_page`, and `menu`). **Maintenance → Setup Controller Mapping** is
+the only ROMCloud mapping UI. It persists per-controller SDL raw mappings
+under `ports-gfx-state/controller_mappings.json`. Chromium's standardized
+Gamepad slots are translated centrally to the same logical actions; SDL
+raw button numbers are intentionally not copied into the browser because
+Gamepad API indices and identities are not equivalent, and a remote
+browser may use a different controller. A browser pad without a standard
+mapping is reported as unavailable instead of being assigned guessed
+buttons.
 
 **Download Pinned** performs a dependency-aware storage preflight before
 starting its background job. The estimate deduplicates shared physical

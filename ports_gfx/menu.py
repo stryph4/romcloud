@@ -30,8 +30,8 @@ class MenuItem:
 
 EXIT_ACTION = "exit"
 CONTROLLER_TEST_ACTION = "controller-test"
-"""Sentinel action the UI layer interprets as "switch to the Controller
-Test/diagnostics screen" rather than dispatching to the backend."""
+"""Sentinel action the UI layer interprets as "switch to the controller
+mapping/diagnostics screen" rather than dispatching to the backend."""
 
 CATEGORY_ACTION_PREFIX = "category:"
 BACK_ACTION = "navigation-back"

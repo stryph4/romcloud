@@ -6,6 +6,60 @@
     "select", "games", "pager", "global", "dialog",
   ];
 
+  // This vocabulary mirrors ports_gfx.actions.Action. It is the stable
+  // ROMCloud contract above both input backends; raw SDL and Gamepad API
+  // indices must be translated here/below, never consumed by navigation.
+  const LOGICAL_ACTIONS = Object.freeze({
+    UP: "up", DOWN: "down", LEFT: "left", RIGHT: "right",
+    CONFIRM: "confirm", BACK: "back", PREVIOUS_PAGE: "previous_page",
+    NEXT_PAGE: "next_page", MENU: "menu",
+  });
+
+  // W3C standard Gamepad layout slots. These are deliberately not SDL raw
+  // joystick indices. A pad with mapping === "" has implementation-specific
+  // ordering and is not guessed at; the native persisted raw mapping cannot
+  // safely translate it (and may describe a different, host-side controller).
+  const STANDARD_GAMEPAD_BINDINGS = Object.freeze({
+    [LOGICAL_ACTIONS.CONFIRM]: Object.freeze({button: 0}),
+    [LOGICAL_ACTIONS.BACK]: Object.freeze({button: 1}),
+    [LOGICAL_ACTIONS.PREVIOUS_PAGE]: Object.freeze({button: 4}),
+    [LOGICAL_ACTIONS.NEXT_PAGE]: Object.freeze({button: 5}),
+    [LOGICAL_ACTIONS.MENU]: Object.freeze({button: 9}),
+    [LOGICAL_ACTIONS.UP]: Object.freeze({button: 12, axis: 1, direction: -1}),
+    [LOGICAL_ACTIONS.DOWN]: Object.freeze({button: 13, axis: 1, direction: 1}),
+    [LOGICAL_ACTIONS.LEFT]: Object.freeze({button: 14, axis: 0, direction: -1}),
+    [LOGICAL_ACTIONS.RIGHT]: Object.freeze({button: 15, axis: 0, direction: 1}),
+  });
+
+  class StandardGamepadMapper {
+    constructor(bindings = STANDARD_GAMEPAD_BINDINGS, deadzone = 0.58) {
+      this.bindings = bindings;
+      this.deadzone = deadzone;
+    }
+
+    supports(pad) {
+      return Boolean(pad && pad.connected && pad.mapping === "standard");
+    }
+
+    pressedState(pad) {
+      const result = {};
+      Object.values(LOGICAL_ACTIONS).forEach((action) => { result[action] = false; });
+      if (!this.supports(pad)) return result;
+      const buttonPressed = (index) => Boolean(
+        pad.buttons[index] && (pad.buttons[index].pressed || pad.buttons[index].value > 0.5)
+      );
+      Object.entries(this.bindings).forEach(([action, binding]) => {
+        let pressed = buttonPressed(binding.button);
+        if (binding.axis !== undefined) {
+          const value = Number(pad.axes[binding.axis] || 0);
+          pressed = pressed || value * binding.direction > this.deadzone;
+        }
+        result[action] = pressed;
+      });
+      return result;
+    }
+  }
+
   class FocusModel {
     constructor(zoneOrder = DEFAULT_ZONES) {
       this.zoneOrder = [...zoneOrder];
@@ -106,12 +160,13 @@
   }
 
   class BrowserGamepadNavigator {
-    constructor(win, doc) {
+    constructor(win, doc, mapper = new StandardGamepadMapper()) {
       this.window = win;
       this.document = doc;
       this.model = new FocusModel();
       this.elements = new Map();
       this.connected = new Set();
+      this.mapper = mapper;
       this.frame = null;
       this.usingController = false;
       this.editing = null;
@@ -123,7 +178,7 @@
         lb: new RepeatButton({initialDelay: 420, accelerated: true}),
         rb: new RepeatButton({initialDelay: 420, accelerated: true}),
       };
-      this.edges = {a: false, b: false};
+      this.edges = {confirm: false, back: false, menu: false};
       this._boundPoll = (now) => this._poll(now);
     }
 
@@ -139,7 +194,7 @@
       }, true);
       const pads = this._gamepads();
       pads.forEach((pad) => { if (pad) this.connected.add(pad.index); });
-      if (this.connected.size) {
+      if (this._activePad()) {
         this._setControllerMode(true);
         this.reconcile(true);
         this._schedule();
@@ -193,8 +248,10 @@
     _connect(gamepad) {
       this.connected.add(gamepad.index);
       this._resetInputs();
-      this._setControllerMode(true);
-      this.reconcile(true);
+      if (this.mapper.supports(gamepad)) {
+        this._setControllerMode(true);
+        this.reconcile(true);
+      }
       this._announce();
       this._schedule();
     }
@@ -202,7 +259,7 @@
     _disconnect(gamepad) {
       this.connected.delete(gamepad.index);
       this._resetInputs();
-      if (!this.connected.size) {
+      if (!this._activePad(gamepad.index)) {
         if (this.frame !== null) this.window.cancelAnimationFrame(this.frame);
         this.frame = null;
         this._setControllerMode(false);
@@ -224,7 +281,7 @@
       const modal = this._dialogOpen();
       const lb = this.repeaters.lb.update(modal ? false : pressed.lb, now);
       const rb = this.repeaters.rb.update(modal ? false : pressed.rb, now);
-      if (vertical || horizontal || lb || rb || pressed.a || pressed.b) this._setControllerMode(true);
+      if (vertical || horizontal || lb || rb || pressed.confirm || pressed.back || pressed.menu) this._setControllerMode(true);
       if (this.editing) {
         if (vertical) this._changeSelect(vertical);
       } else if (!modal) {
@@ -235,10 +292,12 @@
       } else if (vertical || horizontal) {
         this._move("horizontal", vertical || horizontal);
       }
-      if (pressed.a && !this.edges.a) this._activate();
-      if (pressed.b && !this.edges.b) this._back();
-      this.edges.a = pressed.a;
-      this.edges.b = pressed.b;
+      if (pressed.confirm && !this.edges.confirm) this._activate();
+      if (pressed.back && !this.edges.back) this._back();
+      if (pressed.menu && !this.edges.menu) this._menu();
+      this.edges.confirm = pressed.confirm;
+      this.edges.back = pressed.back;
+      this.edges.menu = pressed.menu;
       this._schedule();
     }
 
@@ -275,6 +334,12 @@
       const dialog = this.document.querySelector("dialog[open]");
       if (dialog) { dialog.close("cancel"); return; }
       const event = new this.window.CustomEvent("romcloud:controller-back", {cancelable: true});
+      if (!this.window.dispatchEvent(event)) return;
+      this.focusZone("systems");
+    }
+
+    _menu() {
+      const event = new this.window.CustomEvent("romcloud:controller-menu", {cancelable: true});
       if (!this.window.dispatchEvent(event)) return;
       this.focusZone("systems");
     }
@@ -328,19 +393,22 @@
     }
 
     _pressedState(pad) {
-      const button = (index) => Boolean(pad.buttons[index] && (pad.buttons[index].pressed || pad.buttons[index].value > 0.5));
-      const x = Number(pad.axes[0] || 0), y = Number(pad.axes[1] || 0);
+      const logical = this.mapper.pressedState(pad);
       return {
-        a: button(0), b: button(1), lb: button(4), rb: button(5),
-        up: button(12) || y < -0.58, down: button(13) || y > 0.58,
-        left: button(14) || x < -0.58, right: button(15) || x > 0.58,
+        up: logical[LOGICAL_ACTIONS.UP], down: logical[LOGICAL_ACTIONS.DOWN],
+        left: logical[LOGICAL_ACTIONS.LEFT], right: logical[LOGICAL_ACTIONS.RIGHT],
+        confirm: logical[LOGICAL_ACTIONS.CONFIRM], back: logical[LOGICAL_ACTIONS.BACK],
+        lb: logical[LOGICAL_ACTIONS.PREVIOUS_PAGE], rb: logical[LOGICAL_ACTIONS.NEXT_PAGE],
+        menu: logical[LOGICAL_ACTIONS.MENU],
       };
     }
 
-    _activePad() {
+    _activePad(excludedIndex = null) {
       const pads = this._gamepads();
-      for (const index of this.connected) if (pads[index] && pads[index].connected) return pads[index];
-      const fallback = pads.find((pad) => pad && pad.connected);
+      for (const index of this.connected) {
+        if (index !== excludedIndex && this.mapper.supports(pads[index])) return pads[index];
+      }
+      const fallback = pads.find((pad) => pad && pad.index !== excludedIndex && this.mapper.supports(pad));
       if (fallback) this.connected.add(fallback.index);
       return fallback || null;
     }
@@ -364,12 +432,16 @@
     }
 
     _announce() {
-      this.window.dispatchEvent(new this.window.CustomEvent("romcloud:controller-status", {detail: {connected: this.connected.size > 0}}));
+      const pads = this._gamepads().filter((pad) => pad && pad.connected);
+      const usable = pads.filter((pad) => this.mapper.supports(pad)).length;
+      this.window.dispatchEvent(new this.window.CustomEvent("romcloud:controller-status", {
+        detail: {connected: pads.length > 0, usable: usable > 0, unsupported: Math.max(0, pads.length - usable)},
+      }));
     }
 
     _resetInputs() {
       Object.values(this.repeaters).forEach((repeater) => repeater.reset());
-      this.edges = {a: false, b: false};
+      this.edges = {confirm: false, back: false, menu: false};
     }
 
     _schedule() {
@@ -385,7 +457,10 @@
     return new BrowserGamepadNavigator(win, doc).start();
   }
 
-  const api = {FocusModel, RepeatButton, BrowserGamepadNavigator, startBrowserController, DEFAULT_ZONES};
+  const api = {
+    FocusModel, RepeatButton, StandardGamepadMapper, BrowserGamepadNavigator,
+    startBrowserController, DEFAULT_ZONES, LOGICAL_ACTIONS, STANDARD_GAMEPAD_BINDINGS,
+  };
   root.ROMCloudController = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);

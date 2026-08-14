@@ -4,6 +4,26 @@ const assert = require("assert");
 const path = require("path");
 const controller = require(path.resolve(process.argv[2]));
 
+const mapper = new controller.StandardGamepadMapper();
+const buttons = Array.from({length: 16}, () => ({pressed: false, value: 0}));
+const standardPad = {connected: true, mapping: "standard", buttons, axes: [0, 0]};
+buttons[0] = {pressed: true, value: 1};
+buttons[4] = {pressed: true, value: 1};
+buttons[9] = {pressed: true, value: 1};
+buttons[15] = {pressed: true, value: 1};
+let logical = mapper.pressedState(standardPad);
+assert.strictEqual(logical[controller.LOGICAL_ACTIONS.CONFIRM], true);
+assert.strictEqual(logical[controller.LOGICAL_ACTIONS.PREVIOUS_PAGE], true);
+assert.strictEqual(logical[controller.LOGICAL_ACTIONS.MENU], true);
+assert.strictEqual(logical[controller.LOGICAL_ACTIONS.RIGHT], true);
+standardPad.axes[1] = -0.8;
+logical = mapper.pressedState(standardPad);
+assert.strictEqual(logical[controller.LOGICAL_ACTIONS.UP], true);
+
+const rawPad = {...standardPad, mapping: ""};
+assert.strictEqual(mapper.supports(rawPad), false);
+assert.ok(Object.values(mapper.pressedState(rawPad)).every((pressed) => pressed === false));
+
 const model = new controller.FocusModel([
   "systems", "primary", "tabs", "controls", "games", "pager", "dialog",
 ]);

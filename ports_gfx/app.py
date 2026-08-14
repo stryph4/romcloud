@@ -128,7 +128,7 @@ MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
         MenuItem("Check for Updates", "update-check"),
         MenuItem("Update ROMCloud", "update-install"),
         MenuItem("Health Check", "healthcheck"),
-        MenuItem("Controller Test", CONTROLLER_TEST_ACTION),
+        MenuItem("Setup Controller Mapping", CONTROLLER_TEST_ACTION),
     )
 }
 
@@ -793,12 +793,26 @@ _REMAPPABLE_ACTIONS: tuple[Action, ...] = (
     Action.RIGHT,
     Action.CONFIRM,
     Action.BACK,
+    Action.PREVIOUS_PAGE,
+    Action.NEXT_PAGE,
+    Action.MENU,
 )
+_CONTROLLER_ACTION_LABELS: dict[Action, str] = {
+    Action.UP: "Up",
+    Action.DOWN: "Down",
+    Action.LEFT: "Left",
+    Action.RIGHT: "Right",
+    Action.CONFIRM: "Confirm / A",
+    Action.BACK: "Back / B",
+    Action.PREVIOUS_PAGE: "Previous Page / LB",
+    Action.NEXT_PAGE: "Next Page / RB",
+    Action.MENU: "Menu / Start",
+}
 _CONTROLLER_TEST_HINT = "D-pad/stick select   A/Enter remap   B/Esc back"
 
 
 class _ControllerTestScreenState:
-    """Local UI state for the Controller Test/diagnostics screen — which
+    """Local UI state for controller mapping/diagnostics — which
     action slot is focused, and whether a remap capture is in progress."""
 
     def __init__(self) -> None:
@@ -1634,7 +1648,7 @@ def _render_controller_test(  # noqa: ANN001
 ) -> None:
     screen.fill(_BG_COLOR)
 
-    title = fonts["title"].render("Controller Test", True, _FG_COLOR)
+    title = fonts["title"].render("Setup Controller Mapping", True, _FG_COLOR)
     screen.blit(title, (layout.safe_area.x, layout.safe_area.y))
 
     snapshots = input_manager.controllers.snapshots()
@@ -1667,7 +1681,7 @@ def _render_controller_test(  # noqa: ANN001
         color = _SELECTED_BG if is_selected else _CARD_BG
         suffix = "  (press a button...)" if is_awaiting else ""
         pygame.draw.rect(screen, color, (layout.safe_area.x, y, 260, line_h), border_radius=4)
-        label = fonts["body"].render(f"{action.value}{suffix}", True, _FG_COLOR)
+        label = fonts["body"].render(f"{_CONTROLLER_ACTION_LABELS[action]}{suffix}", True, _FG_COLOR)
         screen.blit(label, (layout.safe_area.x + 8, y))
         y += line_h + 4
 

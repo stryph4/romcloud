@@ -201,8 +201,12 @@ window.addEventListener("romcloud:controller-back", (event) => {
 
 window.addEventListener("romcloud:controller-status", (event) => {
   const connected = Boolean(event.detail.connected);
+  const usable = Boolean(event.detail.usable);
+  $("controller-status").textContent = usable
+    ? "Controller connected"
+    : "Controller connected — browser standard mapping unavailable";
   $("controller-status").classList.toggle("hidden", !connected);
-  $("controller-help").classList.toggle("hidden", !connected);
+  $("controller-help").classList.toggle("hidden", !usable);
   contentUpdated();
 });
 

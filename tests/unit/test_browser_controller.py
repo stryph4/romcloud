@@ -21,14 +21,36 @@ def test_controller_assets_wire_all_required_inputs_and_focus_scopes() -> None:
     for zone in ("systems", "tabs", "controls", "games", "dialog", "pager"):
         assert zone in javascript or f'data-controller-zone="{zone}"' in html
     assert "navigator.getGamepads" in javascript
-    assert 'a: button(0)' in javascript and 'b: button(1)' in javascript
-    assert 'lb: button(4)' in javascript and 'rb: button(5)' in javascript
-    assert 'button(12)' in javascript and 'button(15)' in javascript
-    assert 'pad.axes[0]' in javascript and 'pad.axes[1]' in javascript
+    assert 'mapping === "standard"' in javascript
+    for slot in (0, 1, 4, 5, 9, 12, 13, 14, 15):
+        assert f"button: {slot}" in javascript
+    for action in (
+        "up", "down", "left", "right", "confirm", "back",
+        "previous_page", "next_page", "menu",
+    ):
+        assert action in javascript
     assert 'gamepaddisconnected' in javascript
     assert 'dialog[open]' in javascript
     assert 'romcloud:page-jump' in javascript and 'romcloud:page-jump' in app
+    assert 'romcloud:controller-menu' in javascript
+    assert "standard mapping unavailable" in app
     assert 'controller-focus' in css and 'controller-editing' in css
+
+
+def test_browser_and_native_share_one_logical_action_contract() -> None:
+    from ports_gfx.actions import Action
+
+    javascript = (STATIC / "controller.js").read_text(encoding="utf-8")
+    shared = {
+        Action.UP, Action.DOWN, Action.LEFT, Action.RIGHT, Action.CONFIRM,
+        Action.BACK, Action.PREVIOUS_PAGE, Action.NEXT_PAGE, Action.MENU,
+    }
+    assert {action.value for action in shared} == {
+        "up", "down", "left", "right", "confirm", "back",
+        "previous_page", "next_page", "menu",
+    }
+    for action in shared:
+        assert f'"{action.value}"' in javascript
 
 
 def test_controller_focus_and_repeat_state_machine_when_node_is_available() -> None:
