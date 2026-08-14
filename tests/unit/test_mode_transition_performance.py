@@ -32,6 +32,9 @@ from romcloud.integrations.batocera.game_access import (
     reconcile_library_presentation,
     set_operating_mode,
 )
+from romcloud.integrations.batocera.catalog import CatalogService
+from romcloud.integrations.batocera.system_registry import EffectiveSystemRegistry
+from romcloud.infrastructure.providers.local import LocalFilesystemProvider
 from romcloud.services.library_sync import (
     CANONICAL_FILENAME,
     SCHEMA_VERSION,
@@ -110,8 +113,8 @@ def test_offline_visibility_does_not_open_a_connection_per_game(
 
     assert report.visible == cached
     # However many connections bulk reconciliation legitimately needs, it
-    # must not scale anywhere near 1-per-game (previously 2 * total+).
-    assert counter.count < total // 2
+    # must remain constant rather than scaling with games or cached entries.
+    assert counter.count < 20
 
 
 def test_large_synthetic_catalog_offline_transition_is_fast(tmp_path: Path) -> None:
@@ -413,4 +416,44 @@ def test_cache_mode_exposes_full_catalog_without_prior_proxy_registration(
     proxies = list((Path(config.local_roms_path) / "snes").glob("*.romcloud"))
     assert len(proxies) == 250
     assert report.visible == 250
+
+
+def test_refresh_does_not_parse_phase_b_dependency_descriptors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    local = tmp_path / "roms"
+    (source / "psx").mkdir(parents=True)
+    (source / "xbox360").mkdir()
+    local.mkdir()
+    (source / "psx" / "Collection.m3u").write_text("Disc 1.chd\n")
+    (source / "psx" / "Disc 1.chd").write_bytes(b"disc")
+    (source / "xbox360" / "Arcade.xbox360").write_text("Arcade\n")
+    (source / "xbox360" / "Arcade").write_bytes(b"payload")
+    db = Database(str(tmp_path / "data" / "catalog.db"))
+    db.initialize()
+    provider = LocalFilesystemProvider()
+    monkeypatch.setattr(
+        provider,
+        "read_text",
+        lambda path: (_ for _ in ()).throw(
+            AssertionError(f"refresh parsed dependency descriptor: {path}")
+        ),
+    )
+    catalog = CatalogService(
+        provider=provider,
+        game_repo=GameRepository(db),
+        proxy_repo=ProxyRepository(db),
+        local_roms_root=str(local),
+        source_root=str(source),
+        system_registry=EffectiveSystemRegistry.from_extensions(
+            {"psx": {".m3u", ".chd"}, "xbox360": {".xbox360"}}
+        ),
+    )
+
+    first = catalog.refresh()
+    second = catalog.refresh()
+
+    assert first.errors == second.errors == []
+    assert second.added == 0
 

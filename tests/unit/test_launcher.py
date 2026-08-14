@@ -17,6 +17,7 @@ Key invariants proved here:
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from unittest.mock import call, patch
 
@@ -200,8 +201,10 @@ class TestIsRomcloudProxy:
 @pytest.fixture
 def fake_launcher(tmp_path):
     """A real executable on PATH for shutil.which to find."""
-    script = tmp_path / "emulatorlauncher"
-    script.write_text("#!/bin/sh\n")
+    script = tmp_path / (
+        "emulatorlauncher.cmd" if os.name == "nt" else "emulatorlauncher"
+    )
+    script.write_text("@echo off\n" if os.name == "nt" else "#!/bin/sh\n")
     script.chmod(0o755)
     return str(script), str(tmp_path)
 
@@ -773,6 +776,9 @@ class TestLaunchModeIsolation:
         from romcloud.infrastructure.database import Database
         from romcloud.infrastructure.repositories.cache import CacheRepository
         from romcloud.infrastructure.repositories.game import GameRepository
+        from romcloud.infrastructure.repositories.proxy import ProxyRepository
+        from romcloud.core.models.proxy import ProxyRecord
+        from romcloud.lifecycle.manage import restore_owned_proxies
 
         source_root = tmp_path / "source"
         cache_root = tmp_path / "cache"
@@ -802,6 +808,11 @@ class TestLaunchModeIsolation:
         entry.status = CacheStatus.COMPLETE
         entry.size_bytes = 4
         cache_repo.save(entry)
+        proxy_path = local_roms / "snes" / "Chrono Trigger.romcloud"
+        ProxyRepository(database).save(
+            ProxyRecord.create(game.id, str(proxy_path))
+        )
+        restore_owned_proxies(config, game_ids={game.id})
         return config, game, cached_path
 
     def test_cached_launch_never_changes_mode_or_reconciles_presentation(

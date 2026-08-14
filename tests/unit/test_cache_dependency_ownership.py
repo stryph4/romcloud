@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -110,6 +111,41 @@ def test_persisted_membership_survives_service_restart_and_descriptor_change(
     assert {
         member.relative_path for member in cache_repo.list_members(game.id)
     } == {"psx/Restarted.m3u", "psx/Shared.chd"}
+
+
+def test_dependency_cache_hit_survives_restart_with_source_unavailable(
+    cache_service, cache_repo, game_repo, transfer_service, policy, cache_dir,
+    tmp_path: Path, monkeypatch,
+) -> None:
+    source = tmp_path / "source"
+    game = _playlist_game(source, game_repo, "Offline Restart")
+    launch = Path(cache_service.cache_game(game.id))
+    cache_service.pin(game.id)
+    before = cache_repo.get(game.id)
+    members_before = cache_repo.list_members(game.id)
+    shutil.rmtree(source)
+    restarted = CacheService(
+        cache_repo=cache_repo,
+        game_repo=game_repo,
+        transfer_service=transfer_service,
+        cache_root=str(cache_dir),
+        policy=policy,
+    )
+    monkeypatch.setattr(
+        transfer_service,
+        "transfer",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("complete restart cache hit transferred data")
+        ),
+    )
+
+    assert restarted.cache_game(game.id) == str(launch)
+    after = cache_repo.get(game.id)
+    assert after is not None and before is not None
+    assert after.is_pinned
+    assert after.cached_at == before.cached_at
+    assert after.last_accessed >= before.last_accessed
+    assert cache_repo.list_members(game.id) == members_before
 
 
 def test_remove_uses_persisted_membership_not_changed_source_descriptor(

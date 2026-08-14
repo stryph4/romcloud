@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -182,6 +183,23 @@ class CacheRepository:
                 (game_id,),
             ).fetchall()
             return [self._row_to_member(row) for row in rows]
+
+    def list_resolved_memberships(self) -> dict[str, list[CacheMember]]:
+        """Bulk-load authoritative membership snapshots for cache validation."""
+        with self._db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT m.* FROM cache_members AS m
+                JOIN cache_entries AS e ON e.game_id = m.game_id
+                WHERE e.membership_resolved = 1
+                ORDER BY m.game_id, m.is_primary DESC, m.relative_path
+                """
+            ).fetchall()
+        memberships: dict[str, list[CacheMember]] = defaultdict(list)
+        for row in rows:
+            member = self._row_to_member(row)
+            memberships[member.game_id].append(member)
+        return dict(memberships)
 
     def owner_count(self, relative_path: str) -> int:
         with self._db.connect() as conn:

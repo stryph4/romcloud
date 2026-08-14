@@ -377,6 +377,7 @@ def _valid_cached_game_ids(
     container = Container(config)
     entries = container.cache_repo.list_complete()
     games = {game.id: game for game in container.game_repo.list_all()}
+    memberships = container.cache_repo.list_resolved_memberships()
     valid: set[str] = set()
     total = len(entries)
     emit_progress(
@@ -390,7 +391,13 @@ def _valid_cached_game_ids(
     )
     interval = max(1, total // 100) if total else 1
     for index, entry in enumerate(entries, start=1):
-        if container.cache.is_valid_cached_entry(entry, games.get(entry.game_id)):
+        members = memberships.get(entry.game_id)
+        if container.cache.is_valid_cached_entry(
+            entry,
+            games.get(entry.game_id),
+            members=members or [],
+            membership_resolved=members is not None,
+        ):
             valid.add(entry.game_id)
         if index == total or index % interval == 0:
             emit_progress(

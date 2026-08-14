@@ -94,18 +94,29 @@ class CacheService:
         return self.is_valid_cached_entry(entry, game)
 
     def is_valid_cached_entry(
-        self, entry: Optional[CacheEntry], game: Optional[Game]
+        self,
+        entry: Optional[CacheEntry],
+        game: Optional[Game],
+        *,
+        members: Optional[list[CacheMember]] = None,
+        membership_resolved: Optional[bool] = None,
     ) -> bool:
         """Same canonical validity rule as :meth:`has_valid_cached_assets`,
         but taking an already-loaded entry/game. A complete cache entry whose
-        persisted membership closure actually exists on disk is playable."""
+        persisted membership closure actually exists on disk is playable.
+
+        Bulk presentation callers may supply the membership state to avoid
+        opening SQLite connections once per cached game.
+        """
         if entry is None or not entry.is_complete or game is None:
             return False
-        if not self._cache_repo.membership_resolved(entry.game_id):
+        if membership_resolved is None:
+            membership_resolved = self._cache_repo.membership_resolved(entry.game_id)
+        if not membership_resolved:
             return False
-        return self._all_members_present(
-            entry, game, self._cache_repo.list_members(entry.game_id)
-        )
+        if members is None:
+            members = self._cache_repo.list_members(entry.game_id)
+        return self._all_members_present(entry, game, members)
 
     def _all_members_present(
         self, entry: CacheEntry, game: Game, members: list[CacheMember]

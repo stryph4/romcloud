@@ -27,6 +27,7 @@ from romcloud.infrastructure.credentials import (
 from romcloud.infrastructure.database import Database
 from romcloud.infrastructure.repositories.game import GameRepository
 from romcloud.infrastructure.repositories.proxy import ProxyRepository
+from romcloud.integrations.batocera.proxy_ownership import remove_owned_proxy_files
 from romcloud.lifecycle import manage
 
 
@@ -181,7 +182,9 @@ def test_purge_removes_owned_state_and_signed_orphan_only(
 ) -> None:
     config, home, local_roms, cache = _config(tmp_path)
     proxy, _game_id = _catalogued_proxy(config, local_roms)
-    signed_orphan = local_roms / "nes" / "Orphan.romcloud"
+    # Candidate enumeration must retain the prior case-insensitive ownership
+    # behavior while avoiding one filesystem probe per manifest row.
+    signed_orphan = local_roms / "nes" / "Orphan.ROMCLOUD"
     signed_orphan.write_text(json.dumps({
         "romcloud_version": "1", "game_id": "orphan", "assets": []
     }))
@@ -259,6 +262,38 @@ def test_install_boot_integration_then_purge_stops_and_removes_only_owned_paths(
     assert unrelated_service.read_text(encoding="utf-8") == "user service"
     assert unrelated_hook.read_text(encoding="utf-8") == "user hook"
     assert not home.exists()
+
+
+def test_proxy_cleanup_scans_candidates_once_without_weakening_ownership(
+    tmp_path: Path,
+) -> None:
+    local_root = tmp_path / "roms"
+    system = local_root / "nes"
+    system.mkdir(parents=True)
+    kept = system / "Kept.romcloud"
+    orphan = system / "Orphan.ROMCLOUD"
+    foreign = system / "Foreign.romcloud"
+    kept.write_text(json.dumps({
+        "romcloud_version": "1", "game_id": "kept", "assets": []
+    }))
+    orphan.write_text(json.dumps({
+        "romcloud_version": "1", "game_id": "orphan", "assets": []
+    }))
+    foreign.write_text("{}")
+    missing = [
+        (f"missing-{index}", system / f"Missing {index}.romcloud")
+        for index in range(100)
+    ]
+
+    removed = remove_owned_proxy_files(
+        local_root,
+        manifest_records=[("kept", kept), *missing],
+        keep_game_ids={"kept"},
+    )
+
+    assert removed == 1
+    assert kept.is_file() and foreign.is_file()
+    assert not orphan.exists()
 
 
 def test_purge_preserves_user_controlled_remote_data(

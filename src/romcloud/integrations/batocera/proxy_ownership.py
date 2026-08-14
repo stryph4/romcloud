@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -51,6 +52,14 @@ def remove_owned_proxy_files(
     removed.
     """
     removed: set[Path] = set()
+    pattern = "*.[rR][oO][mM][cC][lL][oO][uU][dD]"
+    candidates = list(local_root.rglob(pattern)) if local_root.is_dir() else []
+
+    def path_key(path: Path) -> str:
+        return os.path.normcase(os.path.abspath(path))
+
+    candidates_by_path = {path_key(path): path for path in candidates}
+    inspected: set[str] = set()
 
     def selected(game_id: str) -> bool:
         if remove_game_ids is not None and game_id not in remove_game_ids:
@@ -58,26 +67,32 @@ def remove_owned_proxy_files(
         return keep_game_ids is None or game_id not in keep_game_ids
 
     for game_id, path in manifest_records:
+        key = path_key(path)
+        candidate = candidates_by_path.get(key)
+        if candidate is None:
+            continue
+        inspected.add(key)
         if not selected(game_id):
+            continue
+        payload = proxy_payload(candidate)
+        if (
+            payload is not None
+            and payload["game_id"] == game_id
+            and is_within(candidate, local_root)
+        ):
+            candidate.unlink(missing_ok=True)
+            removed.add(candidate)
+
+    for path in candidates:
+        if path_key(path) in inspected:
             continue
         payload = proxy_payload(path)
         if (
             payload is not None
-            and payload["game_id"] == game_id
+            and selected(payload["game_id"])
             and is_within(path, local_root)
         ):
             path.unlink(missing_ok=True)
             removed.add(path)
-
-    if local_root.is_dir():
-        for path in local_root.rglob("*.romcloud"):
-            payload = proxy_payload(path)
-            if (
-                payload is not None
-                and selected(payload["game_id"])
-                and is_within(path, local_root)
-            ):
-                path.unlink(missing_ok=True)
-                removed.add(path)
 
     return len(removed)
