@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -11,7 +12,7 @@ from romcloud.integrations.batocera.catalog import CatalogService
 from romcloud.core.exceptions import ProxyError
 from romcloud.core.models.game import Game, GameAsset
 from romcloud.core.models.proxy import ProxyRecord
-from romcloud.core.models.cache import CacheEntry
+from romcloud.core.models.cache import CacheEntry, CacheStatus
 from romcloud.integrations.batocera.system_registry import EffectiveSystemRegistry
 from tests.system_registry_fixture import TEST_SYSTEM_REGISTRY
 
@@ -220,6 +221,8 @@ class TestPositiveRecursiveDiscovery:
             system_registry=permissive,
         ).refresh()
         legacy = game_repo.find_by_system("nes")[0]
+        proxy_path = Path(proxy_repo.get(legacy.id).proxy_path)
+        assert proxy_path.is_file()
         monkeypatch.setattr(
             provider, "list_entries", lambda *_args: (_ for _ in ()).throw(OSError("gone"))
         )
@@ -232,6 +235,8 @@ class TestPositiveRecursiveDiscovery:
         assert result.errors == [("nes", "gone")]
         assert game_repo.get(legacy.id).is_eligible is True
         assert game_repo.find_by_system("nes")[0].id == legacy.id
+        assert proxy_repo.get(legacy.id) is not None
+        assert proxy_path.is_file()
 
     def test_last_known_good_registry_never_suppresses_existing_row(
         self, provider, game_repo, proxy_repo, local_roms_dir, tmp_path
@@ -245,6 +250,8 @@ class TestPositiveRecursiveDiscovery:
             system_registry=permissive,
         ).refresh()
         legacy = game_repo.find_by_system("nes")[0]
+        proxy_path = Path(proxy_repo.get(legacy.id).proxy_path)
+        assert proxy_path.is_file()
         strict = EffectiveSystemRegistry.from_extensions({"nes": {".nes"}})
         lkg = EffectiveSystemRegistry(strict.systems, from_last_known_good=True)
 
@@ -255,6 +262,8 @@ class TestPositiveRecursiveDiscovery:
 
         assert game_repo.get(legacy.id).is_eligible is True
         assert game_repo.find_by_system("nes")[0].id == legacy.id
+        assert proxy_repo.get(legacy.id) is not None
+        assert proxy_path.is_file()
 
     def test_unambiguous_legacy_directory_adopts_id(
         self, provider, game_repo, proxy_repo, local_roms_dir, tmp_path
@@ -279,8 +288,8 @@ class TestPositiveRecursiveDiscovery:
             "xbox360/XBLA/Only Game/default.xex"
         )
 
-    def test_ambiguous_legacy_directory_is_not_guessed(
-        self, provider, game_repo, proxy_repo, local_roms_dir, tmp_path
+    def test_authoritative_refresh_removes_stale_legacy_container_presentation(
+        self, provider, game_repo, cache_repo, proxy_repo, local_roms_dir, tmp_path
     ):
         root = tmp_path / "roms"
         for name in ("One", "Two"):
@@ -291,16 +300,57 @@ class TestPositiveRecursiveDiscovery:
             "xbox360", "XBLA", "local", str(root),
             [GameAsset("XBLA", "xbox360/XBLA", is_primary=True)],
         )
+        legacy.last_played = datetime(2025, 2, 3, tzinfo=timezone.utc)
         game_repo.save(legacy)
+        cached_path = tmp_path / "cache" / "XBLA"
+        cached_path.mkdir(parents=True)
+        cached_content = cached_path / "legacy-cache.bin"
+        cached_content.write_bytes(b"preserved")
+        cached = CacheEntry.create(legacy.id, str(cached_path))
+        cached.status = CacheStatus.COMPLETE
+        cached.is_pinned = True
+        cached.cached_at -= timedelta(days=10)
+        cached.last_accessed -= timedelta(days=2)
+        cached.size_bytes = 1234
+        cache_repo.save(cached)
 
-        result = _make_catalog_service(
+        service = _make_catalog_service(
             provider, game_repo, proxy_repo, local_roms_dir, root
-        ).refresh()
+        )
+        stale_proxy = Path(service.ensure_proxy(legacy).proxy_path)
+        foreign_file = stale_proxy.with_name("foreign-not-romcloud.romcloud")
+        foreign_file.write_text("user-owned content", encoding="utf-8")
+        # A signed proxy may outlive its manifest row after a legacy repair or
+        # interrupted presentation transition. Its embedded game identity is
+        # still sufficient to prove ROMCloud ownership.
+        proxy_repo.delete(legacy.id)
+        assert stale_proxy.is_file()
+
+        result = service.refresh()
 
         assert result.added == 2 and result.updated == 0
-        assert game_repo.get(legacy.id).is_eligible is False
+        retained = game_repo.get(legacy.id)
+        assert retained is not None and retained.is_eligible is False
+        assert retained.id == legacy.id
+        assert retained.last_played == legacy.last_played
+        assert cache_repo.get(legacy.id) == cached
+        assert cached_content.read_bytes() == b"preserved"
+        assert not stale_proxy.exists()
+        assert foreign_file.read_text(encoding="utf-8") == "user-owned content"
         visible = game_repo.find_by_system("xbox360")
         assert len(visible) == 2 and legacy.id not in {game.id for game in visible}
+        child_records = {
+            record.game_id: Path(record.proxy_path)
+            for record in proxy_repo.list_all()
+        }
+        assert set(child_records) == {game.id for game in visible}
+        assert all(path.is_file() for path in child_records.values())
+
+        second = service.refresh()
+
+        assert second.added == 0
+        assert not stale_proxy.exists()
+        assert foreign_file.is_file()
 
 
 def _make_catalog_service(provider, game_repo, proxy_repo, local_roms_dir, source_root):

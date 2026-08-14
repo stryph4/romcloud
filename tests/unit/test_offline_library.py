@@ -628,16 +628,24 @@ def test_known_ineligible_cached_row_stays_hidden_in_cache_and_offline(
     config = _config(tmp_path)
     game, cached_file = _game_with_cache_entry(config, "Legacy Backup")
     assert cached_file.is_file()
+    restore_owned_proxies(config, game_ids={game.id})
+    proxy = Path(config.local_roms_path) / "snes" / "Legacy Backup.romcloud"
+    assert proxy.is_file()
     Container(config).game_repo.set_eligible(game.id, False)
 
     cache_report = reconcile_library_presentation(config, offline=False)
-    offline_report = reconcile_library_presentation(config, offline=True)
+    assert not proxy.exists()
+    offline_report = set_operating_mode(config, OperatingMode.OFFLINE)
+    assert not proxy.exists()
+    cache_cycle = set_operating_mode(config, OperatingMode.CACHE)
 
-    proxy = Path(config.local_roms_path) / "snes" / "Legacy Backup.romcloud"
     assert cache_report.visible == 0
     assert offline_report.visible == 0
+    assert cache_cycle.visible == 0
     assert not proxy.exists()
-    assert Container(config).cache_repo.get(game.id) is not None
+    retained_cache = Container(config).cache_repo.get(game.id)
+    assert retained_cache is not None
+    assert retained_cache.status is CacheStatus.COMPLETE
 
 
 def test_offline_exposes_directory_container_cached_game_with_no_proxy_record(

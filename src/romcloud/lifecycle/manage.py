@@ -25,6 +25,10 @@ from romcloud.integrations.batocera import (
     mount_service,
     ports_gamelist_config,
 )
+from romcloud.integrations.batocera.proxy_ownership import (
+    is_within as _is_within,
+    remove_owned_proxy_files,
+)
 from romcloud.lifecycle import install
 
 
@@ -34,32 +38,6 @@ class LifecycleReport:
     proxies_restored: int = 0
     direct_links_removed: int = 0
     library_entries_removed: int = 0
-
-
-def _is_within(path: Path, root: Path) -> bool:
-    try:
-        path.resolve().relative_to(root.resolve())
-    except (OSError, ValueError):
-        return False
-    return True
-
-
-def _proxy_payload(path: Path) -> Optional[dict]:
-    if path.is_symlink() or path.suffix.lower() != ".romcloud":
-        return None
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    if payload.get("romcloud_version") != "1":
-        return None
-    if not isinstance(payload.get("game_id"), str) or not payload["game_id"]:
-        return None
-    if not isinstance(payload.get("assets"), list):
-        return None
-    return payload
 
 
 def _manifest_records(config: AppConfig) -> list[tuple[str, Path]]:
@@ -78,36 +56,11 @@ def remove_owned_proxies(
     config: AppConfig, *, keep_game_ids: Optional[set[str]] = None
 ) -> int:
     """Remove only manifest-owned or strictly signed ROMCloud proxy files."""
-    local_root = Path(config.local_roms_path)
-    removed: set[Path] = set()
-
-    for game_id, path in _manifest_records(config):
-        if keep_game_ids is not None and game_id in keep_game_ids:
-            continue
-        payload = _proxy_payload(path)
-        if (
-            payload is not None
-            and payload["game_id"] == game_id
-            and _is_within(path, local_root)
-        ):
-            path.unlink(missing_ok=True)
-            removed.add(path)
-
-    if local_root.is_dir():
-        for path in local_root.rglob("*.romcloud"):
-            payload = _proxy_payload(path)
-            if (
-                payload is not None
-                and (
-                    keep_game_ids is None
-                    or payload["game_id"] not in keep_game_ids
-                )
-                and _is_within(path, local_root)
-            ):
-                path.unlink(missing_ok=True)
-                removed.add(path)
-
-    return len(removed)
+    return remove_owned_proxy_files(
+        Path(config.local_roms_path),
+        manifest_records=_manifest_records(config),
+        keep_game_ids=keep_game_ids,
+    )
 
 
 def restore_owned_proxies(

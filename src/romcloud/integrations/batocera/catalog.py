@@ -36,6 +36,7 @@ from romcloud.integrations.batocera.system_registry import (
     SystemLaunchSpec,
     SystemRegistryError,
 )
+from romcloud.integrations.batocera.proxy_ownership import remove_owned_proxy_files
 from romcloud.infrastructure.logging import get_logger
 from romcloud.infrastructure.repositories.game import GameRepository
 from romcloud.infrastructure.repositories.proxy import ProxyRepository
@@ -848,33 +849,45 @@ class CatalogService:
     ) -> None:
         if not known_ineligible:
             return
-        for game in self._game_repo.find_by_system(system, include_ineligible=True):
-            primary = game.primary_asset
-            if primary is not None and primary.relative_path in known_ineligible:
-                self._suppress_game(game)
+        games = [
+            game
+            for game in self._game_repo.find_by_system(
+                system, include_ineligible=True
+            )
+            if game.primary_asset is not None
+            and game.primary_asset.relative_path in known_ineligible
+        ]
+        self._suppress_games(games)
 
     def _suppress_entire_system(self, system: str) -> None:
-        for game in self._game_repo.find_by_system(system, include_ineligible=True):
-            self._suppress_game(game)
+        self._suppress_games(
+            self._game_repo.find_by_system(system, include_ineligible=True)
+        )
 
-    def _suppress_game(self, game: Game) -> None:
-        """Hide one retained row and remove only its owned presentation."""
-        record = self._proxy_repo.get(game.id)
-        if record is not None:
-            proxy_path = Path(record.proxy_path)
-            if proxy_path.exists():
-                if not self._proxy_repo.owns_path(str(proxy_path)):
-                    log.warning("Refusing to suppress unowned proxy path: %s", proxy_path)
-                    return
-                proxy_path.unlink()
+    def _suppress_games(self, games: list[Game]) -> None:
+        """Hide retained rows and remove only their owned presentation."""
+        if not games:
+            return
+        game_ids = {game.id for game in games}
+        manifest_records = [
+            (record.game_id, Path(record.proxy_path))
+            for record in self._proxy_repo.list_all()
+            if record.game_id in game_ids
+        ]
+        remove_owned_proxy_files(
+            self._local_roms_root,
+            manifest_records=manifest_records,
+            remove_game_ids=game_ids,
+        )
+        for game in games:
             self._proxy_repo.delete(game.id)
-        if game.is_eligible:
-            self._game_repo.set_eligible(game.id, False)
-            log.info(
-                "Retained but hid ineligible catalog row %r (%s)",
-                game.title,
-                game.primary_asset.relative_path if game.primary_asset else game.id,
-            )
+            if game.is_eligible:
+                self._game_repo.set_eligible(game.id, False)
+                log.info(
+                    "Retained but hid ineligible catalog row %r (%s)",
+                    game.title,
+                    game.primary_asset.relative_path if game.primary_asset else game.id,
+                )
 
     # ── proxy I/O ─────────────────────────────────────────────────────────────
 
