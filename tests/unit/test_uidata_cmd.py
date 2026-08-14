@@ -248,8 +248,11 @@ class TestLibrarySyncBridge:
         from romcloud.core.models.librarysync import LibrarySyncReport
         from romcloud.core.progress import emit_progress
 
+        calls: list[bool] = []
+
         class Service:
-            def sync(self, progress=None):
+            def sync(self, progress=None, *, full=False):
+                calls.append(full)
                 emit_progress(
                     progress,
                     "library_sync",
@@ -285,10 +288,53 @@ class TestLibrarySyncBridge:
 
         assert result.exit_code == 0
         assert "@romcloud-progress" in result.output
+        assert calls == [False]
         payload_line = next(
             line for line in reversed(result.output.splitlines()) if line.startswith("{")
         )
         assert json.loads(payload_line)["rendered"] == 1
+
+    def test_full_import_bridge_calls_existing_full_mode(self, monkeypatch):
+        import romcloud.cli.commands.uidata as uidata_module
+        from romcloud.core.models.librarysync import LibrarySyncReport
+
+        calls: list[bool] = []
+
+        class Service:
+            def sync(self, progress=None, *, full=False):
+                calls.append(full)
+                return LibrarySyncReport(
+                    direction="sync",
+                    reconciliation="full" if full else "quick",
+                )
+
+        container = type(
+            "Container",
+            (),
+            {
+                "library_sync": Service(),
+                "config": object(),
+                "game_repo": type(
+                    "Repo", (), {"list_systems": lambda self: ["ps2"]}
+                )(),
+            },
+        )()
+        monkeypatch.setattr(uidata_module, "_load_context_config", lambda ctx: None)
+        monkeypatch.setattr(uidata_module, "get_container", lambda ctx: container)
+        monkeypatch.setattr(
+            "romcloud.integrations.batocera.presentation.refresh_emulationstation",
+            lambda config, systems: None,
+        )
+
+        result = CliRunner().invoke(
+            uidata_module.uidata_group,
+            ["library-sync-full"],
+            obj={"config_path": "unused"},
+        )
+
+        assert result.exit_code == 0
+        assert calls == [True]
+        assert json.loads(result.stdout)["reconciliation"] == "full"
 
 
 class TestUpdateBridge:

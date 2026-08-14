@@ -70,7 +70,7 @@ def _drain(state: LibrarySyncScreenState, limit: int = 50) -> None:
             return
 
 
-def test_preview_is_shown_before_any_import_and_hold_is_required():
+def test_preview_is_shown_before_quick_sync_starts():
     actions = []
 
     def popen(argv, **kwargs):
@@ -86,11 +86,9 @@ def test_preview_is_shown_before_any_import_and_hold_is_required():
     assert state.preview["games_eligible"] == 18200
     assert actions == ["library-sync-preview"]
 
-    state.begin_confirm()
-    state.handle_confirm_event(InputEvent(action=Action.CONFIRM))
-    state.update_confirm(2.9)
-    assert state.step == CONFIRMING
-    assert actions == ["library-sync-preview"]
+    state.start_sync()
+    assert state.step == IMPORTING
+    assert actions == ["library-sync-preview", "library-sync"]
 
 
 def test_full_long_press_starts_import_and_reports_real_progress():
@@ -108,14 +106,14 @@ def test_full_long_press_starts_import_and_reports_real_progress():
             return _Process(PREVIEW_PAYLOAD)
         return _Process({"ok": True, "metadata_added": 2, "media_transferred": 4, "rendered": 8}, stderr=progress)
 
-    state = LibrarySyncScreenState("romcloud", popen=popen)
+    state = LibrarySyncScreenState("romcloud", sync_mode="full", popen=popen)
     state.start_preview()
     _drain(state)
     state.begin_confirm()
     state.handle_confirm_event(InputEvent(action=Action.CONFIRM))
     state.update_confirm(3.0)
     assert state.step == IMPORTING
-    assert actions == ["library-sync-preview", "library-sync"]
+    assert actions == ["library-sync-preview", "library-sync-full"]
 
     _drain(state)
     assert state.step == RESULT
@@ -140,9 +138,7 @@ def test_cancel_is_retryable_and_terminates_only_the_import_process():
     state = LibrarySyncScreenState("romcloud", popen=popen)
     state.start_preview()
     _drain(state)
-    state.begin_confirm()
-    state.handle_confirm_event(InputEvent(action=Action.CONFIRM))
-    state.update_confirm(3.0)
+    state.start_sync()
     state.cancel_import()
 
     assert state.step == RESULT
@@ -164,9 +160,7 @@ def test_failure_returns_retryable_result():
     state = LibrarySyncScreenState("romcloud", popen=lambda argv, **kwargs: next(responses))
     state.start_preview()
     _drain(state)
-    state.begin_confirm()
-    state.handle_confirm_event(InputEvent(action=Action.CONFIRM))
-    state.update_confirm(3.0)
+    state.start_sync()
     _drain(state)
 
     assert state.step == RESULT

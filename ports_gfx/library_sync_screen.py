@@ -23,6 +23,7 @@ PopenFunc = Callable[..., object]
 @dataclass
 class LibrarySyncScreenState:
     romcloud_bin: str
+    sync_mode: str = "quick"
     step: str = PREFLIGHTING
     preview: dict[str, Any] = field(default_factory=dict)
     result: dict[str, Any] = field(default_factory=dict)
@@ -44,6 +45,22 @@ class LibrarySyncScreenState:
         self.confirm = HoldToConfirmState()
         self.step = CONFIRMING
 
+    @property
+    def sync_label(self) -> str:
+        return "Full Sync" if self.sync_mode == "full" else "Quick Sync"
+
+    @property
+    def is_full(self) -> bool:
+        return self.sync_mode == "full"
+
+    def start_sync(self) -> None:
+        self.error = ""
+        self.cancelled = False
+        self.latest_progress = None
+        action = "library-sync-full" if self.is_full else "library-sync"
+        self._start_operation(action, {})
+        self.step = IMPORTING
+
     def handle_confirm_event(self, event: InputEvent) -> None:
         handle_hold_to_confirm_event(event, self.confirm)
 
@@ -54,8 +71,7 @@ class LibrarySyncScreenState:
         if self.confirm.cancelled:
             self.step = PREFLIGHT
         elif self.confirm.confirmed:
-            self._start_operation("library-sync", {})
-            self.step = IMPORTING
+            self.start_sync()
 
     def cancel_import(self) -> None:
         if self.step != IMPORTING or self._runner is None:
@@ -63,7 +79,9 @@ class LibrarySyncScreenState:
         self._runner.cancel()
         self._runner = None
         self.cancelled = True
-        self.error = "Import canceled. ROMCloud remains usable and the import is safe to retry."
+        self.error = (
+            f"{self.sync_label} canceled. ROMCloud remains usable and the sync is safe to retry."
+        )
         self.step = RESULT
 
     def cancel_pending(self) -> None:

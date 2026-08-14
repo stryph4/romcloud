@@ -360,21 +360,32 @@ def uidata_library_sync_status(ctx: click.Context) -> None:
     _run_action(ctx, build)
 
 
-@uidata_group.command("library-sync")
-@click.pass_context
-def uidata_library_sync(ctx: click.Context) -> None:
-    """Deliberately import source metadata after graphical confirmation."""
+def _run_library_sync(ctx: click.Context, *, full: bool) -> None:
     def build() -> dict:
         _load_context_config(ctx)
         container = get_container(ctx)
         progress = _progress_sink({"progress": True})
-        report = container.library_sync.sync(progress=progress)
+        report = container.library_sync.sync(progress=progress, full=full)
         from romcloud.integrations.batocera.presentation import refresh_emulationstation
 
         refresh_emulationstation(container.config, container.game_repo.list_systems())
         return report.as_dict()
 
     _run_action(ctx, build)
+
+
+@uidata_group.command("library-sync")
+@click.pass_context
+def uidata_library_sync(ctx: click.Context) -> None:
+    """Run routine presence-only Library Quick Sync for the GUI."""
+    _run_library_sync(ctx, full=False)
+
+
+@uidata_group.command("library-sync-full")
+@click.pass_context
+def uidata_library_sync_full(ctx: click.Context) -> None:
+    """Run explicit validating/repairing Library Full Sync for the GUI."""
+    _run_library_sync(ctx, full=True)
 
 
 @uidata_group.command("library-sync-preview")

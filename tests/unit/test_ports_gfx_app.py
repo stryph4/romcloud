@@ -192,9 +192,16 @@ class TestMenuItems:
         disabled = menu_categories_for_mode("smart_cache", False, False)["Library"]
         enabled = menu_categories_for_mode("smart_cache", False, True)["Library"]
 
-        assert all(item.action != "library-sync" for item in disabled)
-        assert enabled[-1].action == "library-sync"
-        assert enabled[-1].label == "Import Source Metadata"
+        assert all(
+            item.action not in ("library-sync-quick", "library-sync-full")
+            for item in disabled
+        )
+        assert [(item.label, item.action) for item in enabled[-2:]] == [
+            ("Quick Sync", "library-sync-quick"),
+            ("Full Sync", "library-sync-full"),
+        ]
+        assert "copies missing media" in enabled[-2].description.lower()
+        assert "significantly longer" in enabled[-1].description.lower()
 
     def test_metadata_import_preflight_copy_shows_cost_without_fake_estimate(self):
         screen = LibrarySyncScreenState(
@@ -219,7 +226,53 @@ class TestMenuItems:
         assert "Video references: 240" in lines
         assert "Transfer bytes: counted only as files are copied" in lines
         assert any("storage/network speed" in line for line in lines)
+        assert "Copies missing media and skips existing payloads." in lines
+        assert "Press Confirm to start Quick Sync. Back cancels." in lines
+        assert not any("hold for 3 seconds" in line for line in lines)
+
+    def test_full_metadata_sync_copy_warns_and_requires_long_press(self):
+        screen = LibrarySyncScreenState(
+            "romcloud",
+            sync_mode="full",
+            step=PREFLIGHT,
+            preview={"systems": [], "duration_note": "Storage dependent."},
+        )
+
+        lines = _library_sync_body_lines(screen)
+
+        assert "Verifies and repairs existing media payloads." in lines
+        assert "This may take significantly longer on large libraries." in lines
         assert any("hold for 3 seconds" in line for line in lines)
+
+    def test_quick_confirm_starts_without_long_press(self, monkeypatch):
+        from ports_gfx import app as app_module
+
+        screen = LibrarySyncScreenState("romcloud", step=PREFLIGHT)
+        started: list[str] = []
+        monkeypatch.setattr(screen, "start_sync", lambda: started.append("quick"))
+
+        result = app_module._handle_library_sync_event(
+            InputEvent(action=Action.CONFIRM), screen
+        )
+
+        assert result == "library_sync"
+        assert started == ["quick"]
+        assert screen.step == PREFLIGHT
+
+    def test_full_confirm_begins_existing_long_press(self):
+        from ports_gfx import app as app_module
+        from ports_gfx.library_sync_screen import CONFIRMING
+
+        screen = LibrarySyncScreenState(
+            "romcloud", sync_mode="full", step=PREFLIGHT
+        )
+
+        app_module._handle_library_sync_event(
+            InputEvent(action=Action.CONFIRM), screen
+        )
+
+        assert screen.step == CONFIRMING
+        assert screen.confirm.pressed is True
 
     def test_metadata_import_result_distinguishes_skip_hash_copy_and_bytes(self):
         screen = LibrarySyncScreenState(
@@ -238,7 +291,7 @@ class TestMenuItems:
         lines = _library_sync_body_lines(screen)
 
         assert "Media examined: 20" in lines
-        assert "Media skipped unchanged: 18" in lines
+        assert "Media skipped: 18" in lines
         assert "Full-file hashes: 3" in lines
         assert "Bytes fully hashed: 2.0 KB" in lines
         assert "Media copied: 1" in lines

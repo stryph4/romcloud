@@ -109,7 +109,8 @@ SAVESYNC_ACTION = "savesync"
 rather than dispatching to the backend — SaveSync is a first-class
 top-level menu entry, not a Settings submenu."""
 SETUP_ACTION = "setup"
-LIBRARY_SYNC_ACTION = "library-sync"
+LIBRARY_QUICK_SYNC_ACTION = "library-sync-quick"
+LIBRARY_FULL_SYNC_ACTION = "library-sync-full"
 
 MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
     "Library": (
@@ -217,7 +218,20 @@ def menu_categories_for_state(
         library.append(MenuItem("Refresh Catalog", "refresh"))
     library.append(MenuItem("Cache Status", "cache-status"))
     if library_sync_enabled and capabilities.get("library_sync", True):
-        library.append(MenuItem("Import Source Metadata", LIBRARY_SYNC_ACTION))
+        library.extend(
+            (
+                MenuItem(
+                    "Quick Sync",
+                    LIBRARY_QUICK_SYNC_ACTION,
+                    "Copies missing media and skips existing payloads.",
+                ),
+                MenuItem(
+                    "Full Sync",
+                    LIBRARY_FULL_SYNC_ACTION,
+                    "Verifies or repairs existing media and may take significantly longer.",
+                ),
+            )
+        )
     storage = MENU_CATEGORIES["Storage"]
     if not capabilities.get("remote_validation", True):
         storage = tuple(item for item in storage if item.action != SETUP_ACTION)
@@ -1015,8 +1029,19 @@ def _run(  # noqa: ANN001
                         savesync_screen = SaveSyncScreenState(romcloud_bin=romcloud_bin)
                         savesync_screen.start_loading()
                         current_screen = "savesync"
-                    elif ievent.action == Action.CONFIRM and item.action == LIBRARY_SYNC_ACTION:
-                        library_sync_screen = LibrarySyncScreenState(romcloud_bin=romcloud_bin)
+                    elif (
+                        ievent.action == Action.CONFIRM
+                        and item.action
+                        in (LIBRARY_QUICK_SYNC_ACTION, LIBRARY_FULL_SYNC_ACTION)
+                    ):
+                        library_sync_screen = LibrarySyncScreenState(
+                            romcloud_bin=romcloud_bin,
+                            sync_mode=(
+                                "full"
+                                if item.action == LIBRARY_FULL_SYNC_ACTION
+                                else "quick"
+                            ),
+                        )
                         library_sync_screen.start_preview()
                         current_screen = "library_sync"
                     elif ievent.action == Action.CONFIRM and item.action == SETUP_ACTION:
@@ -1441,11 +1466,14 @@ def _handle_savesync_event(ievent: InputEvent, savesync_screen: SaveSyncScreenSt
 def _handle_library_sync_event(
     ievent: InputEvent, screen: LibrarySyncScreenState
 ) -> str:
-    """Drive the deliberate preview -> hold -> import workflow."""
+    """Drive Quick confirm or Full hold-confirm through the shared workflow."""
     if screen.step == LIBRARY_PREFLIGHT:
         if ievent.action == Action.CONFIRM:
-            screen.begin_confirm()
-            screen.handle_confirm_event(ievent)
+            if screen.is_full:
+                screen.begin_confirm()
+                screen.handle_confirm_event(ievent)
+            else:
+                screen.start_sync()
         elif ievent.action == Action.BACK:
             return "menu"
     elif screen.step == LIBRARY_CONFIRMING:
@@ -2017,7 +2045,8 @@ def _library_sync_body_lines(screen: LibrarySyncScreenState) -> list[str]:
         preview = screen.preview
         systems = preview.get("systems", [])
         systems_text = ", ".join(str(item) for item in systems) or "none"
-        return [
+        lines = [
+            screen.sync_label,
             f"Eligible catalog games: {int(preview.get('games_eligible', 0)):,}",
             f"Systems ({len(systems)}): {systems_text}",
             (
@@ -2031,16 +2060,31 @@ def _library_sync_body_lines(screen: LibrarySyncScreenState) -> list[str]:
             str(preview.get("duration_note", "Duration depends on library size and storage speed.")),
             "",
             "Source game lists and source media will not be modified.",
-            "Press Confirm, then hold for 3 seconds to start. Back cancels.",
         ]
+        if screen.is_full:
+            lines.extend(
+                [
+                    "Verifies and repairs existing media payloads.",
+                    "This may take significantly longer on large libraries.",
+                    "Press Confirm, then hold for 3 seconds to start. Back cancels.",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "Copies missing media and skips existing payloads.",
+                    "Press Confirm to start Quick Sync. Back cancels.",
+                ]
+            )
+        return lines
     if screen.step == LIBRARY_CONFIRMING:
         return [
-            "Hold to Start Import",
+            "Hold to Start Full Sync",
             "Keep holding Confirm for 3 seconds. Release or press Back to cancel.",
         ]
     if screen.step == LIBRARY_IMPORTING:
         event = screen.latest_progress
-        lines = ["Importing source metadata and referenced media…"]
+        lines = [f"Running {screen.sync_label}…"]
         if event is not None:
             lines.append(event.message)
             if event.detail:
@@ -2054,11 +2098,11 @@ def _library_sync_body_lines(screen: LibrarySyncScreenState) -> list[str]:
                 "Press Confirm to retry the preflight, or Back to return.",
             ]
         return [
-            "Source metadata import complete.",
+            f"{screen.sync_label} complete.",
             f"Metadata added: {int(screen.result.get('metadata_added', 0)):,}",
             f"Metadata updated: {int(screen.result.get('metadata_updated', 0)):,}",
             f"Media examined: {int(screen.result.get('media_examined', 0)):,}",
-            f"Media skipped unchanged: {int(screen.result.get('media_skipped', 0)):,}",
+            f"Media skipped: {int(screen.result.get('media_skipped', 0)):,}",
             f"Full-file hashes: {int(screen.result.get('media_hashed', 0)):,}",
             f"Bytes fully hashed: {_save_size(int(screen.result.get('media_bytes_hashed', 0)))}",
             f"Media copied: {int(screen.result.get('media_transferred', 0)):,}",
@@ -2078,7 +2122,9 @@ def _render_library_sync(  # noqa: ANN001
     activity: ActivityLog,
 ) -> None:
     screen_surface.fill(_BG_COLOR)
-    title = fonts["title"].render("Import Source Metadata", True, _FG_COLOR)
+    title = fonts["title"].render(
+        f"Library {state.sync_label}", True, _FG_COLOR
+    )
     screen_surface.blit(title, (layout.header_rect.x, layout.header_rect.y))
 
     y = layout.navigation_rect.y
@@ -2376,7 +2422,7 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
             lines.append("Direct: the source must remain reachable while playing.")
         if wizard.library_sync_enabled:
             lines.append(
-                "Optional metadata was not imported. Use Library > Import Source Metadata when ready."
+                "Optional metadata was not synchronized. Use Library > Quick Sync when ready."
             )
         return lines
     return context
