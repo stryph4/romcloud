@@ -12,6 +12,10 @@ from pathlib import Path
 import pytest
 
 from romcloud.integrations.batocera import es_config
+from romcloud.integrations.batocera.system_registry import (
+    EffectiveSystemRegistry,
+    SystemLaunchSpec,
+)
 
 _WRAPPER = Path("/userdata/system/romcloud/bin/romcloud-run")
 
@@ -70,6 +74,29 @@ class TestInstall:
                 wrapper_path=_WRAPPER,
             )
         assert not override_path.exists()
+
+    def test_effective_registry_can_install_user_added_system(
+        self, tmp_path, override_path
+    ):
+        registry = EffectiveSystemRegistry(
+            {
+                "custom": SystemLaunchSpec(
+                    "custom", frozenset({".foo"}),
+                    "custom-launch -system %SYSTEM% -rom %ROM%",
+                )
+            }
+        )
+
+        result = es_config.install(
+            ["custom"],
+            stock_path=tmp_path / "missing-stock.cfg",
+            override_path=override_path,
+            wrapper_path=_WRAPPER,
+            system_registry=registry,
+        )
+
+        assert result.included_systems == ["custom"]
+        assert ".foo .romcloud" in override_path.read_text()
 
 
 class TestIdempotency:

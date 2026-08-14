@@ -33,6 +33,7 @@ import pytest
 from romcloud.core.models.game import Game, GameAsset
 from romcloud.core.models.proxy import ProxyRecord
 from romcloud.integrations.batocera.catalog import CatalogService
+from tests.system_registry_fixture import TEST_SYSTEM_REGISTRY
 
 
 CUE_TEXT = 'FILE "Game (Track 1).bin" BINARY\nFILE "Game (Track 2).bin" BINARY\n'
@@ -106,6 +107,7 @@ class TestLegacySingleAssetCacheBecomesIncompleteAfterRefresh:
             proxy_repo=proxy_repo,
             local_roms_root=str(local_roms_dir),
             source_root=str(root),
+            system_registry=TEST_SYSTEM_REGISTRY,
         )
         result = catalog_svc.refresh()
         assert result.errors == []
@@ -306,6 +308,7 @@ class TestStaleIndependentTrackDoesNotInterfere:
             proxy_repo=proxy_repo,
             local_roms_root=str(local_roms_dir),
             source_root=str(root),
+            system_registry=TEST_SYSTEM_REGISTRY,
         )
         result = catalog_svc.refresh()
 
@@ -352,6 +355,7 @@ class TestStaleIndependentTrackDoesNotInterfere:
             proxy_repo=proxy_repo,
             local_roms_root=str(local_roms_dir),
             source_root=str(root),
+            system_registry=TEST_SYSTEM_REGISTRY,
         )
         catalog_svc.refresh()
 

@@ -16,17 +16,26 @@ import posixpath
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Optional
+from typing import Callable, Optional
 from xml.etree import ElementTree as ET
 
 from romcloud.core.cue_parser import resolve_cue_dependencies
 from romcloud.core.capabilities import Capability, CapabilityPolicy
-from romcloud.core.exceptions import GameNotFoundError, ProxyError, ProxyNotOwnedError
+from romcloud.core.exceptions import (
+    GameNotFoundError,
+    ProviderError,
+    ProxyError,
+    ProxyNotOwnedError,
+)
 from romcloud.core.models.game import Game, GameAsset, derive_title
 from romcloud.core.models.proxy import ProxyRecord
 from romcloud.core.progress import ProgressSink, emit_progress
 from romcloud.core.storage import RemoteEntry, StorageProvider
-from romcloud.integrations.batocera.systems import BATOCERA_SYSTEMS
+from romcloud.integrations.batocera.system_registry import (
+    EffectiveSystemRegistry,
+    SystemLaunchSpec,
+    SystemRegistryError,
+)
 from romcloud.infrastructure.logging import get_logger
 from romcloud.infrastructure.repositories.game import GameRepository
 from romcloud.infrastructure.repositories.proxy import ProxyRepository
@@ -80,7 +89,8 @@ class CatalogService:
         proxy_repo: ProxyRepository,
         local_roms_root: str,
         source_root: str,
-        known_systems: Optional[frozenset[str]] = None,
+        system_registry: Optional[EffectiveSystemRegistry] = None,
+        registry_loader: Optional[Callable[[], EffectiveSystemRegistry]] = None,
         write_proxies: bool = True,
         capability_policy: Optional[CapabilityPolicy] = None,
     ) -> None:
@@ -89,7 +99,8 @@ class CatalogService:
         self._proxy_repo = proxy_repo
         self._local_roms_root = Path(local_roms_root)
         self._source_root = source_root
-        self._known_systems = known_systems or BATOCERA_SYSTEMS
+        self._system_registry = system_registry
+        self._registry_loader = registry_loader
         self._write_proxies_enabled = write_proxies
         self._capabilities = capability_policy or CapabilityPolicy("smart_cache")
 
@@ -120,6 +131,15 @@ class CatalogService:
         )
 
         try:
+            registry = (
+                self._registry_loader()
+                if self._registry_loader is not None
+                else self._system_registry
+            )
+            if registry is None:
+                raise SystemRegistryError(
+                    "No Batocera launch registry was configured; discovery was skipped"
+                )
             remote_systems = self._provider.list_systems(self._source_root)
         except Exception as exc:  # noqa: BLE001
             errors.append(("(root)", str(exc)))
@@ -136,10 +156,23 @@ class CatalogService:
             )
             return CatalogRefreshResult(added, skipped, removed, errors, warnings=warnings, updated=updated)
 
-        matched = [s for s in remote_systems if s in self._known_systems]
-        unmatched = [s for s in remote_systems if s not in self._known_systems]
+        matched = [s for s in remote_systems if s in registry.names]
+        unmatched = [s for s in remote_systems if s not in registry.names]
         if unmatched:
-            log.debug("Ignoring unrecognised system folders: %s", unmatched)
+            log.debug("Ignoring systems absent from effective Batocera config: %s", unmatched)
+            # A complete live registry positively proves that retained rows
+            # for these present source systems are no longer launchable. An
+            # LKG registry is intentionally non-authoritative for removals.
+            if not registry.from_last_known_good:
+                for system in unmatched:
+                    try:
+                        self._suppress_entire_system(system)
+                    except Exception as exc:  # noqa: BLE001
+                        log.exception(
+                            "Could not suppress catalog rows for removed system %r",
+                            system,
+                        )
+                        errors.append((system, str(exc)))
 
         system_total = len(matched)
         for system in matched:
@@ -174,15 +207,17 @@ class CatalogService:
                 metadata={"system": system},
             )
             try:
-                entries = self._provider.list_entries(self._source_root, system)
-                metadata_paths = self._source_metadata_entries(system)
-                entries = [
-                    entry
-                    for entry in entries
-                    if entry.relative_path not in metadata_paths
-                ]
+                spec = registry.get(system)
+                if spec is None:  # guarded by `matched`; keeps narrowing explicit
+                    continue
+                entries, known_ineligible, ordinary_directories = (
+                    self._discover_entries(system, spec)
+                )
                 games, consumed_paths, group_warnings = self._group_entries(system, entries)
                 warnings.extend(group_warnings)
+                legacy_matches = self._legacy_container_matches(
+                    system, games, ordinary_directories
+                )
 
                 game_total = len(games)
                 emit_progress(
@@ -218,12 +253,17 @@ class CatalogService:
                         primary.relative_path,
                     )
                     if existing is None:
-                        existing = self._find_legacy_container_game(game)
+                        existing = legacy_matches.get(primary.relative_path)
                     if existing is not None:
-                        if _asset_paths_differ(existing.assets, game.assets):
+                        changed = (
+                            _asset_paths_differ(existing.assets, game.assets)
+                            or not existing.is_eligible
+                        )
+                        if changed:
                             game.id = existing.id
                             game.added_at = existing.added_at
                             game.last_played = existing.last_played
+                            game.is_eligible = True
                             self._game_repo.save(game)
                             self._rewrite_owned_proxy(game)
                             updated += 1
@@ -245,6 +285,12 @@ class CatalogService:
                     self._emit_system_progress(
                         progress, system, game_index, game_total, progress_interval
                     )
+
+                # Only paths positively observed and rejected during this
+                # complete system traversal are suppressed. Missing source
+                # paths and failed scans retain their previous exposure.
+                if not registry.from_last_known_good:
+                    self._suppress_ineligible_paths(system, known_ineligible)
 
                 # Empty systems and all-skipped systems still need an explicit
                 # terminal state; percentages are only based on the known
@@ -286,7 +332,7 @@ class CatalogService:
                 metadata={"succeeded": completed_systems, "failed": failed_systems},
             )
 
-        final_status = "error" if failed_systems else "success"
+        final_status = "error" if errors else "success"
         summary = f"Catalog refresh complete: {completed_systems} succeeded"
         if failed_systems:
             summary += f", {failed_systems} failed"
@@ -481,123 +527,113 @@ class CatalogService:
                 excluded.add(PurePosixPath(system, parts[0]).as_posix())
         return excluded
 
+    def _discover_entries(
+        self, system: str, spec: SystemLaunchSpec
+    ) -> tuple[list[RemoteEntry], set[str], set[str]]:
+        """Recursively find only entries Batocera can launch for *system*."""
+        candidates: list[RemoteEntry] = []
+        known_ineligible: set[str] = set()
+        ordinary_directories: set[str] = set()
+        excluded = self._source_metadata_entries(system)
+        pending = [system]
+        visited: set[str] = set()
+
+        while pending:
+            relative_dir = pending.pop()
+            if relative_dir in visited:
+                raise ProviderError(
+                    f"Provider returned a recursive directory cycle at {relative_dir!r}"
+                )
+            visited.add(relative_dir)
+            for raw_entry in self._provider.list_entries(
+                self._source_root, relative_dir
+            ):
+                entry = self._validated_entry(system, relative_dir, raw_entry)
+                path = entry.relative_path
+                if any(path == root or path.startswith(root + "/") for root in excluded):
+                    known_ineligible.add(path)
+                    continue
+                if entry.is_symlink:
+                    known_ineligible.add(path)
+                    log.warning("Ignoring symlink during source discovery: %s", path)
+                    continue
+                if spec.accepts(entry.name):
+                    candidates.append(entry)
+                    continue
+                known_ineligible.add(path)
+                if entry.is_directory:
+                    ordinary_directories.add(path)
+                    pending.append(path)
+
+        candidates.sort(key=lambda entry: entry.relative_path.casefold())
+        return candidates, known_ineligible, ordinary_directories
+
+    @staticmethod
+    def _validated_entry(
+        system: str, parent: str, entry: RemoteEntry
+    ) -> RemoteEntry:
+        """Reject malformed provider paths before they enter catalog identity."""
+        if (
+            not entry.name
+            or entry.name in (".", "..")
+            or "/" in entry.name
+            or "\\" in entry.name
+        ):
+            raise ProviderError(f"Provider returned unsafe entry name: {entry.name!r}")
+        normalized_parent = PurePosixPath(parent.replace("\\", "/")).as_posix()
+        normalized_path = PurePosixPath(
+            entry.relative_path.replace("\\", "/")
+        ).as_posix()
+        expected = PurePosixPath(normalized_parent, entry.name).as_posix()
+        parts = PurePosixPath(normalized_path).parts
+        if (
+            normalized_path != expected
+            or not parts
+            or parts[0] != system
+            or any(part in ("", ".", "..") for part in parts)
+        ):
+            raise ProviderError(
+                "Provider entry escapes or disagrees with source directory: "
+                f"{entry.relative_path!r}"
+            )
+        return RemoteEntry(
+            name=entry.name,
+            relative_path=normalized_path,
+            is_directory=entry.is_directory,
+            size_bytes=entry.size_bytes,
+            is_symlink=entry.is_symlink,
+        )
+
     def _group_entries(
         self, system: str, entries: list[RemoteEntry]
     ) -> tuple[list[Game], set[str], list[str]]:
-        """Convert raw directory entries into logical Game objects.
-
-        Returns ``(games, consumed_paths, warnings)``:
-
-        - ``consumed_paths`` — asset ``relative_path`` values that are now
-          required companions of a cue-based game (or a directory now
-          represented by cue-based game(s) instead of one opaque blob).
-          These must never become independent games, and any *existing*
-          catalog entry at one of these exact paths is stale (see
-          ``_prune_stale_entries``). Matching is always by full relative
-          path, never by bare filename — two cue sets may legally share a
-          companion filename in different directories without colliding.
-        - ``warnings`` — human-readable, non-fatal issues (malformed cue
-          lines, rejected path-traversal references, missing referenced
-          assets) surfaced for visibility without aborting the scan.
-        """
+        """Convert already-eligible recursive candidates into logical games."""
         games: list[Game] = []
         consumed_paths: set[str] = set()
         warnings: list[str] = []
-        handled_root_cue_names: set[str] = set()
-        superseded_dirs: set[str] = set()
-        nested_entries: dict[str, list[RemoteEntry]] = {}
+        handled_cues: set[str] = set()
 
-        # Pass 1: top-level .cue files are their own logical game.
         for entry in entries:
-            if entry.is_directory or entry.name.startswith("."):
+            if entry.is_directory or Path(entry.name).suffix.lower() != _CUE_EXTENSION:
                 continue
-            if Path(entry.name).suffix.lower() != _CUE_EXTENSION:
-                continue
-
             game, cue_warnings = self._build_cue_game(system, entry.relative_path)
             warnings.extend(cue_warnings)
             if game is None:
-                continue  # unreadable cue — falls through to plain file cataloguing below
-
+                continue
             games.append(game)
-            handled_root_cue_names.add(entry.name)
-            for asset in game.assets:
-                if not asset.is_primary:
-                    consumed_paths.add(asset.relative_path)
+            handled_cues.add(entry.relative_path)
+            consumed_paths.update(
+                asset.relative_path for asset in game.assets if not asset.is_primary
+            )
 
-        # Pass 2: directories containing their own .cue(s) — the "directory
-        # isolation" case (e.g. psx/Game A/Game A.cue). Each nested .cue
-        # becomes its own logical game instead of the whole directory being
-        # one opaque blob (which would cache/launch the directory itself,
-        # not the .cue Batocera actually needs).
         for entry in entries:
-            if not entry.is_directory or entry.name.startswith("."):
+            if entry.relative_path in handled_cues or entry.relative_path in consumed_paths:
                 continue
-            try:
-                nested = self._provider.list_entries(
-                    self._source_root, f"{system}/{entry.name}"
-                )
-            except Exception:  # noqa: BLE001 — fall back to opaque directory game
-                nested = []
-            nested_entries[entry.relative_path] = nested
-
-            nested_cue_entries = [
-                n for n in nested
-                if not n.is_directory and Path(n.name).suffix.lower() == _CUE_EXTENSION
-            ]
-            if not nested_cue_entries:
-                continue
-
-            produced: list[Game] = []
-            for cue_entry in nested_cue_entries:
-                game, cue_warnings = self._build_cue_game(system, cue_entry.relative_path)
-                warnings.extend(cue_warnings)
-                if game is not None:
-                    produced.append(game)
-
-            if not produced:
-                continue  # every nested cue was unreadable — keep old opaque behaviour
-
-            games.extend(produced)
-            superseded_dirs.add(entry.relative_path)
-            for game in produced:
-                for asset in game.assets:
-                    if not asset.is_primary:
-                        consumed_paths.add(asset.relative_path)
-
-        # Pass 3: everything else — unrelated standalone files/directories
-        # keep the pre-existing discovery behaviour untouched.
-        for entry in entries:
-            if entry.name.startswith("."):
-                continue
-            if entry.name.endswith(".romcloud"):
-                continue  # never re-catalog existing proxies
-
-            if entry.is_directory:
-                if entry.relative_path in superseded_dirs:
-                    continue
-                nested = nested_entries.get(entry.relative_path, [])
-                nested_files = [
-                    item for item in nested
-                    if not item.is_directory and not item.name.endswith(".romcloud")
-                ]
-                sole_file_matches_container = (
-                    len(nested) == 1
-                    and len(nested_files) == 1
-                    and Path(nested_files[0].name).stem.casefold() == entry.name.casefold()
-                )
-                if sole_file_matches_container:
-                    games.append(self._make_file_game(system, nested_files[0]))
-                else:
-                    games.append(self._make_directory_game(system, entry))
-            else:
-                if entry.name in handled_root_cue_names:
-                    continue
-                if entry.relative_path in consumed_paths:
-                    continue
-                games.append(self._make_file_game(system, entry))
-
-        consumed_paths |= superseded_dirs
+            games.append(
+                self._make_directory_game(system, entry)
+                if entry.is_directory
+                else self._make_file_game(system, entry)
+            )
         return games, consumed_paths, warnings
 
     def _build_cue_game(
@@ -751,7 +787,7 @@ class CatalogService:
         )
 
     def _make_directory_game(self, system: str, entry: RemoteEntry) -> Game:
-        title = entry.name  # directory name is the title (e.g. BCES00000)
+        title = derive_title(entry.name)
         asset = GameAsset(
             filename=entry.name,
             relative_path=entry.relative_path,
@@ -766,25 +802,79 @@ class CatalogService:
             assets=[asset],
         )
 
-    def _find_legacy_container_game(self, game: Game) -> Optional[Game]:
-        """Find the exact directory game superseded by a sole nested file."""
-        primary = game.primary_asset
-        if primary is None:
-            return None
-        parent = Path(primary.relative_path).parent
-        if str(parent) in ("", ".", game.system):
-            return None
-        existing = self._game_repo.find_by_source_path(
-            game.source_provider,
-            game.source_root,
-            str(parent),
-        )
-        if existing is None or existing.system != game.system or len(existing.assets) != 1:
-            return None
-        old_primary = existing.primary_asset
-        if old_primary is None or old_primary.relative_path != str(parent):
-            return None
-        return existing
+    def _legacy_container_matches(
+        self,
+        system: str,
+        games: list[Game],
+        ordinary_directories: set[str],
+    ) -> dict[str, Game]:
+        """Map one nested launchable to an old opaque-directory identity.
+
+        A legacy directory is adopted only when it contains exactly one
+        discovered game. Multiple descendants leave the old row retained but
+        ineligible; none is allowed to guess which cache/pin/history owns it.
+        """
+        primaries = {
+            game.primary_asset.relative_path: game
+            for game in games
+            if game.primary_asset is not None
+        }
+        legacy_dirs: dict[str, Game] = {}
+        for existing in self._game_repo.find_by_system(
+            system, include_ineligible=True
+        ):
+            primary = existing.primary_asset
+            if (
+                primary is not None
+                and len(existing.assets) == 1
+                and primary.relative_path in ordinary_directories
+            ):
+                legacy_dirs[primary.relative_path] = existing
+
+        matches: dict[str, Game] = {}
+        for directory, existing in sorted(
+            legacy_dirs.items(), key=lambda item: len(PurePosixPath(item[0]).parts),
+            reverse=True,
+        ):
+            descendants = [
+                path for path in primaries if path.startswith(directory.rstrip("/") + "/")
+            ]
+            if len(descendants) == 1 and descendants[0] not in matches:
+                matches[descendants[0]] = existing
+        return matches
+
+    def _suppress_ineligible_paths(
+        self, system: str, known_ineligible: set[str]
+    ) -> None:
+        if not known_ineligible:
+            return
+        for game in self._game_repo.find_by_system(system, include_ineligible=True):
+            primary = game.primary_asset
+            if primary is not None and primary.relative_path in known_ineligible:
+                self._suppress_game(game)
+
+    def _suppress_entire_system(self, system: str) -> None:
+        for game in self._game_repo.find_by_system(system, include_ineligible=True):
+            self._suppress_game(game)
+
+    def _suppress_game(self, game: Game) -> None:
+        """Hide one retained row and remove only its owned presentation."""
+        record = self._proxy_repo.get(game.id)
+        if record is not None:
+            proxy_path = Path(record.proxy_path)
+            if proxy_path.exists():
+                if not self._proxy_repo.owns_path(str(proxy_path)):
+                    log.warning("Refusing to suppress unowned proxy path: %s", proxy_path)
+                    return
+                proxy_path.unlink()
+            self._proxy_repo.delete(game.id)
+        if game.is_eligible:
+            self._game_repo.set_eligible(game.id, False)
+            log.info(
+                "Retained but hid ineligible catalog row %r (%s)",
+                game.title,
+                game.primary_asset.relative_path if game.primary_asset else game.id,
+            )
 
     # ── proxy I/O ─────────────────────────────────────────────────────────────
 

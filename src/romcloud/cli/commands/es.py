@@ -11,6 +11,7 @@ import click
 
 from romcloud.cli.context import get_container
 from romcloud.integrations.batocera import es_config
+from romcloud.integrations.batocera.system_registry import SystemRegistryError
 
 
 @click.group("es")
@@ -26,8 +27,10 @@ def es_install_cmd(ctx: click.Context) -> None:
     managed = container.game_repo.list_systems()
 
     try:
-        result = es_config.install(managed)
-    except es_config.ESConfigError as exc:
+        result = es_config.install(
+            managed, system_registry=container.system_registry
+        )
+    except (es_config.ESConfigError, SystemRegistryError) as exc:
         click.echo(f"error: {exc}", err=True)
         ctx.exit(1)
         return
@@ -43,8 +46,10 @@ def es_refresh_cmd(ctx: click.Context) -> None:
     managed = container.game_repo.list_systems()
 
     try:
-        result = es_config.refresh(managed)
-    except es_config.ESConfigError as exc:
+        result = es_config.refresh(
+            managed, system_registry=container.system_registry
+        )
+    except (es_config.ESConfigError, SystemRegistryError) as exc:
         click.echo(f"error: {exc}", err=True)
         ctx.exit(1)
         return
@@ -59,7 +64,12 @@ def es_status_cmd(ctx: click.Context) -> None:
     container = get_container(ctx)
     managed = container.game_repo.list_systems()
 
-    st = es_config.status(managed)
+    try:
+        st = es_config.status(managed, system_registry=container.system_registry)
+    except SystemRegistryError as exc:
+        click.echo(f"error: {exc}", err=True)
+        ctx.exit(1)
+        return
 
     click.echo("\nROMCloud EmulationStation integration")
     click.echo("─" * 50)

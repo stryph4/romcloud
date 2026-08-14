@@ -55,6 +55,13 @@ class Game:
     assets: list[GameAsset]
     added_at: datetime
     last_played: Optional[datetime] = None
+    is_eligible: bool = True
+    """Whether this retained catalog row may be exposed to users.
+
+    Rows positively rejected by the current Batocera launch registry remain
+    persisted (including their stable id/cache history) but are hidden until
+    that same primary path becomes launchable again.
+    """
 
     # ── factory ───────────────────────────────────────────────────────────────
 

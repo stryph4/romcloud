@@ -21,6 +21,7 @@ from romcloud.infrastructure.repositories.cache import CacheRepository
 from romcloud.infrastructure.repositories.proxy import ProxyRepository
 from romcloud.infrastructure.providers.local import LocalFilesystemProvider
 from romcloud.integrations.batocera.catalog import CatalogService
+from tests.system_registry_fixture import TEST_SYSTEM_REGISTRY
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -41,6 +42,7 @@ def _make_catalog(
         proxy_repo=ProxyRepository(db),
         local_roms_root=str(local_roms),
         source_root=str(source_root),
+        system_registry=TEST_SYSTEM_REGISTRY,
     )
 
 

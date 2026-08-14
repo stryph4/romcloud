@@ -9,7 +9,12 @@ from __future__ import annotations
 
 from romcloud.integrations.batocera.es_systems import (
     generate_override,
+    generate_override_from_registry,
     parse_override_systems,
+)
+from romcloud.integrations.batocera.system_registry import (
+    EffectiveSystemRegistry,
+    SystemLaunchSpec,
 )
 
 _WRAPPER = "/userdata/system/romcloud/bin/romcloud-run"
@@ -99,6 +104,22 @@ class TestExtensionPreservation:
             line for line in result.xml.splitlines() if "<extension>" in line
         ][0]
         assert extension_line.lower().count(".romcloud") == 1
+
+    def test_effective_registry_supports_user_systems_and_overrides(self):
+        registry = EffectiveSystemRegistry(
+            {
+                "custom": SystemLaunchSpec(
+                    "custom", frozenset({".foo", ".bar"}),
+                    "custom-launch --system %SYSTEM% --rom %ROM%",
+                )
+            }
+        )
+
+        result = generate_override_from_registry(registry, ["custom"], _WRAPPER)
+
+        assert result.included_systems == ["custom"]
+        assert ".bar .foo .romcloud" in result.xml
+        assert f"{_WRAPPER} --system %SYSTEM% --rom %ROM%" in result.xml
 
 
 class TestCommandArgvPreservation:

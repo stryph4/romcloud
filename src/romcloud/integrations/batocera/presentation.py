@@ -30,6 +30,13 @@ def refresh_emulationstation(
         return None
     # install() and refresh() are intentionally identical; the former keeps
     # this shared path compatible with setup's first-write integration seam.
+    if hasattr(config, "data_path"):
+        from romcloud.bootstrap.container import Container
+
+        return es_config.install(
+            managed_systems, system_registry=Container(config).system_registry
+        )
+    # Lightweight adapter/test configurations predate registry injection.
     return es_config.install(managed_systems)
 
 

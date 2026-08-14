@@ -153,6 +153,23 @@ class TransferService:
             total += _existing_size(staged) or 0
         return total
 
+    def estimate_size(self, game: Game) -> int:
+        """Return the best available source-size estimate for *game*.
+
+        Directory packages deliberately have no catalog-time size: recursively
+        sizing every candidate would duplicate the discovery walk.  Resolve
+        those unknowns only when the user actually requests a transfer, where
+        the value is needed for quota enforcement.
+        """
+        total = 0
+        for asset in game.assets:
+            if asset.size_bytes is not None:
+                total += asset.size_bytes
+                continue
+            source = str(Path(self._asset_source_root(game)) / asset.relative_path)
+            total += self._provider.get_size(source) or 0
+        return total
+
     def discard_staging(self, game: Game) -> None:
         """Remove any staged (partial) data for *game* (e.g. after a failed cancel)."""
         for asset in game.assets:

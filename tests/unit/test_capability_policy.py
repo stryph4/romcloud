@@ -20,6 +20,7 @@ from romcloud.infrastructure.config import (
 )
 from romcloud.infrastructure.library_view import write_offline_library_state
 from romcloud.integrations.batocera.catalog import CatalogService
+from tests.system_registry_fixture import TEST_SYSTEM_REGISTRY
 from romcloud.services.cache import CacheService
 from romcloud.services.saves import SaveSyncService
 
@@ -82,6 +83,7 @@ def test_catalog_guard_runs_before_provider_access(
         proxy_repo=proxy_repo,
         local_roms_root=str(local_roms_dir),
         source_root=str(rom_root),
+        system_registry=TEST_SYSTEM_REGISTRY,
         capability_policy=offline_policy,
     )
 

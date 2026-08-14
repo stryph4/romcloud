@@ -29,6 +29,7 @@ from romcloud.infrastructure.providers.local import LocalFilesystemProvider
 from romcloud.services.transfer import TransferService
 from romcloud.services.cache import CacheService
 from romcloud.integrations.batocera.catalog import CatalogService
+from tests.system_registry_fixture import TEST_SYSTEM_REGISTRY
 
 
 def test_local_vertical_slice(tmp_path: Path) -> None:
@@ -88,6 +89,7 @@ def test_local_vertical_slice(tmp_path: Path) -> None:
         proxy_repo=proxy_repo,
         local_roms_root=str(local_roms),
         source_root=str(source_root),
+        system_registry=TEST_SYSTEM_REGISTRY,
     )
 
     # ── Step 1: refresh catalog ───────────────────────────────────────────────
@@ -184,7 +186,7 @@ def test_directory_game_vertical_slice(tmp_path: Path) -> None:
     """Verify that directory-based games (e.g. PS3) are handled correctly."""
 
     source_root = tmp_path / "source_roms"
-    game_dir = source_root / "ps3" / "BCES00000"
+    game_dir = source_root / "ps3" / "BCES00000.ps3"
     game_dir.mkdir(parents=True)
     (game_dir / "EBOOT.BIN").write_bytes(b"eboot_data" * 30)
     (game_dir / "data" / "archive.pkg").parent.mkdir()
@@ -219,6 +221,7 @@ def test_directory_game_vertical_slice(tmp_path: Path) -> None:
         proxy_repo=proxy_repo,
         local_roms_root=str(local_roms),
         source_root=str(source_root),
+        system_registry=TEST_SYSTEM_REGISTRY,
     )
 
     result = catalog_svc.refresh()
@@ -270,6 +273,7 @@ def test_cue_bin_game(tmp_path: Path) -> None:
         proxy_repo=proxy_repo,
         local_roms_root=str(local_roms),
         source_root=str(source_root),
+        system_registry=TEST_SYSTEM_REGISTRY,
     )
 
     result = catalog_svc.refresh()
@@ -328,6 +332,7 @@ def test_cue_bin_end_to_end_cache_and_launch(tmp_path: Path) -> None:
         proxy_repo=proxy_repo,
         local_roms_root=str(local_roms),
         source_root=str(source_root),
+        system_registry=TEST_SYSTEM_REGISTRY,
     )
 
     result = catalog_svc.refresh()
@@ -417,6 +422,7 @@ def test_cue_bin_directory_scoped_layout_end_to_end(tmp_path: Path) -> None:
         proxy_repo=proxy_repo,
         local_roms_root=str(local_roms),
         source_root=str(source_root),
+        system_registry=TEST_SYSTEM_REGISTRY,
     )
 
     result = catalog_svc.refresh()
@@ -469,6 +475,7 @@ def test_cue_bin_full_cache_hit_bypasses_transfer(tmp_path: Path) -> None:
         proxy_repo=proxy_repo,
         local_roms_root=str(local_roms),
         source_root=str(source_root),
+        system_registry=TEST_SYSTEM_REGISTRY,
     )
     catalog_svc.refresh()
     game = game_repo.find_by_system("psx")[0]

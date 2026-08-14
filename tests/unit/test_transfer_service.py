@@ -50,6 +50,25 @@ def dir_game(tmp_path) -> tuple[Game, Path]:
 
 
 class TestTransferService:
+    def test_estimates_unknown_directory_size_only_when_requested(
+        self, dir_game, cache_dir
+    ):
+        from romcloud.infrastructure.providers.local import LocalFilesystemProvider
+
+        game, _ = dir_game
+        original = game.assets[0]
+        game.assets[0] = GameAsset(
+            filename=original.filename,
+            relative_path=original.relative_path,
+            size_bytes=None,
+            is_primary=original.is_primary,
+        )
+        svc = TransferService(
+            provider=LocalFilesystemProvider(), cache_root=str(cache_dir)
+        )
+
+        assert svc.estimate_size(game) == len(b"eboot" * 50) + len(b"data" * 200)
+
     def test_transfers_single_file(self, simple_game, cache_dir):
         game, source_root = simple_game
         svc = TransferService(provider=__import__(

@@ -8,6 +8,7 @@ import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Callable, Optional
 
 from romcloud.core.exceptions import (
@@ -84,11 +85,27 @@ class LocalFilesystemProvider(StorageProvider):
         return sorted(
             entry.name
             for entry in root.iterdir()
-            if entry.is_dir() and not entry.name.startswith(".")
+            if entry.is_dir()
+            and not entry.is_symlink()
+            and not entry.name.startswith(".")
         )
 
     def list_entries(self, rom_root: str, system: str) -> list[RemoteEntry]:
-        system_path = Path(rom_root) / system
+        root = Path(rom_root).resolve()
+        relative = PurePosixPath(str(system).replace("\\", "/"))
+        if (
+            relative.is_absolute()
+            or not relative.parts
+            or any(part in ("", ".", "..") for part in relative.parts)
+        ):
+            raise ProviderError(f"Unsafe relative source directory: {system!r}")
+        system_path = root.joinpath(*relative.parts)
+        try:
+            system_path.resolve().relative_to(root)
+        except (OSError, ValueError) as exc:
+            raise ProviderError(
+                f"Source directory escapes ROM root: {system!r}"
+            ) from exc
         if not system_path.is_dir():
             raise ProviderError(f"System path not found: {system_path}")
 
@@ -96,12 +113,22 @@ class LocalFilesystemProvider(StorageProvider):
         for entry in sorted(system_path.iterdir(), key=lambda item: item.name.lower()):
             if entry.name.startswith("."):
                 continue
+            is_symlink = entry.is_symlink()
+            is_directory = entry.is_dir()
             entries.append(
                 RemoteEntry(
                     name=entry.name,
-                    relative_path=str(Path(system) / entry.name),
-                    is_directory=entry.is_dir(),
-                    size_bytes=_entry_size(entry),
+                    relative_path=PurePosixPath(relative, entry.name).as_posix(),
+                    is_directory=is_directory,
+                    # Recursive directory sizing during discovery is O(tree)
+                    # work duplicated by the traversal itself. Package sizes
+                    # remain unknown until transfer/accounting needs them.
+                    size_bytes=(
+                        None
+                        if is_symlink or is_directory
+                        else _entry_size(entry)
+                    ),
+                    is_symlink=is_symlink,
                 )
             )
         return entries

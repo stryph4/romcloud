@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import pytest
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -13,10 +14,30 @@ from romcloud.infrastructure.repositories.proxy import ProxyRepository
 from romcloud.core.models.cache import CachePolicy
 from romcloud.infrastructure.providers.local import LocalFilesystemProvider
 from romcloud.integrations.batocera.catalog import CatalogService
+from tests.system_registry_fixture import TEST_SYSTEM_REGISTRY
 
 if TYPE_CHECKING:
     from romcloud.services.cache import CacheService
     from romcloud.services.transfer import TransferService
+
+
+@pytest.fixture(autouse=True)
+def _explicit_test_system_registry(monkeypatch):
+    """Container-backed tests run off-device with an explicit ES registry."""
+    module = sys.modules.get("romcloud.bootstrap.container")
+    if module is None:
+        # Avoid importing POSIX-only lifecycle dependencies for focused tests
+        # that do not use the application container.
+        yield
+        return
+    Container = module.Container
+
+    monkeypatch.setattr(
+        Container,
+        "system_registry",
+        property(lambda _self: TEST_SYSTEM_REGISTRY),
+    )
+    yield
 
 
 @pytest.fixture
@@ -130,4 +151,5 @@ def catalog_service(
         proxy_repo=proxy_repo,
         local_roms_root=str(local_roms_dir),
         source_root=str(rom_root),
+        system_registry=TEST_SYSTEM_REGISTRY,
     )

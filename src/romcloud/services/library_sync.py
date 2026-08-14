@@ -697,6 +697,11 @@ class LibrarySyncService:
             record = dataset["records"].get(library_id)
             if record is not None:
                 by_system.setdefault(game.system, []).append((game, library_id, record))
+        # Retained ineligible rows are intentionally absent above, but their
+        # previously rendered ROMCloud-owned gamelist entries still need a
+        # reconciliation pass so they cannot linger in Library presentation.
+        for system in self._games.list_systems(include_ineligible=True):
+            by_system.setdefault(system, [])
         total = sum(len(entries) for entries in by_system.values())
         # Loaded once for the whole render — resolving each game's local
         # launch path must never issue its own per-game database query.

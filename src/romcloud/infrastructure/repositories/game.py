@@ -46,15 +46,17 @@ class GameRepository:
             conn.execute(
                 """
                 INSERT INTO games
-                    (id, system, title, source_provider, source_root, last_played, added_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (id, system, title, source_provider, source_root, last_played,
+                     added_at, is_eligible)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     system          = excluded.system,
                     title           = excluded.title,
                     source_provider = excluded.source_provider,
                     source_root     = excluded.source_root,
                     last_played     = excluded.last_played,
-                    added_at        = excluded.added_at
+                    added_at        = excluded.added_at,
+                    is_eligible     = excluded.is_eligible
                 """,
                 (
                     game.id,
@@ -64,6 +66,7 @@ class GameRepository:
                     game.source_root,
                     _fmt_dt(game.last_played),
                     _fmt_dt(game.added_at),
+                    1 if game.is_eligible else 0,
                 ),
             )
             # Delete existing assets then re-insert.
@@ -96,6 +99,13 @@ class GameRepository:
         with self._db.connect() as conn:
             conn.execute("DELETE FROM games WHERE id = ?", (game_id,))
 
+    def set_eligible(self, game_id: str, eligible: bool) -> None:
+        with self._db.connect() as conn:
+            conn.execute(
+                "UPDATE games SET is_eligible = ? WHERE id = ?",
+                (1 if eligible else 0, game_id),
+            )
+
     # ── read ──────────────────────────────────────────────────────────────────
 
     def get(self, game_id: str) -> Optional[Game]:
@@ -107,10 +117,14 @@ class GameRepository:
                 return None
             return self._row_to_game(conn, row)
 
-    def find_by_system(self, system: str) -> list[Game]:
+    def find_by_system(
+        self, system: str, *, include_ineligible: bool = False
+    ) -> list[Game]:
         with self._db.connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM games WHERE system = ? ORDER BY title",
+                "SELECT * FROM games WHERE system = ? "
+                + ("" if include_ineligible else "AND is_eligible = 1 ")
+                + "ORDER BY title",
                 (system,),
             ).fetchall()
             return [self._row_to_game(conn, r) for r in rows]
@@ -139,10 +153,12 @@ class GameRepository:
                 return None
             return self._row_to_game(conn, row)
 
-    def list_all(self) -> list[Game]:
+    def list_all(self, *, include_ineligible: bool = False) -> list[Game]:
         with self._db.connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM games ORDER BY system, title"
+                "SELECT * FROM games "
+                + ("" if include_ineligible else "WHERE is_eligible = 1 ")
+                + "ORDER BY system, title"
             ).fetchall()
             asset_rows = conn.execute(
                 "SELECT * FROM game_assets ORDER BY game_id, is_primary DESC, filename"
@@ -155,18 +171,23 @@ class GameRepository:
                 for row in rows
             ]
 
-    def list_systems(self) -> list[str]:
+    def list_systems(self, *, include_ineligible: bool = False) -> list[str]:
         """Return the distinct systems that currently have at least one
         cataloged game — i.e. the systems ROMCloud actually manages."""
         with self._db.connect() as conn:
             rows = conn.execute(
-                "SELECT DISTINCT system FROM games ORDER BY system"
+                "SELECT DISTINCT system FROM games "
+                + ("" if include_ineligible else "WHERE is_eligible = 1 ")
+                + "ORDER BY system"
             ).fetchall()
             return [r["system"] for r in rows]
 
-    def count(self) -> int:
+    def count(self, *, include_ineligible: bool = False) -> int:
         with self._db.connect() as conn:
-            return conn.execute("SELECT COUNT(*) FROM games").fetchone()[0]
+            return conn.execute(
+                "SELECT COUNT(*) FROM games"
+                + ("" if include_ineligible else " WHERE is_eligible = 1")
+            ).fetchone()[0]
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -197,4 +218,5 @@ class GameRepository:
             assets=assets,
             added_at=_parse_dt(row["added_at"]) or datetime.now(timezone.utc),
             last_played=_parse_dt(row["last_played"]),
+            is_eligible=bool(row["is_eligible"]),
         )

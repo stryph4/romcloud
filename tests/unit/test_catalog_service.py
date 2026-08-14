@@ -11,6 +11,9 @@ from romcloud.integrations.batocera.catalog import CatalogService
 from romcloud.core.exceptions import ProxyError
 from romcloud.core.models.game import Game, GameAsset
 from romcloud.core.models.proxy import ProxyRecord
+from romcloud.core.models.cache import CacheEntry
+from romcloud.integrations.batocera.system_registry import EffectiveSystemRegistry
+from tests.system_registry_fixture import TEST_SYSTEM_REGISTRY
 
 
 class TestCatalogServiceRefresh:
@@ -93,6 +96,7 @@ class TestCatalogServiceRefresh:
             proxy_repo=proxy_repo,
             local_roms_root=str(local_roms_dir),
             source_root="/nonexistent/path",
+            system_registry=TEST_SYSTEM_REGISTRY,
         )
         result = svc.refresh()
         assert len(result.errors) > 0
@@ -112,6 +116,7 @@ class TestCatalogServiceRefresh:
             proxy_repo=proxy_repo,
             local_roms_root=str(local_roms_dir),
             source_root=str(cue_root),
+            system_registry=TEST_SYSTEM_REGISTRY,
         )
         result = svc.refresh()
         # Game.cue (1) + other.iso (1) = 2; Game.bin should be suppressed
@@ -128,6 +133,176 @@ class TestCatalogServiceRefresh:
         assert companion_paths == ["psx/Game.bin"]
 
 
+class TestPositiveRecursiveDiscovery:
+    def test_unsupported_backup_is_not_catalogued(
+        self, provider, game_repo, proxy_repo, local_roms_dir, tmp_path
+    ):
+        root = tmp_path / "roms"
+        (root / "nes").mkdir(parents=True)
+        (root / "nes" / "Mario.nes").write_bytes(b"rom")
+        (root / "nes" / "gamelist.xml.bak").write_text("backup")
+
+        result = _make_catalog_service(
+            provider, game_repo, proxy_repo, local_roms_dir, root
+        ).refresh()
+
+        assert result.added == 1
+        assert [game.title for game in game_repo.find_by_system("nes")] == ["Mario"]
+
+    def test_xbla_and_arbitrary_nested_launchables_are_discovered(
+        self, provider, game_repo, proxy_repo, local_roms_dir, tmp_path
+    ):
+        root = tmp_path / "roms"
+        game_path = root / "xbox360" / "XBLA" / "Publisher" / "Game" / "default.xex"
+        game_path.parent.mkdir(parents=True)
+        game_path.write_bytes(b"xex")
+
+        result = _make_catalog_service(
+            provider, game_repo, proxy_repo, local_roms_dir, root
+        ).refresh()
+
+        assert result.added == 1
+        game = game_repo.find_by_system("xbox360")[0]
+        assert game.primary_asset.relative_path == (
+            "xbox360/XBLA/Publisher/Game/default.xex"
+        )
+
+    def test_known_ineligible_legacy_row_is_hidden_but_retained_and_reactivates(
+        self, provider, game_repo, cache_repo, proxy_repo, local_roms_dir, tmp_path
+    ):
+        root = tmp_path / "roms"
+        (root / "nes").mkdir(parents=True)
+        backup = root / "nes" / "gamelist.xml.bak"
+        backup.write_text("backup")
+        permissive = EffectiveSystemRegistry.from_extensions({"nes": {".bak"}})
+        first = CatalogService(
+            provider, game_repo, proxy_repo, str(local_roms_dir), str(root),
+            system_registry=permissive,
+        )
+        first.refresh()
+        legacy = game_repo.find_by_system("nes")[0]
+        cache_entry = CacheEntry.create(legacy.id, str(tmp_path / "cache" / "backup"))
+        cache_entry.is_pinned = True
+        cache_repo.save(cache_entry)
+        proxy_path = Path(proxy_repo.get(legacy.id).proxy_path)
+        assert proxy_path.is_file()
+
+        strict = CatalogService(
+            provider, game_repo, proxy_repo, str(local_roms_dir), str(root),
+            system_registry=EffectiveSystemRegistry.from_extensions({"nes": {".nes"}}),
+        )
+        strict.refresh()
+
+        retained = game_repo.get(legacy.id)
+        assert retained is not None and retained.is_eligible is False
+        assert game_repo.find_by_system("nes") == []
+        assert cache_repo.get(legacy.id).is_pinned is True
+        assert proxy_repo.get(legacy.id) is None and not proxy_path.exists()
+
+        reactivated = CatalogService(
+            provider, game_repo, proxy_repo, str(local_roms_dir), str(root),
+            system_registry=permissive,
+        ).refresh()
+        assert reactivated.updated == 1
+        assert game_repo.find_by_system("nes")[0].id == legacy.id
+        assert game_repo.get(legacy.id).is_eligible is True
+        assert proxy_repo.get(legacy.id) is not None
+
+    def test_failed_system_scan_never_suppresses_existing_row(
+        self, provider, game_repo, proxy_repo, local_roms_dir, tmp_path, monkeypatch
+    ):
+        root = tmp_path / "roms"
+        (root / "nes").mkdir(parents=True)
+        (root / "nes" / "invalid.bak").write_text("backup")
+        permissive = EffectiveSystemRegistry.from_extensions({"nes": {".bak"}})
+        CatalogService(
+            provider, game_repo, proxy_repo, str(local_roms_dir), str(root),
+            system_registry=permissive,
+        ).refresh()
+        legacy = game_repo.find_by_system("nes")[0]
+        monkeypatch.setattr(
+            provider, "list_entries", lambda *_args: (_ for _ in ()).throw(OSError("gone"))
+        )
+
+        result = CatalogService(
+            provider, game_repo, proxy_repo, str(local_roms_dir), str(root),
+            system_registry=EffectiveSystemRegistry.from_extensions({"nes": {".nes"}}),
+        ).refresh()
+
+        assert result.errors == [("nes", "gone")]
+        assert game_repo.get(legacy.id).is_eligible is True
+        assert game_repo.find_by_system("nes")[0].id == legacy.id
+
+    def test_last_known_good_registry_never_suppresses_existing_row(
+        self, provider, game_repo, proxy_repo, local_roms_dir, tmp_path
+    ):
+        root = tmp_path / "roms"
+        (root / "nes").mkdir(parents=True)
+        (root / "nes" / "legacy.bak").write_text("backup")
+        permissive = EffectiveSystemRegistry.from_extensions({"nes": {".bak"}})
+        CatalogService(
+            provider, game_repo, proxy_repo, str(local_roms_dir), str(root),
+            system_registry=permissive,
+        ).refresh()
+        legacy = game_repo.find_by_system("nes")[0]
+        strict = EffectiveSystemRegistry.from_extensions({"nes": {".nes"}})
+        lkg = EffectiveSystemRegistry(strict.systems, from_last_known_good=True)
+
+        CatalogService(
+            provider, game_repo, proxy_repo, str(local_roms_dir), str(root),
+            system_registry=lkg,
+        ).refresh()
+
+        assert game_repo.get(legacy.id).is_eligible is True
+        assert game_repo.find_by_system("nes")[0].id == legacy.id
+
+    def test_unambiguous_legacy_directory_adopts_id(
+        self, provider, game_repo, proxy_repo, local_roms_dir, tmp_path
+    ):
+        root = tmp_path / "roms"
+        nested = root / "xbox360" / "XBLA" / "Only Game" / "default.xex"
+        nested.parent.mkdir(parents=True)
+        nested.write_bytes(b"xex")
+        legacy = Game.create(
+            "xbox360", "XBLA", "local", str(root),
+            [GameAsset("XBLA", "xbox360/XBLA", is_primary=True)],
+        )
+        game_repo.save(legacy)
+
+        result = _make_catalog_service(
+            provider, game_repo, proxy_repo, local_roms_dir, root
+        ).refresh()
+
+        assert result.updated == 1 and result.added == 0
+        migrated = game_repo.get(legacy.id)
+        assert migrated.primary_asset.relative_path == (
+            "xbox360/XBLA/Only Game/default.xex"
+        )
+
+    def test_ambiguous_legacy_directory_is_not_guessed(
+        self, provider, game_repo, proxy_repo, local_roms_dir, tmp_path
+    ):
+        root = tmp_path / "roms"
+        for name in ("One", "Two"):
+            path = root / "xbox360" / "XBLA" / name / "default.xex"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(name.encode())
+        legacy = Game.create(
+            "xbox360", "XBLA", "local", str(root),
+            [GameAsset("XBLA", "xbox360/XBLA", is_primary=True)],
+        )
+        game_repo.save(legacy)
+
+        result = _make_catalog_service(
+            provider, game_repo, proxy_repo, local_roms_dir, root
+        ).refresh()
+
+        assert result.added == 2 and result.updated == 0
+        assert game_repo.get(legacy.id).is_eligible is False
+        visible = game_repo.find_by_system("xbox360")
+        assert len(visible) == 2 and legacy.id not in {game.id for game in visible}
+
+
 def _make_catalog_service(provider, game_repo, proxy_repo, local_roms_dir, source_root):
     return CatalogService(
         provider=provider,
@@ -135,6 +310,7 @@ def _make_catalog_service(provider, game_repo, proxy_repo, local_roms_dir, sourc
         proxy_repo=proxy_repo,
         local_roms_root=str(local_roms_dir),
         source_root=str(source_root),
+        system_registry=TEST_SYSTEM_REGISTRY,
     )
 
 
@@ -380,13 +556,13 @@ class TestCueBinCatalogDiscovery:
         assert companions_a == ["psx/Game A/Track 01.bin"]
         assert companions_b == ["psx/Game B/Track 01.bin"]
 
-    def test_directory_without_cue_still_uses_opaque_directory_game(
+    def test_launchable_extension_directory_is_an_opaque_package_game(
         self, provider, game_repo, proxy_repo, local_roms_dir, tmp_path
     ):
-        """Non-cue directories (e.g. PS3-style folder games) are unaffected."""
+        """Batocera extension-matched directories are games and stop recursion."""
         root = tmp_path / "roms"
-        (root / "ps3" / "BCES00000").mkdir(parents=True)
-        (root / "ps3" / "BCES00000" / "EBOOT.BIN").write_bytes(b"x" * 50)
+        (root / "ps3" / "BCES00000.ps3").mkdir(parents=True)
+        (root / "ps3" / "BCES00000.ps3" / "EBOOT.BIN").write_bytes(b"x" * 50)
 
         svc = _make_catalog_service(provider, game_repo, proxy_repo, local_roms_dir, root)
         result = svc.refresh()
@@ -394,7 +570,7 @@ class TestCueBinCatalogDiscovery:
         assert result.added == 1
         games = game_repo.find_by_system("ps3")
         assert len(games) == 1
-        assert games[0].primary_asset.relative_path == "ps3/BCES00000"
+        assert games[0].primary_asset.relative_path == "ps3/BCES00000.ps3"
 
     def test_nested_directories_do_not_regress_top_level_scan(
         self, provider, game_repo, proxy_repo, local_roms_dir, tmp_path
@@ -690,6 +866,7 @@ class TestCatalogServiceResolveProxy:
             proxy_repo=proxy_repo,
             local_roms_root=str(local_roms_dir),
             source_root=str(rom_root),
+            system_registry=TEST_SYSTEM_REGISTRY,
         )
 
         proxy_path = tmp_path / "fallback.romcloud"

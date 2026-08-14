@@ -104,6 +104,21 @@ class Container:
             self._proxy_repo = ProxyRepository(self.database)
         return self._proxy_repo
 
+    @property
+    def system_registry(self):  # noqa: ANN201
+        """Current effective Batocera launch registry with LKG fallback."""
+        from romcloud.integrations.batocera.system_registry import (
+            REGISTRY_CACHE_FILENAME,
+            load_effective_system_registry,
+        )
+
+        # Deliberately reload on each operation: a long-lived GUI/container
+        # must see user edits and recover from a previously malformed config
+        # without requiring a ROMCloud restart.
+        return load_effective_system_registry(
+            cache_path=Path(self._config.data_path) / REGISTRY_CACHE_FILENAME
+        )
+
     # ── provider ──────────────────────────────────────────────────────────────
 
     @property
@@ -160,13 +175,13 @@ class Container:
     def catalog(self) -> CatalogService:
         if self._catalog is None:
             from romcloud.infrastructure.library_view import operating_mode
-
             self._catalog = CatalogService(
                 provider=self.provider,
                 game_repo=self.game_repo,
                 proxy_repo=self.proxy_repo,
                 local_roms_root=self._config.local_roms_path,
                 source_root=self._config.source.rom_root,
+                registry_loader=lambda: self.system_registry,
                 write_proxies=operating_mode(self._config) is OperatingMode.CACHE,
                 capability_policy=self._policy(),
             )

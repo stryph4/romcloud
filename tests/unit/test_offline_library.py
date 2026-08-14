@@ -37,6 +37,7 @@ from romcloud.integrations.batocera.game_access import (
     LINK_NAME,
     _operating_mode_lock,
     reconcile_game_access,
+    reconcile_library_presentation,
     set_operating_mode,
 )
 from romcloud.lifecycle.manage import restore_owned_proxies
@@ -619,6 +620,24 @@ def test_offline_exposes_cache_complete_game_with_no_proxy_record(tmp_path: Path
     proxy = Path(config.local_roms_path) / "snes" / "Aggressive Inline (USA).romcloud"
     assert proxy.is_file()
     assert ProxyRepository(db).get(game.id) is not None
+
+
+def test_known_ineligible_cached_row_stays_hidden_in_cache_and_offline(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    game, cached_file = _game_with_cache_entry(config, "Legacy Backup")
+    assert cached_file.is_file()
+    Container(config).game_repo.set_eligible(game.id, False)
+
+    cache_report = reconcile_library_presentation(config, offline=False)
+    offline_report = reconcile_library_presentation(config, offline=True)
+
+    proxy = Path(config.local_roms_path) / "snes" / "Legacy Backup.romcloud"
+    assert cache_report.visible == 0
+    assert offline_report.visible == 0
+    assert not proxy.exists()
+    assert Container(config).cache_repo.get(game.id) is not None
 
 
 def test_offline_exposes_directory_container_cached_game_with_no_proxy_record(

@@ -53,8 +53,10 @@ from romcloud.infrastructure.logging import get_logger
 from romcloud.integrations.batocera.es_systems import (
     GeneratedOverride,
     generate_override,
+    generate_override_from_registry,
     parse_override_systems,
 )
+from romcloud.integrations.batocera.system_registry import EffectiveSystemRegistry
 
 log = get_logger("batocera.es_config")
 
@@ -103,7 +105,12 @@ def _generate(
     *,
     stock_path: Path,
     wrapper_path: Path,
+    system_registry: EffectiveSystemRegistry | None = None,
 ) -> GeneratedOverride:
+    if system_registry is not None:
+        return generate_override_from_registry(
+            system_registry, managed_systems, str(wrapper_path)
+        )
     stock_xml = _read_stock_xml(stock_path)
     return generate_override(stock_xml, managed_systems, str(wrapper_path))
 
@@ -114,13 +121,19 @@ def install(
     stock_path: Path = STOCK_ES_SYSTEMS_PATH,
     override_path: Path = ROMCLOUD_OVERRIDE_PATH,
     wrapper_path: Path = WRAPPER_SCRIPT_PATH,
+    system_registry: EffectiveSystemRegistry | None = None,
 ) -> GeneratedOverride:
     """Generate and write the ROMCloud override for the first time (or refresh it).
 
     Idempotent: writing the same *managed_systems* against an unchanged stock
     file always produces the same file content.
     """
-    result = _generate(managed_systems, stock_path=stock_path, wrapper_path=wrapper_path)
+    result = _generate(
+        managed_systems,
+        stock_path=stock_path,
+        wrapper_path=wrapper_path,
+        system_registry=system_registry,
+    )
     override_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(override_path, result.xml)
     log.info(
@@ -138,6 +151,7 @@ def refresh(
     stock_path: Path = STOCK_ES_SYSTEMS_PATH,
     override_path: Path = ROMCLOUD_OVERRIDE_PATH,
     wrapper_path: Path = WRAPPER_SCRIPT_PATH,
+    system_registry: EffectiveSystemRegistry | None = None,
 ) -> GeneratedOverride:
     """Regenerate the override to match the catalog's current managed systems.
 
@@ -149,6 +163,7 @@ def refresh(
         stock_path=stock_path,
         override_path=override_path,
         wrapper_path=wrapper_path,
+        system_registry=system_registry,
     )
 
 
@@ -158,6 +173,7 @@ def status(
     stock_path: Path = STOCK_ES_SYSTEMS_PATH,
     override_path: Path = ROMCLOUD_OVERRIDE_PATH,
     wrapper_path: Path = WRAPPER_SCRIPT_PATH,
+    system_registry: EffectiveSystemRegistry | None = None,
 ) -> ESIntegrationStatus:
     """Report the current state of ROMCloud's ES integration without changing anything."""
     managed_list = sorted(set(managed_systems))
@@ -173,7 +189,12 @@ def status(
         systems_in_override = parse_override_systems(current_xml)
 
         try:
-            fresh = _generate(managed_list, stock_path=stock_path, wrapper_path=wrapper_path)
+            fresh = _generate(
+                managed_list,
+                stock_path=stock_path,
+                wrapper_path=wrapper_path,
+                system_registry=system_registry,
+            )
             up_to_date = fresh.xml == current_xml
         except ESConfigError:
             up_to_date = False

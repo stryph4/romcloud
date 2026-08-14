@@ -171,6 +171,22 @@ def test_source_import_preflight_is_lightweight_and_reports_media_types(
     assert "storage/network speed" in preview["duration_note"]
 
 
+def test_ineligible_row_is_removed_from_library_presentation(tmp_path: Path):
+    config, container, _ = _setup(tmp_path)
+    container.library_sync.sync()
+    assert _managed(_local_root(config)) is not None
+    game = container.game_repo.list_all()[0]
+    container.game_repo.set_eligible(game.id, False)
+
+    preview = container.library_sync.preview_source_import().as_dict()
+    report = container.library_sync.render_local()
+
+    assert preview["games_eligible"] == 0
+    assert report.rendered == 0
+    root = ET.parse(_local_root(config)).getroot()
+    assert not any(item.findtext(OWNERSHIP_TAG) for item in root.findall("game"))
+
+
 def test_source_import_emits_real_entry_file_byte_and_render_progress(tmp_path: Path):
     _config_value, container, _ = _setup(tmp_path)
     events = []

@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS games (
     source_provider  TEXT NOT NULL,
     source_root      TEXT NOT NULL,
     last_played      TEXT,
-    added_at         TEXT NOT NULL
+    added_at         TEXT NOT NULL,
+    is_eligible      INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS game_assets (
@@ -57,7 +58,7 @@ CREATE TABLE IF NOT EXISTS proxy_records (
 CREATE INDEX IF NOT EXISTS idx_proxy_records_path ON proxy_records(proxy_path);
 """
 
-_CURRENT_SCHEMA_VERSION = 1
+_CURRENT_SCHEMA_VERSION = 2
 
 
 class Database:
@@ -101,3 +102,16 @@ class Database:
                     "INSERT INTO schema_version (version) VALUES (?)",
                     (_CURRENT_SCHEMA_VERSION,),
                 )
+            elif int(version_row["version"]) < 2:
+                columns = {
+                    row["name"]
+                    for row in conn.execute("PRAGMA table_info(games)").fetchall()
+                }
+                if "is_eligible" not in columns:
+                    # Legacy rows remain visible until a successful positive
+                    # eligibility scan classifies their primary path.
+                    conn.execute(
+                        "ALTER TABLE games ADD COLUMN "
+                        "is_eligible INTEGER NOT NULL DEFAULT 1"
+                    )
+                conn.execute("UPDATE schema_version SET version = 2")

@@ -87,6 +87,44 @@ class TestLocalFilesystemProvider:
         with pytest.raises(ProviderError):
             p.list_entries(str(source_tree), "nonexistent")
 
+    @pytest.mark.parametrize("relative", ["../outside", "/absolute", "ps2/../../outside"])
+    def test_list_entries_rejects_root_escape(self, source_tree, relative):
+        p = LocalFilesystemProvider()
+        with pytest.raises(ProviderError, match="Unsafe|escapes"):
+            p.list_entries(str(source_tree), relative)
+
+    def test_directory_listing_does_not_recursively_calculate_size(self, source_tree):
+        nested = source_tree / "ps2" / "Nested"
+        nested.mkdir()
+        (nested / "large.bin").write_bytes(b"x" * 1000)
+
+        entry = next(
+            item
+            for item in LocalFilesystemProvider().list_entries(str(source_tree), "ps2")
+            if item.name == "Nested"
+        )
+
+        assert entry.is_directory is True
+        assert entry.size_bytes is None
+
+    def test_symlink_entry_is_identified_without_following_it(self, source_tree, tmp_path):
+        target = tmp_path / "outside"
+        target.mkdir()
+        link = source_tree / "ps2" / "Loop"
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlink creation is unavailable on this host")
+
+        entry = next(
+            item
+            for item in LocalFilesystemProvider().list_entries(str(source_tree), "ps2")
+            if item.name == "Loop"
+        )
+
+        assert entry.is_symlink is True
+        assert entry.size_bytes is None
+
     def test_transfer_file(self, source_tree, tmp_path):
         p = LocalFilesystemProvider()
         dest = tmp_path / "dest" / "Game A.iso"

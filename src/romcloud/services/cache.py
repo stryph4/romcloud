@@ -237,7 +237,15 @@ class CacheService:
         if primary is None:
             raise CacheError(f"Game {game_id!r} has no cacheable assets")
 
-        needed = game.total_size_bytes or 0
+        # Directory packages remain unsized during catalog discovery so a
+        # refresh stays O(entries), without a second recursive walk per
+        # package.  Size them once here, when quota preflight actually needs
+        # the number.
+        needed = (
+            game.total_size_bytes
+            if game.total_size_bytes is not None
+            else self._transfer.estimate_size(game)
+        )
         self._ensure_space(needed, protected_game_id=game_id)
 
         # cache_path is fully determined by (system, primary asset's relative

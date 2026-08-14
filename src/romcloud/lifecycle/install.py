@@ -293,6 +293,7 @@ def reconcile_es_override(config_path: Path) -> Optional[bool]:
             stock_path=es_config.STOCK_ES_SYSTEMS_PATH,
             override_path=override_path,
             wrapper_path=es_config.WRAPPER_SCRIPT_PATH,
+            system_registry=container.system_registry,
         )
         return True
     except Exception:  # noqa: BLE001 — optional integration, never fatal

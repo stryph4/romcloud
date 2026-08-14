@@ -19,6 +19,7 @@ class RemoteEntry:
 
     is_directory: bool
     size_bytes: Optional[int]
+    is_symlink: bool = False
 
 
 class StorageProvider(ABC):
@@ -39,7 +40,12 @@ class StorageProvider(ABC):
 
     @abstractmethod
     def list_entries(self, rom_root: str, system: str) -> list[RemoteEntry]:
-        """Return all top-level entries inside ``rom_root/system/``."""
+        """Return immediate entries inside ``rom_root/system/``.
+
+        ``system`` may include a safe nested relative directory. Providers
+        must reject root escapes; callers use repeated single-directory
+        listings for bounded recursive discovery.
+        """
 
     @abstractmethod
     def get_size(self, path: str) -> Optional[int]:

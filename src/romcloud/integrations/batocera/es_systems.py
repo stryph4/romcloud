@@ -160,6 +160,43 @@ def generate_override(
     return GeneratedOverride(xml=xml_text, included_systems=included, missing_systems=missing)
 
 
+def generate_override_from_registry(
+    registry, managed_systems: Iterable[str], wrapper_path: str
+) -> GeneratedOverride:
+    """Generate from Batocera's effective native system definitions.
+
+    ``registry`` is intentionally duck-typed to keep this pure XML module
+    independent of the filesystem loader. Unlike stock-only generation, this
+    includes user-added systems and user-overridden extensions/commands.
+    """
+    requested = sorted(set(managed_systems))
+    included: list[str] = []
+    missing: list[str] = []
+    out_root = ET.Element("systemList")
+    out_root.append(ET.Comment(f" {_GENERATED_HEADER} "))
+    for name in requested:
+        spec = registry.get(name)
+        if spec is None:
+            missing.append(name)
+            continue
+        system_el = ET.Element("system")
+        ET.SubElement(system_el, "name").text = name
+        native_extensions = " ".join(sorted(spec.extensions))
+        ET.SubElement(system_el, "extension").text = _ensure_romcloud_extension(
+            native_extensions
+        )
+        ET.SubElement(system_el, "command").text = _rewrite_command(
+            spec.command, wrapper_path
+        )
+        out_root.append(system_el)
+        included.append(name)
+    ET.indent(out_root, space="  ")
+    xml = '<?xml version="1.0"?>\n' + ET.tostring(
+        out_root, encoding="unicode"
+    ) + "\n"
+    return GeneratedOverride(xml, included, missing)
+
+
 def parse_override_systems(override_xml: str) -> list[str]:
     """Return the list of system names present in a generated override document."""
     try:

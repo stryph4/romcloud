@@ -27,6 +27,36 @@ class TestDatabase:
         db.initialize()
         assert db.path.exists()
 
+    def test_v1_migration_preserves_legacy_rows_as_visible(self, tmp_path):
+        path = tmp_path / "legacy.db"
+        with sqlite3.connect(path) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE schema_version (version INTEGER NOT NULL);
+                INSERT INTO schema_version VALUES (1);
+                CREATE TABLE games (
+                    id TEXT PRIMARY KEY, system TEXT NOT NULL, title TEXT NOT NULL,
+                    source_provider TEXT NOT NULL, source_root TEXT NOT NULL,
+                    last_played TEXT, added_at TEXT NOT NULL
+                );
+                INSERT INTO games VALUES (
+                    'legacy', 'nes', 'Legacy', 'local', '/roms', NULL,
+                    '2026-01-01T00:00:00+00:00'
+                );
+                """
+            )
+
+        db = Database(str(path))
+        db.initialize()
+
+        with db.connect() as conn:
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(games)")}
+            assert "is_eligible" in columns
+            assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 2
+            assert conn.execute(
+                "SELECT is_eligible FROM games WHERE id = 'legacy'"
+            ).fetchone()[0] == 1
+
 
 class TestGameRepository:
     def test_save_and_get(self, game_repo, db):
@@ -42,6 +72,24 @@ class TestGameRepository:
         assert len(fetched.assets) == 1
         assert fetched.assets[0].filename == "game.iso"
         assert fetched.assets[0].is_primary is True
+
+    def test_ineligible_rows_are_internal_but_not_listed(self, game_repo):
+        game = Game.create(
+            "nes", "Backup", "local", "/roms",
+            [GameAsset("gamelist.xml.bak", "nes/gamelist.xml.bak", is_primary=True)],
+        )
+        game_repo.save(game)
+        game_repo.set_eligible(game.id, False)
+
+        assert game_repo.get(game.id) is not None
+        assert game_repo.get(game.id).is_eligible is False
+        assert game_repo.list_all() == []
+        assert game_repo.find_by_system("nes") == []
+        assert game_repo.list_systems() == []
+        assert game_repo.count() == 0
+        assert [row.id for row in game_repo.list_all(include_ineligible=True)] == [
+            game.id
+        ]
 
     def test_save_replaces(self, game_repo):
         game = Game.create("ps2", "Original", "local", "/roms", [])
