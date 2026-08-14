@@ -91,6 +91,12 @@ def _make_archive_bytes(
     files = {
         f"{top}/pyproject.toml": f'[project]\nname = "romcloud"\nversion = "{version}"\n'.encode(),
         f"{top}/src/romcloud/__init__.py": f'__version__ = "{version}"\n'.encode(),
+        f"{top}/src/romcloud/cli/main.py": b"def cli():\n    pass\n",
+        # Realistic archives are always far larger than the "implausibly
+        # small download" floor; pad the fixture so that floor is only
+        # crossed deliberately (in the tests that target it), not by
+        # accident.
+        f"{top}/_padding.bin": b"0" * 4096,
     }
     if extra_files:
         for name, content in extra_files.items():
@@ -107,12 +113,30 @@ def _make_archive_bytes(
 
 
 def _fake_runner_success(argv, **kwargs):
+    # Simulate `<python> -m venv <dir>` actually creating a venv directory,
+    # since perform_update's candidate activation swap needs a real
+    # directory on disk to rename — everything else is a pure no-op success.
+    if len(argv) >= 4 and argv[1:3] == ["-m", "venv"]:
+        venv_dir = Path(argv[3])
+        (venv_dir / "bin").mkdir(parents=True, exist_ok=True)
+        (venv_dir / "bin" / "python").write_text("fake-candidate-python")
     return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
 
 def _fake_runner_failure(stderr: str = "pip failed"):
     def runner(argv, **kwargs):
         return subprocess.CompletedProcess(argv, 1, stdout="", stderr=stderr)
+
+    return runner
+
+
+def _tracking_runner(calls: list):
+    """A fake runner that records every argv (for call-sequence assertions)
+    while behaving like _fake_runner_success."""
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        return _fake_runner_success(argv, **kwargs)
 
     return runner
 
@@ -194,6 +218,24 @@ class TestDownloadFile:
                 clock=lambda: next(ticks),
             )
 
+    def test_rejects_zero_byte_download(self, tmp_path):
+        opener = _make_opener({"http://x/f.zip": b""})
+        with pytest.raises(UpdateDownloadError, match="empty"):
+            upd.download_file("http://x/f.zip", tmp_path / "out.zip", opener=opener)
+
+    def test_rejects_implausibly_small_download(self, tmp_path):
+        opener = _make_opener({"http://x/f.zip": b"PK\x03\x04"})
+        with pytest.raises(UpdateDownloadError, match="implausibly small"):
+            upd.download_file(
+                "http://x/f.zip", tmp_path / "out.zip", opener=opener, min_size=1024
+            )
+
+    def test_min_size_zero_allows_small_but_nonempty_downloads(self, tmp_path):
+        dest = tmp_path / "out.zip"
+        opener = _make_opener({"http://x/f.zip": b"hi"})
+        upd.download_file("http://x/f.zip", dest, opener=opener)
+        assert dest.read_bytes() == b"hi"
+
 
 # ── safe_extract_zip ──────────────────────────────────────────────────────────
 
@@ -228,6 +270,31 @@ class TestSafeExtractZip:
         archive = tmp_path / "not_a_zip.zip"
         archive.write_bytes(b"this is not a zip file at all")
         with pytest.raises(UpdateArchiveError):
+            upd.safe_extract_zip(archive, tmp_path / "out")
+
+    def test_empty_archive_raises_archive_error(self, tmp_path):
+        archive = tmp_path / "empty.zip"
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w"):
+            pass
+        archive.write_bytes(buf.getvalue())
+        with pytest.raises(UpdateArchiveError, match="empty"):
+            upd.safe_extract_zip(archive, tmp_path / "out")
+
+    def test_corrupt_member_raises_archive_error(self, tmp_path):
+        archive = tmp_path / "corrupt.zip"
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("proj/pyproject.toml", "[project]\nversion='1'\n")
+        raw = bytearray(buf.getvalue())
+        # Flip a byte in the middle of the stored file content so its CRC
+        # no longer matches what the central directory recorded — this is
+        # the "zip opens, but a member's content is corrupt" scenario.
+        content_start = raw.find(b"[project]")
+        raw[content_start] ^= 0xFF
+        archive.write_bytes(bytes(raw))
+
+        with pytest.raises(UpdateArchiveError, match="integrity"):
             upd.safe_extract_zip(archive, tmp_path / "out")
 
     def test_path_traversal_is_rejected(self, tmp_path):
@@ -273,6 +340,52 @@ class TestFindExtractedProjectRoot:
         (tmp_path / "b").mkdir()
         with pytest.raises(UpdateArchiveError):
             upd.find_extracted_project_root(tmp_path)
+
+
+# ── validate_extracted_candidate ─────────────────────────────────────────────
+
+
+def _write_minimal_valid_project(root: Path) -> None:
+    (root / "src" / "romcloud" / "cli").mkdir(parents=True)
+    (root / "pyproject.toml").write_text('[project]\nversion = "1.0"\n')
+    (root / "src" / "romcloud" / "__init__.py").write_text("x = 1\n")
+    (root / "src" / "romcloud" / "cli" / "main.py").write_text("def cli():\n    pass\n")
+
+
+class TestValidateExtractedCandidate:
+    def test_valid_project_passes(self, tmp_path):
+        _write_minimal_valid_project(tmp_path)
+        upd.validate_extracted_candidate(tmp_path)  # must not raise
+
+    def test_missing_critical_file_raises(self, tmp_path):
+        _write_minimal_valid_project(tmp_path)
+        (tmp_path / "src" / "romcloud" / "cli" / "main.py").unlink()
+        with pytest.raises(UpdateArchiveError, match="missing"):
+            upd.validate_extracted_candidate(tmp_path)
+
+    def test_zero_byte_critical_file_raises(self, tmp_path):
+        _write_minimal_valid_project(tmp_path)
+        (tmp_path / "src" / "romcloud" / "cli" / "main.py").write_text("")
+        with pytest.raises(UpdateArchiveError, match="zero-byte"):
+            upd.validate_extracted_candidate(tmp_path)
+
+    def test_zero_byte_noncritical_source_file_raises(self, tmp_path):
+        """Reproduces the real Batocera failure: critical files survive
+        intact but many other source files are zero-byte — must still be
+        rejected."""
+        _write_minimal_valid_project(tmp_path)
+        (tmp_path / "src" / "romcloud" / "services").mkdir()
+        for name in ("catalog.py", "library.py", "healthcheck.py"):
+            (tmp_path / "src" / "romcloud" / "services" / name).write_text("")
+        with pytest.raises(UpdateArchiveError, match="zero-byte"):
+            upd.validate_extracted_candidate(tmp_path)
+
+    def test_zero_byte_ports_gfx_file_raises(self, tmp_path):
+        _write_minimal_valid_project(tmp_path)
+        (tmp_path / "ports_gfx").mkdir()
+        (tmp_path / "ports_gfx" / "app.py").write_text("")
+        with pytest.raises(UpdateArchiveError, match="zero-byte"):
+            upd.validate_extracted_candidate(tmp_path)
 
 
 # ── build info persistence ───────────────────────────────────────────────────
@@ -412,44 +525,63 @@ class TestPerformUpdateSuccess:
 
         assert not any(home.glob("romcloud-update-*"))
 
-    def test_pip_invoked_with_venv_python_and_extracted_project(self, tmp_path):
+    def test_activated_venv_contains_the_built_candidate(self, tmp_path):
         home = tmp_path / "romcloud"
         venv_python = home / "venv" / "bin" / "python"
         archive = _make_archive_bytes(sha=_SHA)
         opener = _make_opener(_full_payloads(archive_bytes=archive))
 
-        calls = []
+        upd.perform_update(home, venv_python, opener=opener, runner=_fake_runner_success)
 
-        def runner(argv, **kwargs):
-            calls.append(argv)
-            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        assert venv_python.read_text() == "fake-candidate-python"
 
-        upd.perform_update(home, venv_python, opener=opener, runner=runner)
+    def test_pip_installs_into_candidate_not_the_live_venv(self, tmp_path):
+        home = tmp_path / "romcloud"
+        venv_python = home / "venv" / "bin" / "python"
+        archive = _make_archive_bytes(sha=_SHA)
+        opener = _make_opener(_full_payloads(archive_bytes=archive))
 
-        pip_argv = calls[0]
-        assert pip_argv[0] == str(venv_python)
-        assert pip_argv[1:4] == ["-m", "pip", "install"]
+        calls: list = []
+        upd.perform_update(home, venv_python, opener=opener, runner=_tracking_runner(calls))
+
+        install_calls = [c for c in calls if c[1:4] == ["-m", "pip", "install"]]
+        assert len(install_calls) == 1
+        pip_argv = install_calls[0]
+        assert pip_argv[0] != str(venv_python)
+        assert "venv-candidate" in pip_argv[0]
         assert "--upgrade" in pip_argv
 
-    def test_reconcile_invoked_after_pip_with_venv_python_and_project_root(self, tmp_path):
+    def test_candidate_is_smoke_tested(self, tmp_path):
         home = tmp_path / "romcloud"
         venv_python = home / "venv" / "bin" / "python"
         archive = _make_archive_bytes(sha=_SHA)
         opener = _make_opener(_full_payloads(archive_bytes=archive))
 
-        calls = []
+        calls: list = []
+        upd.perform_update(home, venv_python, opener=opener, runner=_tracking_runner(calls))
 
-        def runner(argv, **kwargs):
-            calls.append(argv)
-            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        smoke_tails = [
+            tuple(c[3:])
+            for c in calls
+            if len(c) >= 3 and c[1:3] == ["-m", "romcloud.cli.main"] and "_reconcile-install" not in c
+        ]
+        assert ("--version",) in smoke_tails
+        assert ("--help",) in smoke_tails
+        assert ("configure", "--help") in smoke_tails
 
+    def test_reconcile_invoked_last_with_venv_python_and_project_root(self, tmp_path):
+        home = tmp_path / "romcloud"
+        venv_python = home / "venv" / "bin" / "python"
+        archive = _make_archive_bytes(sha=_SHA)
+        opener = _make_opener(_full_payloads(archive_bytes=archive))
+
+        calls: list = []
         upd.perform_update(
-            home, venv_python, opener=opener, runner=runner,
+            home, venv_python, opener=opener, runner=_tracking_runner(calls),
             ports_dir=tmp_path / "ports", system_python="/fake/system-python",
         )
 
-        assert len(calls) == 2
-        reconcile_argv = calls[1]
+        reconcile_argv = calls[-1]
         assert reconcile_argv[0] == str(venv_python)
         assert reconcile_argv[1:4] == ["-m", "romcloud.cli.main", "_reconcile-install"]
         assert "--romcloud-home" in reconcile_argv
@@ -504,13 +636,99 @@ class TestPerformUpdateFailedDownload:
 class TestPerformUpdateMalformedArchive:
     def test_raises_update_archive_error(self, tmp_path):
         home = tmp_path / "romcloud"
-        payloads = _full_payloads(archive_bytes=b"garbage, not a zip")
+        # Large enough to clear the "implausibly small download" floor on
+        # its own, so this test exercises zip parsing, not download size.
+        payloads = _full_payloads(archive_bytes=b"garbage, not a zip" * 200)
         opener = _make_opener(payloads)
 
         with pytest.raises(UpdateArchiveError):
             upd.perform_update(home, home / "venv" / "bin" / "python", opener=opener, runner=_fake_runner_success)
 
         assert not (home / "version.json").exists()
+        assert not any(home.glob("romcloud-update-*"))
+
+
+class TestPerformUpdateZeroByteDownload:
+    """Reproduces the real Batocera failure trigger: romcloud-update.zip
+    downloaded as 0 bytes."""
+
+    def test_raises_update_download_error(self, tmp_path):
+        home = tmp_path / "romcloud"
+        payloads = _full_payloads(archive_bytes=b"")
+        opener = _make_opener(payloads)
+
+        with pytest.raises(UpdateDownloadError, match="empty"):
+            upd.perform_update(home, home / "venv" / "bin" / "python", opener=opener, runner=_fake_runner_success)
+
+    def test_live_venv_and_version_json_untouched(self, tmp_path):
+        home = tmp_path / "romcloud"
+        venv_python = home / "venv" / "bin" / "python"
+        venv_python.parent.mkdir(parents=True)
+        venv_python.write_text("real-existing-python")
+        previous = upd.BuildInfo(
+            version="1.0.0", commit="old" * 13, commit_short="oldold", build_date="x", source="s"
+        )
+        upd.write_build_info(home, previous)
+
+        opener = _make_opener(_full_payloads(archive_bytes=b""))
+
+        with pytest.raises(UpdateDownloadError):
+            upd.perform_update(home, venv_python, opener=opener, runner=_fake_runner_success)
+
+        assert venv_python.read_text() == "real-existing-python"
+        assert upd.read_build_info(home) == previous
+        assert not any(home.glob("romcloud-update-*"))
+
+
+class TestPerformUpdateZeroByteStagedFiles:
+    """Reproduces the second half of the real Batocera failure: the zip
+    itself is well-formed, but the extracted tree contains zero-byte
+    source files — must be rejected before any venv work begins."""
+
+    def test_zero_byte_critical_file_raises_archive_error(self, tmp_path):
+        home = tmp_path / "romcloud"
+        archive = _make_archive_bytes(
+            sha=_SHA, extra_files={"src/romcloud/cli/main.py": b""}
+        )
+        opener = _make_opener(_full_payloads(archive_bytes=archive))
+
+        with pytest.raises(UpdateArchiveError, match="zero-byte"):
+            upd.perform_update(home, home / "venv" / "bin" / "python", opener=opener, runner=_fake_runner_success)
+
+        assert not (home / "version.json").exists()
+
+    def test_many_zero_byte_noncritical_files_raises_archive_error(self, tmp_path):
+        """225-zero-byte-files-style corruption: critical files are intact
+        but many other source files are empty."""
+        archive = _make_archive_bytes(
+            sha=_SHA,
+            extra_files={
+                f"src/romcloud/services/module_{i}.py": b"" for i in range(10)
+            },
+        )
+        home = tmp_path / "romcloud"
+        opener = _make_opener(_full_payloads(archive_bytes=archive))
+
+        with pytest.raises(UpdateArchiveError, match="zero-byte"):
+            upd.perform_update(home, home / "venv" / "bin" / "python", opener=opener, runner=_fake_runner_success)
+
+        assert not (home / "version.json").exists()
+
+    def test_live_venv_untouched(self, tmp_path):
+        home = tmp_path / "romcloud"
+        venv_python = home / "venv" / "bin" / "python"
+        venv_python.parent.mkdir(parents=True)
+        venv_python.write_text("real-existing-python")
+
+        archive = _make_archive_bytes(
+            sha=_SHA, extra_files={"src/romcloud/cli/main.py": b""}
+        )
+        opener = _make_opener(_full_payloads(archive_bytes=archive))
+
+        with pytest.raises(UpdateArchiveError):
+            upd.perform_update(home, venv_python, opener=opener, runner=_fake_runner_success)
+
+        assert venv_python.read_text() == "real-existing-python"
         assert not any(home.glob("romcloud-update-*"))
 
 
@@ -574,6 +792,146 @@ class TestPerformUpdateFailedInstall:
             )
 
         assert not any(home.glob("romcloud-update-*"))
+
+
+class TestPerformUpdateFailedCandidateValidation:
+    """The candidate builds fine but fails to prove itself — must never be
+    activated, and the previously working runtime must be left alone."""
+
+    def test_smoke_test_failure_raises_update_install_error(self, tmp_path):
+        home = tmp_path / "romcloud"
+        archive = _make_archive_bytes(sha=_SHA)
+        opener = _make_opener(_full_payloads(archive_bytes=archive))
+
+        def runner(argv, **kwargs):
+            if argv[1:3] == ["-m", "romcloud.cli.main"] and argv[3:] == ["--help"]:
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr="ImportError: corrupted module")
+            return _fake_runner_success(argv, **kwargs)
+
+        with pytest.raises(UpdateInstallError, match="corrupted module"):
+            upd.perform_update(home, home / "venv" / "bin" / "python", opener=opener, runner=runner)
+
+    def test_live_venv_never_activated_on_smoke_test_failure(self, tmp_path):
+        home = tmp_path / "romcloud"
+        venv_python = home / "venv" / "bin" / "python"
+        venv_python.parent.mkdir(parents=True)
+        venv_python.write_text("real-existing-python")
+        previous = upd.BuildInfo(
+            version="1.0.0", commit="old" * 13, commit_short="oldold", build_date="x", source="s"
+        )
+        upd.write_build_info(home, previous)
+
+        archive = _make_archive_bytes(sha=_SHA)
+        opener = _make_opener(_full_payloads(archive_bytes=archive))
+
+        def runner(argv, **kwargs):
+            if argv[1:3] == ["-m", "romcloud.cli.main"] and argv[3:] == ["--version"]:
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom")
+            return _fake_runner_success(argv, **kwargs)
+
+        with pytest.raises(UpdateInstallError):
+            upd.perform_update(home, venv_python, opener=opener, runner=runner)
+
+        assert venv_python.read_text() == "real-existing-python"
+        assert upd.read_build_info(home) == previous
+        assert not any(home.glob("romcloud-update-*"))
+
+    def test_candidate_pip_install_failure_never_touches_live_venv(self, tmp_path):
+        home = tmp_path / "romcloud"
+        venv_python = home / "venv" / "bin" / "python"
+        venv_python.parent.mkdir(parents=True)
+        venv_python.write_text("real-existing-python")
+
+        archive = _make_archive_bytes(sha=_SHA)
+        opener = _make_opener(_full_payloads(archive_bytes=archive))
+
+        def runner(argv, **kwargs):
+            if argv[1:4] == ["-m", "pip", "install"]:
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr="ERROR: no space left on device")
+            return _fake_runner_success(argv, **kwargs)
+
+        with pytest.raises(UpdateInstallError, match="no space left"):
+            upd.perform_update(home, venv_python, opener=opener, runner=runner)
+
+        assert venv_python.read_text() == "real-existing-python"
+
+
+class TestPerformUpdateReconcileFailureRollsBack:
+    """Activation (the venv swap) happens before reconciliation; if
+    reconciliation then fails, the swap must be rolled back."""
+
+    def _failing_reconcile_runner(self, argv, **kwargs):
+        if "_reconcile-install" in argv:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="failed to write wrappers")
+        return _fake_runner_success(argv, **kwargs)
+
+    def test_previous_venv_is_restored(self, tmp_path):
+        home = tmp_path / "romcloud"
+        venv_python = home / "venv" / "bin" / "python"
+        venv_python.parent.mkdir(parents=True)
+        venv_python.write_text("real-existing-python")
+
+        archive = _make_archive_bytes(sha=_SHA)
+        opener = _make_opener(_full_payloads(archive_bytes=archive))
+
+        with pytest.raises(UpdateInstallError, match="failed to write wrappers"):
+            upd.perform_update(
+                home, venv_python, opener=opener, runner=self._failing_reconcile_runner
+            )
+
+        assert venv_python.read_text() == "real-existing-python"
+
+    def test_version_json_untouched(self, tmp_path):
+        home = tmp_path / "romcloud"
+        venv_python = home / "venv" / "bin" / "python"
+        venv_python.parent.mkdir(parents=True)
+        venv_python.write_text("real-existing-python")
+        previous = upd.BuildInfo(
+            version="1.0.0", commit="old" * 13, commit_short="oldold", build_date="x", source="s"
+        )
+        upd.write_build_info(home, previous)
+
+        archive = _make_archive_bytes(sha=_SHA)
+        opener = _make_opener(_full_payloads(archive_bytes=archive))
+
+        with pytest.raises(UpdateInstallError):
+            upd.perform_update(
+                home, venv_python, opener=opener, runner=self._failing_reconcile_runner
+            )
+
+        assert upd.read_build_info(home) == previous
+
+    def test_no_leftover_temp_or_backup_directories(self, tmp_path):
+        home = tmp_path / "romcloud"
+        venv_python = home / "venv" / "bin" / "python"
+        venv_python.parent.mkdir(parents=True)
+        venv_python.write_text("real-existing-python")
+
+        archive = _make_archive_bytes(sha=_SHA)
+        opener = _make_opener(_full_payloads(archive_bytes=archive))
+
+        with pytest.raises(UpdateInstallError):
+            upd.perform_update(
+                home, venv_python, opener=opener, runner=self._failing_reconcile_runner
+            )
+
+        assert not any(home.glob("romcloud-update-*"))
+
+    def test_first_time_activation_leaves_no_venv_on_reconcile_failure(self, tmp_path):
+        """No previous venv existed (fresh install) — a reconcile failure
+        must not leave a half-activated venv behind either."""
+        home = tmp_path / "romcloud"
+        venv_python = home / "venv" / "bin" / "python"
+
+        archive = _make_archive_bytes(sha=_SHA)
+        opener = _make_opener(_full_payloads(archive_bytes=archive))
+
+        with pytest.raises(UpdateInstallError):
+            upd.perform_update(
+                home, venv_python, opener=opener, runner=self._failing_reconcile_runner
+            )
+
+        assert not venv_python.parent.parent.exists()
 
 
 class TestConfigDataCacheUntouched:
@@ -651,12 +1009,13 @@ class TestNoGitAvailable:
         opener = _make_opener(_full_payloads(archive_bytes=archive))
 
         # The fake archive is a minimal version-only stub package (no CLI
-        # module) — real for the pip-install step under test, but not a full
-        # enough ROMCloud checkout to run the reconcile subprocess against.
-        # Reconciliation itself is covered separately/in-process; here only
-        # bypass it so this test stays focused on "pip install needs no git".
+        # module) — real for the venv-creation and pip-install steps under
+        # test, but not a full enough ROMCloud checkout to run the smoke
+        # tests or the reconcile subprocess against. Those are covered
+        # separately/in-process; here only bypass them so this test stays
+        # focused on "venv creation + pip install need no git".
         def runner(argv, **kwargs):
-            if "pip" in argv:
+            if "pip" in argv or "venv" in argv:
                 return real_subprocess.run(argv, **kwargs)
             return real_subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 

@@ -15,26 +15,47 @@ Design
    (``https://github.com/{repo}/archive/{sha}.zip``) — not the branch name —
    so what gets installed and what gets recorded as "current" can never
    drift apart between the check and the download.
-3. Extract it into an isolated temp directory (under ``romcloud_home`` by
+3. Reject the download outright if it is zero bytes or implausibly small
+   (see ``_MIN_ARCHIVE_BYTES``) — a real source archive is always far
+   larger, so a truncated/empty response is caught before it is ever
+   opened as a zip.
+4. Extract it into an isolated temp directory (under ``romcloud_home`` by
    default, falling back to the system temp dir), verifying every member
-   path stays inside the extraction directory first (no path traversal).
-4. Upgrade the existing persistent venv in place:
-   ``<venv python> -m pip install --upgrade <extracted project>``.
-5. Reconcile every ROMCloud-managed runtime artifact (the ``romcloud``/
-   ``romcloud-run`` wrappers, the graphical Ports UI, and — only if
-   previously enabled — the Batocera mount service script and the
+   path stays inside the extraction directory first (no path traversal),
+   that the archive isn't empty, and that it passes zip CRC integrity
+   checking (:func:`safe_extract_zip`).
+5. Validate the *extracted* candidate before it ever touches a venv
+   (:func:`validate_extracted_candidate`): a defined set of critical files
+   must exist and be non-empty, and no ``.py`` file anywhere under ``src/``
+   or ``ports_gfx/`` may be zero bytes — this is the check that would have
+   caught the real Batocera failure this module is hardened against (a
+   corrupted download whose zip opened fine but whose extracted tree was
+   hundreds of zero-byte files).
+6. Build and pip-install the candidate into a throwaway venv — never
+   directly over the active install — then smoke-test it (``--version``,
+   ``--help``, and a lightweight subcommand) via
+   :func:`_build_and_smoke_test_candidate`. Only a candidate that actually
+   runs is ever activated.
+7. Activate the validated candidate by swapping it in for the live venv
+   directory (the previous venv is kept as a backup until the next step
+   succeeds). Reconcile every ROMCloud-managed runtime artifact (the
+   ``romcloud``/``romcloud-run`` wrappers, the graphical Ports UI, and —
+   only if previously enabled — the Batocera mount service script and the
    EmulationStation override) against that same extracted source tree, via
     :mod:`romcloud.lifecycle.install` (shared with
    ``scripts/install.sh`` so neither duplicates this logic). The wrappers
    are required — a failure there fails the whole update; every other
    artifact is reconciled best-effort ("ROMCloud may fail; Batocera must
-   not").
-6. Only once both the venv upgrade *and* the required wrapper reconciliation
-   succeed, persist the new :class:`BuildInfo` — any earlier failure leaves
-   the previous ``version.json`` (and therefore the previously installed
+   not"). If reconciliation fails after activation, the swap is rolled
+   back — the previous venv is restored — before the error propagates.
+8. Only once activation *and* the required wrapper reconciliation succeed,
+   persist the new :class:`BuildInfo` — any earlier failure leaves the
+   previous ``version.json`` (and therefore the previously installed
    backend/wrappers) as the source of truth, so a failed update is never
-   reported as installed.
-7. The temp directory is always removed (success or failure).
+   reported as installed, and the previously working runtime is left
+   untouched.
+9. The temp directory (download, extraction, candidate venv, and any
+   rolled-back backup venv) is always removed (success or failure).
 
 This module normally leaves ``romcloud.toml``, ``credentials.toml``, the
 cache root, the local ROMs directory, the catalog database, and logs alone.
@@ -133,6 +154,32 @@ _GITHUB_API_BASE = "https://api.github.com"
 _GITHUB_WEB_BASE = "https://github.com"
 _GITHUB_RAW_BASE = "https://raw.githubusercontent.com"
 _USER_AGENT = "romcloud-updater"
+
+# A real GitHub source archive for this project is always far larger than
+# this; a downloaded file below it is a truncated/empty/error-page response,
+# never real source, and must never reach the extractor.
+_MIN_ARCHIVE_BYTES = 2048
+
+# The minimal set of files an extracted candidate must have, present and
+# non-empty, before it is ever built into a venv or touches the live
+# runtime. Deliberately small and stable — this is a floor, not a full
+# manifest; :func:`validate_extracted_candidate` also sweeps every ``.py``
+# file under ``src/`` and ``ports_gfx/`` for zero-byte corruption.
+_CRITICAL_RELATIVE_FILES = (
+    "pyproject.toml",
+    "src/romcloud/__init__.py",
+    "src/romcloud/cli/main.py",
+)
+
+# Argv tails (after "<candidate python> -m romcloud.cli.main") used to prove
+# the candidate actually runs before it is ever activated. All three must
+# exit zero. "configure --help" is side-effect-free and needs no existing
+# romcloud.toml, unlike most other subcommands.
+_SMOKE_TEST_ARGV_TAILS = (
+    ["--version"],
+    ["--help"],
+    ["configure", "--help"],
+)
 
 OpenerType = Callable[..., object]
 RunnerType = Callable[..., "subprocess.CompletedProcess[str]"]
@@ -280,7 +327,11 @@ def download_file(
     timeout: float = 60.0,
     total_timeout: float = 120.0,
     clock: Callable[[], float] = time.monotonic,
+    min_size: int = 0,
 ) -> None:
+    """Download *url* to *dest_path*, then reject the result if it's empty
+    or (when *min_size* is given) implausibly small — never leaves a
+    truncated/empty download for a caller to mistake for real content."""
     request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
     try:
         deadline = clock() + max(0.01, total_timeout)
@@ -301,6 +352,15 @@ def download_file(
         raise UpdateDownloadError(f"Failed to download {url}: {exc.reason}") from exc
     except (OSError, TimeoutError) as exc:
         raise UpdateDownloadError(f"Failed to download {url}: {exc}") from exc
+
+    size = dest_path.stat().st_size
+    if size == 0:
+        raise UpdateDownloadError(f"Downloaded file is empty (0 bytes): {url}")
+    if min_size and size < min_size:
+        raise UpdateDownloadError(
+            f"Downloaded file is implausibly small ({size} bytes, expected at "
+            f"least {min_size}): {url}"
+        )
 
 
 # ── safe archive extraction ──────────────────────────────────────────────────
@@ -345,7 +405,20 @@ def safe_extract_zip(zip_path: Path, dest_dir: Path) -> None:
         raise UpdateArchiveError(f"Downloaded archive is not a valid zip file: {exc}") from exc
 
     with zf:
-        for member in zf.infolist():
+        infolist = zf.infolist()
+        if not infolist:
+            raise UpdateArchiveError("Downloaded archive is empty (contains no files)")
+
+        # CRC-check every member's compressed data before extracting
+        # anything — catches a corrupted/truncated download whose central
+        # directory still parses but whose content doesn't match.
+        bad_member = zf.testzip()
+        if bad_member is not None:
+            raise UpdateArchiveError(
+                f"Downloaded archive failed integrity check (corrupt member: {bad_member!r})"
+            )
+
+        for member in infolist:
             target = _resolve_member_path(dest_dir, member.filename)
             if member.is_dir():
                 target.mkdir(parents=True, exist_ok=True)
@@ -373,6 +446,37 @@ def find_extracted_project_root(extract_dir: Path) -> Path:
     raise UpdateArchiveError(
         f"Unexpected archive layout in {extract_dir} — expected a single top-level directory."
     )
+
+
+def validate_extracted_candidate(project_root: Path) -> None:
+    """Reject an extracted update candidate before it is built into a venv
+    or otherwise touches the live runtime.
+
+    Guards against the exact Batocera failure mode this module exists to
+    prevent: a corrupted/truncated download whose zip *opened* successfully
+    but whose extracted tree was partly or wholly zero-byte files.
+    """
+    for rel in _CRITICAL_RELATIVE_FILES:
+        path = project_root / rel
+        if not path.is_file():
+            raise UpdateArchiveError(f"Update candidate is missing a required file: {rel}")
+        if path.stat().st_size == 0:
+            raise UpdateArchiveError(f"Update candidate has a zero-byte required file: {rel}")
+
+    zero_byte: list[Path] = []
+    for sub in ("src", "ports_gfx"):
+        base_dir = project_root / sub
+        if not base_dir.is_dir():
+            continue
+        for path in base_dir.rglob("*.py"):
+            if path.is_file() and path.stat().st_size == 0:
+                zero_byte.append(path.relative_to(project_root))
+
+    if zero_byte:
+        raise UpdateArchiveError(
+            f"Update candidate contains {len(zero_byte)} zero-byte Python file(s) "
+            f"(e.g. {zero_byte[0]}) — refusing to install a corrupted payload"
+        )
 
 
 # ── build/version metadata ───────────────────────────────────────────────────
@@ -511,6 +615,81 @@ def _make_temp_dir(romcloud_home: Path) -> Path:
         return Path(tempfile.mkdtemp(prefix="romcloud-update-"))
 
 
+def _run_step(
+    runner: RunnerType,
+    argv: list,
+    *,
+    timeout: float,
+    action: str,
+) -> "subprocess.CompletedProcess[str]":
+    """Run *argv*, raising :class:`UpdateInstallError` with actionable
+    detail on a nonzero exit or a timeout. Shared by every candidate
+    staging/activation step."""
+    try:
+        result = runner(argv, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise UpdateInstallError(f"{action} timed out after {timeout:.0f}s") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "unknown error").strip()
+        raise UpdateInstallError(f"{action} failed: {detail}")
+    return result
+
+
+def _build_and_smoke_test_candidate(
+    candidate_dir: Path,
+    base_python: Path,
+    project_root: Path,
+    *,
+    runner: RunnerType,
+    timeout: float,
+) -> None:
+    """Build the extracted candidate into a throwaway venv and prove it
+    actually runs — never pip-install an unproven payload directly over the
+    active install. Raises :class:`UpdateInstallError` on any failure,
+    before the live runtime has been touched.
+    """
+    _run_step(
+        runner,
+        [str(base_python), "-m", "venv", str(candidate_dir)],
+        timeout=timeout,
+        action="Creating the candidate environment",
+    )
+    candidate_python = candidate_dir / "bin" / "python"
+
+    try:
+        pip_check = runner(
+            [str(candidate_python), "-m", "pip", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        pip_present = pip_check.returncode == 0
+    except subprocess.TimeoutExpired:
+        pip_present = False
+    if not pip_present:
+        _run_step(
+            runner,
+            [str(candidate_python), "-m", "ensurepip", "--upgrade"],
+            timeout=timeout,
+            action="Bootstrapping pip in the candidate environment",
+        )
+
+    _run_step(
+        runner,
+        [str(candidate_python), "-m", "pip", "install", "--upgrade", "--quiet", str(project_root)],
+        timeout=timeout,
+        action="Installing the update into the candidate environment",
+    )
+
+    for tail in _SMOKE_TEST_ARGV_TAILS:
+        _run_step(
+            runner,
+            [str(candidate_python), "-m", "romcloud.cli.main", *tail],
+            timeout=timeout,
+            action=f"Candidate smoke test ({' '.join(tail)})",
+        )
+
+
 def perform_update(
     romcloud_home: Path,
     venv_python: Path,
@@ -525,21 +704,23 @@ def perform_update(
     install_timeout: float = 300.0,
     reconcile_timeout: float = 120.0,
 ) -> UpdateResult:
-    """Download the latest commit's archive, upgrade the persistent venv,
-    and reconcile every ROMCloud-managed runtime artifact (wrappers,
-    graphical Ports UI, previously-enabled Batocera integrations) against
-    that exact same source revision.
+    """Download the latest commit's archive, build and smoke-test it in a
+    throwaway candidate venv, activate it in place of the live venv, and
+    reconcile every ROMCloud-managed runtime artifact (wrappers, graphical
+    Ports UI, previously-enabled Batocera integrations) against that exact
+    same source revision.
 
     Never leaves a partially-upgraded install recorded as current: the new
-    :class:`BuildInfo` is only written after both the venv upgrade *and*
-    reconciling the required core wrappers succeed — a failure in either
-    leaves the previous ``version.json`` (and therefore the previously
-    installed backend/wrappers) as the source of truth, so a failed update
-    is never reported as installed. Reconciling optional artifacts (the
-    graphical Ports UI, the mount service script, the EmulationStation
-    override) is best-effort and never fails the update — "ROMCloud may
-    fail; Batocera must not". The temporary download/extraction directory is
-    always removed, on success or failure.
+    :class:`BuildInfo` is only written after activation *and* reconciling
+    the required core wrappers succeed — a failure anywhere along the way
+    leaves the previous ``version.json`` and the previously installed
+    backend/wrappers untouched, so a failed update is never reported as
+    installed and the working runtime is never left in a half-upgraded
+    state. Reconciling optional artifacts (the graphical Ports UI, the
+    mount service script, the EmulationStation override) is best-effort
+    and never fails the update — "ROMCloud may fail; Batocera must not".
+    The temporary download/extraction/candidate-venv directory is always
+    removed, on success or failure.
     """
     previous = read_build_info(romcloud_home)
     emit_progress(
@@ -553,7 +734,12 @@ def perform_update(
         emit_progress(
             progress, "update", "download", "running", "Downloading the update"
         )
-        download_file(archive_download_url(repo, latest.sha), archive_path, opener=opener)
+        download_file(
+            archive_download_url(repo, latest.sha),
+            archive_path,
+            opener=opener,
+            min_size=_MIN_ARCHIVE_BYTES,
+        )
 
         extract_dir = tmp_root / "extracted"
         emit_progress(
@@ -561,65 +747,84 @@ def perform_update(
         )
         safe_extract_zip(archive_path, extract_dir)
         project_root = find_extracted_project_root(extract_dir)
+        validate_extracted_candidate(project_root)
 
-        log.info("Upgrading venv at %s from %s", venv_python, project_root)
+        candidate_dir = tmp_root / "venv-candidate"
+        log.info("Staging update candidate at %s from %s", candidate_dir, project_root)
         emit_progress(
-            progress, "update", "install", "running", "Installing the ROMCloud update"
+            progress, "update", "stage", "running", "Building and smoke-testing the update"
         )
-        try:
-            result = runner(
-                [str(venv_python), "-m", "pip", "install", "--upgrade", "--quiet", str(project_root)],
-                capture_output=True,
-                text=True,
-                timeout=install_timeout,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise UpdateInstallError(
-                f"Update installation timed out after {install_timeout:.0f}s"
-            ) from exc
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout or "unknown pip error").strip()
-            raise UpdateInstallError(f"Failed to install update into the venv: {detail}")
+        _build_and_smoke_test_candidate(
+            candidate_dir,
+            venv_python,
+            project_root,
+            runner=runner,
+            timeout=install_timeout,
+        )
 
         resolved_ports_dir = Path(ports_dir) if ports_dir else _DEFAULT_PORTS_DIR
-        log.info("Reconciling installed runtime artifacts from %s", project_root)
+        live_venv_dir = venv_python.parent.parent
+        backup_venv_dir = tmp_root / "venv-previous"
+        had_previous_venv = live_venv_dir.exists()
+
+        log.info("Activating validated candidate at %s", live_venv_dir)
         emit_progress(
-            progress,
-            "update",
-            "reconcile",
-            "running",
-            "Updating ROMCloud launchers and integrations",
+            progress, "update", "install", "running", "Activating the ROMCloud update"
         )
+        if had_previous_venv:
+            live_venv_dir.rename(backup_venv_dir)
+        candidate_dir.rename(live_venv_dir)
+
         try:
-            reconcile_result = runner(
-                [
-                    str(venv_python),
-                    "-m",
-                    "romcloud.cli.main",
-                    "_reconcile-install",
-                    "--romcloud-home",
-                    str(romcloud_home),
-                    "--project-root",
-                    str(project_root),
-                    "--ports-dir",
-                    str(resolved_ports_dir),
-                    "--system-python",
-                    system_python or "",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=reconcile_timeout,
+            log.info("Reconciling installed runtime artifacts from %s", project_root)
+            emit_progress(
+                progress,
+                "update",
+                "reconcile",
+                "running",
+                "Updating ROMCloud launchers and integrations",
             )
-        except subprocess.TimeoutExpired as exc:
-            raise UpdateInstallError(
-                f"Runtime reconciliation timed out after {reconcile_timeout:.0f}s"
-            ) from exc
-        reconcile_log = (reconcile_result.stdout or "") + (reconcile_result.stderr or "")
-        if reconcile_result.returncode != 0:
-            detail = reconcile_log.strip() or "unknown reconciliation error"
-            raise UpdateInstallError(
-                f"Backend upgraded, but failed to reconcile installed runtime artifacts: {detail}"
+            try:
+                reconcile_result = runner(
+                    [
+                        str(venv_python),
+                        "-m",
+                        "romcloud.cli.main",
+                        "_reconcile-install",
+                        "--romcloud-home",
+                        str(romcloud_home),
+                        "--project-root",
+                        str(project_root),
+                        "--ports-dir",
+                        str(resolved_ports_dir),
+                        "--system-python",
+                        system_python or "",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=reconcile_timeout,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise UpdateInstallError(
+                    f"Runtime reconciliation timed out after {reconcile_timeout:.0f}s"
+                ) from exc
+            reconcile_log = (reconcile_result.stdout or "") + (reconcile_result.stderr or "")
+            if reconcile_result.returncode != 0:
+                detail = reconcile_log.strip() or "unknown reconciliation error"
+                raise UpdateInstallError(
+                    f"Backend upgraded, but failed to reconcile installed runtime artifacts: {detail}"
+                )
+        except BaseException:
+            # The validated candidate is already activated; if reconciling
+            # the runtime it depends on fails, restore whatever was running
+            # before rather than leave a half-activated update in place.
+            log.warning(
+                "Reconciliation failed after activation — rolling back to the previous venv"
             )
+            shutil.rmtree(live_venv_dir, ignore_errors=True)
+            if had_previous_venv:
+                backup_venv_dir.rename(live_venv_dir)
+            raise
 
         new_info = BuildInfo(
             version=read_project_version(project_root),
