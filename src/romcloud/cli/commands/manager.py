@@ -90,6 +90,9 @@ def manager_cmd(
                     access_token,
                     tls_cert=str(tls_cert) if tls_cert else None,
                     tls_key=str(tls_key) if tls_key else None,
+                    auth_state_path=str(
+                        Path(container.config.data_path) / "web" / "trusted-devices.json"
+                    ),
                 )
             except KeyboardInterrupt:
                 if not quiet:

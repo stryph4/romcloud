@@ -8,7 +8,7 @@ from romcloud.web import lifecycle
 
 
 def test_unavailable_browser_reports_clear_error(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(lifecycle, "find_local_browser", lambda: None)
+    monkeypatch.setattr(lifecycle, "find_local_browser", lambda **kwargs: None)
     with pytest.raises(RuntimeError, match="Chromium-compatible"):
         lifecycle.launch_local_browser(tmp_path)
 
@@ -16,21 +16,20 @@ def test_unavailable_browser_reports_clear_error(tmp_path: Path, monkeypatch) ->
 def test_local_back_exit_terminates_browser_but_not_manager(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         lifecycle,
-        "issue_browser_bootstrap",
-        lambda data_path, kind: {
-            "url": "https://127.0.0.1:8765/?bootstrap=temporary",
-            "launch_id": "launch-one",
-        },
+        "manager_status",
+        lambda data_path: {"local_url": "https://127.0.0.1:8765/"},
     )
     monkeypatch.setattr(
         "romcloud.web.tls.manager_certificate_spki_pin", lambda data_path: "pin"
     )
     requests = []
-    monkeypatch.setattr(
-        lifecycle,
-        "_manager_request",
-        lambda data_path, path: requests.append(path) or {"exit_requested": True},
-    )
+    def request(data_path, path, **kwargs):
+        requests.append(path)
+        if path == "/api/auth/local-launch":
+            return {"launch_id": "launch-one"}
+        return {"exit_requested": True}
+
+    monkeypatch.setattr(lifecycle, "_manager_request", request)
 
     class Process:
         returncode = None
@@ -57,7 +56,8 @@ def test_local_back_exit_terminates_browser_but_not_manager(tmp_path: Path, monk
         tmp_path, browser="/usr/bin/chromium", popen=popen, sleep=lambda _: None
     )
     assert process.terminated
-    assert requests == ["/api/local-session-status/launch-one"]
+    assert requests == ["/api/auth/local-launch", "/api/local-session-status/launch-one"]
     assert "--kiosk" in captured["argv"]
     assert "permanent" not in " ".join(captured["argv"])
+    assert "?" not in captured["argv"][-1]
     assert result["closed"] is True

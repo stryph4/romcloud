@@ -19,7 +19,13 @@ from urllib.parse import parse_qs, urlparse
 from romcloud.core.exceptions import ROMCloudError
 from romcloud.infrastructure.logging import get_logger
 from romcloud.services.library_manager import LibraryManagerService
-from romcloud.web.auth import BrowserAuthRegistry, BrowserSession
+from romcloud.web.auth import (
+    REMEMBER_90_DAYS_SECONDS,
+    BrowserAuthRegistry,
+    BrowserSession,
+    PairingRateLimited,
+    is_loopback,
+)
 
 log = get_logger("web-manager")
 _MAX_BODY = 128 * 1024
@@ -127,6 +133,14 @@ class ManagerRequestHandler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/api/status":
                 self._json(HTTPStatus.OK, self.server.manager.status())
+            elif parsed.path == "/api/trusted-devices":
+                session = self._cookie_session()
+                self._json(
+                    HTTPStatus.OK,
+                    {"devices": self.server.browser_auth.list_sessions(
+                        current_token=session.token if session else ""
+                    )},
+                )
             elif parsed.path == "/api/systems":
                 self._json(HTTPStatus.OK, self.server.manager.systems())
             elif parsed.path == "/api/games":
@@ -158,38 +172,39 @@ class ManagerRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
-        if parsed.path == "/auth/exchange":
-            self._exchange_bootstrap()
+        if parsed.path == "/auth/pair":
+            self._exchange_pairing()
             return
         if not self._authenticated():
             self._json(HTTPStatus.UNAUTHORIZED, {"error": "Authentication required."})
             return
         try:
-            if parsed.path == "/api/auth/bootstrap":
-                body = self._body()
-                local = str(body.get("kind", "remote")) == "local"
-                code, launch_id = self.server.browser_auth.issue(local=local)
-                result: dict[str, object] = {
-                    "code": code,
-                    "expires_in": 60,
-                    "kind": "local" if local else "remote",
-                }
-                if launch_id:
-                    result["launch_id"] = launch_id
-                self._json(HTTPStatus.CREATED, result)
+            if parsed.path == "/api/auth/pairing-code":
+                self._json(
+                    HTTPStatus.CREATED,
+                    {"code": self.server.browser_auth.issue_pairing(), "expires_in": 120},
+                )
+            elif parsed.path == "/api/auth/local-launch":
+                if not self._bearer_authenticated():
+                    self._json(HTTPStatus.FORBIDDEN, {"error": "Local launch registration is unavailable."})
+                else:
+                    self._json(HTTPStatus.CREATED, {"launch_id": self.server.browser_auth.begin_local_launch()})
             elif parsed.path == "/api/auth/logout":
                 session = self._cookie_session()
                 if session:
                     self.server.browser_auth.revoke(session.token)
                 self._json(HTTPStatus.OK, {"signed_out": True}, clear_cookie=True)
             elif parsed.path == "/api/local-exit":
-                session = self._cookie_session()
-                if not session or not self.server.browser_auth.request_local_exit(
-                    session, peer=self.client_address[0]
-                ):
+                if not self._trusted_local_request() or not self.server.browser_auth.request_local_exit(peer=self.client_address[0]):
                     self._json(HTTPStatus.FORBIDDEN, {"error": "Local exit is unavailable."})
                 else:
                     self._json(HTTPStatus.OK, {"closing": True})
+            elif parsed.path == "/api/trusted-devices/revoke":
+                revoked = self.server.browser_auth.revoke_id(str(self._body().get("id", "")))
+                self._json(HTTPStatus.OK if revoked else HTTPStatus.NOT_FOUND, {"revoked": revoked})
+            elif parsed.path == "/api/trusted-devices/revoke-all":
+                count = self.server.browser_auth.revoke_all()
+                self._json(HTTPStatus.OK, {"revoked": count}, clear_cookie=True)
             elif parsed.path == "/api/actions":
                 body = self._body()
                 with self.server.mutation_lock:
@@ -214,9 +229,18 @@ class ManagerRequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Internal server error."})
 
     def _authenticated(self) -> bool:
+        return self._trusted_local_request() or self._bearer_authenticated() or self._cookie_session() is not None
+
+    def _bearer_authenticated(self) -> bool:
         provided = self.headers.get("Authorization", "")
         expected = f"Bearer {self.server.auth_token}"
-        return hmac.compare_digest(provided, expected) or self._cookie_session() is not None
+        return hmac.compare_digest(provided, expected)
+
+    def _trusted_local_request(self) -> bool:
+        if not is_loopback(self.client_address[0]):
+            return False
+        host = (urlparse("//" + self.headers.get("Host", "")).hostname or "").lower()
+        return host in {"127.0.0.1", "localhost", "::1"}
 
     def _cookie_session(self) -> BrowserSession | None:
         cookie = self.headers.get("Cookie", "")
@@ -226,23 +250,33 @@ class ManagerRequestHandler(BaseHTTPRequestHandler):
                 return self.server.browser_auth.authenticate(value)
         return None
 
-    def _exchange_bootstrap(self) -> None:
+    def _exchange_pairing(self) -> None:
         try:
-            code = str(self._body().get("code", ""))
-            session = self.server.browser_auth.exchange(
-                code, peer=self.client_address[0]
+            body = self._body()
+            session = self.server.browser_auth.exchange_pairing(
+                str(body.get("code", "")),
+                peer=self.client_address[0],
+                trust=str(body.get("trust", "session")),
+                label=self.headers.get("User-Agent", "") or f"Browser at {self.client_address[0]}",
             )
             if session is None:
                 self._json(
                     HTTPStatus.UNAUTHORIZED,
-                    {"error": "This pairing link is invalid, expired, or already used."},
+                    {"error": "That pairing code is invalid, expired, or already used."},
                 )
                 return
             self._json(
                 HTTPStatus.OK,
-                {"authenticated": True, "local": session.local},
+                {"authenticated": True},
                 session_cookie=session.token,
+                cookie_max_age=(
+                    None if session.trust == "session"
+                    else REMEMBER_90_DAYS_SECONDS if session.trust == "90-days"
+                    else 10 * 365 * 24 * 60 * 60
+                ),
             )
+        except PairingRateLimited as exc:
+            self._json(HTTPStatus.TOO_MANY_REQUESTS, {"error": str(exc)})
         except ValueError as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
 
@@ -280,6 +314,7 @@ class ManagerRequestHandler(BaseHTTPRequestHandler):
         value: object,
         *,
         session_cookie: str | None = None,
+        cookie_max_age: int | None = None,
         clear_cookie: bool = False,
     ) -> None:
         content = json.dumps(value, separators=(",", ":")).encode("utf-8")
@@ -288,9 +323,10 @@ class ManagerRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(content)))
         self.send_header("Cache-Control", "no-store")
         if session_cookie is not None:
+            max_age = "" if cookie_max_age is None else f"; Max-Age={cookie_max_age}"
             self.send_header(
                 "Set-Cookie",
-                f"romcloud_session={session_cookie}; Path=/; HttpOnly; Secure; SameSite=Strict",
+                f"romcloud_session={session_cookie}; Path=/; HttpOnly; Secure; SameSite=Strict{max_age}",
             )
         elif clear_cookie:
             self.send_header(
@@ -324,8 +360,10 @@ def serve_manager(
     *,
     tls_cert: str | None = None,
     tls_key: str | None = None,
+    auth_state_path: str | None = None,
 ) -> None:
-    server = ManagerHTTPServer((host, port), manager, token)
+    registry = BrowserAuthRegistry(state_path=auth_state_path) if auth_state_path else None
+    server = ManagerHTTPServer((host, port), manager, token, auth_registry=registry)
     if tls_cert or tls_key:
         if not tls_cert or not tls_key:
             server.server_close()

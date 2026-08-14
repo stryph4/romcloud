@@ -113,3 +113,16 @@ def test_open_here_surfaces_unavailable_browser_runtime() -> None:
     assert actions == ["manager-open-local"]
     assert state.step == FAILED
     assert "Chromium-compatible" in state.error
+
+
+def test_pair_action_displays_short_code_and_stable_url() -> None:
+    def popen(argv, **kwargs):
+        return _Process({"ok": True, "url": "https://batocera.local:8765/", "code": "7KMP", "expires_in": 120})
+
+    state = LibraryManagerScreenState("romcloud", step=READY, details={"running": True}, popen=popen)
+    state.selected_index = 1
+    state.activate(); _drain(state)
+    lines = _library_manager_body_lines(state)
+    assert "7KMP" in lines
+    assert "https://batocera.local:8765/" in lines
+    assert not any("?" in line for line in lines)

@@ -275,10 +275,23 @@ def mount_install_cmd(ctx: click.Context) -> None:
     """Install the Batocera boot-time service for configured SMB locations."""
     config = _require_mounts(ctx)
 
-    romcloud_bin = _romcloud_home(config) / "bin" / "romcloud"
-    path = mount_service.install_service(str(romcloud_bin))
+    romcloud_home = _romcloud_home(config)
+    romcloud_bin = romcloud_home / "bin" / "romcloud"
+    activation_path = mount_service.startup_activation.state_path(romcloud_home)
+    path = mount_service.install_service(
+        str(romcloud_bin),
+        activation_state_path=activation_path,
+    )
     click.echo(f"Installed boot service: {path}")
     click.echo(f"If not enabled automatically, run: batocera-services enable {mount_service.SERVICE_NAME}")
+    if mount_service.startup_activation.activation_status(activation_path)[
+        "startup_restart_required"
+    ]:
+        click.echo(
+            "Restart Batocera before automatic Library Browser availability "
+            "on future boots is considered active. The manager remains usable "
+            "in this session."
+        )
 
 
 @mount_group.command("remove")

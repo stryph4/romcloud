@@ -233,7 +233,12 @@ def test_http_api_requires_token_and_serves_paginated_json(
         with urllib.request.urlopen(f"{base}/controller.js", timeout=2) as response:
             assert b"navigator.getGamepads" in response.read()
         with pytest.raises(urllib.error.HTTPError) as denied:
-            urllib.request.urlopen(f"{base}/api/status", timeout=2)
+            urllib.request.urlopen(
+                urllib.request.Request(
+                    f"{base}/api/status", headers={"Host": "batocera.local"}
+                ),
+                timeout=2,
+            )
         assert denied.value.code == 401
         request = urllib.request.Request(
             f"{base}/api/games?system=nes&scope=full&page_size=10",
@@ -295,8 +300,7 @@ def test_real_browser_loads_authenticated_manager_app(
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    code, _ = server.browser_auth.issue(local=False)
-    url = f"http://127.0.0.1:{server.server_address[1]}/?pair={code}"
+    url = f"http://127.0.0.1:{server.server_address[1]}/"
     try:
         result = subprocess.run(
             [

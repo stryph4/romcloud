@@ -8,13 +8,15 @@
 </head>
 <body>
   <div id="auth" class="auth hidden">
-    <form id="auth-form" class="auth-card">
+    <form id="pair-form" class="auth-card">
       <div class="brand-mark">RC</div>
-      <h1>Connect to ROMCloud</h1>
-      <p>Use a ROMCloud pairing link. Manual token entry is available for advanced troubleshooting.</p>
-      <input id="token" type="password" autocomplete="current-password" placeholder="Access token" required data-controller-zone="auth" data-controller-row="0" data-controller-col="0">
-      <button class="primary" type="submit" data-controller-zone="auth" data-controller-row="0" data-controller-col="1">Connect</button>
+      <h1>Pair with ROMCloud</h1>
+      <p>In ROMCloud, open Library Manager and choose Pair Another Device.</p>
+      <input id="pair-code" class="pair-code" type="text" inputmode="text" maxlength="4" autocomplete="one-time-code" placeholder="4-character code" required data-controller-zone="auth" data-controller-row="0" data-controller-col="0">
+      <label><span>Trust this device</span><select id="pair-trust" data-controller-zone="auth" data-controller-row="1" data-controller-col="0"><option value="session">This session only</option><option value="90-days">Remember for 90 days</option><option value="until-revoked">Remember until revoked</option></select></label>
+      <button class="primary" type="submit" data-controller-zone="auth" data-controller-row="2" data-controller-col="0">Pair</button>
       <p id="auth-error" class="error"></p>
+      <details><summary>Advanced manual authentication</summary><div id="token-form"><input id="token" type="password" autocomplete="current-password" placeholder="Permanent access token"><button id="token-connect" type="button">Connect</button></div></details>
     </form>
   </div>
 
@@ -24,6 +26,7 @@
       <div id="controller-status" class="controller-status hidden" aria-live="polite">Controller connected</div>
       <div id="mode" class="mode">Connecting…</div>
       <button id="logout" class="icon-button" title="Forget access token" data-controller-zone="global" data-controller-row="0" data-controller-col="0">Sign out</button>
+      <button id="trusted-devices" class="icon-button" data-controller-zone="global" data-controller-row="0" data-controller-col="1">Trusted Devices</button>
     </header>
     <div id="offline-banner" class="banner hidden"><b>Offline</b> — showing local content only. Remote-only games and downloads are unavailable.</div>
 
@@ -71,6 +74,13 @@
   </dialog>
 
   <div id="job" class="job hidden"><div><b id="job-title">Downloading pinned games</b><span id="job-detail"></span></div><progress id="job-progress"></progress></div>
+  <dialog id="devices-dialog">
+    <div class="dialog-card">
+      <div class="dialog-head"><h2>Trusted Remote Devices</h2><button id="close-devices" class="icon-button">Close</button></div>
+      <div id="device-list"></div>
+      <div class="dialog-actions"><button id="revoke-all" class="danger-text">Revoke All</button></div>
+    </div>
+  </dialog>
   <script src="/controller.js" defer></script>
   <script src="/app.js" defer></script>
 </body>

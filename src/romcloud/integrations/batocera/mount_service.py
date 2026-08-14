@@ -7,7 +7,8 @@ under ``/userdata/system/services/`` that responds to ``start``/``stop``/
 <name>``. This module generates and installs exactly one such script,
 ``romcloud_mount``. The historical name is retained for compatibility; its
 local-only ``boot-start`` handoff now also detaches Auto SaveSync's resident
-menu loop when that persisted setting is enabled.
+menu loop when that persisted setting is enabled.  The same owned service
+ensures the singleton Library Manager so remote access is ready after boot.
 
 Boot safety ("ROMCloud may fail; Batocera must not")
 Real Batocera 42 hardware testing showed that a service's ``start`` action
@@ -16,7 +17,9 @@ boot. The generated script therefore:
 
 - Routes ``start`` to ``romcloud mount boot-start`` — which never blocks;
   it only spawns a detached background worker and returns immediately (see
-  :mod:`romcloud.infrastructure.mount_worker`).
+  :mod:`romcloud.infrastructure.mount_worker`). The manager readiness check
+  is local-only, performs no source discovery or polling, and is bounded to
+  five seconds.
 - Wraps both ``start`` and ``stop`` with ``|| true`` and an explicit
   ``exit 0``, so that *even if* the ``romcloud`` command itself fails
   outright (missing venv, broken Python, malformed config, etc.), the
@@ -38,6 +41,7 @@ import subprocess
 from pathlib import Path
 
 from romcloud.infrastructure.logging import get_logger
+from romcloud.integrations.batocera import startup_activation
 
 log = get_logger("batocera.mount_service")
 
@@ -45,6 +49,21 @@ SERVICE_NAME = "romcloud_mount"
 LEGACY_SERVICE_NAME = "romcloud-mount"
 SERVICE_SCRIPT_PATH = Path(f"/userdata/system/services/{SERVICE_NAME}")
 LEGACY_SERVICE_PATH = Path(f"/userdata/system/services/{LEGACY_SERVICE_NAME}")
+SYSTEM_CONFIG_PATH = Path("/userdata/system/batocera.conf")
+
+
+def _service_is_enabled(config_path: Path) -> bool:
+    """Return whether Batocera's persisted service list contains ROMCloud."""
+    try:
+        lines = config_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    configured = ""
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("system.services="):
+            configured = stripped.partition("=")[2].strip().strip('"\'')
+    return SERVICE_NAME in configured.replace(",", " ").split()
 
 
 def generate_service_script(romcloud_bin: str) -> str:
@@ -73,9 +92,14 @@ def generate_service_script(romcloud_bin: str) -> str:
         'case "${1:-}" in\n'
         "    start)\n"
         '        "${ROMCLOUD_BIN}" mount boot-start || true\n'
+        '        if "${ROMCLOUD_BIN}" uidata manager-start >/dev/null 2>&1; then\n'
+        '            "${ROMCLOUD_BIN}" uidata startup-integration-activated '
+        ">/dev/null 2>&1 || true\n"
+        "        fi\n"
         "        exit 0\n"
         "        ;;\n"
         "    stop)\n"
+        '        "${ROMCLOUD_BIN}" uidata manager-stop >/dev/null 2>&1 || true\n'
         '        "${ROMCLOUD_BIN}" mount stop --shutdown || true\n'
         "        exit 0\n"
         "        ;;\n"
@@ -90,7 +114,13 @@ def generate_service_script(romcloud_bin: str) -> str:
     )
 
 
-def install_service(romcloud_bin: str, *, service_path: Path = SERVICE_SCRIPT_PATH) -> Path:
+def install_service(
+    romcloud_bin: str,
+    *,
+    service_path: Path = SERVICE_SCRIPT_PATH,
+    activation_state_path: Path | None = None,
+    services_config_path: Path = SYSTEM_CONFIG_PATH,
+) -> Path:
     """Write the service script (mode 0755) and try to enable it.
 
     Enabling via ``batocera-services`` is best-effort: if the binary isn't
@@ -99,8 +129,16 @@ def install_service(romcloud_bin: str, *, service_path: Path = SERVICE_SCRIPT_PA
     failing the whole install — the script is still written and can be
     enabled manually.
     """
+    generated = generate_service_script(romcloud_bin)
+    try:
+        previous = service_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        previous = None
+    changed = previous != generated
+    was_enabled = _service_is_enabled(services_config_path)
+
     service_path.parent.mkdir(parents=True, exist_ok=True)
-    service_path.write_text(generate_service_script(romcloud_bin), encoding="utf-8")
+    service_path.write_text(generated, encoding="utf-8")
     service_path.chmod(0o755)
     log.info("Wrote service script: %s", service_path)
 
@@ -139,6 +177,13 @@ def install_service(romcloud_bin: str, *, service_path: Path = SERVICE_SCRIPT_PA
         log.warning(
             "Timed out enabling %s; enable it manually after Batocera services recover",
             SERVICE_NAME,
+        )
+
+    if activation_state_path is not None and (changed or not was_enabled):
+        startup_activation.mark_restart_required(activation_state_path)
+        log.info(
+            "Startup integration changed; restart required before future-boot "
+            "availability is considered active"
         )
 
     return service_path

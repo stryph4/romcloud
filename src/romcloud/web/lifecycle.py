@@ -15,7 +15,6 @@ import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urlencode
 
 
 STATE_FILENAME = "manager-state.json"
@@ -107,7 +106,9 @@ def network_hosts(host: str) -> list[str]:
                 addresses.insert(0, candidate)
     except OSError:
         pass
-    return [*addresses, *[name for name in names if name not in addresses]]
+    # Keep the bookmarkable mDNS name primary; numeric LAN addresses remain
+    # explicit fallbacks for networks where .local resolution is unavailable.
+    return [*[name for name in names if name not in addresses], *addresses]
 
 
 def manager_runtime_state(
@@ -357,30 +358,31 @@ def _manager_request(
     return result
 
 
-def issue_browser_bootstrap(
+def issue_pairing_code(
     data_path: str | Path,
     *,
-    kind: str,
     opener=urllib.request.urlopen,
 ) -> dict[str, object]:
-    if kind not in {"local", "remote"}:
-        raise ValueError("Bootstrap kind must be local or remote.")
     result = _manager_request(
         data_path,
-        "/api/auth/bootstrap",
+        "/api/auth/pairing-code",
         method="POST",
-        body={"kind": kind},
+        body={},
         opener=opener,
     )
     state = manager_status(data_path)
-    base = str(state.get("local_url" if kind == "local" else "url", ""))
-    parameter = "bootstrap" if kind == "local" else "pair"
-    return {**result, "url": f"{base}?{urlencode({parameter: result['code']})}"}
+    return {**result, "url": str(state.get("url", ""))}
 
 
-def find_local_browser(*, which=shutil.which) -> str | None:
+def find_local_browser(*, data_path: str | Path | None = None, which=shutil.which) -> str | None:
     """Resolve the Chromium-compatible kiosk runtime used on Batocera."""
 
+    if data_path is not None:
+        from romcloud.web.browser_runtime import managed_browser
+
+        managed = managed_browser(data_path)
+        if managed:
+            return managed
     configured = os.environ.get("ROMCLOUD_BROWSER")
     candidates = [configured] if configured else []
     candidates.extend(("chromium", "chromium-browser", "google-chrome", "google-chrome-stable"))
@@ -405,13 +407,20 @@ def launch_local_browser(
 ) -> dict[str, object]:
     """Launch a kiosk browser and return only after it exits cleanly."""
 
-    executable = browser or find_local_browser()
+    executable = browser or find_local_browser(data_path=data_path)
     if not executable:
         raise RuntimeError(
             "Open Here requires a Chromium-compatible local browser runtime; "
-            "none was found. Set ROMCLOUD_BROWSER to its executable path."
+            "none was found. Managed installation is not enabled until Chrome for "
+            "Testing passes Batocera dependency and sandbox validation. Remote "
+            "Library Browser access remains available."
         )
-    handoff = issue_browser_bootstrap(data_path, kind="local")
+    launch = _manager_request(
+        data_path,
+        "/api/auth/local-launch",
+        method="POST",
+        body={},
+    )
     from romcloud.web.tls import manager_certificate_spki_pin
 
     certificate_pin = manager_certificate_spki_pin(data_path)
@@ -425,12 +434,12 @@ def launch_local_browser(
         "--disable-session-crashed-bubble",
         f"--ignore-certificate-errors-spki-list={certificate_pin}",
         f"--user-data-dir={profile}",
-        str(handoff["url"]),
+        str(manager_status(data_path).get("local_url", "")),
     ]
     # Stay in the uidata operation's process group so cancelling the native
     # screen also terminates the browser it owns.
     process = popen(argv)
-    launch_id = str(handoff.get("launch_id", ""))
+    launch_id = str(launch.get("launch_id", ""))
     try:
         while process.poll() is None:
             if launch_id:

@@ -84,11 +84,16 @@ class LibraryManagerScreenState:
             return drained
         if self.operation == "pair":
             if result.ok:
-                self.details = {**self.details, "pairing_url": result.data.get("url", "")}
+                self.details = {
+                    **self.details,
+                    "url": result.data.get("url", self.details.get("url", "")),
+                    "pairing_code": result.data.get("code", ""),
+                    "pairing_expires_in": result.data.get("expires_in", 120),
+                }
                 self.error = ""
                 self.step = READY
             else:
-                self.error = result.error or "A pairing link could not be created."
+                self.error = result.error or "A pairing code could not be created."
                 self.step = FAILED
             return drained
         if result.ok and result.data.get("running"):

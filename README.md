@@ -261,31 +261,46 @@ storage failure.
 
 ## Browser Library/Cache Manager
 
-Open the Library Manager from ROMCloud's Library menu. It is a lazy,
-persistent service: the first visit starts one detached `romcloud manager`
-process, and later visits reuse it. It performs no catalog scan, descriptor
+The installed Batocera `romcloud_mount` custom service ensures one detached
+`romcloud manager` process during boot; the Library menu also recovers it on
+demand if it is unexpectedly absent. It performs no catalog scan, descriptor
 resolution, network polling, or transfer until a browser explicitly requests
 an operation. Emulator and EmulationStation launches do not own or terminate
 the process.
 
+Installing, newly enabling, or changing that startup integration records a
+pending activation state. ROMCloud can start the manager immediately for the
+current session, but it does not describe future-boot availability as active
+until Batocera has restarted and the service's next successful `start`
+callback clears the marker. The native UI offers **Restart Now** and **Later**;
+Later leaves a visible warning on the menu and prompts again on a later
+ROMCloud launch. This restart requirement applies to the startup service only,
+not to installation or removal of the optional local browser runtime.
+
 **Open Here** launches the existing manager page in a Chromium-compatible
 runtime with `--kiosk`, a dedicated profile, and the loopback URL. ROMCloud
-resolves `ROMCLOUD_BROWSER` first, then `chromium`, `chromium-browser`,
-`google-chrome`, or `google-chrome-stable`. A 60-second, single-use local
-handoff is exchanged for an HttpOnly session cookie and is rejected from
-non-loopback peers. The local launch pins ROMCloud's self-signed certificate
+resolves a versioned ROMCloud-managed runtime first, then `ROMCLOUD_BROWSER`,
+`chromium`, `chromium-browser`, `google-chrome`, or `google-chrome-stable`.
+Open Here uses no token, pairing code, bootstrap credential, or cookie: only
+a loopback peer using a loopback Host is admitted. The local launch pins ROMCloud's self-signed certificate
 by SPKI, so no certificate prompt is required. Back/Escape asks the owned
 launcher to close the kiosk and returns to ROMCloud without stopping the
 manager. If no compatible runtime exists, the native screen reports that
 explicitly.
 
-**Pair Another Device** displays the reachable HTTPS URL, LAN IP and `.local`
-hostname where available, plus a 60-second single-use pairing link suitable
-for copying or encoding as a QR code. The browser removes the handoff from the
-visible URL before exchanging it and receives an HttpOnly, Secure,
-SameSite=Strict session cookie. The permanent bearer is never included in a
-URL, log, pairing link, QR payload, or native screen. Manual bearer entry on
-the browser sign-in card remains an Advanced/debug fallback.
+**Pair Another Device** keeps the reachable HTTPS URL stable and bookmarkable,
+preferring the `.local` hostname when available and showing the LAN IP as a
+fallback. ROMCloud displays a four-character, single-use code that expires in
+two minutes. The remote screen offers session-only trust, 90-day trust, or
+trust until revoked. Failed attempts are rate-limited; devices can be revoked
+individually or all at once without restarting the manager. The permanent
+bearer remains an Advanced/debug fallback only.
+
+**Maintenance → Local Browser Runtime** reports the independent versioned
+runtime under `/userdata/system/romcloud/browser`. Automatic Chrome for
+Testing installation remains disabled until its Batocera shared-library and
+secure-sandbox behavior passes hardware validation; remote access is not
+affected when the local runtime is absent.
 
 The foreground diagnostic command remains available:
 

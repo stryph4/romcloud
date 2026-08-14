@@ -46,6 +46,7 @@ from romcloud.infrastructure.config import load_config
 from romcloud.infrastructure.capabilities import capability_policy
 from romcloud.infrastructure.source_display import source_display_summary
 from romcloud.infrastructure import savesync_prompts
+from romcloud.integrations.batocera import startup_activation
 from romcloud.services.connections import (
     connection_status,
     mount_connections,
@@ -138,9 +139,42 @@ def uidata_setup_status(ctx: click.Context) -> None:
     """Report whether graphical setup is fresh, repairable, or complete."""
 
     def build() -> dict:
-        return setup_state(Path(ctx.obj["config_path"]))
+        config_path = Path(ctx.obj["config_path"])
+        payload = setup_state(config_path)
+        payload.update(
+            startup_activation.activation_status(
+                startup_activation.state_path(config_path.parent.parent)
+            )
+        )
+        return payload
 
     _run_action(ctx, build)
+
+
+@uidata_group.command("startup-integration-activated")
+@click.pass_context
+def uidata_startup_integration_activated(ctx: click.Context) -> None:
+    """Clear restart-required state after Batocera invokes service start."""
+
+    def build() -> dict:
+        config_path = Path(ctx.obj["config_path"])
+        activation_path = startup_activation.state_path(config_path.parent.parent)
+        activated = startup_activation.mark_activated(activation_path)
+        status = startup_activation.activation_status(activation_path)
+        return {
+            "startup_integration_activated": activated,
+            "startup_restart_required": status["startup_restart_required"],
+        }
+
+    _run_action(ctx, build)
+
+
+@uidata_group.command("startup-restart-now")
+@click.pass_context
+def uidata_startup_restart_now(ctx: click.Context) -> None:
+    """Request a Batocera restart; activation clears on the next service start."""
+
+    _run_action(ctx, startup_activation.request_reboot)
 
 
 @uidata_group.command("setup-discover")
@@ -410,17 +444,31 @@ def uidata_manager_start(ctx: click.Context) -> None:
 @uidata_group.command("manager-pair")
 @click.pass_context
 def uidata_manager_pair(ctx: click.Context) -> None:
-    """Issue a single-use LAN pairing link."""
+    """Issue a short-lived LAN pairing code."""
 
     def build() -> dict:
-        from romcloud.web.lifecycle import issue_browser_bootstrap, start_manager
+        from romcloud.web.lifecycle import issue_pairing_code, start_manager
 
         config = _load_context_config(ctx)
         romcloud_bin = os.environ.get("ROMCLOUD_BIN") or str(
             Path(sys.executable).with_name("romcloud")
         )
         start_manager(romcloud_bin, config.data_path)
-        return issue_browser_bootstrap(config.data_path, kind="remote")
+        return issue_pairing_code(config.data_path)
+
+    _run_action(ctx, build)
+
+
+@uidata_group.command("manager-stop")
+@click.pass_context
+def uidata_manager_stop(ctx: click.Context) -> None:
+    """Stop the exact recorded Library Manager process."""
+
+    def build() -> dict:
+        from romcloud.web.lifecycle import stop_manager
+
+        config = _load_context_config(ctx)
+        return {"stopped": stop_manager(config.data_path)}
 
     _run_action(ctx, build)
 
@@ -439,6 +487,20 @@ def uidata_manager_open_local(ctx: click.Context) -> None:
         )
         start_manager(romcloud_bin, config.data_path)
         return launch_local_browser(config.data_path)
+
+    _run_action(ctx, build)
+
+
+@uidata_group.command("browser-runtime-status")
+@click.pass_context
+def uidata_browser_runtime_status(ctx: click.Context) -> None:
+    """Report the independently managed local-browser dependency."""
+
+    def build() -> dict:
+        from romcloud.web.browser_runtime import runtime_status
+
+        config = _load_context_config(ctx)
+        return runtime_status(config.data_path)
 
     _run_action(ctx, build)
 

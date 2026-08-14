@@ -118,6 +118,10 @@ from ports_gfx.savesync_conflict_popup import (
     render_conflict_resolver,
 )
 from ports_gfx.splash import SplashRenderer
+from ports_gfx.startup_restart import (
+    LATER as STARTUP_RESTART_LATER,
+    StartupRestartPromptState,
+)
 from ports_gfx.update_state import UpdateCheckState
 from ports_gfx.wizard import WizardState, WizardStep
 
@@ -129,6 +133,7 @@ SETUP_ACTION = "setup"
 LIBRARY_QUICK_SYNC_ACTION = "library-sync-quick"
 LIBRARY_FULL_SYNC_ACTION = "library-sync-full"
 LIBRARY_MANAGER_ACTION = "library-manager"
+STARTUP_RESTART_SCREEN = "startup-restart"
 
 MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
     "Library": (
@@ -152,6 +157,7 @@ MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
         MenuItem("Update ROMCloud", "update-install"),
         MenuItem("Health Check", "healthcheck"),
         MenuItem("Setup Controller Mapping", CONTROLLER_TEST_ACTION),
+        MenuItem("Local Browser Runtime", "browser-runtime-status"),
     )
 }
 
@@ -330,6 +336,9 @@ _OPERATIONS: dict[str, OperationSpec] = {
     ),
     "update-install": OperationSpec(
         title="Update ROMCloud", args=("uidata", "update-install"), arms_gui_relaunch=True
+    ),
+    "browser-runtime-status": OperationSpec(
+        title="Local Browser Runtime", args=("uidata", "browser-runtime-status")
     ),
 }
 _MODE_TRANSITION_ACTIONS = frozenset(
@@ -918,6 +927,7 @@ def _run(  # noqa: ANN001
     savesync_screen: Optional[SaveSyncScreenState] = None
     library_sync_screen: Optional[LibrarySyncScreenState] = None
     library_manager_screen: Optional[LibraryManagerScreenState] = None
+    startup_restart: StartupRestartPromptState | None = None
     update_check: UpdateCheckState | None = None
 
     try:
@@ -965,7 +975,13 @@ def _run(  # noqa: ANN001
         if not isinstance(capabilities, dict) or capabilities.get("update_network", True):
             update_check.start(romcloud_bin)
         splash.render("Starting ROMCloud…", "Finishing startup…", 0.90)
-        current_screen = "wizard" if wizard is not None else "menu"
+        if wizard is not None:
+            current_screen = "wizard"
+        elif setup_status.data.get("startup_restart_required"):
+            startup_restart = StartupRestartPromptState()
+            current_screen = STARTUP_RESTART_SCREEN
+        else:
+            current_screen = "menu"
         message: Optional[str] = None
         message_kind = "info"
         if current_screen == "menu":
@@ -1030,6 +1046,8 @@ def _run(  # noqa: ANN001
                     rects = (layout.safe_area,)
                 elif current_screen == "library_manager":
                     rects = (layout.safe_area,)
+                elif current_screen == STARTUP_RESTART_SCREEN:
+                    rects = tuple(_startup_restart_action_rects(layout))
                 else:
                     rects = ()
                 ievent = input_manager.handle_event(
@@ -1115,6 +1133,45 @@ def _run(  # noqa: ANN001
                         if new_operation is not None:
                             operation_screen = new_operation
                         layout = compute_layout(screen_w, screen_h, len(state.items))
+                elif (
+                    current_screen == STARTUP_RESTART_SCREEN
+                    and startup_restart is not None
+                ):
+                    if ievent.touch_index is not None and 0 <= ievent.touch_index < 2:
+                        startup_restart.selected_index = ievent.touch_index
+                    if ievent.action == Action.BACK:
+                        current_screen = "menu"
+                        message = setup_status.data.get(
+                            "startup_restart_message",
+                            "Restart still required for future-boot availability.",
+                        )
+                        message_kind = "warning"
+                    elif ievent.action in (Action.UP, Action.LEFT):
+                        startup_restart.move(-1)
+                    elif ievent.action in (Action.DOWN, Action.RIGHT):
+                        startup_restart.move(1)
+                    elif ievent.action == Action.CONFIRM:
+                        if startup_restart.activate() == STARTUP_RESTART_LATER:
+                            current_screen = "menu"
+                            message = setup_status.data.get(
+                                "startup_restart_message",
+                                "Restart still required for future-boot availability.",
+                            )
+                            message_kind = "warning"
+                        else:
+                            result = call_backend(romcloud_bin, "startup-restart-now")
+                            if result.ok and result.data.get("restart_requested"):
+                                splash.render(
+                                    "Restart requested",
+                                    "Restarting Batocera...",
+                                    1.0,
+                                )
+                                current_screen = "restarting"
+                                running = False
+                            else:
+                                startup_restart.error = (
+                                    result.error or "Could not restart Batocera."
+                                )
                 elif current_screen == "savesync" and savesync_screen is not None:
                     current_screen = _handle_savesync_event(ievent, savesync_screen)
                     if current_screen == "menu":
@@ -1268,7 +1325,6 @@ def _run(  # noqa: ANN001
                 for line in wizard.poll():
                     activity.ingest(line.text)
                 if wizard.finished:
-                    current_screen = "menu"
                     setup_status = call_backend(romcloud_bin, "setup-status")
                     operating_state = operating_state_from_status(setup_status.data)
                     library_sync_enabled = bool(
@@ -1279,8 +1335,14 @@ def _run(  # noqa: ANN001
                         menu_categories_for_state(operating_state, library_sync_enabled),
                     )
                     wizard = None
-                    message = "Setup complete"
-                    message_kind = "success"
+                    if setup_status.data.get("startup_restart_required"):
+                        startup_restart = StartupRestartPromptState()
+                        current_screen = STARTUP_RESTART_SCREEN
+                        message = None
+                    else:
+                        current_screen = "menu"
+                        message = "Setup complete"
+                        message_kind = "success"
 
             should_capture_text = bool(
                 current_screen == "wizard"
@@ -1301,6 +1363,15 @@ def _run(  # noqa: ANN001
                 rects = _wizard_rects(layout, wizard)
                 for action in input_manager.update(dt):
                     wizard.update_direction(action, rects)
+            elif (
+                current_screen == STARTUP_RESTART_SCREEN
+                and startup_restart is not None
+            ):
+                for action in input_manager.update(dt):
+                    if action in (Action.UP, Action.LEFT):
+                        startup_restart.move(-1)
+                    elif action in (Action.DOWN, Action.RIGHT):
+                        startup_restart.move(1)
 
             if current_screen == "menu":
                 _render_menu(
@@ -1344,6 +1415,13 @@ def _run(  # noqa: ANN001
             elif current_screen == "wizard" and wizard is not None:
                 _render_wizard(
                     pygame, screen, fonts, layout, wizard, wizard.activity
+                )
+            elif (
+                current_screen == STARTUP_RESTART_SCREEN
+                and startup_restart is not None
+            ):
+                _render_startup_restart(
+                    pygame, screen, fonts, layout, startup_restart
                 )
         return 0
     finally:
@@ -1614,8 +1692,13 @@ def _library_manager_body_lines(screen: LibraryManagerScreenState) -> list[str]:
         f"Hostname: {screen.details.get('local_hostname') or 'Unavailable'}",
         "The first visit may ask you to accept ROMCloud's certificate.",
     ]
-    if screen.details.get("pairing_url"):
-        lines.extend(("", "Single-use pairing link (expires in 60 seconds):", str(screen.details["pairing_url"])))
+    if screen.details.get("pairing_code"):
+        lines.extend((
+            "",
+            "Pairing code (expires in 2 minutes):",
+            str(screen.details["pairing_code"]),
+            "Enter this code on the remote device's pairing screen.",
+        ))
     lines.extend(("", *[
         ("> " if index == screen.selected_index else "  ") + action
         for index, action in enumerate(screen.actions)
@@ -2325,6 +2408,68 @@ def _render_library_manager(  # noqa: ANN001
     hint = fonts["hint"].render(hint_text, True, _HINT_COLOR)
     screen_surface.blit(hint, (layout.hint_rect.x, layout.hint_rect.y))
     pygame.display.flip()
+
+
+def _render_startup_restart(  # noqa: ANN001
+    pygame,
+    screen_surface,
+    fonts: dict,
+    layout: Layout,
+    state: StartupRestartPromptState,
+) -> None:
+    """Explain deferred boot activation without blocking this session."""
+    screen_surface.fill(_BG_COLOR)
+    title = fonts["title"].render("Restart Required", True, _WARNING_COLOR)
+    screen_surface.blit(title, (layout.header_rect.x, layout.header_rect.y))
+
+    y = layout.navigation_rect.y
+    line_h = layout.fonts.body + max(8, layout.fonts.hint // 2)
+    max_chars = max(24, layout.navigation_rect.w // max(8, layout.fonts.body // 2))
+    body = (
+        "ROMCloud's startup integration changed. Restart Batocera before "
+        "automatic Library Browser availability on future boots is guaranteed. "
+        "The Library Browser remains available in this session."
+    )
+    for line in wrap_lines((body,), max_chars):
+        label = fonts["body"].render(line, True, _FG_COLOR)
+        screen_surface.blit(label, (layout.navigation_rect.x, y))
+        y += line_h
+
+    rects = _startup_restart_action_rects(layout)
+    for index, (label_text, rect) in enumerate(zip(state.actions, rects)):
+        focused = index == state.selected_index
+        draw_card(pygame, screen_surface, rect, focused=focused)
+        label = fonts["body"].render(label_text, True, _FG_COLOR)
+        screen_surface.blit(
+            label,
+            (
+                rect.x + max(12, layout.fonts.body // 2),
+                rect.y + max(1, (rect.h - label.get_height()) // 2),
+            ),
+        )
+
+    if state.error:
+        error = fonts["hint"].render(state.error, True, _ERROR_COLOR)
+        screen_surface.blit(error, (layout.hint_rect.x, layout.hint_rect.y))
+    else:
+        hint = fonts["hint"].render(
+            "D-pad choose   A/Enter select   B/Esc later",
+            True,
+            _HINT_COLOR,
+        )
+        screen_surface.blit(hint, (layout.hint_rect.x, layout.hint_rect.y))
+    pygame.display.flip()
+
+
+def _startup_restart_action_rects(layout: Layout) -> list[Rect]:
+    start_y = layout.navigation_rect.y + int(layout.navigation_rect.h * 0.48)
+    area = Rect(
+        layout.navigation_rect.x,
+        start_y,
+        layout.navigation_rect.w,
+        max(MIN_CONTROL_HEIGHT_PX * 2 + 12, layout.navigation_rect.bottom - start_y),
+    )
+    return compute_vertical_control_rects(area, 2)
 
 
 def _render_savesync(  # noqa: ANN001

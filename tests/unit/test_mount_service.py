@@ -26,10 +26,16 @@ class TestGenerateServiceScript:
         content = mount_service.generate_service_script("/path/to/romcloud")
         assert 'ROMCLOUD_BIN="/path/to/romcloud"' in content
         assert '"${ROMCLOUD_BIN}" mount boot-start' in content
+        assert 'if "${ROMCLOUD_BIN}" uidata manager-start' in content
+        assert '"${ROMCLOUD_BIN}" uidata startup-integration-activated' in content
+        assert content.index("manager-start") < content.index(
+            "startup-integration-activated"
+        )
 
     def test_stop_and_status_dispatch_correctly(self):
         content = mount_service.generate_service_script("/path/to/romcloud")
         assert '"${ROMCLOUD_BIN}" mount stop --shutdown' in content
+        assert '"${ROMCLOUD_BIN}" uidata manager-stop' in content
         assert '"${ROMCLOUD_BIN}" mount status' in content
 
     def test_start_and_stop_always_exit_zero(self):
@@ -81,6 +87,66 @@ class TestInstallService:
         assert mount_service.is_service_installed(service_path=service_path) is False
         service_path.write_text("x")
         assert mount_service.is_service_installed(service_path=service_path) is True
+
+    def test_changed_script_marks_restart_required(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mount_service.subprocess, "run", lambda *args, **kwargs: None)
+        service_path = tmp_path / "services" / mount_service.SERVICE_NAME
+        config_path = tmp_path / "batocera.conf"
+        config_path.write_text(f"system.services={mount_service.SERVICE_NAME}\n")
+        activation_path = tmp_path / "state" / "startup-integration.json"
+
+        mount_service.install_service(
+            "/bin/romcloud",
+            service_path=service_path,
+            activation_state_path=activation_path,
+            services_config_path=config_path,
+        )
+
+        assert mount_service.startup_activation.activation_status(
+            activation_path
+        )["startup_restart_required"] is True
+
+    def test_unchanged_enabled_service_does_not_mark_restart_required(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(mount_service.subprocess, "run", lambda *args, **kwargs: None)
+        service_path = tmp_path / "services" / mount_service.SERVICE_NAME
+        service_path.parent.mkdir()
+        service_path.write_text(
+            mount_service.generate_service_script("/bin/romcloud"), encoding="utf-8"
+        )
+        config_path = tmp_path / "batocera.conf"
+        config_path.write_text(f"system.services={mount_service.SERVICE_NAME}\n")
+        activation_path = tmp_path / "state" / "startup-integration.json"
+
+        mount_service.install_service(
+            "/bin/romcloud",
+            service_path=service_path,
+            activation_state_path=activation_path,
+            services_config_path=config_path,
+        )
+
+        assert not activation_path.exists()
+
+    def test_newly_enabled_service_marks_restart_required(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mount_service.subprocess, "run", lambda *args, **kwargs: None)
+        service_path = tmp_path / "services" / mount_service.SERVICE_NAME
+        service_path.parent.mkdir()
+        service_path.write_text(
+            mount_service.generate_service_script("/bin/romcloud"), encoding="utf-8"
+        )
+        config_path = tmp_path / "batocera.conf"
+        config_path.write_text("system.services=other_service\n")
+        activation_path = tmp_path / "state" / "startup-integration.json"
+
+        mount_service.install_service(
+            "/bin/romcloud",
+            service_path=service_path,
+            activation_state_path=activation_path,
+            services_config_path=config_path,
+        )
+
+        assert activation_path.exists()
 
 
 class TestRemoveService:

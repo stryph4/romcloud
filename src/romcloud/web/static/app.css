@@ -95,6 +95,10 @@ aside h2 { margin: 0 0 10px; padding: 0 10px; }
 .auth { position: fixed; inset: 0; display: grid; place-items: center; padding: 20px; background: radial-gradient(circle at 50% 18%,rgba(38,215,242,.13),transparent 30%),radial-gradient(circle at 74% 60%,rgba(139,80,246,.11),transparent 36%); }
 .auth-card, .dialog-card { width: min(430px,100%); padding: 28px; border: 1px solid var(--border); border-radius: 18px; background: var(--surface); box-shadow: var(--shadow-raised); }
 .auth-card { display: flex; flex-direction: column; gap: 13px; }
+.pair-code { text-transform: uppercase; letter-spacing: .35em; font-size: 1.35rem; font-weight: 800; }
+#token-form { display: flex; gap: 8px; margin-top: 10px; }
+#device-list { display: flex; flex-direction: column; gap: 8px; min-width: min(560px,80vw); }
+.device-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius-card); }
 .auth-card .brand-mark { width: 52px; height: 52px; border-radius: 15px; font-size: 1rem; }
 .auth-card h1, .auth-card p { margin: 0; }
 .auth-card h1 { font-size: 1.55rem; font-weight: 780; letter-spacing: -.02em; }

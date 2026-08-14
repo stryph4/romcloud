@@ -255,7 +255,13 @@ def reconcile_mount_service(bin_dir: Path) -> bool:
 
     service_path = mount_service.SERVICE_SCRIPT_PATH
     try:
-        mount_service.install_service(str(bin_dir / "romcloud"), service_path=service_path)
+        mount_service.install_service(
+            str(bin_dir / "romcloud"),
+            service_path=service_path,
+            activation_state_path=mount_service.startup_activation.state_path(
+                bin_dir.parent
+            ),
+        )
         return True
     except Exception:  # noqa: BLE001 — optional integration, never fatal
         log.warning("Failed to reconcile Batocera mount service script", exc_info=True)

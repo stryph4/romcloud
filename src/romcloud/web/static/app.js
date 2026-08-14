@@ -11,8 +11,7 @@ function contentUpdated() {
   });
 }
 
-function tokenFromLocation() {
-  if (location.hash) history.replaceState(null, "", location.pathname);
+function tokenFromStorage() {
   return sessionStorage.getItem("romcloud-token") || "";
 }
 
@@ -25,19 +24,14 @@ async function api(path, options = {}) {
   return body;
 }
 
-async function bootstrapFromLocation() {
-  const query = new URLSearchParams(location.search);
-  const code = query.get("bootstrap") || query.get("pair");
-  if (!code) return false;
-  history.replaceState(null, "", location.pathname);
+async function pair(code, trust) {
   try {
-    const response = await fetch("/auth/exchange", {
+    const response = await fetch("/auth/pair", {
       method: "POST", credentials: "same-origin",
-      headers: {"Content-Type": "application/json"}, body: JSON.stringify({code}),
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify({code, trust}),
     });
     const body = await response.json();
     if (!response.ok) throw new Error(body.error || "Pairing failed.");
-    state.localSession = Boolean(body.local);
     await connect("");
     return true;
   } catch (error) {
@@ -53,6 +47,7 @@ async function connect(token) {
     state.status = await api("/api/status");
     sessionStorage.setItem("romcloud-token", token);
     $("auth").classList.add("hidden"); $("shell").classList.remove("hidden");
+    $("logout").classList.toggle("hidden", state.localSession);
     const modeName = state.status.mode === "cache" ? "Cached Storage" : title(state.status.mode);
     $("mode").textContent = modeName;
     $("offline-banner").classList.toggle("hidden", !state.status.offline);
@@ -67,6 +62,20 @@ async function connect(token) {
     $("auth-error").textContent = error.status === 401 ? "That access token was not accepted." : error.message;
     $("auth").classList.remove("hidden"); $("shell").classList.add("hidden");
   }
+}
+
+async function loadTrustedDevices() {
+  const data = await api("/api/trusted-devices");
+  const root = $("device-list"); root.replaceChildren();
+  if (!data.devices.length) root.append(el("div", "empty", "No remembered remote devices."));
+  data.devices.forEach((device) => {
+    const row = el("div", "device-row");
+    const detail = el("div");
+    detail.append(el("b", "", device.label), el("small", "", `${device.trust}${device.current ? " · This device" : ""}`));
+    const revoke = el("button", "danger-text", "Revoke");
+    revoke.addEventListener("click", async () => { await api("/api/trusted-devices/revoke", {method: "POST", body: JSON.stringify({id: device.id})}); await loadTrustedDevices(); });
+    row.append(detail, revoke); root.append(row);
+  });
 }
 
 async function loadSystems() {
@@ -189,11 +198,15 @@ function labelState(value) { return {remote_only: "Remote Only", cached: "Cached
 function number(value) { return new Intl.NumberFormat().format(value || 0); }
 function formatBytes(value) { if (value == null) return "Size unknown"; if (value === 0) return "0 B"; const units = ["B", "KB", "MB", "GB", "TB"]; const power = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1); return `${(value / 1024 ** power).toFixed(power ? 1 : 0)} ${units[power]}`; }
 
-$("auth-form").addEventListener("submit", (event) => { event.preventDefault(); connect($("token").value); });
+$("pair-form").addEventListener("submit", (event) => { event.preventDefault(); pair($("pair-code").value, $("pair-trust").value); });
+$("token-connect").addEventListener("click", () => connect($("token").value));
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") window.dispatchEvent(new CustomEvent("romcloud:controller-back", {cancelable: true}));
 });
 $("logout").addEventListener("click", async () => { sessionStorage.removeItem("romcloud-token"); try { await api("/api/auth/logout", {method: "POST", body: "{}"}); } finally { location.reload(); } });
+$("trusted-devices").addEventListener("click", async () => { await loadTrustedDevices(); $("devices-dialog").showModal(); });
+$("close-devices").addEventListener("click", () => $("devices-dialog").close());
+$("revoke-all").addEventListener("click", async () => { await api("/api/trusted-devices/revoke-all", {method: "POST", body: "{}"}); location.reload(); });
 document.querySelectorAll(".tab").forEach((tab) => tab.addEventListener("click", () => { state.scope = tab.dataset.scope; state.page = 1; setActiveTab(); loadGames(); }));
 let searchTimer; $("search").addEventListener("input", () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { state.page = 1; loadGames(); }, 250); });
 [$("state-filter"), $("sort")].forEach((node) => node.addEventListener("change", () => { state.page = 1; loadGames(); }));
@@ -241,10 +254,10 @@ window.addEventListener("romcloud:controller-status", (event) => {
 });
 
 (async () => {
-  if (await bootstrapFromLocation()) return;
-  state.token = tokenFromLocation();
+  state.localSession = ["127.0.0.1", "localhost", "::1"].includes(location.hostname);
+  state.token = tokenFromStorage();
   if (state.token) connect(state.token); else {
-    try { await connect(""); } catch (_) { $("auth").classList.remove("hidden"); }
+    await connect("");
   }
 })();
 window.romcloudGamepad = window.ROMCloudController.startBrowserController();
