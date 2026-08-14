@@ -221,14 +221,14 @@ def menu_categories_for_state(
         library.extend(
             (
                 MenuItem(
-                    "Quick Sync",
+                    "Sync Missing Media",
                     LIBRARY_QUICK_SYNC_ACTION,
-                    "Copies missing media and skips existing payloads.",
+                    "Quick Sync: copies missing media and skips existing payloads.",
                 ),
                 MenuItem(
-                    "Full Sync",
+                    "Verify & Repair Media",
                     LIBRARY_FULL_SYNC_ACTION,
-                    "Verifies or repairs existing media and may take significantly longer.",
+                    "Full Sync: verifies or repairs existing media and may take significantly longer.",
                 ),
             )
         )
@@ -2422,7 +2422,7 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
             lines.append("Direct: the source must remain reachable while playing.")
         if wizard.library_sync_enabled:
             lines.append(
-                "Optional metadata was not synchronized. Use Library > Quick Sync when ready."
+                "Optional metadata was not synchronized. Use Library > Sync Missing Media when ready."
             )
         return lines
     return context

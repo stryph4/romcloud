@@ -197,9 +197,11 @@ class TestMenuItems:
             for item in disabled
         )
         assert [(item.label, item.action) for item in enabled[-2:]] == [
-            ("Quick Sync", "library-sync-quick"),
-            ("Full Sync", "library-sync-full"),
+            ("Sync Missing Media", "library-sync-quick"),
+            ("Verify & Repair Media", "library-sync-full"),
         ]
+        assert enabled[-2].description.startswith("Quick Sync:")
+        assert enabled[-1].description.startswith("Full Sync:")
         assert "copies missing media" in enabled[-2].description.lower()
         assert "significantly longer" in enabled[-1].description.lower()
 
