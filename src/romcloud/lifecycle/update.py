@@ -723,6 +723,16 @@ def perform_update(
     removed, on success or failure.
     """
     previous = read_build_info(romcloud_home)
+    manager_was_running = False
+    manager_data_path = romcloud_home / "data"
+    config_path = romcloud_home / "config" / "romcloud.toml"
+    if config_path.is_file():
+        try:
+            from romcloud.infrastructure.config import load_config
+
+            manager_data_path = Path(load_config(str(config_path)).data_path)
+        except Exception:  # noqa: BLE001 - update can proceed with the standard layout
+            pass
     emit_progress(
         progress, "update", "resolve", "running", "Resolving the latest ROMCloud release"
     )
@@ -761,6 +771,12 @@ def perform_update(
             runner=runner,
             timeout=install_timeout,
         )
+
+        from romcloud.web.lifecycle import manager_status, stop_manager
+
+        manager_was_running = bool(manager_status(manager_data_path).get("running"))
+        if manager_was_running:
+            stop_manager(manager_data_path)
 
         resolved_ports_dir = Path(ports_dir) if ports_dir else _DEFAULT_PORTS_DIR
         live_venv_dir = venv_python.parent.parent
@@ -846,3 +862,7 @@ def perform_update(
         return UpdateResult(previous=previous, new=new_info, reconcile_log=reconcile_log.strip())
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
+        if manager_was_running:
+            from romcloud.web.lifecycle import start_manager
+
+            start_manager(romcloud_home / "bin" / "romcloud", manager_data_path)

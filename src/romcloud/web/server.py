@@ -6,6 +6,7 @@ import hmac
 import json
 import mimetypes
 import ssl
+import signal
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -18,6 +19,7 @@ from urllib.parse import parse_qs, urlparse
 from romcloud.core.exceptions import ROMCloudError
 from romcloud.infrastructure.logging import get_logger
 from romcloud.services.library_manager import LibraryManagerService
+from romcloud.web.auth import BrowserAuthRegistry, BrowserSession
 
 log = get_logger("web-manager")
 _MAX_BODY = 128 * 1024
@@ -104,9 +106,11 @@ class ManagerHTTPServer(ThreadingHTTPServer):
         address: tuple[str, int],
         manager: LibraryManagerService,
         token: str,
+        auth_registry: BrowserAuthRegistry | None = None,
     ) -> None:
         self.manager = manager
         self.auth_token = token
+        self.browser_auth = auth_registry or BrowserAuthRegistry()
         self.mutation_lock = threading.RLock()
         self.jobs = JobRegistry(manager, self.mutation_lock)
         super().__init__(address, ManagerRequestHandler)
@@ -134,6 +138,12 @@ class ManagerRequestHandler(BaseHTTPRequestHandler):
                     HTTPStatus.OK if job else HTTPStatus.NOT_FOUND,
                     job.serialize() if job else {"error": "Job not found."},
                 )
+            elif parsed.path.startswith("/api/local-session-status/"):
+                launch_id = parsed.path.rsplit("/", 1)[-1]
+                self._json(
+                    HTTPStatus.OK,
+                    {"exit_requested": self.server.browser_auth.local_exit_requested(launch_id)},
+                )
             elif parsed.path == "/" or parsed.path == "/index.html":
                 self._static("index.html")
             elif parsed.path in {"/app.js", "/app.css", "/controller.js"}:
@@ -147,11 +157,40 @@ class ManagerRequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Internal server error."})
 
     def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        if parsed.path == "/auth/exchange":
+            self._exchange_bootstrap()
+            return
         if not self._authenticated():
             self._json(HTTPStatus.UNAUTHORIZED, {"error": "Authentication required."})
             return
         try:
-            if self.path == "/api/actions":
+            if parsed.path == "/api/auth/bootstrap":
+                body = self._body()
+                local = str(body.get("kind", "remote")) == "local"
+                code, launch_id = self.server.browser_auth.issue(local=local)
+                result: dict[str, object] = {
+                    "code": code,
+                    "expires_in": 60,
+                    "kind": "local" if local else "remote",
+                }
+                if launch_id:
+                    result["launch_id"] = launch_id
+                self._json(HTTPStatus.CREATED, result)
+            elif parsed.path == "/api/auth/logout":
+                session = self._cookie_session()
+                if session:
+                    self.server.browser_auth.revoke(session.token)
+                self._json(HTTPStatus.OK, {"signed_out": True}, clear_cookie=True)
+            elif parsed.path == "/api/local-exit":
+                session = self._cookie_session()
+                if not session or not self.server.browser_auth.request_local_exit(
+                    session, peer=self.client_address[0]
+                ):
+                    self._json(HTTPStatus.FORBIDDEN, {"error": "Local exit is unavailable."})
+                else:
+                    self._json(HTTPStatus.OK, {"closing": True})
+            elif parsed.path == "/api/actions":
                 body = self._body()
                 with self.server.mutation_lock:
                     result = self.server.manager.action(
@@ -177,7 +216,35 @@ class ManagerRequestHandler(BaseHTTPRequestHandler):
     def _authenticated(self) -> bool:
         provided = self.headers.get("Authorization", "")
         expected = f"Bearer {self.server.auth_token}"
-        return hmac.compare_digest(provided, expected)
+        return hmac.compare_digest(provided, expected) or self._cookie_session() is not None
+
+    def _cookie_session(self) -> BrowserSession | None:
+        cookie = self.headers.get("Cookie", "")
+        for item in cookie.split(";"):
+            name, separator, value = item.strip().partition("=")
+            if separator and name == "romcloud_session":
+                return self.server.browser_auth.authenticate(value)
+        return None
+
+    def _exchange_bootstrap(self) -> None:
+        try:
+            code = str(self._body().get("code", ""))
+            session = self.server.browser_auth.exchange(
+                code, peer=self.client_address[0]
+            )
+            if session is None:
+                self._json(
+                    HTTPStatus.UNAUTHORIZED,
+                    {"error": "This pairing link is invalid, expired, or already used."},
+                )
+                return
+            self._json(
+                HTTPStatus.OK,
+                {"authenticated": True, "local": session.local},
+                session_cookie=session.token,
+            )
+        except ValueError as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
 
     def _body(self) -> dict[str, Any]:
         if self.headers.get_content_type() != "application/json":
@@ -207,12 +274,29 @@ class ManagerRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(content)
 
-    def _json(self, status: HTTPStatus, value: object) -> None:
+    def _json(
+        self,
+        status: HTTPStatus,
+        value: object,
+        *,
+        session_cookie: str | None = None,
+        clear_cookie: bool = False,
+    ) -> None:
         content = json.dumps(value, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(content)))
         self.send_header("Cache-Control", "no-store")
+        if session_cookie is not None:
+            self.send_header(
+                "Set-Cookie",
+                f"romcloud_session={session_cookie}; Path=/; HttpOnly; Secure; SameSite=Strict",
+            )
+        elif clear_cookie:
+            self.send_header(
+                "Set-Cookie",
+                "romcloud_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict",
+            )
         self._security_headers()
         self.end_headers()
         self.wfile.write(content)
@@ -228,7 +312,8 @@ class ManagerRequestHandler(BaseHTTPRequestHandler):
         )
 
     def log_message(self, format: str, *args: object) -> None:
-        log.debug("HTTP %s", format % args)
+        # Never put pairing query strings or credentials in logs.
+        log.debug("HTTP %s %s", self.command, urlparse(self.path).path)
 
 
 def serve_manager(
@@ -248,7 +333,17 @@ def serve_manager(
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(tls_cert, tls_key)
         server.socket = context.wrap_socket(server.socket, server_side=True)
+    previous_term = None
+    if threading.current_thread() is threading.main_thread():
+        previous_term = signal.getsignal(signal.SIGTERM)
+
+        def stop_on_term(signum, frame):  # noqa: ANN001, ARG001
+            threading.Thread(target=server.shutdown, daemon=True).start()
+
+        signal.signal(signal.SIGTERM, stop_on_term)
     try:
         server.serve_forever(poll_interval=0.25)
     finally:
+        if previous_term is not None:
+            signal.signal(signal.SIGTERM, previous_term)
         server.server_close()

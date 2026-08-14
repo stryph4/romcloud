@@ -295,10 +295,8 @@ def test_real_browser_loads_authenticated_manager_app(
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    url = (
-        f"http://127.0.0.1:{server.server_address[1]}/"
-        "#token=browser-secret"
-    )
+    code, _ = server.browser_auth.issue(local=False)
+    url = f"http://127.0.0.1:{server.server_address[1]}/?pair={code}"
     try:
         result = subprocess.run(
             [

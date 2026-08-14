@@ -261,21 +261,45 @@ storage failure.
 
 ## Browser Library/Cache Manager
 
-Start the first-version browser manager on Batocera with:
+Open the Library Manager from ROMCloud's Library menu. It is a lazy,
+persistent service: the first visit starts one detached `romcloud manager`
+process, and later visits reuse it. It performs no catalog scan, descriptor
+resolution, network polling, or transfer until a browser explicitly requests
+an operation. Emulator and EmulationStation launches do not own or terminate
+the process.
+
+**Open Here** launches the existing manager page in a Chromium-compatible
+runtime with `--kiosk`, a dedicated profile, and the loopback URL. ROMCloud
+resolves `ROMCLOUD_BROWSER` first, then `chromium`, `chromium-browser`,
+`google-chrome`, or `google-chrome-stable`. A 60-second, single-use local
+handoff is exchanged for an HttpOnly session cookie and is rejected from
+non-loopback peers. The local launch pins ROMCloud's self-signed certificate
+by SPKI, so no certificate prompt is required. Back/Escape asks the owned
+launcher to close the kiosk and returns to ROMCloud without stopping the
+manager. If no compatible runtime exists, the native screen reports that
+explicitly.
+
+**Pair Another Device** displays the reachable HTTPS URL, LAN IP and `.local`
+hostname where available, plus a 60-second single-use pairing link suitable
+for copying or encoding as a QR code. The browser removes the handoff from the
+visible URL before exchanging it and receives an HttpOnly, Secure,
+SameSite=Strict session cookie. The permanent bearer is never included in a
+URL, log, pairing link, QR payload, or native screen. Manual bearer entry on
+the browser sign-in card remains an Advanced/debug fallback.
+
+The foreground diagnostic command remains available:
 
 ``` bash
 romcloud manager
 ```
 
-The command starts HTTPS and prints a local URL containing a temporary
-access token. The first visit may require accepting ROMCloud's stable
+The command starts HTTPS and prints a local URL plus an explicitly labeled
+Advanced manual token. The first remote visit may require accepting
+ROMCloud's stable
 self-signed certificate; `--tls-cert` and `--tls-key` can supply a
 trusted certificate instead. HTTPS is the default because Chromium
 requires a secure context for controller access through the Gamepad API.
-To
-open it from a phone, tablet, or PC, replace `127.0.0.1` with the
-Batocera device's LAN or Tailscale address and keep the `#token=...`
-fragment. The server listens on port `8765` by default and runs until the
+The server listens on port `8765` by default and runs until the
 command is stopped. Use `--host`, `--port`, or
 `ROMCLOUD_MANAGER_TOKEN` for an explicit deployment. `--http` is
 available for localhost diagnostics, where browsers still consider the
@@ -289,11 +313,13 @@ sorting, multi-select pin/unpin, individual downloads, and local-copy
 removal are available without loading the full catalog into the browser.
 
 The same manager can be started without the CLI from **Library → Library
-Manager** in the native Ports interface. ROMCloud starts or reconnects to
-the existing `romcloud manager` process and shows its HTTPS URL, access
-token, and running state on screen. Runtime discovery state is stored with
-private permissions under the ROMCloud data directory; the browser server
-and authentication behavior remain the same as the CLI command.
+Manager** in the native Ports interface. Singleton ownership is enforced by
+an advisory lock plus the listening socket. Runtime discovery and the
+permanent bearer are stored in a mode-0600 state file under the ROMCloud data
+directory; normal status output omits the bearer. Repair and update stop the
+exact recorded manager before replacing runtime files and restart it
+afterward. Uninstall stops it before removing the runtime. Shutdown uses
+SIGTERM with a five-second bound and SIGKILL only as a final fallback.
 
 Controllers exposed by Chromium with the W3C `standard` mapping are
 supported directly. D-pad or left stick moves through systems, controls,

@@ -1578,12 +1578,22 @@ def _handle_library_manager_event(
 ) -> str:
     if ievent.action == Action.BACK:
         return "menu"
-    if ievent.action == Action.CONFIRM and screen.step != "starting":
-        screen.start_or_refresh()
+    if screen.step not in ("starting", "opening"):
+        if ievent.action == Action.UP:
+            screen.move(-1)
+        elif ievent.action == Action.DOWN:
+            screen.move(1)
+        elif ievent.action == Action.CONFIRM:
+            screen.activate()
     return "library_manager"
 
 
 def _library_manager_body_lines(screen: LibraryManagerScreenState) -> list[str]:
+    if screen.step == "opening":
+        return [
+            "Opening the local Library Browser in fullscreen mode…",
+            "Press Back/Exit in the browser to return to ROMCloud.",
+        ]
     if screen.step == "starting":
         return [
             "Starting or locating the ROMCloud Library Manager…",
@@ -1595,18 +1605,22 @@ def _library_manager_body_lines(screen: LibraryManagerScreenState) -> list[str]:
             f"Error: {screen.error}",
             "Press Confirm to retry or Back to return.",
         ]
-    return [
+    lines = [
         "State: Running",
         "",
-        "HTTPS URL:",
+        "Open on Another Device:",
         str(screen.details.get("url", "")),
-        "",
-        "Access token:",
-        str(screen.details.get("token", "")),
-        "",
-        "Open the URL on a PC, phone, tablet, or this Batocera device.",
+        f"LAN IP: {screen.details.get('lan_ip') or 'Unavailable'}",
+        f"Hostname: {screen.details.get('local_hostname') or 'Unavailable'}",
         "The first visit may ask you to accept ROMCloud's certificate.",
     ]
+    if screen.details.get("pairing_url"):
+        lines.extend(("", "Single-use pairing link (expires in 60 seconds):", str(screen.details["pairing_url"])))
+    lines.extend(("", *[
+        ("> " if index == screen.selected_index else "  ") + action
+        for index, action in enumerate(screen.actions)
+    ]))
+    return lines
 
 
 def _render_menu(  # noqa: ANN001
@@ -2306,7 +2320,7 @@ def _render_library_manager(  # noqa: ANN001
     hint_text = (
         "B/Esc back"
         if state.step == "starting"
-        else "A/Enter refresh   B/Esc back"
+        else "D-pad choose   A/Enter select   B/Esc back"
     )
     hint = fonts["hint"].render(hint_text, True, _HINT_COLOR)
     screen_surface.blit(hint, (layout.hint_rect.x, layout.hint_rect.y))

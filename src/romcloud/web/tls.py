@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ipaddress
+import base64
+import hashlib
 import os
 import socket
 from datetime import datetime, timedelta, timezone
@@ -14,6 +16,16 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 from romcloud.infrastructure.atomic_file import atomic_write_text
+
+
+def manager_certificate_spki_pin(data_path: str | Path) -> str:
+    certificate_path, _ = ensure_manager_certificate(data_path)
+    certificate = x509.load_pem_x509_certificate(certificate_path.read_bytes())
+    public_key = certificate.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return base64.b64encode(hashlib.sha256(public_key).digest()).decode("ascii")
 
 
 def ensure_manager_certificate(data_path: str | Path) -> tuple[Path, Path]:
@@ -44,6 +56,8 @@ def ensure_manager_certificate(data_path: str | Path) -> tuple[Path, Path]:
         x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
         x509.IPAddress(ipaddress.ip_address("::1")),
     ]
+    if "." not in hostname:
+        names.append(x509.DNSName(f"{hostname}.local"))
     try:
         addresses = socket.getaddrinfo(hostname, None)
     except OSError:

@@ -38,6 +38,7 @@ def manager_cmd(
     from romcloud.web.server import serve_manager
     from romcloud.web.lifecycle import (
         clear_manager_state,
+        manager_instance_lock,
         manager_runtime_state,
         write_manager_state,
     )
@@ -47,43 +48,53 @@ def manager_cmd(
     if plain_http and tls_cert:
         raise click.UsageError("--http cannot be combined with --tls-cert/--tls-key.")
     container = get_container(ctx)
-    if not plain_http and tls_cert is None:
-        from romcloud.web.tls import ensure_manager_certificate
-
-        tls_cert, tls_key = ensure_manager_certificate(container.config.data_path)
-    access_token = token or secrets.token_urlsafe(24)
-    display_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
-    scheme = "http" if plain_http else "https"
-    if not quiet:
-        click.echo("ROMCloud Library Manager")
-        click.echo(f"Local URL: {scheme}://{display_host}:{port}/#token={access_token}")
-        if host in {"0.0.0.0", "::"}:
-            click.echo(
-                "For another device, replace 127.0.0.1 with this Batocera device's "
-                "LAN or Tailscale address. Keep the #token fragment."
-            )
-        click.echo("Press Ctrl+C to stop.")
-        if not plain_http and tls_cert and "manager-cert.pem" in tls_cert.name:
-            click.echo("The first browser visit may ask you to accept ROMCloud's self-signed certificate.")
-    runtime_state = manager_runtime_state(
-        host=host,
-        port=port,
-        token=access_token,
-        scheme=scheme,
-        pid=os.getpid(),
-    )
-    write_manager_state(container.config.data_path, runtime_state)
     try:
-        serve_manager(
-            container.library_manager,
-            host,
-            port,
-            access_token,
-            tls_cert=str(tls_cert) if tls_cert else None,
-            tls_key=str(tls_key) if tls_key else None,
-        )
-    except KeyboardInterrupt:
-        if not quiet:
-            click.echo("\nLibrary Manager stopped.")
-    finally:
-        clear_manager_state(container.config.data_path, pid=os.getpid())
+        with manager_instance_lock(container.config.data_path):
+            if not plain_http and tls_cert is None:
+                from romcloud.web.tls import ensure_manager_certificate
+
+                tls_cert, tls_key = ensure_manager_certificate(container.config.data_path)
+            access_token = token or secrets.token_urlsafe(24)
+            display_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+            scheme = "http" if plain_http else "https"
+            if not quiet:
+                click.echo("ROMCloud Library Manager")
+                click.echo(f"Local URL: {scheme}://{display_host}:{port}/")
+                if host in {"0.0.0.0", "::"}:
+                    click.echo(
+                        "For another device, replace 127.0.0.1 with this Batocera "
+                        "device's LAN or Tailscale address, then create a pairing "
+                        "link in ROMCloud."
+                    )
+                click.echo(f"Advanced manual access token: {access_token}")
+                click.echo("Press Ctrl+C to stop.")
+                if not plain_http and tls_cert and "manager-cert.pem" in tls_cert.name:
+                    click.echo(
+                        "The first browser visit may ask you to accept ROMCloud's "
+                        "self-signed certificate."
+                    )
+            runtime_state = manager_runtime_state(
+                host=host,
+                port=port,
+                token=access_token,
+                scheme=scheme,
+                pid=os.getpid(),
+                instance_id=os.environ.get("ROMCLOUD_MANAGER_INSTANCE"),
+            )
+            write_manager_state(container.config.data_path, runtime_state)
+            try:
+                serve_manager(
+                    container.library_manager,
+                    host,
+                    port,
+                    access_token,
+                    tls_cert=str(tls_cert) if tls_cert else None,
+                    tls_key=str(tls_key) if tls_key else None,
+                )
+            except KeyboardInterrupt:
+                if not quiet:
+                    click.echo("\nLibrary Manager stopped.")
+            finally:
+                clear_manager_state(container.config.data_path, pid=os.getpid())
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc)) from exc

@@ -82,10 +82,34 @@ def test_screen_starts_existing_manager_action_and_displays_connection_details()
     lines = _library_manager_body_lines(state)
     assert "State: Running" in lines
     assert "https://batocera.local:8765/" in lines
-    assert "access-token" in lines
+    assert "access-token" not in lines
+    assert "> Open Here" in lines
 
 
 def test_failure_can_retry_and_back_always_returns_to_menu() -> None:
     state = LibraryManagerScreenState("romcloud", step=FAILED, error="startup failed")
     assert _handle_library_manager_event(InputEvent(action=Action.BACK), state) == "menu"
     assert "startup failed" in " ".join(_library_manager_body_lines(state))
+
+
+def test_open_here_surfaces_unavailable_browser_runtime() -> None:
+    actions = []
+
+    def popen(argv, **kwargs):
+        actions.append(argv[-1])
+        return _Process(
+            {
+                "ok": False,
+                "error": "Open Here requires a Chromium-compatible local browser runtime",
+            }
+        )
+
+    state = LibraryManagerScreenState(
+        "romcloud", step=READY, details={"running": True}, popen=popen
+    )
+    state.activate()
+    assert state.step == "opening"
+    _drain(state)
+    assert actions == ["manager-open-local"]
+    assert state.step == FAILED
+    assert "Chromium-compatible" in state.error

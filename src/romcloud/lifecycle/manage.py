@@ -184,24 +184,33 @@ def repair(
             f"The ROMCloud virtual environment is missing at {venv_python}; "
             "rerun the bootstrap installer to recreate it."
         )
-    installed_payload = romcloud_home / "ports-gfx" / "ports_gfx"
-    if not (project_root / "ports_gfx").is_dir() and installed_payload.is_dir():
-        with tempfile.TemporaryDirectory(prefix="romcloud-repair-") as tmp:
-            staged_root = Path(tmp)
-            shutil.copytree(installed_payload, staged_root / "ports_gfx")
+    from romcloud.web.lifecycle import manager_status, start_manager, stop_manager
+
+    manager_was_running = bool(manager_status(config.data_path).get("running"))
+    if manager_was_running:
+        stop_manager(config.data_path)
+    try:
+        installed_payload = romcloud_home / "ports-gfx" / "ports_gfx"
+        if not (project_root / "ports_gfx").is_dir() and installed_payload.is_dir():
+            with tempfile.TemporaryDirectory(prefix="romcloud-repair-") as tmp:
+                staged_root = Path(tmp)
+                shutil.copytree(installed_payload, staged_root / "ports_gfx")
+                reconcile_report = install.reconcile_install(
+                    romcloud_home=romcloud_home,
+                    project_root=staged_root,
+                    ports_dir=ports_dir,
+                    system_python=system_python,
+                )
+        else:
             reconcile_report = install.reconcile_install(
                 romcloud_home=romcloud_home,
-                project_root=staged_root,
+                project_root=project_root,
                 ports_dir=ports_dir,
                 system_python=system_python,
             )
-    else:
-        reconcile_report = install.reconcile_install(
-            romcloud_home=romcloud_home,
-            project_root=project_root,
-            ports_dir=ports_dir,
-            system_python=system_python,
-        )
+    finally:
+        if manager_was_running:
+            start_manager(romcloud_home / "bin" / "romcloud", config.data_path)
     return reconcile_report, LifecycleReport(
         proxies_restored=reconcile_report.proxies_restored
     )
@@ -237,6 +246,9 @@ def uninstall(
     ports_dir: Optional[Path] = None,
 ) -> LifecycleReport:
     resolved_ports_dir = ports_dir or install.DEFAULT_PORTS_DIR
+    from romcloud.web.lifecycle import stop_manager
+
+    stop_manager(config.data_path)
     # Stop the exact verified resident before removing its executable,
     # startup service, hook, or durable state. This never uses broad process
     # matching and cannot target an unrelated Batocera process.

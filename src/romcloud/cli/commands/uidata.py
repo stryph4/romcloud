@@ -407,6 +407,42 @@ def uidata_manager_start(ctx: click.Context) -> None:
     _run_action(ctx, build)
 
 
+@uidata_group.command("manager-pair")
+@click.pass_context
+def uidata_manager_pair(ctx: click.Context) -> None:
+    """Issue a single-use LAN pairing link."""
+
+    def build() -> dict:
+        from romcloud.web.lifecycle import issue_browser_bootstrap, start_manager
+
+        config = _load_context_config(ctx)
+        romcloud_bin = os.environ.get("ROMCLOUD_BIN") or str(
+            Path(sys.executable).with_name("romcloud")
+        )
+        start_manager(romcloud_bin, config.data_path)
+        return issue_browser_bootstrap(config.data_path, kind="remote")
+
+    _run_action(ctx, build)
+
+
+@uidata_group.command("manager-open-local")
+@click.pass_context
+def uidata_manager_open_local(ctx: click.Context) -> None:
+    """Open the manager in the local fullscreen browser until it exits."""
+
+    def build() -> dict:
+        from romcloud.web.lifecycle import launch_local_browser, start_manager
+
+        config = _load_context_config(ctx)
+        romcloud_bin = os.environ.get("ROMCLOUD_BIN") or str(
+            Path(sys.executable).with_name("romcloud")
+        )
+        start_manager(romcloud_bin, config.data_path)
+        return launch_local_browser(config.data_path)
+
+    _run_action(ctx, build)
+
+
 @uidata_group.command("library-sync")
 @click.pass_context
 def uidata_library_sync(ctx: click.Context) -> None:

@@ -1,5 +1,5 @@
 const $ = (id) => document.getElementById(id);
-const state = {token: "", system: "", scope: "full", page: 1, pages: 0, selected: new Set(), status: null, loadSequence: 0};
+const state = {token: "", localSession: false, system: "", scope: "full", page: 1, pages: 0, selected: new Set(), status: null, loadSequence: 0};
 let contentUpdateScheduled = false;
 
 function contentUpdated() {
@@ -12,18 +12,39 @@ function contentUpdated() {
 }
 
 function tokenFromLocation() {
-  const hash = new URLSearchParams(location.hash.slice(1));
-  const value = hash.get("token");
-  if (value) { sessionStorage.setItem("romcloud-token", value); history.replaceState(null, "", location.pathname); }
-  return value || sessionStorage.getItem("romcloud-token") || "";
+  if (location.hash) history.replaceState(null, "", location.pathname);
+  return sessionStorage.getItem("romcloud-token") || "";
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {headers: {"Authorization": `Bearer ${state.token}`, ...(options.body ? {"Content-Type": "application/json"} : {})}, ...options});
+  const auth = state.token ? {"Authorization": `Bearer ${state.token}`} : {};
+  const response = await fetch(path, {credentials: "same-origin", headers: {...auth, ...(options.body ? {"Content-Type": "application/json"} : {})}, ...options});
   let body = {};
   try { body = await response.json(); } catch (_) { /* handled below */ }
   if (!response.ok) { const error = new Error(body.error || `Request failed (${response.status})`); error.status = response.status; throw error; }
   return body;
+}
+
+async function bootstrapFromLocation() {
+  const query = new URLSearchParams(location.search);
+  const code = query.get("bootstrap") || query.get("pair");
+  if (!code) return false;
+  history.replaceState(null, "", location.pathname);
+  try {
+    const response = await fetch("/auth/exchange", {
+      method: "POST", credentials: "same-origin",
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify({code}),
+    });
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.error || "Pairing failed.");
+    state.localSession = Boolean(body.local);
+    await connect("");
+    return true;
+  } catch (error) {
+    $("auth-error").textContent = error.message;
+    $("auth").classList.remove("hidden");
+    return false;
+  }
 }
 
 async function connect(token) {
@@ -169,7 +190,10 @@ function number(value) { return new Intl.NumberFormat().format(value || 0); }
 function formatBytes(value) { if (value == null) return "Size unknown"; if (value === 0) return "0 B"; const units = ["B", "KB", "MB", "GB", "TB"]; const power = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1); return `${(value / 1024 ** power).toFixed(power ? 1 : 0)} ${units[power]}`; }
 
 $("auth-form").addEventListener("submit", (event) => { event.preventDefault(); connect($("token").value); });
-$("logout").addEventListener("click", () => { sessionStorage.removeItem("romcloud-token"); location.reload(); });
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") window.dispatchEvent(new CustomEvent("romcloud:controller-back", {cancelable: true}));
+});
+$("logout").addEventListener("click", async () => { sessionStorage.removeItem("romcloud-token"); try { await api("/api/auth/logout", {method: "POST", body: "{}"}); } finally { location.reload(); } });
 document.querySelectorAll(".tab").forEach((tab) => tab.addEventListener("click", () => { state.scope = tab.dataset.scope; state.page = 1; setActiveTab(); loadGames(); }));
 let searchTimer; $("search").addEventListener("input", () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { state.page = 1; loadGames(); }, 250); });
 [$("state-filter"), $("sort")].forEach((node) => node.addEventListener("change", () => { state.page = 1; loadGames(); }));
@@ -191,11 +215,17 @@ window.addEventListener("romcloud:page-jump", (event) => {
 });
 
 window.addEventListener("romcloud:controller-back", (event) => {
+  if (state.localSession) {
+    event.preventDefault();
+    api("/api/local-exit", {method: "POST", body: "{}"}).catch(() => {});
+    return;
+  }
   if (state.selected.size) {
     state.selected.clear(); updateBulk(); loadGames(); event.preventDefault(); return;
   }
   if ($("search").value) {
     $("search").value = ""; state.page = 1; loadGames(); event.preventDefault();
+    return;
   }
 });
 
@@ -210,6 +240,11 @@ window.addEventListener("romcloud:controller-status", (event) => {
   contentUpdated();
 });
 
-state.token = tokenFromLocation();
-if (state.token) connect(state.token); else $("auth").classList.remove("hidden");
+(async () => {
+  if (await bootstrapFromLocation()) return;
+  state.token = tokenFromLocation();
+  if (state.token) connect(state.token); else {
+    try { await connect(""); } catch (_) { $("auth").classList.remove("hidden"); }
+  }
+})();
 window.romcloudGamepad = window.ROMCloudController.startBrowserController();
