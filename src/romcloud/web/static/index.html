@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ROMCloud Library</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div id="auth" class="auth hidden">
+    <form id="auth-form" class="auth-card">
+      <div class="brand-mark">RC</div>
+      <h1>Connect to ROMCloud</h1>
+      <p>Enter the access token shown by <code>romcloud manager</code>.</p>
+      <input id="token" type="password" autocomplete="current-password" placeholder="Access token" required data-controller-zone="auth" data-controller-row="0" data-controller-col="0">
+      <button class="primary" type="submit" data-controller-zone="auth" data-controller-row="0" data-controller-col="1">Connect</button>
+      <p id="auth-error" class="error"></p>
+    </form>
+  </div>
+
+  <div id="shell" class="shell hidden">
+    <header>
+      <div class="brand"><span class="brand-mark">RC</span><span><b>ROMCloud</b><small>Library Manager</small></span></div>
+      <div id="controller-status" class="controller-status hidden" aria-live="polite">Controller connected</div>
+      <div id="mode" class="mode">Connecting…</div>
+      <button id="logout" class="icon-button" title="Forget access token" data-controller-zone="global" data-controller-row="0" data-controller-col="0">Sign out</button>
+    </header>
+    <div id="offline-banner" class="banner hidden"><b>Offline</b> — showing local content only. Remote-only games and downloads are unavailable.</div>
+
+    <main>
+      <aside>
+        <h2>Systems</h2>
+        <div id="systems" class="systems"></div>
+      </aside>
+
+      <section class="content">
+        <div class="content-head">
+          <div><p class="eyebrow">Selected system</p><h1 id="system-title">Choose a system</h1></div>
+          <button id="download-pinned" class="primary" data-controller-zone="primary" data-controller-row="0" data-controller-col="0">Download Pinned</button>
+        </div>
+
+        <div class="tabs" role="tablist">
+          <button id="tab-full" class="tab active" data-scope="full" data-controller-zone="tabs" data-controller-row="0" data-controller-col="0">Full Library</button>
+          <button id="tab-device" class="tab" data-scope="device" data-controller-zone="tabs" data-controller-row="0" data-controller-col="1">On This Device</button>
+        </div>
+
+        <div class="toolbar">
+          <label class="search"><span>Search</span><input id="search" type="search" placeholder="Search this system…" data-controller-zone="controls" data-controller-row="0" data-controller-col="0"></label>
+          <label><span>State</span><select id="state-filter" data-controller-zone="controls" data-controller-row="0" data-controller-col="1"><option value="all">All states</option><option value="remote_only">Remote Only</option><option value="cached">Cached</option><option value="pinned">Pinned</option><option value="incomplete">Incomplete</option><option value="transferring">Transferring</option></select></label>
+          <label><span>Sort</span><select id="sort" data-controller-zone="controls" data-controller-row="0" data-controller-col="2"><option value="title">Title A–Z</option><option value="title_desc">Title Z–A</option><option value="newest">Recently added</option><option value="recent">Recently played</option><option value="size">Largest local size</option></select></label>
+        </div>
+
+        <div id="bulk" class="bulk hidden"><b id="selected-count">0 selected</b><button data-action="pin" data-controller-zone="bulk" data-controller-row="0" data-controller-col="0">Pin Selected</button><button data-action="unpin" data-controller-zone="bulk" data-controller-row="0" data-controller-col="1">Unpin</button><button data-action="remove" class="danger-text" data-controller-zone="bulk" data-controller-row="0" data-controller-col="2">Remove Local Copy</button><button id="clear-selection" data-controller-zone="bulk" data-controller-row="0" data-controller-col="3">Clear</button></div>
+        <div id="notice" class="notice hidden"></div>
+        <div id="controller-help" class="controller-help hidden"><b>Controller</b><span>Move</span> D-pad / Left Stick <span>Select</span> A <span>Back</span> B <span>Page jump</span> LB / RB</div>
+
+        <div class="list-head"><label><input id="select-page" type="checkbox" data-controller-zone="select" data-controller-row="0" data-controller-col="0"> Select page</label><span id="result-count"></span></div>
+        <div id="games" class="games"><div class="empty">Choose a system to browse its library.</div></div>
+        <nav class="pager"><button id="previous" data-controller-zone="pager" data-controller-row="0" data-controller-col="0">Previous</button><span id="page-label">Page 0 of 0</span><label>Jump to <input id="jump" type="number" min="1" value="1" data-controller-zone="pager" data-controller-row="0" data-controller-col="1"></label><button id="next" data-controller-zone="pager" data-controller-row="0" data-controller-col="2">Next</button></nav>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="preflight">
+    <form method="dialog" class="dialog-card">
+      <div class="dialog-head"><div><p class="eyebrow">Storage preflight</p><h2>Download Pinned</h2></div><button value="cancel" class="icon-button" data-controller-zone="dialog" data-controller-row="0" data-controller-col="0">Close</button></div>
+      <div id="preflight-body" class="metrics"></div>
+      <div id="preflight-error" class="error"></div>
+      <div class="dialog-actions"><button value="cancel" data-controller-zone="dialog" data-controller-row="0" data-controller-col="1">Cancel</button><button id="start-download" value="none" type="button" class="primary" data-controller-zone="dialog" data-controller-row="0" data-controller-col="2">Start Download</button></div>
+    </form>
+  </dialog>
+
+  <div id="job" class="job hidden"><div><b id="job-title">Downloading pinned games</b><span id="job-detail"></span></div><progress id="job-progress"></progress></div>
+  <script src="/controller.js" defer></script>
+  <script src="/app.js" defer></script>
+</body>
+</html>

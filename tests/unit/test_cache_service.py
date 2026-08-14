@@ -200,9 +200,28 @@ class TestPinUnpin:
         # File still exists
         assert cache_service.is_cached(game_with_file.id)
 
-    def test_pin_uncached_raises(self, cache_service, game_with_file):
-        with pytest.raises(CacheError):
-            cache_service.pin(game_with_file.id)
+    def test_pin_uncached_records_intent_without_downloading(
+        self, cache_service, cache_repo, game_with_file, monkeypatch
+    ):
+        monkeypatch.setattr(
+            cache_service._transfer,
+            "transfer",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("pin must not download")
+            ),
+        )
+
+        cache_service.pin(game_with_file.id)
+
+        entry = cache_repo.get(game_with_file.id)
+        assert entry is not None
+        assert entry.is_pinned
+        assert entry.status is CacheStatus.INCOMPLETE
+        assert entry.size_bytes == 0
+        assert cache_repo.list_members(game_with_file.id) == []
+
+        cache_service.unpin(game_with_file.id)
+        assert cache_repo.get(game_with_file.id) is None
 
 
 class TestRemove:

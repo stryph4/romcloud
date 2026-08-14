@@ -60,6 +60,8 @@ CREATE TABLE IF NOT EXISTS cache_members (
 );
 
 CREATE INDEX IF NOT EXISTS idx_cache_members_path ON cache_members(relative_path);
+CREATE INDEX IF NOT EXISTS idx_cache_entries_library_state
+    ON cache_entries(is_pinned, status, game_id);
 
 CREATE TABLE IF NOT EXISTS proxy_records (
     game_id     TEXT PRIMARY KEY REFERENCES games(id) ON DELETE CASCADE,
@@ -114,6 +116,7 @@ class Database:
                     "INSERT INTO schema_version (version) VALUES (?)",
                     (_CURRENT_SCHEMA_VERSION,),
                 )
+                self._create_query_indexes(conn)
                 return
 
             version = int(version_row["version"])
@@ -145,6 +148,15 @@ class Database:
                 self._migrate_cache_membership(conn)
                 version = 3
             conn.execute("UPDATE schema_version SET version = ?", (version,))
+            self._create_query_indexes(conn)
+
+    @staticmethod
+    def _create_query_indexes(conn: sqlite3.Connection) -> None:
+        """Create indexes only after legacy tables have gained new columns."""
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_games_library_browse "
+            "ON games(is_eligible, system, title, id)"
+        )
 
     @staticmethod
     def _migrate_cache_membership(conn: sqlite3.Connection) -> None:

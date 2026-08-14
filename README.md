@@ -253,9 +253,52 @@ transferring, or currently launching. If protected data leaves
 insufficient capacity, the operation fails with a space diagnostic
 rather than deleting protected content.
 
-Pinning protects an existing cached game from ROMCloud's automatic
-eviction. It is not a backup and does not protect against manual
-deletion or storage failure.
+Pinning expresses that a game should be kept locally. An already-cached
+game is protected from automatic eviction immediately; a remote-only
+game remains a zero-byte pinned request until **Download Pinned** runs.
+Pinning is not a backup and does not protect against manual deletion or
+storage failure.
+
+## Browser Library/Cache Manager
+
+Start the first-version browser manager on Batocera with:
+
+``` bash
+romcloud manager
+```
+
+The command starts HTTPS and prints a local URL containing a temporary
+access token. The first visit may require accepting ROMCloud's stable
+self-signed certificate; `--tls-cert` and `--tls-key` can supply a
+trusted certificate instead. HTTPS is the default because Chromium
+requires a secure context for controller access through the Gamepad API.
+To
+open it from a phone, tablet, or PC, replace `127.0.0.1` with the
+Batocera device's LAN or Tailscale address and keep the `#token=...`
+fragment. The server listens on port `8765` by default and runs until the
+command is stopped. Use `--host`, `--port`, or
+`ROMCLOUD_MANAGER_TOKEN` for an explicit deployment. `--http` is
+available for localhost diagnostics, where browsers still consider the
+origin trustworthy, but should not be used for remote controller access.
+
+Browsing is system-first and server-paginated. **Full Library** shows
+eligible catalog entries while the source is available; **On This
+Device** shows cached, pinned, transferring, failed, or incomplete
+entries. Offline mode exposes only the local view. Search, state filters,
+sorting, multi-select pin/unpin, individual downloads, and local-copy
+removal are available without loading the full catalog into the browser.
+
+Standard-mapped controllers are supported directly in Chromium. D-pad
+or left stick moves through systems, controls, and game rows; South/A
+activates; East/B backs out or closes a dialog; LB/RB moves by one
+50-game server page. Holding a bumper accelerates to two and then five
+pages per repeat, and releasing it stops repetition immediately.
+
+**Download Pinned** performs a dependency-aware storage preflight before
+starting its background job. The estimate deduplicates shared physical
+members and uses the same persisted playlist/XBLA closure, ownership,
+cache-size limit, and minimum-free-space reserve as launching and cache
+removal. A transfer that would breach either limit is blocked.
 
 ## Catalog and EmulationStation integration
 
@@ -506,6 +549,7 @@ romcloud healthcheck                Source, cache, integration, and sync checks
 romcloud refresh [--system NAME]    Refresh the catalog
 romcloud library ...                Connected/Cache/Offline mode
 romcloud cache ...                  Cache status/add/remove/pin/unpin
+romcloud manager                    Browser Library/Cache Manager
 romcloud library-sync ...           Metadata/media synchronization
 romcloud saves ...                  SaveSync operations
 romcloud mount ...                  SMB mount management
@@ -655,6 +699,7 @@ Reopen **Ports → ROMCloud** manually and inspect
     and intentionally excludes data it cannot safely classify or
     attribute.
 -   Library Sync remains opt-in beta functionality.
+-   MS-DOS library/cache behavior is not yet beta-supported or audited.
 -   Original Xbox SaveSync requires transferring xemu's complete virtual
     disk and is disabled by default.
 -   Some multi-file/playlist formats still require additional validation

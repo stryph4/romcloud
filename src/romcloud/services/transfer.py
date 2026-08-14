@@ -39,7 +39,7 @@ from typing import Callable, Optional
 
 from romcloud.core.cache_paths import resolve_cache_path
 from romcloud.core.exceptions import TransferError, TransferValidationError
-from romcloud.core.models.game import Game
+from romcloud.core.models.game import Game, GameAsset
 from romcloud.core.storage import StorageProvider
 from romcloud.infrastructure.logging import get_logger
 
@@ -169,14 +169,14 @@ class TransferService:
         those unknowns only when the user actually requests a transfer, where
         the value is needed for quota enforcement.
         """
-        total = 0
-        for asset in game.assets:
-            if asset.size_bytes is not None:
-                total += asset.size_bytes
-                continue
-            source = str(Path(self._asset_source_root(game)) / asset.relative_path)
-            total += self._provider.get_size(source) or 0
-        return total
+        return sum(self.estimate_asset_size(game, asset) for asset in game.assets)
+
+    def estimate_asset_size(self, game: Game, asset: GameAsset) -> int:
+        """Resolve one lazy asset size for deduplicated batch planning."""
+        if asset.size_bytes is not None:
+            return asset.size_bytes
+        source = str(Path(self._asset_source_root(game)) / asset.relative_path)
+        return self._provider.get_size(source) or 0
 
     def discard_staging(self, game: Game) -> None:
         """Remove any staged (partial) data for *game* (e.g. after a failed cancel)."""

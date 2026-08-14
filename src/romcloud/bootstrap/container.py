@@ -61,6 +61,7 @@ class Container:
         self._catalog: Optional[CatalogService] = None
         self._saves: Optional[SaveSyncService] = None
         self._library_sync: Optional[LibrarySyncService] = None
+        self._library_manager = None
 
     def _policy(self) -> CapabilityPolicy:
         """Resolve mode policy only for services that actually consume it."""
@@ -294,6 +295,27 @@ class Container:
                 capability_policy=self._policy(),
             )
         return self._library_sync
+
+    @property
+    def library_manager(self):  # noqa: ANN201
+        if self._library_manager is None:
+            from romcloud.infrastructure.capabilities import capability_policy
+            from romcloud.infrastructure.repositories.library_browser import (
+                LibraryBrowserRepository,
+            )
+            from romcloud.services.library_manager import LibraryManagerService
+
+            self._library_manager = LibraryManagerService(
+                browser_repo=LibraryBrowserRepository(self.database),
+                game_repo=self.game_repo,
+                cache_repo=self.cache_repo,
+                cache=self.cache,
+                policy_loader=lambda: capability_policy(self._config),
+                source_reachable=lambda: self.provider.is_reachable(
+                    self._config.source.rom_root
+                ),
+            )
+        return self._library_manager
 
     # ── helpers ───────────────────────────────────────────────────────────────
 

@@ -30,6 +30,9 @@ romcloud = "romcloud.cli.main:cli"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+romcloud = ["web/static/*.html", "web/static/*.css", "web/static/*.js"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = ["-ra", "--tb=short"]

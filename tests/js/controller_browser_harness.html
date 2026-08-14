@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>ROMCloud browser controller harness</title></head>
+<body data-result="pending">
+  <button id="system-0" data-controller-zone="systems" data-controller-row="0" data-controller-col="0">NES</button>
+  <button id="system-1" data-controller-zone="systems" data-controller-row="1" data-controller-col="0">SNES</button>
+  <button id="tab-0" data-controller-zone="tabs" data-controller-row="0" data-controller-col="0">Full</button>
+  <article id="game-0" tabindex="-1" data-controller-zone="games" data-controller-row="0" data-controller-col="0" data-controller-activate="toggle-row"><input type="checkbox">Game</article>
+  <dialog id="dialog"><button id="close" data-controller-zone="dialog" data-controller-row="0" data-controller-col="0">Close</button><button id="confirm" data-controller-zone="dialog" data-controller-row="0" data-controller-col="1">Confirm</button></dialog>
+  <script src="controller_browser_harness_setup.js"></script>
+  <script src="../../src/romcloud/web/static/controller.js"></script>
+  <script src="controller_browser_harness_test.js"></script>
+</body>
+</html>

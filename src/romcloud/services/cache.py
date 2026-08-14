@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import shutil
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
@@ -38,6 +39,38 @@ from romcloud.infrastructure.repositories.game import GameRepository
 from romcloud.services.dependencies import DependencyResolverRegistry
 
 log = get_logger("cache")
+
+
+@dataclass(frozen=True)
+class PinnedDownloadPreflight:
+    """Authoritative physical-storage plan for the current pinned set."""
+
+    pinned_games: int
+    games_needing_data: int
+    additional_bytes: int
+    current_cache_bytes: int
+    max_cache_bytes: int
+    free_bytes: int
+    min_free_bytes: int
+    game_ids: tuple[str, ...]
+    allowed: bool
+    reasons: tuple[str, ...]
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "pinned_games": self.pinned_games,
+            "games_needing_data": self.games_needing_data,
+            "additional_bytes": self.additional_bytes,
+            "current_cache_bytes": self.current_cache_bytes,
+            "resulting_cache_bytes": self.current_cache_bytes + self.additional_bytes,
+            "max_cache_bytes": self.max_cache_bytes,
+            "free_bytes": self.free_bytes,
+            "resulting_free_bytes": self.free_bytes - self.additional_bytes,
+            "min_free_bytes": self.min_free_bytes,
+            "game_ids": list(self.game_ids),
+            "allowed": self.allowed,
+            "reasons": list(self.reasons),
+        }
 
 
 class CacheService:
@@ -272,22 +305,7 @@ class CacheService:
             raise CacheError(f"Game {game_id!r} has no cacheable assets")
 
         existing = self._cache_repo.get(game_id)
-        existing_members = self._cache_repo.list_members(game_id)
-        if (
-            existing is not None
-            and self._cache_repo.membership_resolved(game_id)
-            and existing_members
-        ):
-            resolved_game = self._game_from_membership(game, existing_members)
-        elif self._dependencies is not None:
-            resolved_game = self._dependencies.resolve(game)
-        else:
-            if Path(primary.filename).suffix.lower() in DESCRIPTOR_EXTENSIONS:
-                raise CacheError(
-                    "Dependency resolution is unavailable for descriptor game "
-                    f"{game_id!r}"
-                )
-            resolved_game = game
+        resolved_game = self._resolved_game(game, existing)
         actual_before = self._existing_member_sizes(existing, resolved_game)
         needed = sum(
             asset.size_bytes or 0
@@ -387,7 +405,29 @@ class CacheService:
     def pin(self, game_id: str) -> None:
         entry = self._cache_repo.get(game_id)
         if entry is None:
-            raise CacheError(f"Game {game_id!r} is not cached — nothing to pin.")
+            game = self._game_repo.get(game_id)
+            if game is None or not game.is_eligible:
+                raise GameNotFoundError(f"Game not found in eligible catalog: {game_id}")
+            primary = game.primary_asset
+            if primary is None:
+                raise CacheError(f"Game {game_id!r} has no cacheable assets")
+            now = datetime.now(timezone.utc)
+            entry = CacheEntry(
+                game_id=game_id,
+                cache_path=str(
+                    resolve_cache_path(
+                        self._cache_root, game.system, primary.relative_path
+                    )
+                ),
+                status=CacheStatus.INCOMPLETE,
+                cached_at=now,
+                last_accessed=now,
+                size_bytes=0,
+                is_pinned=True,
+            )
+            self._cache_repo.save(entry)
+            log.info("Pinned remote catalog game %s for later download", game_id)
+            return
         self._cache_repo.set_pinned(game_id, True)
         log.info("Pinned %s", game_id)
 
@@ -396,8 +436,88 @@ class CacheService:
         entry = self._cache_repo.get(game_id)
         if entry is None:
             return
+        if (
+            entry.status is CacheStatus.INCOMPLETE
+            and entry.size_bytes == 0
+            and not self._cache_repo.list_members(game_id)
+        ):
+            self._cache_repo.delete(game_id)
+            log.info("Removed undownloaded pin %s", game_id)
+            return
         self._cache_repo.set_pinned(game_id, False)
         log.info("Unpinned %s", game_id)
+
+    def preflight_pinned(self, *, free_bytes: Optional[int] = None) -> PinnedDownloadPreflight:
+        """Resolve pinned misses and calculate their deduplicated closure.
+
+        Ordinary browsing never calls this method. Descriptor reads and
+        recursive directory sizing are limited to the explicit preflight.
+        """
+        entries = self._cache_repo.list_pinned()
+        needed_games: list[str] = []
+        missing_paths: dict[str, int] = {}
+        for entry in entries:
+            game = self._game_repo.get(entry.game_id)
+            if game is None or not game.is_eligible:
+                continue
+            if self.is_valid_cached_entry(entry, game):
+                continue
+            resolved = self._resolved_game(game, entry)
+            existing = self._existing_member_sizes(entry, resolved)
+            for asset in resolved.assets:
+                if asset.relative_path in existing:
+                    continue
+                size = self._transfer.estimate_asset_size(resolved, asset)
+                missing_paths[asset.relative_path] = max(
+                    missing_paths.get(asset.relative_path, 0), int(size or 0)
+                )
+            needed_games.append(entry.game_id)
+
+        additional = sum(missing_paths.values())
+        current = self._cache_repo.total_size()
+        free = _free_bytes(str(self._cache_root)) if free_bytes is None else free_bytes
+        reasons: list[str] = []
+        if current + additional > self._policy.max_size_bytes:
+            reasons.append(
+                "Pinned downloads would exceed the configured cache-size limit. "
+                "Remove local copies or unpin games first."
+            )
+        if free - additional < self._policy.min_free_bytes:
+            reasons.append(
+                "Pinned downloads would reduce filesystem free space below the "
+                "configured minimum reserve. Remove local copies or unpin games first."
+            )
+        return PinnedDownloadPreflight(
+            pinned_games=len(entries),
+            games_needing_data=len(needed_games),
+            additional_bytes=additional,
+            current_cache_bytes=current,
+            max_cache_bytes=self._policy.max_size_bytes,
+            free_bytes=free,
+            min_free_bytes=self._policy.min_free_bytes,
+            game_ids=tuple(needed_games),
+            allowed=not reasons,
+            reasons=tuple(reasons),
+        )
+
+    def download_pinned(
+        self,
+        *,
+        on_game: Optional[Callable[[int, int, str], None]] = None,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+    ) -> list[str]:
+        """Download/repair the pinned misses after a fresh preflight."""
+        plan = self.preflight_pinned()
+        if not plan.allowed:
+            raise InsufficientSpaceError(" ".join(plan.reasons))
+        completed: list[str] = []
+        total = len(plan.game_ids)
+        for index, game_id in enumerate(plan.game_ids, 1):
+            if on_game is not None:
+                on_game(index, total, game_id)
+            self.cache_game(game_id, on_progress=on_progress)
+            completed.append(game_id)
+        return completed
 
     def mark_launched(self, game_id: str) -> None:
         """Record that a game is currently launching (protects it from eviction)."""
@@ -480,6 +600,21 @@ class CacheService:
             if asset.size_bytes is None or actual == asset.size_bytes:
                 sizes[asset.relative_path] = actual
         return sizes
+
+    def _resolved_game(self, game: Game, entry: Optional[CacheEntry]) -> Game:
+        """Use a persisted closure when present, otherwise resolve lazily."""
+        members = self._cache_repo.list_members(game.id)
+        if entry is not None and self._cache_repo.membership_resolved(game.id) and members:
+            return self._game_from_membership(game, members)
+        if self._dependencies is not None:
+            return self._dependencies.resolve(game)
+        primary = game.primary_asset
+        if primary and Path(primary.filename).suffix.lower() in DESCRIPTOR_EXTENSIONS:
+            raise CacheError(
+                "Dependency resolution is unavailable for descriptor game "
+                f"{game.id!r}"
+            )
+        return game
 
     @staticmethod
     def _game_from_membership(game: Game, members: list[CacheMember]) -> Game:

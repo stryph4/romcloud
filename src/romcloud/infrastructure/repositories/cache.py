@@ -184,6 +184,26 @@ class CacheRepository:
             ).fetchall()
             return [self._row_to_member(row) for row in rows]
 
+    def list_members_for(self, game_ids: Iterable[str]) -> dict[str, list[CacheMember]]:
+        """Bulk-load memberships for a bounded set of browser result rows."""
+        ids = tuple(dict.fromkeys(game_ids))
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        with self._db.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM cache_members WHERE game_id IN ({placeholders})
+                ORDER BY game_id, is_primary DESC, relative_path
+                """,
+                ids,
+            ).fetchall()
+        memberships: dict[str, list[CacheMember]] = defaultdict(list)
+        for row in rows:
+            member = self._row_to_member(row)
+            memberships[member.game_id].append(member)
+        return dict(memberships)
+
     def list_resolved_memberships(self) -> dict[str, list[CacheMember]]:
         """Bulk-load authoritative membership snapshots for cache validation."""
         with self._db.connect() as conn:
@@ -345,6 +365,14 @@ class CacheRepository:
                 ORDER BY last_accessed ASC
                 """,
                 (CacheStatus.TRANSFERRING.value,),
+            ).fetchall()
+            return [self._row_to_entry(r) for r in rows]
+
+    def list_pinned(self) -> list[CacheEntry]:
+        with self._db.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM cache_entries WHERE is_pinned = 1 "
+                "ORDER BY last_accessed DESC"
             ).fetchall()
             return [self._row_to_entry(r) for r in rows]
 
