@@ -246,6 +246,7 @@ class _DeviceState:
     last_action: Optional[Action] = None
     using_custom_mapping: bool = False
     seen_joy_event: bool = False
+    held_buttons: set[tuple[bool, int]] = field(default_factory=set)
     """Set the first time a raw ``JOY*`` event arrives for this device;
     once ``True``, its ``CONTROLLER*`` event stream is treated as a
     duplicate mirror of the same physical input and ignored (see
@@ -434,6 +435,8 @@ class ControllerManager:
             # This device's raw JOY* events already work; ignore the
             # higher-level mirror of the same physical input rather than
             # dispatching it twice.
+            if event_type == controller_button_up:
+                device.held_buttons.discard((False, event.button))
             return None
 
         if event_type == joy_button_down:
@@ -484,6 +487,7 @@ class ControllerManager:
     def _handle_button_down(
         self, instance_id: int, device: _DeviceState, button: int, *, raw: bool
     ) -> Optional[Action]:
+        device.held_buttons.add((raw, button))
         if self._capture_remap(instance_id, "button", str(button)):
             return None
         action = self._resolve_button_action(device, button, raw=raw)
@@ -495,6 +499,7 @@ class ControllerManager:
         return action
 
     def _handle_button_up(self, device: _DeviceState, button: int, *, raw: bool) -> Optional[Action]:
+        device.held_buttons.discard((raw, button))
         action = self._resolve_button_action(device, button, raw=raw)
         if action in ACTION_DIRECTIONS and device.repeater.held_direction == ACTION_DIRECTIONS[action]:
             device.repeater.release()
@@ -581,6 +586,38 @@ class ControllerManager:
             )
             for instance_id, d in self._devices.items()
         ]
+
+    def all_controls_released(self) -> bool:
+        """Poll actual pad state for popup handoff release barriers."""
+        for device in self._devices.values():
+            if device.held_buttons or device.repeater.held_direction is not None:
+                return False
+            joystick = device.joystick
+            try:
+                if any(
+                    joystick.get_button(index)
+                    for index in range(joystick.get_numbuttons())
+                ):
+                    return False
+            except (AttributeError, OSError):
+                pass
+            try:
+                if any(
+                    joystick.get_hat(index) != (0, 0)
+                    for index in range(joystick.get_numhats())
+                ):
+                    return False
+            except (AttributeError, OSError):
+                pass
+            try:
+                # ROMCloud navigation uses the first two raw axes.  Do not
+                # include trigger axes, whose neutral value is often -1.
+                for index in range(min(2, joystick.get_numaxes())):
+                    if abs(float(joystick.get_axis(index))) >= self._deadzone:
+                        return False
+            except (AttributeError, OSError, TypeError, ValueError):
+                pass
+        return True
 
     @property
     def device_count(self) -> int:

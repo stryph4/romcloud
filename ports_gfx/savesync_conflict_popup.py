@@ -12,6 +12,7 @@ from typing import Any, Callable, Optional
 from ports_gfx.actions import Action
 from ports_gfx.client import operation_result, start_backend_operation
 from ports_gfx.hold_confirm import HoldToConfirmState, handle_hold_to_confirm_event
+from ports_gfx.input_capture import ExclusiveControllerCapture
 from ports_gfx.input_manager import InputEvent, InputManager
 from ports_gfx.layout import Rect, compute_layout, compute_vertical_control_rects
 from ports_gfx.operation import OperationRunner
@@ -26,6 +27,7 @@ _DESTRUCTIVE = frozenset({0, 1})
 _OPERATION_TIMEOUT = 120.0
 _FOCUS_TIMEOUT_SECONDS = 1.5
 _FOCUS_COMMAND_TIMEOUT_SECONDS = 0.75
+_RELEASE_BARRIER_TIMEOUT_SECONDS = 5.0
 
 LOADING = "loading"
 DISPLAYING = "displaying"
@@ -222,6 +224,12 @@ def action_rects(layout) -> list[Rect]:  # noqa: ANN001
 def run_conflict_popup(romcloud_bin: str) -> int:
     """Open one display, drain the queued exact IDs, then exit."""
     pygame = None
+    capture: Optional[ExclusiveControllerCapture] = None
+    window_input_captured = False
+    capture_release_reason = "popup-exit"
+    popup_outcome = "failed"
+    queue_drained = False
+    window_closed = False
     from ports_gfx.display_diagnostics import DisplayDiagnostics
 
     diagnostics = DisplayDiagnostics(romcloud_bin)
@@ -262,10 +270,35 @@ def run_conflict_popup(romcloud_bin: str) -> int:
             surface_size=list(screen.get_size()),
             **_focus_state(pygame),
         )
+        # Finish layout and controller opening before focus is requested so
+        # the interval between proven focus and exclusive capture is only
+        # the two ownership calls themselves.
+        layout = compute_layout(screen_w, screen_h, len(ACTION_LABELS))
+        fonts = _build_fonts(pygame, layout)
+        inputs = InputManager(pygame, romcloud_bin)
         try:
-            pygame.event.set_grab(True)
-        except Exception as exc:  # noqa: BLE001 - focus is verified separately
-            diagnostics.record("conflict_input_grab_failed", error=str(exc))
+            connected_controller_count = pygame.joystick.get_count()
+        except Exception as exc:  # noqa: BLE001 - unknown ownership must fail closed
+            diagnostics.record(
+                "conflict_popup_failed",
+                reason="controller_enumeration_failed",
+                error=str(exc),
+                queue_preserved=True,
+            )
+            return 1
+        try:
+            inputs.controllers.open_existing_devices(connected_controller_count)
+        except Exception as exc:  # noqa: BLE001 - capture count will fail closed
+            diagnostics.record("conflict_controller_open_failed", error=str(exc))
+        if inputs.controllers.device_count < connected_controller_count:
+            diagnostics.record(
+                "conflict_popup_failed",
+                reason="controller_open_incomplete",
+                connected=connected_controller_count,
+                opened=inputs.controllers.device_count,
+                queue_preserved=True,
+            )
+            return 1
         if not _acquire_popup_focus(pygame, diagnostics.record):
             diagnostics.record(
                 "conflict_popup_failed",
@@ -277,9 +310,44 @@ def run_conflict_popup(romcloud_bin: str) -> int:
                 "the conflict remains available for manual resolution"
             )
             return 1
-        layout = compute_layout(screen_w, screen_h, len(ACTION_LABELS))
-        fonts = _build_fonts(pygame, layout)
-        inputs = InputManager(pygame, romcloud_bin)
+        if not _acquire_window_input_grab(pygame, diagnostics.record):
+            diagnostics.record(
+                "conflict_popup_failed",
+                reason="window_input_grab_failed",
+                queue_preserved=True,
+            )
+            print(
+                "error: SaveSync conflict popup could not isolate keyboard/pointer "
+                "input; the conflict remains available for manual resolution"
+            )
+            return 1
+        window_input_captured = True
+        capture = ExclusiveControllerCapture(diagnostics.record)
+        if not capture.acquire(connected_controller_count):
+            capture_release_reason = "capture-failed"
+            diagnostics.record(
+                "conflict_popup_failed",
+                reason="controller_input_capture_failed",
+                queue_preserved=True,
+            )
+            print(
+                "error: SaveSync conflict popup could not acquire exclusive "
+                "controller input; the conflict remains available for manual resolution"
+            )
+            return 1
+        if not _wait_for_input_release(
+            pygame,
+            inputs,
+            diagnostics.record,
+            phase="opening",
+        ):
+            capture_release_reason = "opening-release-timeout"
+            diagnostics.record(
+                "conflict_popup_failed",
+                reason="opening_input_release_timeout",
+                queue_preserved=True,
+            )
+            return 1
         state = ConflictPopupState(
             romcloud_bin,
             source="automatic",
@@ -290,6 +358,7 @@ def run_conflict_popup(romcloud_bin: str) -> int:
         running = True
         rendered = False
         rendered_frames = 0
+        input_capture_failed = False
         while running and state.step != DONE:
             dt = clock.tick(30) / 1000.0
             rects = action_rects(layout)
@@ -298,6 +367,7 @@ def run_conflict_popup(romcloud_bin: str) -> int:
                 if event.type == pygame.QUIT:
                     running = False
                     break
+                controller_count = inputs.controllers.device_count
                 translated = inputs.handle_event(
                     event,
                     screen_w=screen_w,
@@ -305,6 +375,18 @@ def run_conflict_popup(romcloud_bin: str) -> int:
                     rects=rects,
                     now=now,
                 )
+                if inputs.controllers.device_count > controller_count:
+                    # An unexpected hot-plugged controller has not been
+                    # exclusively captured. Abort before accepting input
+                    # from a device that ES can also read.
+                    input_capture_failed = True
+                    running = False
+                    diagnostics.record(
+                        "conflict_input_capture_failed",
+                        mechanism=capture.mechanism,
+                        error="controller hot-plugged while popup was active",
+                    )
+                    break
                 state.handle_event(translated)
             for action in inputs.update(dt):
                 state.handle_event(InputEvent(action=action, source="controller"))
@@ -341,23 +423,147 @@ def run_conflict_popup(romcloud_bin: str) -> int:
                     **_focus_state(pygame),
                 )
         state.cancel_pending()
-        diagnostics.record(
-            "conflict_popup_exit",
-            queue_drained=state.step == DONE,
-            window_closed=not running,
-        )
+        if input_capture_failed:
+            capture_release_reason = "controller-hotplug"
+            diagnostics.record(
+                "conflict_popup_failed",
+                reason="controller_hotplug_not_captured",
+                queue_preserved=True,
+            )
+            return 1
+        if not _wait_for_input_release(
+            pygame,
+            inputs,
+            diagnostics.record,
+            phase="closing",
+        ):
+            capture_release_reason = "closing-release-timeout"
+            diagnostics.record(
+                "conflict_popup_failed",
+                reason="closing_input_release_timeout",
+                queue_preserved=state.step != DONE,
+            )
+            return 1
+        popup_outcome = "complete"
+        queue_drained = state.step == DONE
+        window_closed = not running
         return 0
     except Exception as exc:  # noqa: BLE001 - never crash the lifecycle worker
+        capture_release_reason = "exception"
         diagnostics.record("conflict_popup_failed", error=str(exc))
         print(f"error: SaveSync conflict popup failed: {exc}")
         return 1
     finally:
+        if capture is not None:
+            capture.release(reason=capture_release_reason)
         if pygame is not None:
+            set_keyboard_grab = getattr(pygame.event, "set_keyboard_grab", None)
+            if window_input_captured and callable(set_keyboard_grab):
+                try:
+                    set_keyboard_grab(False)
+                except Exception:  # noqa: BLE001 - cleanup continues to pygame.quit
+                    pass
+            if window_input_captured:
+                try:
+                    pygame.event.set_grab(False)
+                except Exception:  # noqa: BLE001 - cleanup is best effort
+                    pass
+                diagnostics.record(
+                    "conflict_window_input_capture_released",
+                    devices=["keyboard", "pointer"],
+                )
             try:
-                pygame.event.set_grab(False)
-            except Exception:  # noqa: BLE001 - cleanup is best effort
+                pygame.quit()
+            except Exception:  # noqa: BLE001 - diagnostics still report exit
                 pass
-            pygame.quit()
+        window_closed = True
+        diagnostics.record(
+            "conflict_popup_exit",
+            outcome=popup_outcome,
+            queue_drained=queue_drained,
+            window_closed=window_closed,
+            capture_release_reason=capture_release_reason,
+        )
+
+
+def _acquire_window_input_grab(
+    pygame,  # noqa: ANN001
+    record: Callable[..., None],
+) -> bool:
+    """Acquire SDL's keyboard/pointer grab after focus is proven."""
+    mechanisms = ["pygame-event-grab", "verified-keyboard-focus"]
+    record(
+        "conflict_input_capture_attempt",
+        mechanism="pygame-window-input-grab",
+        devices=["keyboard", "pointer"],
+    )
+    try:
+        pygame.event.set_grab(True)
+        get_grab = getattr(pygame.event, "get_grab", None)
+        if callable(get_grab) and not get_grab():
+            raise RuntimeError("pygame event grab did not become active")
+        set_keyboard_grab = getattr(pygame.event, "set_keyboard_grab", None)
+        if callable(set_keyboard_grab):
+            set_keyboard_grab(True)
+            mechanisms.append("pygame-keyboard-grab")
+    except Exception as exc:  # noqa: BLE001 - popup must fail closed
+        record(
+            "conflict_input_capture_failed",
+            mechanism="pygame-window-input-grab",
+            error=str(exc),
+        )
+        return False
+    record(
+        "conflict_input_capture_acquired",
+        mechanism="+".join(mechanisms),
+        devices=["keyboard", "pointer"],
+    )
+    return True
+
+
+def _wait_for_input_release(
+    pygame,  # noqa: ANN001
+    inputs: InputManager,
+    record: Callable[..., None],
+    *,
+    phase: str,
+    timeout: float = _RELEASE_BARRIER_TIMEOUT_SECONDS,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> bool:
+    """Discard transition input until actual held state becomes neutral."""
+    started = clock()
+    deadline = started + max(0.0, timeout)
+    record("conflict_input_release_barrier_started", phase=phase, timeout=timeout)
+    while True:
+        try:
+            events = pygame.event.get()
+        except Exception:  # noqa: BLE001 - polling state remains authoritative
+            events = ()
+        for event in events:
+            if event.type == getattr(pygame, "QUIT", object()):
+                continue
+            inputs.handle_event(event, screen_w=1, screen_h=1)
+        try:
+            pygame.event.pump()
+        except Exception:  # noqa: BLE001
+            pass
+        if inputs.all_controls_released():
+            record(
+                "conflict_input_all_released",
+                phase=phase,
+                elapsed=round(max(0.0, clock() - started), 6),
+            )
+            return True
+        now = clock()
+        if now >= deadline:
+            record(
+                "conflict_input_release_barrier_timed_out",
+                phase=phase,
+                elapsed=round(max(0.0, now - started), 6),
+            )
+            return False
+        sleep(min(0.01, max(0.0, deadline - now)))
 
 
 def _acquire_popup_focus(

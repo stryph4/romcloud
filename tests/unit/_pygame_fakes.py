@@ -17,6 +17,7 @@ _counter = itertools.count(1000)
 
 _CONSTANT_NAMES = [
     "KEYDOWN",
+    "KEYUP",
     "TEXTINPUT",
     "MOUSEBUTTONDOWN",
     "MOUSEBUTTONUP",

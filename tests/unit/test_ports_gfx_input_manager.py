@@ -35,6 +35,24 @@ class TestKeyboardRouting:
         assert result.action == Action.TEXT_INPUT
         assert result.text == "q"
 
+    def test_release_barrier_tracks_keyboard_press_until_key_up(self, tmp_path: Path):
+        manager = _manager(tmp_path)
+        pygame = manager._pygame
+
+        manager.handle_event(
+            FakeEvent(type=pygame.KEYDOWN, key=pygame.K_RETURN),
+            screen_w=1920,
+            screen_h=1080,
+        )
+        assert not manager.all_controls_released()
+
+        manager.handle_event(
+            FakeEvent(type=pygame.KEYUP, key=pygame.K_RETURN),
+            screen_w=1920,
+            screen_h=1080,
+        )
+        assert manager.all_controls_released()
+
 
 class TestTouchRouting:
     def test_mouse_click_on_widget_focuses_and_confirms(self, tmp_path: Path):
@@ -85,6 +103,26 @@ class TestTouchRouting:
         assert result.action == Action.CONFIRM_RELEASED
         assert manager.last_input_mode == "touch"
 
+    def test_release_barrier_tracks_mouse_press_until_button_up(self, tmp_path: Path):
+        manager = _manager(tmp_path)
+        pygame = manager._pygame
+
+        manager.handle_event(
+            FakeEvent(type=pygame.MOUSEBUTTONDOWN, button=1, pos=(50, 50)),
+            screen_w=1920,
+            screen_h=1080,
+            rects=_RECTS,
+            now=1.0,
+        )
+        assert not manager.all_controls_released()
+
+        manager.handle_event(
+            FakeEvent(type=pygame.MOUSEBUTTONUP, button=1, pos=(50, 50)),
+            screen_w=1920,
+            screen_h=1080,
+        )
+        assert manager.all_controls_released()
+
 
 class TestControllerRouting:
     def test_controller_event_routes_through_and_sets_mode(self, tmp_path: Path):
@@ -113,6 +151,26 @@ class TestControllerRouting:
         )
         assert manager.update(0.5) == [Action.DOWN]
         assert manager.last_input_mode == "controller"
+
+    def test_release_barrier_tracks_confirm_until_controller_button_up(self, tmp_path: Path):
+        joystick = FakeJoystick(guid="g1")
+        manager = _manager(tmp_path, joysticks={0: joystick})
+        pygame = manager._pygame
+        manager.controllers.open_existing_devices(1)
+
+        manager.handle_event(
+            FakeEvent(type=pygame.JOYBUTTONDOWN, instance_id=1, button=0),
+            screen_w=1920,
+            screen_h=1080,
+        )
+        assert not manager.all_controls_released()
+
+        manager.handle_event(
+            FakeEvent(type=pygame.JOYBUTTONUP, instance_id=1, button=0),
+            screen_w=1920,
+            screen_h=1080,
+        )
+        assert manager.all_controls_released()
 
 
 class TestInputModeSwitchingPreservesUnrelatedState:
