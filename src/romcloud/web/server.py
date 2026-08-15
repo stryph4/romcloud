@@ -10,9 +10,11 @@ import signal
 import threading
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
+from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
@@ -29,6 +31,66 @@ from romcloud.web.auth import (
 
 log = get_logger("web-manager")
 _MAX_BODY = 128 * 1024
+_CONTROLLER_LOG_MAX_BYTES = 256 * 1024
+_CONTROLLER_EVENT_MAX_BYTES = 4096
+_CONTROLLER_BATCH_MAX = 64
+
+
+class ControllerDiagnosticLog:
+    """Bounded JSON-lines diagnostics for the loopback Open Here session."""
+
+    def __init__(self, path: str | Path, *, max_bytes: int = _CONTROLLER_LOG_MAX_BYTES) -> None:
+        self.path = Path(path)
+        self.max_bytes = max_bytes
+        self._lock = threading.Lock()
+
+    def append(self, events: object) -> int:
+        if not isinstance(events, list):
+            raise ValueError("Controller diagnostics must contain an events list.")
+        if len(events) > _CONTROLLER_BATCH_MAX:
+            raise ValueError("Controller diagnostics batch is too large.")
+        lines: list[bytes] = []
+        for raw in events:
+            if not isinstance(raw, dict):
+                raise ValueError("Controller diagnostic events must be objects.")
+            event = str(raw.get("event", "")).strip()
+            if not event or len(event) > 64:
+                raise ValueError("Controller diagnostic event name is invalid.")
+            detail = raw.get("detail", {})
+            if not isinstance(detail, dict):
+                raise ValueError("Controller diagnostic detail must be an object.")
+            line = json.dumps(
+                {
+                    "time": datetime.now(timezone.utc).isoformat(),
+                    "event": event,
+                    "detail": detail,
+                },
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8") + b"\n"
+            if len(line) > _CONTROLLER_EVENT_MAX_BYTES:
+                raise ValueError("Controller diagnostic event is too large.")
+            lines.append(line)
+        if not lines:
+            return 0
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            for line in lines:
+                try:
+                    current_size = self.path.stat().st_size
+                except FileNotFoundError:
+                    current_size = 0
+                if current_size and current_size + len(line) > self.max_bytes:
+                    previous = self.path.with_suffix(self.path.suffix + ".1")
+                    previous.unlink(missing_ok=True)
+                    self.path.replace(previous)
+                with self.path.open("ab") as handle:
+                    handle.write(line)
+            try:
+                self.path.chmod(0o600)
+            except OSError:
+                pass
+        return len(lines)
 
 
 @dataclass
@@ -113,10 +175,16 @@ class ManagerHTTPServer(ThreadingHTTPServer):
         manager: LibraryManagerService,
         token: str,
         auth_registry: BrowserAuthRegistry | None = None,
+        controller_log_path: str | Path | None = None,
     ) -> None:
         self.manager = manager
         self.auth_token = token
         self.browser_auth = auth_registry or BrowserAuthRegistry()
+        self.controller_diagnostics = (
+            ControllerDiagnosticLog(controller_log_path)
+            if controller_log_path is not None
+            else None
+        )
         self.mutation_lock = threading.RLock()
         self.jobs = JobRegistry(manager, self.mutation_lock)
         super().__init__(address, ManagerRequestHandler)
@@ -199,6 +267,22 @@ class ManagerRequestHandler(BaseHTTPRequestHandler):
                     self._json(HTTPStatus.FORBIDDEN, {"error": "Local exit is unavailable."})
                 else:
                     self._json(HTTPStatus.OK, {"closing": True})
+            elif parsed.path == "/api/controller-diagnostics":
+                if not self._trusted_local_request():
+                    self._json(
+                        HTTPStatus.FORBIDDEN,
+                        {"error": "Controller diagnostics are loopback-only."},
+                    )
+                elif self.server.controller_diagnostics is None:
+                    self._json(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        {"error": "Controller diagnostics are unavailable."},
+                    )
+                else:
+                    count = self.server.controller_diagnostics.append(
+                        self._body().get("events")
+                    )
+                    self._json(HTTPStatus.OK, {"recorded": count})
             elif parsed.path == "/api/trusted-devices/revoke":
                 revoked = self.server.browser_auth.revoke_id(str(self._body().get("id", "")))
                 self._json(HTTPStatus.OK if revoked else HTTPStatus.NOT_FOUND, {"revoked": revoked})
@@ -361,10 +445,17 @@ def serve_manager(
     tls_cert: str | None = None,
     tls_key: str | None = None,
     auth_state_path: str | None = None,
+    controller_log_path: str | None = None,
     on_ready: Callable[[], None] | None = None,
 ) -> None:
     registry = BrowserAuthRegistry(state_path=auth_state_path) if auth_state_path else None
-    server = ManagerHTTPServer((host, port), manager, token, auth_registry=registry)
+    server = ManagerHTTPServer(
+        (host, port),
+        manager,
+        token,
+        auth_registry=registry,
+        controller_log_path=controller_log_path,
+    )
     if tls_cert or tls_key:
         if not tls_cert or not tls_key:
             server.server_close()

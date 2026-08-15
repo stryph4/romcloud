@@ -378,7 +378,12 @@ raw button numbers are intentionally not copied into the browser because
 Gamepad API indices and identities are not equivalent, and a remote
 browser may use a different controller. A browser pad without a standard
 mapping is reported as unavailable instead of being assigned guessed
-buttons.
+buttons. Local Open Here sessions also write bounded, mode-0600 controller
+diagnostics to `/userdata/system/romcloud/logs/browser-controller.log`
+(rotating the previous file to `.log.1`). The log records secure-context and
+Gamepad API initialization, every exposed pad identity/layout, connection
+events, meaningful raw input changes, logical actions, and focus changes. It
+does not enable controller diagnostics for remote browser sessions.
 
 **Download Pinned** performs a dependency-aware storage preflight before
 starting its background job. The estimate deduplicates shared physical

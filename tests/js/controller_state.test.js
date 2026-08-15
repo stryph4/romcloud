@@ -24,6 +24,40 @@ const rawPad = {...standardPad, mapping: ""};
 assert.strictEqual(mapper.supports(rawPad), false);
 assert.ok(Object.values(mapper.pressedState(rawPad)).every((pressed) => pressed === false));
 
+const diagnosticRequests = [];
+let diagnosticTimer = null;
+const diagnosticWindow = {
+  isSecureContext: true,
+  navigator: {getGamepads: () => [rawPad]},
+  addEventListener: () => {},
+  setTimeout: (callback) => { diagnosticTimer = callback; return 1; },
+  clearTimeout: () => { diagnosticTimer = null; },
+  fetch: (endpoint, options) => { diagnosticRequests.push({endpoint, options}); return Promise.resolve(); },
+};
+const diagnostics = new controller.BrowserControllerDiagnostics(
+  diagnosticWindow, "/api/controller-diagnostics", {interactionMode: "controller"}
+);
+diagnostics.initialize([rawPad]);
+buttons[0] = {pressed: false, value: 0};
+diagnostics.observe([rawPad]);
+diagnostics.focus({zone: "games", row: 2, col: 1}, {id: "pin", tagName: "BUTTON"});
+diagnostics.logical({up: false, confirm: true}, {zone: "games", row: 2, col: 1});
+diagnostics.flush();
+assert.strictEqual(diagnosticRequests.length, 1);
+const diagnosticBody = JSON.parse(diagnosticRequests[0].options.body);
+assert.ok(diagnosticBody.events.some((event) => event.event === "controller-initialized"));
+assert.ok(diagnosticBody.events.some((event) =>
+  event.event === "controller-boundary" && event.detail.state === "nonstandard-gamepad-exposed"
+));
+assert.ok(diagnosticBody.events.some((event) => event.event === "gamepad-snapshot"));
+assert.ok(diagnosticBody.events.some((event) =>
+  event.event === "gamepad-snapshot" && event.detail.mapping_supported === false
+));
+assert.ok(diagnosticBody.events.some((event) => event.event === "gamepad-input-change"));
+assert.ok(diagnosticBody.events.some((event) => event.event === "focus-change"));
+assert.ok(diagnosticBody.events.some((event) => event.event === "logical-input-change"));
+assert.strictEqual(diagnosticTimer, null);
+
 const model = new controller.FocusModel([
   "systems", "primary", "tabs", "controls", "games", "pager", "dialog",
 ]);

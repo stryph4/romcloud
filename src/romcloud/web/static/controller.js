@@ -200,15 +200,183 @@
     }
   }
 
+  class BrowserControllerDiagnostics {
+    constructor(win, endpoint, {interactionMode = "unknown", maxEvents = 500} = {}) {
+      this.window = win;
+      this.endpoint = endpoint;
+      this.interactionMode = interactionMode;
+      this.maxEvents = maxEvents;
+      this.eventCount = 0;
+      this.queue = [];
+      this.flushTimer = null;
+      this.padSignatures = new Map();
+      this.padLayouts = new Map();
+      this.lastLogical = "";
+      this.lastFocus = "";
+      this.enabled = Boolean(endpoint && win && win.fetch);
+      if (this.enabled) {
+        this.window.addEventListener("pagehide", () => this.flush(true));
+      }
+    }
+
+    initialize(pads) {
+      const present = pads.filter(Boolean);
+      this.record("controller-initialized", {
+        interaction_mode: this.interactionMode,
+        secure_context: Boolean(this.window.isSecureContext),
+        gamepad_api: Boolean(
+          this.window.navigator && typeof this.window.navigator.getGamepads === "function"
+        ),
+        initial_gamepad_count: present.length,
+      });
+      this.record("controller-boundary", {
+        state: !this.window.navigator || typeof this.window.navigator.getGamepads !== "function"
+          ? "gamepad-api-unavailable"
+          : !present.length
+            ? "no-gamepad-exposed"
+            : present.some((pad) => pad.connected && pad.mapping === "standard")
+              ? "standard-gamepad-exposed"
+              : "nonstandard-gamepad-exposed",
+      });
+      if (!present.length) this.record("gamepad-snapshot", {gamepads: []});
+      this.observe(pads);
+    }
+
+    connected(pad) {
+      this.record("gamepad-connected", this.describe(pad));
+      this.record("controller-boundary", {
+        state: pad && pad.connected && pad.mapping === "standard"
+          ? "standard-gamepad-exposed"
+          : "nonstandard-gamepad-exposed",
+      });
+      this.padSignatures.delete(pad.index);
+      this.padLayouts.delete(pad.index);
+      this.observe([pad]);
+    }
+
+    disconnected(pad) {
+      this.record("gamepad-disconnected", this.describe(pad));
+      this.padSignatures.delete(pad.index);
+      this.padLayouts.delete(pad.index);
+    }
+
+    observe(pads) {
+      if (!this.enabled) return;
+      pads.forEach((pad) => {
+        if (!pad) return;
+        const description = this.describe(pad);
+        const layout = JSON.stringify({
+          id: description.id,
+          mapping: description.mapping,
+          connected: description.connected,
+          buttons: description.buttons,
+          axes: description.axes,
+        });
+        if (this.padLayouts.get(pad.index) !== layout) {
+          this.padLayouts.set(pad.index, layout);
+          this.record("gamepad-snapshot", description);
+        }
+        const signature = this.inputSignature(pad);
+        const previous = this.padSignatures.get(pad.index);
+        this.padSignatures.set(pad.index, signature);
+        if (previous !== undefined && previous !== signature) {
+          this.record("gamepad-input-change", {
+            ...this.describe(pad),
+            pressed_buttons: pad.buttons
+              .map((button, index) => button && (button.pressed || button.value > 0.5) ? index : null)
+              .filter((index) => index !== null),
+            button_values: pad.buttons.map((button) => Number((button && button.value || 0).toFixed(3))),
+            axis_values: pad.axes.map((value) => Number(Number(value || 0).toFixed(3))),
+          });
+        }
+      });
+    }
+
+    logical(state, focus) {
+      const active = Object.entries(state).filter(([, value]) => value).map(([key]) => key);
+      const signature = JSON.stringify(active);
+      if (signature === this.lastLogical) return;
+      this.lastLogical = signature;
+      this.record("logical-input-change", {active, focus: focus || null});
+    }
+
+    focus(descriptor, element) {
+      const detail = {
+        descriptor: descriptor || null,
+        element_id: element && element.id || "",
+        tag: element && element.tagName || "",
+      };
+      const signature = JSON.stringify(detail);
+      if (signature === this.lastFocus) return;
+      this.lastFocus = signature;
+      this.record("focus-change", detail);
+    }
+
+    failure(error) {
+      this.record("controller-initialization-error", {
+        name: error && error.name || "Error",
+        message: String(error && error.message || error || "unknown error").slice(0, 500),
+      });
+      this.flush(true);
+    }
+
+    describe(pad) {
+      return {
+        index: Number(pad && pad.index),
+        id: String(pad && pad.id || "").slice(0, 300),
+        mapping: String(pad && pad.mapping || ""),
+        mapping_supported: Boolean(pad && pad.connected && pad.mapping === "standard"),
+        connected: Boolean(pad && pad.connected),
+        buttons: pad && pad.buttons ? pad.buttons.length : 0,
+        axes: pad && pad.axes ? pad.axes.length : 0,
+        timestamp: Number(pad && pad.timestamp || 0),
+      };
+    }
+
+    inputSignature(pad) {
+      const buttons = pad.buttons.map((button) => Boolean(
+        button && (button.pressed || button.value > 0.5)
+      ));
+      const axes = pad.axes.map((value) => value < -0.35 ? -1 : value > 0.35 ? 1 : 0);
+      return JSON.stringify({buttons, axes});
+    }
+
+    record(event, detail = {}) {
+      if (!this.enabled || this.eventCount >= this.maxEvents) return;
+      this.eventCount += 1;
+      this.queue.push({event, detail});
+      if (this.queue.length >= 8) this.flush();
+      else if (this.flushTimer === null) {
+        this.flushTimer = this.window.setTimeout(() => this.flush(), 250);
+      }
+    }
+
+    flush(keepalive = false) {
+      if (!this.enabled || !this.queue.length) return;
+      if (this.flushTimer !== null) this.window.clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+      const events = this.queue.splice(0, 64);
+      this.window.fetch(this.endpoint, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({events}),
+        keepalive,
+      }).catch(() => {});
+    }
+  }
+
   class BrowserGamepadNavigator {
-    constructor(win, doc, mapper = new StandardGamepadMapper()) {
+    constructor(win, doc, mapper = new StandardGamepadMapper(), diagnostics = null) {
       this.window = win;
       this.document = doc;
       this.model = new FocusModel();
       this.elements = new Map();
       this.connected = new Set();
       this.mapper = mapper;
+      this.diagnostics = diagnostics;
       this.frame = null;
+      this.scanTimer = null;
       this.usingController = false;
       this.editing = null;
       this.editingOriginal = null;
@@ -220,7 +388,20 @@
         rb: new RepeatButton({initialDelay: 420, accelerated: true}),
       };
       this.edges = {confirm: false, back: false, menu: false};
-      this._boundPoll = (now) => this._poll(now);
+      this._boundPoll = (now) => {
+        try {
+          this._poll(now);
+        } catch (error) {
+          this.frame = null;
+          if (this.diagnostics) {
+            this.diagnostics.record("controller-runtime-error", {
+              name: error && error.name || "Error",
+              message: String(error && error.message || error || "unknown error").slice(0, 500),
+            });
+            this.diagnostics.flush(true);
+          }
+        }
+      };
     }
 
     start() {
@@ -234,6 +415,7 @@
         if (event.target && event.target.tagName === "DIALOG") this._restoreAfterDialog();
       }, true);
       const pads = this._gamepads();
+      if (this.diagnostics) this.diagnostics.initialize(pads);
       pads.forEach((pad) => { if (pad) this.connected.add(pad.index); });
       if (this._activePad()) {
         this._setControllerMode(true);
@@ -241,6 +423,7 @@
         this._schedule();
       }
       this._announce();
+      if (this.diagnostics && !this.connected.size) this._schedule();
       return this;
     }
 
@@ -288,6 +471,7 @@
 
     _connect(gamepad) {
       this.connected.add(gamepad.index);
+      if (this.diagnostics) this.diagnostics.connected(gamepad);
       this._resetInputs();
       if (this.mapper.supports(gamepad)) {
         this._setControllerMode(true);
@@ -299,6 +483,7 @@
 
     _disconnect(gamepad) {
       this.connected.delete(gamepad.index);
+      if (this.diagnostics) this.diagnostics.disconnected(gamepad);
       this._resetInputs();
       if (!this._activePad(gamepad.index)) {
         if (this.frame !== null) this.window.cancelAnimationFrame(this.frame);
@@ -306,13 +491,22 @@
         this._setControllerMode(false);
       }
       this._announce();
+      if (this.diagnostics) this._schedule();
     }
 
     _poll(now) {
       this.frame = null;
+      const observed = this._gamepads();
+      if (this.diagnostics) this.diagnostics.observe(observed);
+      const present = new Set(observed.filter(Boolean).map((pad) => pad.index));
+      [...this.connected].forEach((index) => {
+        if (!present.has(index)) this.connected.delete(index);
+      });
+      observed.forEach((pad) => { if (pad) this.connected.add(pad.index); });
       const pad = this._activePad();
-      if (!pad) { this._resetInputs(); return; }
+      if (!pad) { this._resetInputs(); this._schedule(); return; }
       const pressed = this._pressedState(pad);
+      if (this.diagnostics) this.diagnostics.logical(pressed, this.model.current);
       const up = this.repeaters.up.update(pressed.up, now);
       const down = this.repeaters.down.update(pressed.down, now);
       const left = this.repeaters.left.update(pressed.left, now);
@@ -424,6 +618,7 @@
       element.classList.add("controller-focus");
       element.focus({preventScroll: true});
       element.scrollIntoView({block: "nearest", inline: "nearest", behavior: "instant"});
+      if (this.diagnostics) this.diagnostics.focus(this.model.current, element);
     }
 
     _rememberElement(element) {
@@ -496,7 +691,14 @@
     }
 
     _schedule() {
-      if (this.frame === null && this.connected.size) this.frame = this.window.requestAnimationFrame(this._boundPoll);
+      if (this.frame === null && this.connected.size) {
+        this.frame = this.window.requestAnimationFrame(this._boundPoll);
+      } else if (this.diagnostics && this.frame === null && this.scanTimer === null) {
+        this.scanTimer = this.window.setTimeout(() => {
+          this.scanTimer = null;
+          this.frame = this.window.requestAnimationFrame(this._boundPoll);
+        }, 1000);
+      }
     }
 
     _key(descriptor) {
@@ -504,12 +706,25 @@
     }
   }
 
-  function startBrowserController(win = window, doc = document) {
-    return new BrowserGamepadNavigator(win, doc).start();
+  function startBrowserController(win = window, doc = document, options = {}) {
+    const diagnostics = options.diagnostics || (
+      options.diagnosticsEndpoint
+        ? new BrowserControllerDiagnostics(win, options.diagnosticsEndpoint, options)
+        : null
+    );
+    try {
+      return new BrowserGamepadNavigator(
+        win, doc, options.mapper || new StandardGamepadMapper(), diagnostics
+      ).start();
+    } catch (error) {
+      if (diagnostics) diagnostics.failure(error);
+      throw error;
+    }
   }
 
   const api = {
-    FocusModel, RepeatButton, ControllerKeyboardModel, StandardGamepadMapper, BrowserGamepadNavigator,
+    FocusModel, RepeatButton, ControllerKeyboardModel, BrowserControllerDiagnostics,
+    StandardGamepadMapper, BrowserGamepadNavigator,
     startBrowserController, DEFAULT_ZONES, LOGICAL_ACTIONS, STANDARD_GAMEPAD_BINDINGS,
   };
   root.ROMCloudController = api;

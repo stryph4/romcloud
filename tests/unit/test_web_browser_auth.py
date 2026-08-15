@@ -14,7 +14,7 @@ from romcloud.web.auth import (
     BrowserAuthRegistry,
     PairingRateLimited,
 )
-from romcloud.web.server import ManagerHTTPServer
+from romcloud.web.server import ControllerDiagnosticLog, ManagerHTTPServer
 
 
 class _Manager:
@@ -145,3 +145,62 @@ def test_local_exit_does_not_stop_manager() -> None:
     assert registry.request_local_exit(peer="127.0.0.1")
     assert registry.local_exit_requested(launch_id)
     assert not registry.local_exit_requested(launch_id)
+
+
+def test_controller_diagnostics_are_persistent_bounded_and_loopback_only(tmp_path) -> None:
+    log_path = tmp_path / "browser-controller.log"
+    server = ManagerHTTPServer(
+        ("127.0.0.1", 0),
+        _Manager(),
+        "secret",
+        controller_log_path=log_path,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        event = _request(
+            f"{base}/api/controller-diagnostics",
+            body={
+                "events": [
+                    {
+                        "event": "gamepad-snapshot",
+                        "detail": {
+                            "id": "Steam Deck Controller",
+                            "mapping": "",
+                            "buttons": 20,
+                            "axes": 4,
+                        },
+                    }
+                ]
+            },
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(event, timeout=2) as response:
+            assert json.load(response)["recorded"] == 1
+        payload = json.loads(log_path.read_text().strip())
+        assert payload["event"] == "gamepad-snapshot"
+        assert payload["detail"]["mapping"] == ""
+        assert log_path.stat().st_mode & 0o777 == 0o600
+
+        denied = _request(
+            f"{base}/api/controller-diagnostics",
+            body={"events": [{"event": "remote", "detail": {}}]},
+            headers={
+                "Authorization": "Bearer secret",
+                "Content-Type": "application/json",
+                "Host": "batocera.local",
+            },
+        )
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(denied, timeout=2)
+        assert error.value.code == 403
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    bounded = ControllerDiagnosticLog(log_path, max_bytes=100)
+    bounded.append([{"event": "one", "detail": {"value": "x" * 40}}])
+    bounded.append([{"event": "two", "detail": {"value": "y" * 40}}])
+    assert log_path.with_suffix(".log.1").is_file()

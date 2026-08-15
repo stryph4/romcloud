@@ -348,4 +348,11 @@ window.addEventListener("romcloud:controller-status", (event) => {
     await connect("");
   }
 })();
-window.romcloudGamepad = window.ROMCloudController.startBrowserController();
+window.romcloudGamepad = window.ROMCloudController.startBrowserController(
+  window,
+  document,
+  {
+    diagnosticsEndpoint: state.controllerFirst ? "/api/controller-diagnostics" : "",
+    interactionMode: state.controllerFirst ? "controller" : "remote",
+  },
+);

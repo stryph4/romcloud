@@ -34,6 +34,9 @@ def test_controller_assets_wire_all_required_inputs_and_focus_scopes() -> None:
     assert 'romcloud:page-jump' in javascript and 'romcloud:page-jump' in app
     assert 'romcloud:controller-menu' in javascript
     assert 'romcloud:controller-text' in javascript
+    assert 'BrowserControllerDiagnostics' in javascript
+    assert '/api/controller-diagnostics' in app
+    assert 'state.controllerFirst ? "/api/controller-diagnostics" : ""' in app
     assert 'id="controller-osk"' in html
     assert 'id="osk-submit"' in html and 'id="osk-cancel"' in html
     assert 'get("interaction") === "controller"' in app

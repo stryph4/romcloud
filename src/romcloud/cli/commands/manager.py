@@ -92,6 +92,11 @@ def manager_cmd(
                     auth_state_path=str(
                         Path(container.config.data_path) / "web" / "trusted-devices.json"
                     ),
+                    controller_log_path=str(
+                        Path(container.config.data_path).parent
+                        / "logs"
+                        / "browser-controller.log"
+                    ),
                     # Publishing state is the readiness edge: the socket has
                     # already bound and TLS has already loaded successfully.
                     on_ready=lambda: write_manager_state(
