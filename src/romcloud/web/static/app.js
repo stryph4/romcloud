@@ -1,6 +1,7 @@
 const $ = (id) => document.getElementById(id);
-const state = {token: "", localSession: false, system: "", scope: "full", page: 1, pages: 0, selected: new Set(), status: null, loadSequence: 0};
+const state = {token: "", localSession: false, controllerFirst: false, system: "", scope: "full", page: 1, pages: 0, selected: new Set(), status: null, loadSequence: 0};
 let contentUpdateScheduled = false;
+let oskSession = null;
 
 function contentUpdated() {
   if (contentUpdateScheduled) return;
@@ -68,11 +69,12 @@ async function loadTrustedDevices() {
   const data = await api("/api/trusted-devices");
   const root = $("device-list"); root.replaceChildren();
   if (!data.devices.length) root.append(el("div", "empty", "No remembered remote devices."));
-  data.devices.forEach((device) => {
+  data.devices.forEach((device, index) => {
     const row = el("div", "device-row");
     const detail = el("div");
     detail.append(el("b", "", device.label), el("small", "", `${device.trust}${device.current ? " · This device" : ""}`));
     const revoke = el("button", "danger-text", "Revoke");
+    revoke.dataset.controllerZone = "dialog"; revoke.dataset.controllerRow = String(index + 1); revoke.dataset.controllerCol = "0";
     revoke.addEventListener("click", async () => { await api("/api/trusted-devices/revoke", {method: "POST", body: JSON.stringify({id: device.id})}); await loadTrustedDevices(); });
     row.append(detail, revoke); root.append(row);
   });
@@ -143,6 +145,8 @@ function renderGames(games) {
     if (!game.offline_ready && state.status.can_download) actions.append(actionButton("Download", "cache", [game.id]));
     actions.append(actionButton(game.pinned ? "Unpin" : "Pin", game.pinned ? "unpin" : "pin", [game.id]));
     if (game.has_local_copy) actions.append(actionButton("Remove", "remove", [game.id]));
+    const select = el("button", "controller-row-select", state.selected.has(game.id) ? "Unselect" : "Select");
+    select.addEventListener("click", () => check.click()); actions.append(select);
     [...actions.children].forEach((button, actionIndex) => { button.dataset.controllerZone = "games"; button.dataset.controllerRow = String(rowIndex); button.dataset.controllerCol = String(actionIndex + 1); });
     right.append(badges, actions); row.append(check, details, filename, right); root.append(row);
   });
@@ -198,6 +202,61 @@ function labelState(value) { return {remote_only: "Remote Only", cached: "Cached
 function number(value) { return new Intl.NumberFormat().format(value || 0); }
 function formatBytes(value) { if (value == null) return "Size unknown"; if (value === 0) return "0 B"; const units = ["B", "KB", "MB", "GB", "TB"]; const power = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1); return `${(value / 1024 ** power).toFixed(power ? 1 : 0)} ${units[power]}`; }
 
+function renderOskPreview() {
+  const preview = $("osk-preview"); preview.replaceChildren();
+  if (!oskSession) return;
+  preview.append(document.createTextNode(oskSession.model.value.slice(0, oskSession.model.cursor)));
+  preview.append(el("span", "osk-caret", "│"));
+  preview.append(document.createTextNode(oskSession.model.value.slice(oskSession.model.cursor)));
+}
+
+function buildOsk() {
+  const keys = "1234567890QWERTYUIOPASDFGHJKLZXCVBNM-_.";
+  const root = $("osk-keys"); root.replaceChildren();
+  [...keys].forEach((character, index) => {
+    const button = el("button", "osk-key", character);
+    button.type = "button"; button.dataset.oskValue = character;
+    button.dataset.controllerZone = "dialog";
+    button.dataset.controllerRow = String(Math.floor(index / 10));
+    button.dataset.controllerCol = String(index % 10);
+    root.append(button);
+  });
+  document.querySelectorAll("#controller-osk [data-osk-action], #controller-osk .osk-edit-actions [data-osk-value]").forEach((button, index) => {
+    button.dataset.controllerZone = "dialog"; button.dataset.controllerRow = "4"; button.dataset.controllerCol = String(index);
+  });
+  $("osk-cancel").dataset.controllerZone = "dialog"; $("osk-cancel").dataset.controllerRow = "5"; $("osk-cancel").dataset.controllerCol = "0";
+  $("osk-submit").dataset.controllerZone = "dialog"; $("osk-submit").dataset.controllerRow = "5"; $("osk-submit").dataset.controllerCol = "1";
+}
+
+function openControllerKeyboard(source) {
+  if (!state.controllerFirst) { source.focus(); return; }
+  oskSession = {source, model: new window.ROMCloudController.ControllerKeyboardModel(source.value)};
+  $("osk-title").textContent = source.id === "search" ? "Search library" : "Enter text";
+  $("osk-submit").textContent = source.id === "search" ? "Search" : "Submit";
+  renderOskPreview(); $("controller-osk").showModal(); contentUpdated();
+}
+
+function cancelControllerKeyboard() {
+  if (!oskSession) return;
+  oskSession.source.value = oskSession.model.cancel();
+  oskSession = null; $("controller-osk").close("cancel");
+}
+
+async function submitControllerKeyboard() {
+  if (!oskSession) return;
+  const {source, model} = oskSession;
+  source.value = model.value; oskSession = null; $("controller-osk").close("submit");
+  source.dispatchEvent(new Event("input", {bubbles: true}));
+  if (source.id === "search") {
+    clearTimeout(searchTimer); state.page = 1; await loadGames();
+    window.romcloudGamepad.focusZone("games");
+  } else source.dispatchEvent(new Event("change", {bubbles: true}));
+}
+
+function requestLocalExit() {
+  api("/api/local-exit", {method: "POST", body: "{}"}).catch((error) => showNotice(error.message, true));
+}
+
 $("pair-form").addEventListener("submit", (event) => { event.preventDefault(); pair($("pair-code").value, $("pair-trust").value); });
 $("token-connect").addEventListener("click", () => connect($("token").value));
 document.addEventListener("keydown", (event) => {
@@ -207,6 +266,28 @@ $("logout").addEventListener("click", async () => { sessionStorage.removeItem("r
 $("trusted-devices").addEventListener("click", async () => { await loadTrustedDevices(); $("devices-dialog").showModal(); });
 $("close-devices").addEventListener("click", () => $("devices-dialog").close());
 $("revoke-all").addEventListener("click", async () => { await api("/api/trusted-devices/revoke-all", {method: "POST", body: "{}"}); location.reload(); });
+$("controller-menu-button").addEventListener("click", () => { $("controller-menu-dialog").showModal(); contentUpdated(); });
+$("close-controller-menu").addEventListener("click", () => $("controller-menu-dialog").close());
+$("exit-open-here").addEventListener("click", requestLocalExit);
+$("osk-keys").addEventListener("click", (event) => { if (oskSession && event.target.dataset.oskValue) { oskSession.model.insert(event.target.dataset.oskValue); renderOskPreview(); } });
+$("controller-osk").addEventListener("click", (event) => {
+  if (!oskSession) return;
+  const action = event.target.dataset.oskAction;
+  if (event.target.closest("#osk-keys")) return;
+  if (event.target.dataset.oskValue) oskSession.model.insert(event.target.dataset.oskValue);
+  else if (action === "left") oskSession.model.moveCursor(-1);
+  else if (action === "right") oskSession.model.moveCursor(1);
+  else if (action === "backspace") oskSession.model.backspace();
+  else if (action === "delete") oskSession.model.deleteForward();
+  renderOskPreview();
+});
+$("osk-cancel").addEventListener("click", cancelControllerKeyboard);
+$("osk-submit").addEventListener("click", submitControllerKeyboard);
+$("controller-osk").addEventListener("close", () => {
+  if (!oskSession) return;
+  oskSession.source.value = oskSession.model.cancel(); oskSession = null;
+});
+document.addEventListener("romcloud:controller-text", (event) => openControllerKeyboard(event.detail.element));
 document.querySelectorAll(".tab").forEach((tab) => tab.addEventListener("click", () => { state.scope = tab.dataset.scope; state.page = 1; setActiveTab(); loadGames(); }));
 let searchTimer; $("search").addEventListener("input", () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { state.page = 1; loadGames(); }, 250); });
 [$("state-filter"), $("sort")].forEach((node) => node.addEventListener("change", () => { state.page = 1; loadGames(); }));
@@ -228,11 +309,6 @@ window.addEventListener("romcloud:page-jump", (event) => {
 });
 
 window.addEventListener("romcloud:controller-back", (event) => {
-  if (state.localSession) {
-    event.preventDefault();
-    api("/api/local-exit", {method: "POST", body: "{}"}).catch(() => {});
-    return;
-  }
   if (state.selected.size) {
     state.selected.clear(); updateBulk(); loadGames(); event.preventDefault(); return;
   }
@@ -240,6 +316,14 @@ window.addEventListener("romcloud:controller-back", (event) => {
     $("search").value = ""; state.page = 1; loadGames(); event.preventDefault();
     return;
   }
+  if (state.controllerFirst) {
+    event.preventDefault(); requestLocalExit();
+  }
+});
+
+window.addEventListener("romcloud:controller-menu", (event) => {
+  if (!state.controllerFirst) return;
+  event.preventDefault(); $("controller-menu-dialog").showModal(); contentUpdated();
 });
 
 window.addEventListener("romcloud:controller-status", (event) => {
@@ -255,6 +339,10 @@ window.addEventListener("romcloud:controller-status", (event) => {
 
 (async () => {
   state.localSession = ["127.0.0.1", "localhost", "::1"].includes(location.hostname);
+  state.controllerFirst = state.localSession && new URLSearchParams(location.search).get("interaction") === "controller";
+  document.body.classList.toggle("controller-first", state.controllerFirst);
+  $("controller-menu-button").classList.toggle("hidden", !state.controllerFirst);
+  buildOsk();
   state.token = tokenFromStorage();
   if (state.token) connect(state.token); else {
     await connect("");

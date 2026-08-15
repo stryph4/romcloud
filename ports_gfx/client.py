@@ -96,6 +96,7 @@ def start_backend_operation(
     action: str,
     payload: dict[str, Any] | None = None,
     *,
+    extra_args: tuple[str, ...] = (),
     popen=None,  # noqa: ANN001
     max_runtime: float | None = None,
     timeout_message: str = "operation timed out",
@@ -112,7 +113,7 @@ def start_backend_operation(
         kwargs["popen"] = popen
     if clock is not None:
         kwargs["clock"] = clock
-    runner = OperationRunner([romcloud_bin, "uidata", action], **kwargs)
+    runner = OperationRunner([romcloud_bin, "uidata", action, *extra_args], **kwargs)
     runner.start()
     return runner
 

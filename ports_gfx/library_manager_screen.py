@@ -40,20 +40,35 @@ class LibraryManagerScreenState:
 
     @property
     def actions(self) -> tuple[str, ...]:
+        if self.requires_no_sandbox:
+            return (
+                "Open Here Without Sandbox",
+                "Pair Another Device",
+                "Refresh",
+            )
         return ("Open Here", "Pair Another Device", "Refresh")
+
+    @property
+    def requires_no_sandbox(self) -> bool:
+        return "removes Chromium process isolation" in self.error
 
     def move(self, delta: int) -> None:
         self.selected_index = (self.selected_index + delta) % len(self.actions)
 
     def activate(self) -> None:
         action = self.actions[self.selected_index]
-        if action == "Open Here":
+        if action in ("Open Here", "Open Here Without Sandbox"):
             self.cancel_pending()
             self.operation = "open"
             self.step = OPENING
             self.error = ""
             self._runner = start_backend_operation(
-                self.romcloud_bin, "manager-open-local", popen=self.popen
+                self.romcloud_bin,
+                "manager-open-local",
+                extra_args=("--allow-no-sandbox",)
+                if action == "Open Here Without Sandbox"
+                else (),
+                popen=self.popen,
             )
         elif action == "Pair Another Device":
             self.cancel_pending()

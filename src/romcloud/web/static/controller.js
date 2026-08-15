@@ -100,7 +100,7 @@
       const sign = Math.sign(delta);
       const {zone, row, col} = this.current;
       const rows = this._rows(zone);
-      if ((zone === "systems" || zone === "games") && rows[row + sign]) {
+      if (rows[row + sign]) {
         return this.set({zone, row: row + sign, col});
       }
       const zoneIndex = this.zoneOrder.indexOf(zone);
@@ -156,6 +156,47 @@
       this.held = false;
       this.startedAt = 0;
       this.nextAt = 0;
+    }
+  }
+
+  class ControllerKeyboardModel {
+    constructor(value = "") {
+      this.original = String(value);
+      this.value = this.original;
+      this.cursor = this.value.length;
+    }
+
+    insert(text) {
+      const addition = String(text);
+      this.value = this.value.slice(0, this.cursor) + addition + this.value.slice(this.cursor);
+      this.cursor += addition.length;
+      return this.value;
+    }
+
+    backspace() {
+      if (this.cursor > 0) {
+        this.value = this.value.slice(0, this.cursor - 1) + this.value.slice(this.cursor);
+        this.cursor -= 1;
+      }
+      return this.value;
+    }
+
+    deleteForward() {
+      if (this.cursor < this.value.length) {
+        this.value = this.value.slice(0, this.cursor) + this.value.slice(this.cursor + 1);
+      }
+      return this.value;
+    }
+
+    moveCursor(delta) {
+      this.cursor = Math.max(0, Math.min(this.value.length, this.cursor + Math.sign(delta)));
+      return this.cursor;
+    }
+
+    cancel() {
+      this.value = this.original;
+      this.cursor = this.original.length;
+      return this.value;
     }
   }
 
@@ -289,8 +330,10 @@
         else if (rb) this._pageJump(rb);
         else if (vertical) this._move("vertical", vertical);
         else if (horizontal) this._move("horizontal", horizontal);
-      } else if (vertical || horizontal) {
-        this._move("horizontal", vertical || horizontal);
+      } else if (vertical) {
+        this._move("vertical", vertical);
+      } else if (horizontal) {
+        this._move("horizontal", horizontal);
       }
       if (pressed.confirm && !this.edges.confirm) this._activate();
       if (pressed.back && !this.edges.back) this._back();
@@ -318,6 +361,14 @@
           this.editingOriginal = element.value;
           element.classList.add("controller-editing");
         }
+        return;
+      }
+      if (element.tagName === "INPUT" && ["search", "text", "password"].includes(element.type)) {
+        element.dispatchEvent(new this.window.CustomEvent("romcloud:controller-text", {
+          bubbles: true,
+          cancelable: true,
+          detail: {element},
+        }));
         return;
       }
       if (element.dataset.controllerActivate === "toggle-row") {
@@ -458,7 +509,7 @@
   }
 
   const api = {
-    FocusModel, RepeatButton, StandardGamepadMapper, BrowserGamepadNavigator,
+    FocusModel, RepeatButton, ControllerKeyboardModel, StandardGamepadMapper, BrowserGamepadNavigator,
     startBrowserController, DEFAULT_ZONES, LOGICAL_ACTIONS, STANDARD_GAMEPAD_BINDINGS,
   };
   root.ROMCloudController = api;

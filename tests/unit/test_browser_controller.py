@@ -33,6 +33,13 @@ def test_controller_assets_wire_all_required_inputs_and_focus_scopes() -> None:
     assert 'dialog[open]' in javascript
     assert 'romcloud:page-jump' in javascript and 'romcloud:page-jump' in app
     assert 'romcloud:controller-menu' in javascript
+    assert 'romcloud:controller-text' in javascript
+    assert 'id="controller-osk"' in html
+    assert 'id="osk-submit"' in html and 'id="osk-cancel"' in html
+    assert 'get("interaction") === "controller"' in app
+    assert 'state.localSession &&' in app
+    assert 'window.romcloudGamepad.focusZone("games")' in app
+    assert 'id="exit-open-here"' in html
     assert "standard mapping unavailable" in app
     assert 'controller-focus' in css and 'controller-editing' in css
 
@@ -72,7 +79,7 @@ def test_controller_focus_and_repeat_state_machine_when_node_is_available() -> N
     assert "controller state tests passed" in result.stdout
 
 
-def test_controller_core_executes_in_chromium_when_available() -> None:
+def test_controller_core_executes_in_chromium_when_available(tmp_path: Path) -> None:
     candidates = [
         shutil.which("chromium"),
         shutil.which("google-chrome"),
@@ -90,6 +97,7 @@ def test_controller_core_executes_in_chromium_when_available() -> None:
             "--headless=new",
             "--disable-gpu",
             "--no-sandbox",
+            f"--user-data-dir={tmp_path / 'core-profile'}",
             "--dump-dom",
             harness,
         ],
@@ -98,11 +106,18 @@ def test_controller_core_executes_in_chromium_when_available() -> None:
         timeout=20,
         check=False,
     )
+    diagnostic = result.stdout + result.stderr
+    if (
+        result.returncode
+        and "crashpad" in diagnostic
+        and "Operation not permitted" in diagnostic
+    ):
+        pytest.skip("Chromium crash reporter is blocked by this test sandbox")
     assert result.returncode == 0, result.stdout + result.stderr
     assert 'data-result="passed"' in result.stdout, result.stdout + result.stderr
 
 
-def test_gamepad_navigation_executes_in_chromium_when_available() -> None:
+def test_gamepad_navigation_executes_in_chromium_when_available(tmp_path: Path) -> None:
     candidates = [
         shutil.which("chromium"),
         shutil.which("google-chrome"),
@@ -115,11 +130,26 @@ def test_gamepad_navigation_executes_in_chromium_when_available() -> None:
         pytest.skip("Chromium is not installed on this development host")
     harness = (ROOT / "tests" / "js" / "controller_browser_harness.html").resolve().as_uri()
     result = subprocess.run(
-        [browser, "--headless=new", "--disable-gpu", "--no-sandbox", "--dump-dom", harness],
+        [
+            browser,
+            "--headless=new",
+            "--disable-gpu",
+            "--no-sandbox",
+            f"--user-data-dir={tmp_path / 'navigation-profile'}",
+            "--dump-dom",
+            harness,
+        ],
         capture_output=True,
         text=True,
         timeout=20,
         check=False,
     )
+    diagnostic = result.stdout + result.stderr
+    if (
+        result.returncode
+        and "crashpad" in diagnostic
+        and "Operation not permitted" in diagnostic
+    ):
+        pytest.skip("Chromium crash reporter is blocked by this test sandbox")
     assert result.returncode == 0, result.stdout + result.stderr
     assert 'data-result="passed"' in result.stdout, result.stdout + result.stderr

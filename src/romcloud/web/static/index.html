@@ -25,8 +25,9 @@
       <div class="brand"><span class="brand-mark">RC</span><span><b>ROMCloud</b><small>Library Manager</small></span></div>
       <div id="controller-status" class="controller-status hidden" aria-live="polite">Controller connected</div>
       <div id="mode" class="mode">Connecting…</div>
-      <button id="logout" class="icon-button" title="Forget access token" data-controller-zone="global" data-controller-row="0" data-controller-col="0">Sign out</button>
-      <button id="trusted-devices" class="icon-button" data-controller-zone="global" data-controller-row="0" data-controller-col="1">Trusted Devices</button>
+      <button id="controller-menu-button" class="icon-button local-only hidden" data-controller-zone="global" data-controller-row="0" data-controller-col="0">Help / Exit</button>
+      <button id="logout" class="icon-button" title="Forget access token" data-controller-zone="global" data-controller-row="0" data-controller-col="1">Sign out</button>
+      <button id="trusted-devices" class="icon-button" data-controller-zone="global" data-controller-row="0" data-controller-col="2">Trusted Devices</button>
     </header>
     <div id="offline-banner" class="banner hidden"><b>Offline</b> — showing local content only. Remote-only games and downloads are unavailable.</div>
 
@@ -76,9 +77,31 @@
   <div id="job" class="job hidden"><div><b id="job-title">Downloading pinned games</b><span id="job-detail"></span></div><progress id="job-progress"></progress></div>
   <dialog id="devices-dialog">
     <div class="dialog-card">
-      <div class="dialog-head"><h2>Trusted Remote Devices</h2><button id="close-devices" class="icon-button">Close</button></div>
+      <div class="dialog-head"><h2>Trusted Remote Devices</h2><button id="close-devices" class="icon-button" data-controller-zone="dialog" data-controller-row="0" data-controller-col="0">Close</button></div>
       <div id="device-list"></div>
-      <div class="dialog-actions"><button id="revoke-all" class="danger-text">Revoke All</button></div>
+      <div class="dialog-actions"><button id="revoke-all" class="danger-text" data-controller-zone="dialog" data-controller-row="1" data-controller-col="0">Revoke All</button></div>
+    </div>
+  </dialog>
+  <dialog id="controller-menu-dialog">
+    <div class="dialog-card">
+      <div class="dialog-head"><div><p class="eyebrow">Open Here</p><h2>Controller Help</h2></div><button id="close-controller-menu" class="icon-button" data-controller-zone="dialog" data-controller-row="0" data-controller-col="0">Close</button></div>
+      <div class="controller-guide"><b>D-pad / Left Stick</b><span>Move focus</span><b>A</b><span>Activate or select</span><b>B</b><span>Back, then exit at the top level</span><b>LB / RB</b><span>Previous / next page</span><b>Start</b><span>Open this menu</span></div>
+      <div class="dialog-actions"><button id="exit-open-here" class="danger-text" data-controller-zone="dialog" data-controller-row="1" data-controller-col="0">Exit Open Here</button></div>
+    </div>
+  </dialog>
+  <dialog id="controller-osk">
+    <div class="dialog-card osk-card">
+      <div class="dialog-head"><div><p class="eyebrow">Controller keyboard</p><h2 id="osk-title">Enter text</h2></div></div>
+      <div id="osk-preview" class="osk-preview" aria-live="polite"></div>
+      <div id="osk-keys" class="osk-keys"></div>
+      <div class="osk-edit-actions">
+        <button type="button" data-osk-action="left">← Cursor</button>
+        <button type="button" data-osk-action="right">Cursor →</button>
+        <button type="button" data-osk-action="backspace">Backspace</button>
+        <button type="button" data-osk-action="delete">Delete</button>
+        <button type="button" data-osk-value=" ">Space</button>
+      </div>
+      <div class="dialog-actions"><button id="osk-cancel" type="button">Cancel</button><button id="osk-submit" type="button" class="primary">Search</button></div>
     </div>
   </dialog>
   <script src="/controller.js" defer></script>

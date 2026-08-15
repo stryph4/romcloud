@@ -15,7 +15,7 @@ import urllib.request
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 
 STATE_FILENAME = "manager-state.json"
@@ -23,6 +23,17 @@ LOCK_FILENAME = "manager.lock"
 START_LOCK_FILENAME = "manager-start.lock"
 DEFAULT_MANAGER_HOST = "0.0.0.0"
 DEFAULT_MANAGER_PORT = 8765
+PATH_BROWSER_NAMES = (
+    "chromium",
+    "chromium-browser",
+    "google-chrome",
+    "google-chrome-stable",
+)
+BATOCERA_BROWSER_PATHS = (
+    Path("/userdata/system/add-ons/google-chrome/GoogleChrome.AppImage"),
+    Path("/userdata/system/add-ons/chromium/Chromium.AppImage"),
+)
+BATOCERA_BROWSER_DIRECTORIES = tuple(path.parent for path in BATOCERA_BROWSER_PATHS)
 
 
 def manager_state_path(data_path: str | Path) -> Path:
@@ -455,46 +466,232 @@ def issue_pairing_code(
     return {**result, "url": str(state.get("url", ""))}
 
 
-def find_local_browser(*, data_path: str | Path | None = None, which=shutil.which) -> str | None:
-    """Resolve the Chromium-compatible kiosk runtime used on Batocera."""
+def _browser_candidates(
+    *,
+    data_path: str | Path | None,
+    which: Callable[[str], str | None],
+    configured: str | None,
+    persistent_paths: Iterable[str | Path],
+) -> list[dict[str, str]]:
+    """Return ordered candidates without treating a wrapper script as a browser."""
 
+    candidates: list[dict[str, str]] = []
+    if configured:
+        candidates.append(
+            {"path": configured, "source": "configured", "ownership": "user-installed"}
+        )
+    for name in PATH_BROWSER_NAMES:
+        resolved = which(name)
+        candidates.append(
+            {
+                "path": resolved or name,
+                "source": f"PATH:{name}",
+                "ownership": "user-installed",
+                "resolved": "true" if resolved else "false",
+            }
+        )
+    for item in persistent_paths:
+        candidates.append(
+            {
+                "path": str(item),
+                "source": "Batocera persistent add-on",
+                "ownership": "user-installed",
+            }
+        )
     if data_path is not None:
         from romcloud.web.browser_runtime import managed_browser
 
         managed = managed_browser(data_path)
         if managed:
-            return managed
-    configured = os.environ.get("ROMCLOUD_BROWSER")
-    candidates = [configured] if configured else []
-    candidates.extend(("chromium", "chromium-browser", "google-chrome", "google-chrome-stable"))
+            candidates.append(
+                {
+                    "path": managed,
+                    "source": "ROMCloud managed runtime",
+                    "ownership": "romcloud-managed",
+                }
+            )
+
+    unique: list[dict[str, str]] = []
+    seen: set[str] = set()
     for candidate in candidates:
-        if not candidate:
+        key = os.path.realpath(candidate["path"])
+        if key in seen:
             continue
-        resolved = which(candidate)
-        if resolved:
-            return resolved
-        path = Path(candidate)
-        if path.is_file() and os.access(path, os.X_OK):
-            return str(path)
-    return None
+        seen.add(key)
+        unique.append(candidate)
+    return unique
+
+
+def _probe_local_browser(
+    executable: str,
+    *,
+    run=subprocess.run,
+    timeout: float = 5.0,
+) -> dict[str, object]:
+    """Prove that a candidate starts and identifies as Chromium-compatible."""
+
+    path = Path(executable)
+    if not path.is_file():
+        return {"compatible": False, "reason": "executable was not found"}
+    if os.name != "nt" and not os.access(path, os.X_OK):
+        return {"compatible": False, "reason": "file is not executable"}
+    try:
+        result = run(
+            [str(path), "--version"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {"compatible": False, "reason": f"version probe timed out after {timeout:g}s"}
+    except OSError as exc:
+        return {"compatible": False, "reason": f"version probe could not start: {exc}"}
+    output = " ".join(
+        part.strip() for part in (result.stdout or "", result.stderr or "") if part.strip()
+    )
+    if result.returncode != 0:
+        detail = output[:240] or "no diagnostic output"
+        return {
+            "compatible": False,
+            "reason": f"version probe exited {result.returncode}: {detail}",
+        }
+    if not any(
+        marker in output.casefold()
+        for marker in ("chromium", "google chrome", "chrome for testing", "headlesschrome")
+    ):
+        return {
+            "compatible": False,
+            "reason": f"unsupported browser identity: {output[:240] or 'empty output'}",
+        }
+    return {"compatible": True, "version": output[:240]}
+
+
+def discover_local_browser(
+    *,
+    data_path: str | Path | None = None,
+    which=shutil.which,
+    run=subprocess.run,
+    configured: str | None = None,
+    persistent_paths: Iterable[str | Path] | None = None,
+) -> dict[str, object]:
+    """Resolve and capability-test the first usable local Chromium runtime."""
+
+    configured = os.environ.get("ROMCLOUD_BROWSER") if configured is None else configured
+    if persistent_paths is None:
+        discovered_paths = list(BATOCERA_BROWSER_PATHS)
+        for directory in BATOCERA_BROWSER_DIRECTORIES:
+            if directory.is_dir():
+                discovered_paths.extend(sorted(directory.glob("*.AppImage")))
+        persistent_paths = discovered_paths
+    diagnostics: list[dict[str, object]] = []
+    for candidate in _browser_candidates(
+        data_path=data_path,
+        which=which,
+        configured=configured,
+        persistent_paths=persistent_paths,
+    ):
+        if candidate.get("resolved") == "false":
+            probe = {"compatible": False, "reason": "command was not found on PATH"}
+        else:
+            probe = _probe_local_browser(candidate["path"], run=run)
+        diagnostic = {**candidate, **probe}
+        diagnostic.pop("resolved", None)
+        diagnostics.append(diagnostic)
+        if probe["compatible"]:
+            return {"browser": diagnostic, "diagnostics": diagnostics}
+    return {"browser": None, "diagnostics": diagnostics}
+
+
+def find_local_browser(
+    *, data_path: str | Path | None = None, which=shutil.which, run=subprocess.run
+) -> str | None:
+    """Compatibility wrapper returning only the selected executable path."""
+
+    result = discover_local_browser(data_path=data_path, which=which, run=run)
+    browser = result.get("browser")
+    return str(browser["path"]) if isinstance(browser, dict) else None
+
+
+def local_browser_runtime_status(data_path: str | Path) -> dict[str, object]:
+    """Report both managed lifecycle state and the browser Open Here will use."""
+
+    from romcloud.web.browser_runtime import runtime_status
+
+    managed = runtime_status(data_path)
+    discovery = discover_local_browser(data_path=data_path)
+    browser = discovery.get("browser")
+    return {
+        **managed,
+        "available": isinstance(browser, dict),
+        "active_browser": browser,
+        "discovery_diagnostics": discovery["diagnostics"],
+        "remove_available": bool(
+            isinstance(browser, dict) and browser.get("ownership") == "romcloud-managed"
+        ),
+    }
+
+
+@contextmanager
+def _local_browser_lock(data_path: str | Path):
+    path = Path(data_path) / "web" / "local-browser.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+b")
+    try:
+        if os.name != "nt":
+            import fcntl
+
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise RuntimeError("Open Here is already running.") from exc
+        yield
+    finally:
+        if os.name != "nt":
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
 
 
 def launch_local_browser(
     data_path: str | Path,
     *,
     browser: str | None = None,
+    allow_no_sandbox: bool = False,
     popen=subprocess.Popen,
     sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, object]:
     """Launch a kiosk browser and return only after it exits cleanly."""
 
-    executable = browser or find_local_browser(data_path=data_path)
+    discovery = None if browser else discover_local_browser(data_path=data_path)
+    selected = discovery.get("browser") if discovery else None
+    executable = browser or (str(selected["path"]) if isinstance(selected, dict) else None)
+    log_path = Path(data_path).parent / "logs" / "browser-open.log"
     if not executable:
+        diagnostics = "; ".join(
+            f"{item['source']} ({item['path']}): {item['reason']}"
+            for item in (discovery or {}).get("diagnostics", [])
+        )
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("ab") as log_handle:
+            log_handle.write(
+                f"[{datetime.now(timezone.utc).isoformat()}] browser resolution failed: {diagnostics}\n".encode()
+            )
         raise RuntimeError(
             "Open Here requires a Chromium-compatible local browser runtime; "
             "none was found. Managed installation is not enabled until Chrome for "
             "Testing passes Batocera dependency and sandbox validation. Remote "
-            "Library Browser access remains available."
+            f"Library Browser access remains available. Probes: {diagnostics}. See {log_path}"
+        )
+    ownership = selected.get("ownership") if isinstance(selected, dict) else "explicit"
+    if allow_no_sandbox and ownership != "user-installed":
+        raise RuntimeError(
+            "Disabling the browser sandbox is allowed only as an explicit fallback "
+            "for a user-installed browser, never for a ROMCloud-managed runtime."
         )
     launch = _manager_request(
         data_path,
@@ -507,6 +704,9 @@ def launch_local_browser(
     certificate_pin = manager_certificate_spki_pin(data_path)
     profile = Path(data_path) / "web" / "local-browser-profile"
     profile.mkdir(parents=True, exist_ok=True)
+    local_url = str(manager_status(data_path).get("local_url", ""))
+    separator = "&" if "?" in local_url else "?"
+    controller_url = f"{local_url}{separator}interaction=controller"
     argv = [
         executable,
         "--kiosk",
@@ -515,31 +715,102 @@ def launch_local_browser(
         "--disable-session-crashed-bubble",
         f"--ignore-certificate-errors-spki-list={certificate_pin}",
         f"--user-data-dir={profile}",
-        str(manager_status(data_path).get("local_url", "")),
+        controller_url,
     ]
-    # Stay in the uidata operation's process group so cancelling the native
-    # screen also terminates the browser it owns.
-    process = popen(argv)
+    if allow_no_sandbox:
+        argv.insert(1, "--no-sandbox")
+    environment = os.environ.copy()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     launch_id = str(launch.get("launch_id", ""))
-    try:
-        while process.poll() is None:
-            if launch_id:
-                status = _manager_request(
-                    data_path, f"/api/local-session-status/{launch_id}"
+    with _local_browser_lock(data_path):
+        with log_path.open("a+b") as log_handle:
+            timestamp = datetime.now(timezone.utc).isoformat()
+            display = environment.get("DISPLAY", "<unset>")
+            xauthority = environment.get("XAUTHORITY", "<unset>")
+            wayland = environment.get("WAYLAND_DISPLAY", "<unset>")
+            xdg_runtime = environment.get("XDG_RUNTIME_DIR", "<unset>")
+            log_handle.write(
+                (
+                    f"[{timestamp}] Open Here launch browser={executable} uid={getattr(os, 'getuid', lambda: 'unknown')()} "
+                    f"DISPLAY={display} XAUTHORITY={xauthority} WAYLAND_DISPLAY={wayland} "
+                    f"XDG_RUNTIME_DIR={xdg_runtime} sandbox_flags="
+                    f"{'--no-sandbox (explicit user opt-in)' if allow_no_sandbox else 'none'}\n"
+                ).encode()
+            )
+            for diagnostic in (discovery or {}).get("diagnostics", []):
+                log_handle.write(
+                    (
+                        f"[{timestamp}] probe source={diagnostic['source']} path={diagnostic['path']} "
+                        f"compatible={diagnostic['compatible']} detail="
+                        f"{diagnostic.get('version') or diagnostic.get('reason')}\n"
+                    ).encode()
                 )
-                if status.get("exit_requested"):
+            log_handle.flush()
+            child_output_start = log_handle.tell()
+            # Stay in the uidata operation's process group so cancelling the native
+            # screen also terminates the browser it owns.
+            try:
+                process = popen(
+                    argv,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    env=environment,
+                )
+            except OSError as exc:
+                log_handle.write(
+                    f"[{datetime.now(timezone.utc).isoformat()}] browser spawn failed: {exc}\n".encode()
+                )
+                raise RuntimeError(f"Open Here browser could not start; see {log_path}") from exc
+            try:
+                while process.poll() is None:
+                    if launch_id:
+                        status = _manager_request(
+                            data_path, f"/api/local-session-status/{launch_id}"
+                        )
+                        if status.get("exit_requested"):
+                            process.terminate()
+                            try:
+                                process.wait(timeout=3)
+                            except subprocess.TimeoutExpired:
+                                process.kill()
+                            break
+                    sleep(0.25)
+            finally:
+                if process.poll() is None:
                     process.terminate()
                     try:
                         process.wait(timeout=3)
                     except subprocess.TimeoutExpired:
                         process.kill()
-                    break
-            sleep(0.25)
-    finally:
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                process.kill()
-    return {"closed": True, "browser": executable, "launch_mechanism": argv[:-1]}
+            returncode = process.poll()
+            if returncode not in (None, 0):
+                log_handle.flush()
+                log_handle.seek(child_output_start)
+                child_output = log_handle.read().decode(errors="replace")
+                log_handle.seek(0, os.SEEK_END)
+                log_handle.write(
+                    f"[{datetime.now(timezone.utc).isoformat()}] browser exited status={returncode}\n".encode()
+                )
+                if (
+                    not allow_no_sandbox
+                    and ownership == "user-installed"
+                    and "running as root without --no-sandbox is not supported"
+                    in child_output.casefold()
+                ):
+                    raise RuntimeError(
+                        "The user-installed Chrome runtime refused to run as root with "
+                        "its sandbox. Open Here did not disable it. You may explicitly "
+                        "choose 'Open Here Without Sandbox', but that removes Chromium "
+                        f"process isolation for this session. See {log_path}"
+                    )
+                raise RuntimeError(
+                    f"Open Here browser exited with status {returncode}; see {log_path}"
+                )
+    return {
+        "closed": True,
+        "browser": executable,
+        "browser_ownership": ownership,
+        "launch_mechanism": argv[:-1],
+        "log": str(log_path),
+    }

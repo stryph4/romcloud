@@ -515,8 +515,13 @@ def uidata_manager_stop(ctx: click.Context) -> None:
 
 
 @uidata_group.command("manager-open-local")
+@click.option(
+    "--allow-no-sandbox",
+    is_flag=True,
+    help="Explicitly disable sandboxing for a user-installed browser only.",
+)
 @click.pass_context
-def uidata_manager_open_local(ctx: click.Context) -> None:
+def uidata_manager_open_local(ctx: click.Context, allow_no_sandbox: bool) -> None:
     """Open the manager in the local fullscreen browser until it exits."""
 
     def build() -> dict:
@@ -527,7 +532,9 @@ def uidata_manager_open_local(ctx: click.Context) -> None:
             Path(sys.executable).with_name("romcloud")
         )
         start_manager(romcloud_bin, config.data_path)
-        return launch_local_browser(config.data_path)
+        return launch_local_browser(
+            config.data_path, allow_no_sandbox=allow_no_sandbox
+        )
 
     _run_action(ctx, build)
 
@@ -538,10 +545,10 @@ def uidata_browser_runtime_status(ctx: click.Context) -> None:
     """Report the independently managed local-browser dependency."""
 
     def build() -> dict:
-        from romcloud.web.browser_runtime import runtime_status
+        from romcloud.web.lifecycle import local_browser_runtime_status
 
         config = _load_context_config(ctx)
-        return runtime_status(config.data_path)
+        return local_browser_runtime_status(config.data_path)
 
     _run_action(ctx, build)
 

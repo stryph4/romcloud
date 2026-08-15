@@ -68,4 +68,19 @@ assert.strictEqual(bumper.held, false);
 assert.strictEqual(bumper.update(false, 9000), 0);
 assert.strictEqual(bumper.update(true, 9001), 1);
 
+const keyboard = new controller.ControllerKeyboardModel("AB");
+keyboard.moveCursor(-1);
+assert.strictEqual(keyboard.insert("X"), "AXB");
+assert.strictEqual(keyboard.backspace(), "AB");
+assert.strictEqual(keyboard.deleteForward(), "A");
+assert.strictEqual(keyboard.cancel(), "AB");
+assert.strictEqual(keyboard.cursor, 2);
+
+model.zoneOrder = ["dialog"];
+model.current = null;
+model.setLayout({dialog: [3, 2]});
+assert.deepStrictEqual(model.current, {zone: "dialog", row: 0, col: 0});
+assert.deepStrictEqual(model.moveHorizontal(1), {zone: "dialog", row: 0, col: 1});
+assert.deepStrictEqual(model.moveVertical(1), {zone: "dialog", row: 1, col: 1});
+
 console.log("controller state tests passed");

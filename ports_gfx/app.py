@@ -1690,11 +1690,20 @@ def _library_manager_body_lines(screen: LibraryManagerScreenState) -> list[str]:
             "This normally takes only a few seconds.",
         ]
     if screen.error:
-        return [
-            "State: Not running",
+        lines = [
+            "State: Open Here unavailable",
             f"Error: {screen.error}",
-            "Press Confirm to retry or Back to return.",
         ]
+        if screen.requires_no_sandbox:
+            lines.extend((
+                "",
+                "Warning: this disables Chromium's browser-process isolation for this session.",
+            ))
+        lines.extend(("", *[
+            ("> " if index == screen.selected_index else "  ") + action
+            for index, action in enumerate(screen.actions)
+        ]))
+        return lines
     lines = [
         "State: Running",
         "",

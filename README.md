@@ -285,14 +285,28 @@ or removal of the optional local browser runtime.
 
 **Open Here** launches the existing manager page in a Chromium-compatible
 runtime with `--kiosk`, a dedicated profile, and the loopback URL. ROMCloud
-resolves a versioned ROMCloud-managed runtime first, then `ROMCLOUD_BROWSER`,
-`chromium`, `chromium-browser`, `google-chrome`, or `google-chrome-stable`.
+resolves `ROMCLOUD_BROWSER`, PATH-based `chromium`, `chromium-browser`,
+`google-chrome`, or `google-chrome-stable`, known persistent Batocera
+AppImages (including
+`/userdata/system/add-ons/google-chrome/GoogleChrome.AppImage`), and finally a
+versioned ROMCloud-managed runtime. Every candidate must successfully identify
+itself as Chromium-compatible through a bounded `--version` probe; a broken
+candidate is recorded and skipped. The related Ports launcher is not executed
+and the user-installed browser remains user-owned.
 Open Here uses no token, pairing code, bootstrap credential, or cookie: only
 a loopback peer using a loopback Host is admitted. The local launch pins ROMCloud's self-signed certificate
-by SPKI, so no certificate prompt is required. Back/Escape asks the owned
-launcher to close the kiosk and returns to ROMCloud without stopping the
-manager. If no compatible runtime exists, the native screen reports that
-explicitly.
+by SPKI, so no certificate prompt is required. Its inherited display
+environment, selected executable, UID, and sandbox flags are recorded in
+`/userdata/system/romcloud/logs/browser-open.log`. ROMCloud does not add
+`--no-sandbox`. Open Here launch is singleton; B first cancels an active
+selection or search, then asks the owned launcher to close the kiosk at the top
+level and returns to ROMCloud without stopping the manager. If no compatible
+runtime exists, the native screen reports every failed probe explicitly.
+If a user-installed Chrome explicitly refuses root execution without
+`--no-sandbox`, ROMCloud reports the loss of Chromium process isolation and
+offers a controller-selectable, per-launch **Open Here Without Sandbox**
+fallback. It is never selected automatically and is prohibited for a
+ROMCloud-managed runtime.
 
 **Pair Another Device** keeps the reachable HTTPS URL stable and bookmarkable,
 preferring the `.local` hostname when available and showing the LAN IP as a
@@ -345,9 +359,14 @@ SIGTERM with a five-second bound and SIGKILL only as a final fallback.
 Controllers exposed by Chromium with the W3C `standard` mapping are
 supported directly. D-pad or left stick moves through systems, controls,
 and game rows; South/A confirms; East/B backs out or closes a dialog;
-Start/Menu returns focus to the system navigation; and LB/RB moves by one
+Start/Menu opens local Help/Exit; and LB/RB moves by one
 50-game server page. Holding a bumper accelerates to two and then five
 pages per repeat, and releasing it stops repetition immediately.
+The `interaction=controller` mode is added only to the loopback Open Here URL.
+It enlarges the focused row's action surface without changing remote desktop
+rows and provides a controller-scoped on-screen keyboard for Search, including
+cursor movement, space, backspace, delete, explicit Search, and cancel with
+value/focus restoration.
 
 The native Ports UI and browser use the same ROMCloud logical actions
 (`up`, `down`, `left`, `right`, `confirm`, `back`, `previous_page`,

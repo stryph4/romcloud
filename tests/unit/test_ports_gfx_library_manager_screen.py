@@ -115,6 +115,37 @@ def test_open_here_surfaces_unavailable_browser_runtime() -> None:
     assert "Chromium-compatible" in state.error
 
 
+def test_sandbox_refusal_offers_explicit_controller_selectable_fallback() -> None:
+    calls = []
+
+    def popen(argv, **kwargs):
+        calls.append(argv)
+        if "--allow-no-sandbox" in argv:
+            return _Process({"ok": True, "closed": True})
+        return _Process(
+            {
+                "ok": False,
+                "error": (
+                    "You may explicitly choose 'Open Here Without Sandbox', but "
+                    "that removes Chromium process isolation for this session."
+                ),
+            }
+        )
+
+    state = LibraryManagerScreenState(
+        "romcloud", step=READY, details={"running": True}, popen=popen
+    )
+    state.activate()
+    _drain(state)
+    assert state.actions[0] == "Open Here Without Sandbox"
+    assert "process isolation" in " ".join(_library_manager_body_lines(state))
+
+    state.activate()
+    _drain(state)
+    assert calls[-1][-1] == "--allow-no-sandbox"
+    assert state.step == READY
+
+
 def test_pair_action_displays_short_code_and_stable_url() -> None:
     def popen(argv, **kwargs):
         return _Process({"ok": True, "url": "https://batocera.local:8765/", "code": "7KMP", "expires_in": 120})
