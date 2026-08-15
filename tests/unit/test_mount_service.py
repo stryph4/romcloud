@@ -9,6 +9,7 @@ and graceful tolerance of a missing `batocera-services` binary.
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 from romcloud.integrations.batocera import mount_service
@@ -24,13 +25,12 @@ class TestGenerateServiceScript:
         the blocking `mount start` — real-hardware testing showed the latter
         can hang Batocera boot."""
         content = mount_service.generate_service_script("/path/to/romcloud")
-        assert 'ROMCLOUD_BIN="/path/to/romcloud"' in content
+        assert 'export ROMCLOUD_BIN="/path/to/romcloud"' in content
+        assert 'export ROMCLOUD_CONFIG="/path/config/romcloud.toml"' in content
         assert '"${ROMCLOUD_BIN}" mount boot-start' in content
-        assert 'if "${ROMCLOUD_BIN}" uidata manager-start' in content
-        assert '"${ROMCLOUD_BIN}" uidata startup-integration-activated' in content
-        assert content.index("manager-start") < content.index(
-            "startup-integration-activated"
-        )
+        assert 'if "${ROMCLOUD_BIN}" uidata manager-boot-start' in content
+        assert 'startup-service.log' in content
+        assert 'event=manager_boot_start_failed' in content
 
     def test_stop_and_status_dispatch_correctly(self):
         content = mount_service.generate_service_script("/path/to/romcloud")
@@ -61,6 +61,77 @@ class TestGenerateServiceScript:
         content = mount_service.generate_service_script("/path/to/romcloud")
         assert "Usage:" in content
         assert "exit 1" in content
+
+    def test_generated_service_is_valid_bash(self):
+        result = subprocess.run(
+            ["bash", "-n"],
+            input=mount_service.generate_service_script(
+                "/userdata/system/romcloud/bin/romcloud"
+            ),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_boot_environment_invokes_manager_and_persists_result(self, tmp_path):
+        home = tmp_path / "romcloud"
+        romcloud_bin = home / "bin" / "romcloud"
+        romcloud_bin.parent.mkdir(parents=True)
+        romcloud_bin.write_text(
+            "#!/bin/bash\n"
+            "printf 'fake_command=%s %s %s\\n' \"$1\" \"${2:-}\" \"${3:-}\"\n"
+            "exit 0\n"
+        )
+        romcloud_bin.chmod(0o755)
+        service = tmp_path / "romcloud_mount"
+        service.write_text(mount_service.generate_service_script(str(romcloud_bin)))
+        service.chmod(0o755)
+
+        result = subprocess.run(
+            [str(service), "start"],
+            env={"PATH": "/usr/bin:/bin"},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        startup_log = home / "logs" / "startup-service.log"
+        assert result.returncode == 0
+        assert result.stdout == result.stderr == ""
+        log_text = startup_log.read_text()
+        assert "fake_command=uidata manager-boot-start" in log_text
+        assert "event=manager_boot_start_complete status=0" in log_text
+
+    def test_boot_manager_failure_is_not_silently_swallowed(self, tmp_path):
+        home = tmp_path / "romcloud"
+        romcloud_bin = home / "bin" / "romcloud"
+        romcloud_bin.parent.mkdir(parents=True)
+        romcloud_bin.write_text(
+            "#!/bin/bash\n"
+            "if [[ \"$1 $2\" == \"uidata manager-boot-start\" ]]; then\n"
+            "  echo '{\"ok\":false,\"error\":\"bind failed\"}'\n"
+            "  exit 1\n"
+            "fi\n"
+            "exit 0\n"
+        )
+        romcloud_bin.chmod(0o755)
+        service = tmp_path / "romcloud_mount"
+        service.write_text(mount_service.generate_service_script(str(romcloud_bin)))
+        service.chmod(0o755)
+
+        result = subprocess.run(
+            [str(service), "start"],
+            env={"PATH": "/usr/bin:/bin"},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        log_text = (home / "logs" / "startup-service.log").read_text()
+        assert result.returncode == 0
+        assert '"error":"bind failed"' in log_text
+        assert "event=manager_boot_start_failed status=1" in log_text
 
 
 class TestInstallService:
@@ -109,7 +180,12 @@ class TestInstallService:
     def test_unchanged_enabled_service_does_not_mark_restart_required(
         self, tmp_path, monkeypatch
     ):
-        monkeypatch.setattr(mount_service.subprocess, "run", lambda *args, **kwargs: None)
+        calls = []
+        monkeypatch.setattr(
+            mount_service.subprocess,
+            "run",
+            lambda *args, **kwargs: calls.append(args),
+        )
         service_path = tmp_path / "services" / mount_service.SERVICE_NAME
         service_path.parent.mkdir()
         service_path.write_text(
@@ -127,9 +203,9 @@ class TestInstallService:
         )
 
         assert not activation_path.exists()
+        assert calls == []
 
     def test_newly_enabled_service_marks_restart_required(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(mount_service.subprocess, "run", lambda *args, **kwargs: None)
         service_path = tmp_path / "services" / mount_service.SERVICE_NAME
         service_path.parent.mkdir()
         service_path.write_text(
@@ -139,6 +215,14 @@ class TestInstallService:
         config_path.write_text("system.services=other_service\n")
         activation_path = tmp_path / "state" / "startup-integration.json"
 
+        def enable(*args, **kwargs):
+            config_path.write_text(
+                f"system.services=other_service {mount_service.SERVICE_NAME}\n"
+            )
+            return subprocess.CompletedProcess(args[0], 0, "", "")
+
+        monkeypatch.setattr(mount_service.subprocess, "run", enable)
+
         mount_service.install_service(
             "/bin/romcloud",
             service_path=service_path,
@@ -147,6 +231,57 @@ class TestInstallService:
         )
 
         assert activation_path.exists()
+
+    def test_failed_enable_does_not_claim_restart_will_activate_service(
+        self, tmp_path, monkeypatch
+    ):
+        service_path = tmp_path / "services" / mount_service.SERVICE_NAME
+        config_path = tmp_path / "batocera.conf"
+        config_path.write_text("system.services=other_service\n")
+        activation_path = tmp_path / "state" / "startup-integration.json"
+        monkeypatch.setattr(
+            mount_service.subprocess,
+            "run",
+            lambda *args, **kwargs: subprocess.CompletedProcess(
+                args[0], 1, "", "enable failed"
+            ),
+        )
+
+        mount_service.install_service(
+            "/bin/romcloud",
+            service_path=service_path,
+            activation_state_path=activation_path,
+            services_config_path=config_path,
+        )
+
+        assert not activation_path.exists()
+
+    def test_service_change_marks_restart_exactly_once(self, tmp_path, monkeypatch):
+        service_path = tmp_path / "services" / mount_service.SERVICE_NAME
+        service_path.parent.mkdir()
+        service_path.write_text("stale")
+        config_path = tmp_path / "batocera.conf"
+        config_path.write_text(f"system.services={mount_service.SERVICE_NAME}\n")
+        activation_path = tmp_path / "state" / "startup-integration.json"
+
+        mount_service.install_service(
+            "/bin/romcloud",
+            service_path=service_path,
+            activation_state_path=activation_path,
+            services_config_path=config_path,
+        )
+        first_marker = activation_path.read_bytes()
+        first_mtime = service_path.stat().st_mtime_ns
+
+        mount_service.install_service(
+            "/bin/romcloud",
+            service_path=service_path,
+            activation_state_path=activation_path,
+            services_config_path=config_path,
+        )
+
+        assert activation_path.read_bytes() == first_marker
+        assert service_path.stat().st_mtime_ns == first_mtime
 
 
 class TestRemoveService:

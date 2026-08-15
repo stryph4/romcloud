@@ -13,12 +13,14 @@ import subprocess
 import time
 import urllib.request
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
 
 STATE_FILENAME = "manager-state.json"
 LOCK_FILENAME = "manager.lock"
+START_LOCK_FILENAME = "manager-start.lock"
 DEFAULT_MANAGER_HOST = "0.0.0.0"
 DEFAULT_MANAGER_PORT = 8765
 
@@ -53,6 +55,39 @@ def manager_instance_lock(data_path: str | Path):
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError as exc:
                 raise RuntimeError("Library Manager is already running.") from exc
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except (OSError, NameError):
+            pass
+        handle.close()
+
+
+@contextmanager
+def manager_start_lock(data_path: str | Path):
+    """Serialize bounded start/reuse decisions across simultaneous callers."""
+
+    path = Path(data_path) / "web" / START_LOCK_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            if path.stat().st_size == 0:
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         yield
     finally:
         try:
@@ -197,6 +232,7 @@ def manager_status(
     pid_alive: Callable[[int], bool] = _pid_alive,
     port_open: Callable[[str, int], bool] = _port_open,
     include_secret: bool = False,
+    owned_pid: Callable[[int, str], bool] | None = None,
 ) -> dict[str, object]:
     state = read_manager_state(data_path)
     if not state:
@@ -207,7 +243,12 @@ def manager_status(
         host = str(state.get("host", DEFAULT_MANAGER_HOST))
     except (TypeError, ValueError):
         return {"running": False}
-    running = pid_alive(pid) and port_open(host, port)
+    instance_id = str(state.get("instance_id") or "")
+    process_alive = pid_alive(pid)
+    ownership_ok = not instance_id or (
+        process_alive and (owned_pid or _owned_manager_pid)(pid, instance_id)
+    )
+    running = process_alive and ownership_ok and port_open(host, port)
     result = {**state, "running": running}
     if not include_secret:
         result.pop("token", None)
@@ -224,6 +265,32 @@ def start_manager(
     status_reader=None,
     port_open: Callable[[str, int], bool] = _port_open,
     sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, object]:
+    """Serialize startup so repeated service/UI calls stay idempotent."""
+
+    with manager_start_lock(data_path):
+        return _start_manager_unlocked(
+            romcloud_bin,
+            data_path,
+            host=host,
+            port=port,
+            popen=popen,
+            status_reader=status_reader,
+            port_open=port_open,
+            sleep=sleep,
+        )
+
+
+def _start_manager_unlocked(
+    romcloud_bin: str | Path,
+    data_path: str | Path,
+    *,
+    host: str,
+    port: int,
+    popen,
+    status_reader,
+    port_open: Callable[[str, int], bool],
+    sleep: Callable[[float], None],
 ) -> dict[str, object]:
     """Start the existing ``romcloud manager`` command and surface its state."""
 
@@ -250,6 +317,13 @@ def start_manager(
     environment = os.environ.copy()
     environment["ROMCLOUD_MANAGER_TOKEN"] = token
     environment["ROMCLOUD_MANAGER_INSTANCE"] = instance_id
+
+    def append_event(message: str) -> None:
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with log_path.open("ab") as event_handle:
+            event_handle.write(f"[{timestamp}] startup: {message}\n".encode())
+
+    append_event(f"spawn requested host={host} port={port}")
     with log_path.open("ab") as log_handle:
         process = popen(
             argv,
@@ -264,8 +338,14 @@ def start_manager(
     for _ in range(50):
         state = read_status()
         if state.get("running"):
+            append_event(
+                f"ready pid={state.get('pid', process.pid if hasattr(process, 'pid') else 'unknown')} "
+                f"host={state.get('host', host)} port={state.get('port', port)}"
+            )
             return {**state, "started": True}
-        if process.poll() is not None:
+        returncode = process.poll()
+        if returncode is not None:
+            append_event(f"failed: child exited with status {returncode}")
             raise RuntimeError(
                 f"Library Manager exited during startup; see {log_path}"
             )
@@ -273,6 +353,7 @@ def start_manager(
     terminate = getattr(process, "terminate", None)
     if terminate is not None:
         terminate()
+    append_event("failed: readiness timeout after 5 seconds")
     raise RuntimeError(f"Library Manager did not become ready; see {log_path}")
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 from romcloud.web.lifecycle import (
@@ -50,6 +51,29 @@ def test_clear_only_removes_state_owned_by_matching_process(tmp_path: Path) -> N
     assert manager_state_path(tmp_path).exists()
     clear_manager_state(tmp_path, pid=7)
     assert not manager_state_path(tmp_path).exists()
+
+
+def test_status_rejects_live_socket_with_reused_unowned_pid(tmp_path: Path) -> None:
+    write_manager_state(
+        tmp_path,
+        manager_runtime_state(
+            host="0.0.0.0",
+            port=8765,
+            token="token",
+            scheme="https",
+            pid=42,
+            instance_id="expected-instance",
+        ),
+    )
+
+    status = manager_status(
+        tmp_path,
+        pid_alive=lambda pid: True,
+        port_open=lambda host, port: True,
+        owned_pid=lambda pid, instance: False,
+    )
+
+    assert status["running"] is False
 
 
 def test_start_surfaces_existing_service_without_spawning(tmp_path: Path) -> None:
@@ -107,6 +131,106 @@ def test_start_spawns_existing_manager_command_and_returns_recorded_state(tmp_pa
     assert "--quiet" in captured["argv"]
     assert captured["kwargs"]["start_new_session"] is True
     assert result["running"] is True and result["started"] is True
+
+
+def test_repeated_concurrent_start_invocation_spawns_one_manager(tmp_path: Path) -> None:
+    running = threading.Event()
+    barrier = threading.Barrier(2)
+    spawned = []
+    results = []
+
+    class Process:
+        pid = 123
+
+        def poll(self):
+            return None
+
+    def status():
+        if running.is_set():
+            return {"running": True, "pid": 123, "host": "0.0.0.0", "port": 8765}
+        return {"running": False}
+
+    def popen(*args, **kwargs):
+        spawned.append((args, kwargs))
+        running.set()
+        return Process()
+
+    def invoke():
+        barrier.wait()
+        results.append(
+            start_manager(
+                "/opt/romcloud/bin/romcloud",
+                tmp_path,
+                status_reader=status,
+                port_open=lambda host, port: False,
+                popen=popen,
+                sleep=lambda seconds: None,
+            )
+        )
+
+    threads = [threading.Thread(target=invoke) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(spawned) == 1
+    assert sorted(result["started"] for result in results) == [False, True]
+
+
+def test_startup_exit_is_logged_with_exact_failure_point(tmp_path: Path) -> None:
+    data_path = tmp_path / "data"
+
+    class Process:
+        pid = 321
+
+        def poll(self):
+            return 7
+
+    with pytest.raises(RuntimeError, match="exited during startup"):
+        start_manager(
+            "/opt/romcloud/bin/romcloud",
+            data_path,
+            status_reader=lambda: {"running": False},
+            port_open=lambda host, port: False,
+            popen=lambda *args, **kwargs: Process(),
+            sleep=lambda seconds: None,
+        )
+
+    log_text = (tmp_path / "logs" / "browser-manager.log").read_text()
+    assert "spawn requested host=0.0.0.0 port=8765" in log_text
+    assert "failed: child exited with status 7" in log_text
+
+
+def test_startup_readiness_wait_is_bounded_and_terminates_child(tmp_path: Path) -> None:
+    data_path = tmp_path / "data"
+
+    class Process:
+        pid = 654
+        terminated = False
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            self.terminated = True
+
+    process = Process()
+    with pytest.raises(RuntimeError, match="did not become ready"):
+        start_manager(
+            "/opt/romcloud/bin/romcloud",
+            data_path,
+            status_reader=lambda: {"running": False},
+            port_open=lambda host, port: False,
+            popen=lambda *args, **kwargs: process,
+            sleep=lambda seconds: None,
+        )
+
+    assert process.terminated is True
+    assert "readiness timeout after 5 seconds" in (
+        tmp_path / "logs" / "browser-manager.log"
+    ).read_text()
 
 
 def test_singleton_lock_rejects_a_second_owner(tmp_path: Path) -> None:

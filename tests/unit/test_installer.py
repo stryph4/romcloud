@@ -286,6 +286,29 @@ class TestReconcileMountService:
         assert "stale script content" not in content
         assert str(tmp_path / "bin" / "romcloud") in content
 
+    def test_update_and_repair_reconciliation_do_not_rearm_restart_marker(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        from romcloud.integrations.batocera import mount_service
+
+        service_path = tmp_path / "services" / "romcloud_mount"
+        services_config = tmp_path / "batocera.conf"
+        services_config.write_text(
+            f"system.services={mount_service.SERVICE_NAME}\n"
+        )
+        monkeypatch.setattr(mount_service, "SERVICE_SCRIPT_PATH", service_path)
+        monkeypatch.setattr(
+            mount_service, "SYSTEM_CONFIG_PATH", services_config
+        )
+
+        assert inst.reconcile_mount_service(tmp_path / "bin") is True
+        activation_path = tmp_path / "state" / "startup-integration.json"
+        first_marker = activation_path.read_bytes()
+
+        assert inst.reconcile_mount_service(tmp_path / "bin") is True
+
+        assert activation_path.read_bytes() == first_marker
+
 
 class TestReconcileEsOverride:
     def test_not_applicable_when_never_installed(self, tmp_path: Path, monkeypatch) -> None:

@@ -73,6 +73,7 @@ def generate_service_script(romcloud_bin: str) -> str:
     wrapper (see `scripts/install.sh`), which already execs the venv's own
     python — this script never needs to know about Python/venv paths itself.
     """
+    romcloud_home = Path(romcloud_bin).parent.parent
     return (
         "#!/bin/bash\n"
         "# ROMCloud SMB source mount — Batocera custom service.\n"
@@ -87,20 +88,38 @@ def generate_service_script(romcloud_bin: str) -> str:
         "# ultimately succeeds. ROMCloud may fail; Batocera must not.\n"
         "set -uo pipefail\n"
         "\n"
-        f'ROMCLOUD_BIN="{romcloud_bin}"\n'
+        f'export ROMCLOUD_BIN="{romcloud_bin}"\n'
+        f'export ROMCLOUD_CONFIG="{romcloud_home / "config" / "romcloud.toml"}"\n'
+        f'STARTUP_LOG="{romcloud_home / "logs" / "startup-service.log"}"\n'
         "\n"
         'case "${1:-}" in\n'
         "    start)\n"
-        '        "${ROMCLOUD_BIN}" mount boot-start || true\n'
-        '        if "${ROMCLOUD_BIN}" uidata manager-start >/dev/null 2>&1; then\n'
-        '            "${ROMCLOUD_BIN}" uidata startup-integration-activated '
-        ">/dev/null 2>&1 || true\n"
-        "        fi\n"
+        '        mkdir -p "$(dirname "${STARTUP_LOG}")" 2>/dev/null || true\n'
+        "        {\n"
+        '            ROMCLOUD_BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"\n'
+        '            ROMCLOUD_UPTIME="$(cut -d " " -f 1 /proc/uptime 2>/dev/null || true)"\n'
+        '            printf \'boot_id=%s uptime=%s pid=%s parent_pid=%s event=start '
+        'romcloud_bin=%s config=%s\\n\' "${ROMCLOUD_BOOT_ID}" "${ROMCLOUD_UPTIME}" '
+        '"$$" "${PPID}" "${ROMCLOUD_BIN}" "${ROMCLOUD_CONFIG}"\n'
+        '            "${ROMCLOUD_BIN}" mount boot-start\n'
+        "            ROMCLOUD_MOUNT_RC=$?\n"
+        '            printf \'event=mount_boot_start_complete status=%s\\n\' "${ROMCLOUD_MOUNT_RC}"\n'
+        '            if "${ROMCLOUD_BIN}" uidata manager-boot-start; then\n'
+        "                printf 'event=manager_boot_start_complete status=0\\n'\n"
+        "            else\n"
+        "                ROMCLOUD_MANAGER_RC=$?\n"
+        '                printf \'event=manager_boot_start_failed status=%s\\n\' "${ROMCLOUD_MANAGER_RC}"\n'
+        "            fi\n"
+        '        } >> "${STARTUP_LOG}" 2>&1\n'
         "        exit 0\n"
         "        ;;\n"
         "    stop)\n"
-        '        "${ROMCLOUD_BIN}" uidata manager-stop >/dev/null 2>&1 || true\n'
-        '        "${ROMCLOUD_BIN}" mount stop --shutdown || true\n'
+        '        mkdir -p "$(dirname "${STARTUP_LOG}")" 2>/dev/null || true\n'
+        "        {\n"
+        '            printf \'event=stop pid=%s parent_pid=%s\\n\' "$$" "${PPID}"\n'
+        '            "${ROMCLOUD_BIN}" uidata manager-stop || true\n'
+        '            "${ROMCLOUD_BIN}" mount stop --shutdown || true\n'
+        '        } >> "${STARTUP_LOG}" 2>&1\n'
         "        exit 0\n"
         "        ;;\n"
         "    status)\n"
@@ -119,7 +138,7 @@ def install_service(
     *,
     service_path: Path = SERVICE_SCRIPT_PATH,
     activation_state_path: Path | None = None,
-    services_config_path: Path = SYSTEM_CONFIG_PATH,
+    services_config_path: Path | None = None,
 ) -> Path:
     """Write the service script (mode 0755) and try to enable it.
 
@@ -129,6 +148,7 @@ def install_service(
     failing the whole install — the script is still written and can be
     enabled manually.
     """
+    services_config_path = services_config_path or SYSTEM_CONFIG_PATH
     generated = generate_service_script(romcloud_bin)
     try:
         previous = service_path.read_text(encoding="utf-8")
@@ -138,48 +158,70 @@ def install_service(
     was_enabled = _service_is_enabled(services_config_path)
 
     service_path.parent.mkdir(parents=True, exist_ok=True)
-    service_path.write_text(generated, encoding="utf-8")
+    if changed:
+        temporary = service_path.with_name(f".{service_path.name}.tmp")
+        temporary.write_text(generated, encoding="utf-8")
+        temporary.chmod(0o755)
+        temporary.replace(service_path)
     service_path.chmod(0o755)
-    log.info("Wrote service script: %s", service_path)
+    if changed:
+        log.info("Wrote service script: %s", service_path)
+    else:
+        log.debug("Service script already current: %s", service_path)
 
     # If an old legacy service file exists and appears to be the
     # ROMCloud-generated script, remove it so Batocera doesn't warn about
     # invalid service names. Only remove when the file content matches the
     # expected ROMCloud header to avoid touching unrelated files.
     if LEGACY_SERVICE_PATH.exists():
+        try:
+            content = LEGACY_SERVICE_PATH.read_text(encoding="utf-8")
+        except Exception:
+            content = ""
+
+        if "ROMCloud SMB source mount" in content or "romcloud mount boot-start" in content:
             try:
-                content = LEGACY_SERVICE_PATH.read_text(encoding="utf-8")
+                LEGACY_SERVICE_PATH.unlink()
+                log.info("Removed legacy service script: %s", LEGACY_SERVICE_PATH)
             except Exception:
-                content = ""
+                log.warning(
+                    "Failed to remove legacy service script: %s",
+                    LEGACY_SERVICE_PATH,
+                )
 
-            if "ROMCloud SMB source mount" in content or "romcloud mount boot-start" in content:
-                try:
-                    LEGACY_SERVICE_PATH.unlink()
-                    log.info("Removed legacy service script: %s", LEGACY_SERVICE_PATH)
-                except Exception:
-                    log.warning("Failed to remove legacy service script: %s", LEGACY_SERVICE_PATH)
+    enabled = was_enabled
+    if not was_enabled:
+        try:
+            result = subprocess.run(
+                ["batocera-services", "enable", SERVICE_NAME],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10.0,
+            )
+            enabled = result.returncode == 0 and _service_is_enabled(
+                services_config_path
+            )
+            if not enabled:
+                detail = (result.stderr or result.stdout or "no error output").strip()
+                log.warning(
+                    "Batocera did not persist enablement for %s: %s",
+                    SERVICE_NAME,
+                    detail,
+                )
+        except FileNotFoundError:
+            log.warning(
+                "batocera-services not found — enable manually: "
+                "batocera-services enable %s",
+                SERVICE_NAME,
+            )
+        except subprocess.TimeoutExpired:
+            log.warning(
+                "Timed out enabling %s; enable it manually after Batocera services recover",
+                SERVICE_NAME,
+            )
 
-    try:
-        subprocess.run(
-            ["batocera-services", "enable", SERVICE_NAME],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=10.0,
-        )
-    except FileNotFoundError:
-        log.warning(
-            "batocera-services not found — enable manually: "
-            "batocera-services enable %s",
-            SERVICE_NAME,
-        )
-    except subprocess.TimeoutExpired:
-        log.warning(
-            "Timed out enabling %s; enable it manually after Batocera services recover",
-            SERVICE_NAME,
-        )
-
-    if activation_state_path is not None and (changed or not was_enabled):
+    if activation_state_path is not None and enabled and (changed or not was_enabled):
         startup_activation.mark_restart_required(activation_state_path)
         log.info(
             "Startup integration changed; restart required before future-boot "

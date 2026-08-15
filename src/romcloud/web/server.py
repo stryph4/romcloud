@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from romcloud.core.exceptions import ROMCloudError
@@ -361,6 +361,7 @@ def serve_manager(
     tls_cert: str | None = None,
     tls_key: str | None = None,
     auth_state_path: str | None = None,
+    on_ready: Callable[[], None] | None = None,
 ) -> None:
     registry = BrowserAuthRegistry(state_path=auth_state_path) if auth_state_path else None
     server = ManagerHTTPServer((host, port), manager, token, auth_registry=registry)
@@ -371,6 +372,12 @@ def serve_manager(
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(tls_cert, tls_key)
         server.socket = context.wrap_socket(server.socket, server_side=True)
+    if on_ready is not None:
+        try:
+            on_ready()
+        except Exception:
+            server.server_close()
+            raise
     previous_term = None
     if threading.current_thread() is threading.main_thread():
         previous_term = signal.getsignal(signal.SIGTERM)

@@ -154,11 +154,18 @@ def uidata_setup_status(ctx: click.Context) -> None:
 @uidata_group.command("startup-integration-activated")
 @click.pass_context
 def uidata_startup_integration_activated(ctx: click.Context) -> None:
-    """Clear restart-required state after Batocera invokes service start."""
+    """Compatibility activation endpoint; require a healthy manager."""
 
     def build() -> dict:
         config_path = Path(ctx.obj["config_path"])
         activation_path = startup_activation.state_path(config_path.parent.parent)
+        config = _load_context_config(ctx)
+        from romcloud.web.lifecycle import manager_status
+
+        if not manager_status(config.data_path).get("running"):
+            raise RuntimeError(
+                "Library Manager is not healthy; startup activation was not recorded"
+            )
         activated = startup_activation.mark_activated(activation_path)
         status = startup_activation.activation_status(activation_path)
         return {
@@ -436,7 +443,41 @@ def uidata_manager_start(ctx: click.Context) -> None:
         romcloud_bin = os.environ.get("ROMCLOUD_BIN") or str(
             Path(sys.executable).with_name("romcloud")
         )
-        return start_manager(romcloud_bin, config.data_path)
+        result = start_manager(romcloud_bin, config.data_path)
+        activation_path = startup_activation.state_path(
+            Path(ctx.obj["config_path"]).parent.parent
+        )
+        # A manual recovery on a later boot may activate the healthy service;
+        # the boot-ID guard still prevents same-session setup from clearing it.
+        startup_activation.mark_activated(activation_path)
+        return result
+
+    _run_action(ctx, build)
+
+
+@uidata_group.command("manager-boot-start")
+@click.pass_context
+def uidata_manager_boot_start(ctx: click.Context) -> None:
+    """Bounded boot entrypoint with durable attempt/failure evidence."""
+
+    config_path = Path(ctx.obj["config_path"])
+    activation_path = startup_activation.state_path(config_path.parent.parent)
+    startup_activation.record_startup_attempt(activation_path)
+
+    def build() -> dict:
+        from romcloud.web.lifecycle import start_manager
+
+        try:
+            config = _load_context_config(ctx)
+            romcloud_bin = os.environ.get("ROMCLOUD_BIN") or str(
+                Path(sys.executable).with_name("romcloud")
+            )
+            result = start_manager(romcloud_bin, config.data_path)
+            activated = startup_activation.mark_activated(activation_path)
+            return {**result, "startup_integration_activated": activated}
+        except Exception as exc:
+            startup_activation.record_startup_failure(activation_path, str(exc))
+            raise
 
     _run_action(ctx, build)
 

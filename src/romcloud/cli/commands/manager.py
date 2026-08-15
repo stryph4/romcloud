@@ -81,7 +81,6 @@ def manager_cmd(
                 pid=os.getpid(),
                 instance_id=os.environ.get("ROMCLOUD_MANAGER_INSTANCE"),
             )
-            write_manager_state(container.config.data_path, runtime_state)
             try:
                 serve_manager(
                     container.library_manager,
@@ -92,6 +91,11 @@ def manager_cmd(
                     tls_key=str(tls_key) if tls_key else None,
                     auth_state_path=str(
                         Path(container.config.data_path) / "web" / "trusted-devices.json"
+                    ),
+                    # Publishing state is the readiness edge: the socket has
+                    # already bound and TLS has already loaded successfully.
+                    on_ready=lambda: write_manager_state(
+                        container.config.data_path, runtime_state
                     ),
                 )
             except KeyboardInterrupt:

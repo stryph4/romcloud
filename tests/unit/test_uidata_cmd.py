@@ -104,6 +104,66 @@ class TestManagerBridge:
         assert payload["running"] is True
         assert captured["binary"] == "/opt/romcloud/bin/romcloud"
 
+    def test_manager_boot_start_records_attempt_then_healthy_activation(
+        self, tmp_path, monkeypatch
+    ):
+        events = []
+        monkeypatch.setattr(
+            "romcloud.cli.commands.uidata.load_config",
+            lambda path: type("Config", (), {"data_path": str(tmp_path / "data")})(),
+        )
+        monkeypatch.setattr(
+            "romcloud.web.lifecycle.start_manager",
+            lambda *args: {"running": True, "started": True},
+        )
+        monkeypatch.setattr(
+            "romcloud.cli.commands.uidata.startup_activation.record_startup_attempt",
+            lambda path: events.append("attempt"),
+        )
+        monkeypatch.setattr(
+            "romcloud.cli.commands.uidata.startup_activation.mark_activated",
+            lambda path: events.append("activated") or True,
+        )
+
+        result = CliRunner().invoke(
+            cli,
+            ["--config", str(tmp_path / "config.toml"), "uidata", "manager-boot-start"],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output)["running"] is True
+        assert events == ["attempt", "activated"]
+
+    def test_manager_boot_start_failure_is_recorded_and_surfaced(
+        self, tmp_path, monkeypatch
+    ):
+        failures = []
+        monkeypatch.setattr(
+            "romcloud.cli.commands.uidata.load_config",
+            lambda path: type("Config", (), {"data_path": str(tmp_path / "data")})(),
+        )
+        monkeypatch.setattr(
+            "romcloud.web.lifecycle.start_manager",
+            lambda *args: (_ for _ in ()).throw(RuntimeError("bind failed")),
+        )
+        monkeypatch.setattr(
+            "romcloud.cli.commands.uidata.startup_activation.record_startup_attempt",
+            lambda path: None,
+        )
+        monkeypatch.setattr(
+            "romcloud.cli.commands.uidata.startup_activation.record_startup_failure",
+            lambda path, detail: failures.append(detail),
+        )
+
+        result = CliRunner().invoke(
+            cli,
+            ["--config", str(tmp_path / "config.toml"), "uidata", "manager-boot-start"],
+        )
+
+        assert result.exit_code == 1
+        assert json.loads(result.output)["error"] == "bind failed"
+        assert failures == ["bind failed"]
+
 
 class TestSetupBridge:
     def test_fresh_setup_status_works_without_config(self, tmp_path):
@@ -113,6 +173,34 @@ class TestSetupBridge:
         payload = json.loads(result.output)
         assert payload["ok"] is True
         assert payload["state"] == "fresh"
+
+    def test_setup_status_surfaces_manager_boot_failure_distinctly(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "romcloud.cli.commands.uidata.startup_activation.activation_status",
+            lambda path: {
+                "startup_restart_required": False,
+                "startup_manager_startup_failed": True,
+                "startup_manager_failure_message": "Manager bind failed",
+            },
+        )
+
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--config",
+                str(tmp_path / "missing" / "romcloud.toml"),
+                "uidata",
+                "setup-status",
+            ],
+        )
+        payload = json.loads(result.output)
+
+        assert result.exit_code == 0
+        assert payload["startup_restart_required"] is False
+        assert payload["startup_manager_startup_failed"] is True
+        assert payload["startup_manager_failure_message"] == "Manager bind failed"
 
     def test_setup_request_is_read_from_stdin_not_argv(self, tmp_path, monkeypatch):
         import romcloud.cli.commands.uidata as uidata_module

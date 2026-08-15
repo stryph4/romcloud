@@ -985,9 +985,18 @@ def _run(  # noqa: ANN001
         message: Optional[str] = None
         message_kind = "info"
         if current_screen == "menu":
-            assert connection is not None
-            message = format_result("connection-status", connection)
-            message_kind = classify_message_kind("connection-status", connection)
+            startup_failure = setup_status.data.get(
+                "startup_manager_failure_message"
+            )
+            if startup_failure:
+                message = str(startup_failure)
+                message_kind = "error"
+            else:
+                assert connection is not None
+                message = format_result("connection-status", connection)
+                message_kind = classify_message_kind(
+                    "connection-status", connection
+                )
         splash.render("Starting ROMCloud…", "Ready", 1.0)
 
         running = True
@@ -1341,8 +1350,11 @@ def _run(  # noqa: ANN001
                         message = None
                     else:
                         current_screen = "menu"
-                        message = "Setup complete"
-                        message_kind = "success"
+                        startup_failure = setup_status.data.get(
+                            "startup_manager_failure_message"
+                        )
+                        message = str(startup_failure or "Setup complete")
+                        message_kind = "error" if startup_failure else "success"
 
             should_capture_text = bool(
                 current_screen == "wizard"

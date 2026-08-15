@@ -274,8 +274,14 @@ current session, but it does not describe future-boot availability as active
 until Batocera has restarted and the service's next successful `start`
 callback clears the marker. The native UI offers **Restart Now** and **Later**;
 Later leaves a visible warning on the menu and prompts again on a later
-ROMCloud launch. This restart requirement applies to the startup service only,
-not to installation or removal of the optional local browser runtime.
+ROMCloud launch. A failed later-boot manager start is instead shown as a
+startup failure with a no-reboot retry command; it is never converted back
+into another generic restart prompt. Boot-service execution and command
+results are persisted in
+`/userdata/system/romcloud/logs/startup-service.log`, while the detached
+manager's output and readiness events are in `browser-manager.log`. This
+restart requirement applies to the startup service only, not to installation
+or removal of the optional local browser runtime.
 
 **Open Here** launches the existing manager page in a Chromium-compatible
 runtime with `--kiosk`, a dedicated profile, and the loopback URL. ROMCloud
