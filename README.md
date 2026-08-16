@@ -13,7 +13,10 @@ games offline.
 
 ## Install on Batocera
 
-From a Batocera shell:
+Press F1 on the Emulation Station system select screen and open Applications from the side bar.
+From there, open xterm.
+
+Run the following command:
 
 ``` bash
 curl -fsSL https://romcloud.app/install | bash
