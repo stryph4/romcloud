@@ -24,6 +24,8 @@ class WizardStep(Enum):
     PORT = "port"
     USERNAME = "username"
     PASSWORD = "password"
+    SFTP_TRUST = "sftp_trust"
+    SFTP_PATH = "sftp_path"
     DISCOVER = "discover"
     SHARE = "share"
     SOURCE_BROWSE = "source_browse"
@@ -37,6 +39,8 @@ class WizardStep(Enum):
     REMOTE_PORT = "remote_port"
     REMOTE_USERNAME = "remote_username"
     REMOTE_PASSWORD = "remote_password"
+    REMOTE_SFTP_TRUST = "remote_sftp_trust"
+    REMOTE_SFTP_PATH = "remote_sftp_path"
     REMOTE_DISCOVER = "remote_discover"
     REMOTE_SHARE = "remote_share"
     REMOTE_BROWSE = "remote_browse"
@@ -54,11 +58,13 @@ TEXT_STEPS = (
     WizardStep.PORT,
     WizardStep.USERNAME,
     WizardStep.PASSWORD,
+    WizardStep.SFTP_PATH,
     WizardStep.REMOTE_LOCAL,
     WizardStep.REMOTE_SERVER,
     WizardStep.REMOTE_PORT,
     WizardStep.REMOTE_USERNAME,
     WizardStep.REMOTE_PASSWORD,
+    WizardStep.REMOTE_SFTP_PATH,
 )
 CACHE_FIELDS = ("cache_root", "cache_root_manual", "max_size_gb", "min_free_gb")
 
@@ -133,6 +139,14 @@ STEP_CONTEXT: dict[WizardStep, WizardStepContext] = {
         "Enter the password for your ROM-library account.",
         "ROMCloud will connect and show the shares this account can access.",
     ),
+    WizardStep.SFTP_TRUST: WizardStepContext(
+        "Review the SFTP server host-key fingerprint before trusting it.",
+        "Only trust a fingerprint you verified through your server or NAS administration tools.",
+    ),
+    WizardStep.SFTP_PATH: WizardStepContext(
+        "Enter the absolute SFTP path containing your Batocera system folders.",
+        "ROMCloud will validate read access and use Cached Storage for this source.",
+    ),
     WizardStep.DISCOVER: WizardStepContext(
         "ROMCloud is connecting to your ROM server.",
         "It will authenticate and find the shares available to your account.",
@@ -184,6 +198,14 @@ STEP_CONTEXT: dict[WizardStep, WizardStepContext] = {
     WizardStep.REMOTE_PASSWORD: WizardStepContext(
         "Enter the password for the writable-data account.",
         "ROMCloud will connect and show the shares this account can access.",
+    ),
+    WizardStep.REMOTE_SFTP_TRUST: WizardStepContext(
+        "Review the remote-data SFTP server host-key fingerprint before trusting it.",
+        "Read-only remote data remains usable for safe downloads; publishing depends on its validated capabilities.",
+    ),
+    WizardStep.REMOTE_SFTP_PATH: WizardStepContext(
+        "Enter the absolute SFTP path for ROMCloud shared data.",
+        "ROMCloud will verify read access and report any write limitations during setup.",
     ),
     WizardStep.REMOTE_DISCOVER: WizardStepContext(
         "ROMCloud is connecting to the shared-data server.",
@@ -263,6 +285,8 @@ class WizardState:
         self.port = int(data.get("port", 445))
         self.share = str(data.get("share", ""))
         self.source_remote_path = str(data.get("source_remote_path", ""))
+        self.sftp_host_key_fingerprint = ""
+        self.sftp_host_key_type = ""
         self.rom_root = str(data.get("rom_root", "/userdata/romcloud/source"))
         self.shares: list[dict[str, str]] = []
         self.systems: list[str] = []
@@ -276,6 +300,8 @@ class WizardState:
         self.remote_reuse_source_credentials = False
         self.remote_share = str(data.get("remote_share", ""))
         self.remote_remote_path = str(data.get("remote_remote_path", ""))
+        self.remote_sftp_host_key_fingerprint = ""
+        self.remote_sftp_host_key_type = ""
         self.remote_shares: list[dict[str, str]] = []
         self.browser_path = ""
         self.browser_entries: list[dict[str, Any]] = []
@@ -317,10 +343,12 @@ class WizardState:
             ),
             WizardStep.SOURCE: "Choose Source Type",
             WizardStep.LOCAL_BROWSE: "Select a Local Folder",
-            WizardStep.SERVER: "SMB Server",
-            WizardStep.PORT: "SMB Port",
-            WizardStep.USERNAME: "SMB Username",
-            WizardStep.PASSWORD: "SMB Password",
+            WizardStep.SERVER: "SFTP Server" if self.source_type == "sftp" else "SMB Server",
+            WizardStep.PORT: "SFTP Port" if self.source_type == "sftp" else "SMB Port",
+            WizardStep.USERNAME: "SFTP Username" if self.source_type == "sftp" else "SMB Username",
+            WizardStep.PASSWORD: "SFTP Password" if self.source_type == "sftp" else "SMB Password",
+            WizardStep.SFTP_TRUST: "Trust SFTP Host Key",
+            WizardStep.SFTP_PATH: "SFTP ROM Folder",
             WizardStep.DISCOVER: "Discover Shares",
             WizardStep.SHARE: "Select Share",
             WizardStep.SOURCE_BROWSE: "Choose the ROM Folder",
@@ -330,10 +358,12 @@ class WizardState:
             WizardStep.REMOTE_DATA: "ROMCloud Data Storage",
             WizardStep.REMOTE_LOCAL: "Local Data Directory",
             WizardStep.REMOTE_AUTH: "Data SMB Credentials",
-            WizardStep.REMOTE_SERVER: "Data SMB Server",
-            WizardStep.REMOTE_PORT: "Data SMB Port",
-            WizardStep.REMOTE_USERNAME: "Data SMB Username",
-            WizardStep.REMOTE_PASSWORD: "Data SMB Password",
+            WizardStep.REMOTE_SERVER: "Data SFTP Server" if self.remote_data_type == "sftp" else "Data SMB Server",
+            WizardStep.REMOTE_PORT: "Data SFTP Port" if self.remote_data_type == "sftp" else "Data SMB Port",
+            WizardStep.REMOTE_USERNAME: "Data SFTP Username" if self.remote_data_type == "sftp" else "Data SMB Username",
+            WizardStep.REMOTE_PASSWORD: "Data SFTP Password" if self.remote_data_type == "sftp" else "Data SMB Password",
+            WizardStep.REMOTE_SFTP_TRUST: "Trust Data SFTP Host Key",
+            WizardStep.REMOTE_SFTP_PATH: "SFTP Data Folder",
             WizardStep.REMOTE_DISCOVER: "Discover Data Shares",
             WizardStep.REMOTE_SHARE: "Select Data Share",
             WizardStep.REMOTE_BROWSE: "Choose the Data Folder",
@@ -394,17 +424,20 @@ class WizardState:
                 else "Start Setup"
             ]
         if self.step == WizardStep.SOURCE:
-            return ["SMB network share", "Local / external directory"]
+            return ["SMB network share", "Local / external directory", "SFTP server"]
+        if self.step in (WizardStep.SFTP_TRUST, WizardStep.REMOTE_SFTP_TRUST):
+            return ["Trust this host key"]
         if self.step == WizardStep.SHARE:
             return [share["name"] for share in self.shares]
         if self.step == WizardStep.REMOTE_DATA:
             return [
                 "SMB network location",
                 "Local / external directory",
+                "SFTP server",
                 "Skip (sync features unavailable)",
             ]
         if self.step == WizardStep.GAME_ACCESS:
-            return ["Cached Storage", "Direct"]
+            return ["Cached Storage"] if self.source_type == "sftp" else ["Cached Storage", "Direct"]
         if self.step == WizardStep.LIBRARY_SYNC:
             return ["Enable Library Sync", "Keep Library Sync disabled"]
         if self.step == WizardStep.REMOTE_AUTH:
@@ -460,11 +493,13 @@ class WizardState:
             WizardStep.PORT: str(self.port),
             WizardStep.USERNAME: self.username,
             WizardStep.PASSWORD: self.password,
+            WizardStep.SFTP_PATH: self.source_remote_path or "/",
             WizardStep.REMOTE_LOCAL: self.remote_data_root or "/userdata/romcloud/remote",
             WizardStep.REMOTE_SERVER: self.remote_server,
             WizardStep.REMOTE_PORT: str(self.remote_port),
             WizardStep.REMOTE_USERNAME: self.remote_username,
             WizardStep.REMOTE_PASSWORD: self.remote_password,
+            WizardStep.REMOTE_SFTP_PATH: self.remote_data_root or "/",
         }[step]
         self.osk = OskState(
             initial_text=initial,
@@ -602,7 +637,19 @@ class WizardState:
             self.password = value
             self.osk = None
             self.osk_visible = False
-            self._start_operation(WizardStep.DISCOVER, "setup-discover", romcloud_bin)
+            if self.source_type == "sftp":
+                self._start_operation(WizardStep.SFTP_TRUST, "setup-sftp-host-key", romcloud_bin)
+            else:
+                self._start_operation(WizardStep.DISCOVER, "setup-discover", romcloud_bin)
+        elif current == WizardStep.SFTP_PATH:
+            if not value.startswith("/"):
+                self.error = "SFTP path must be absolute."
+                self.osk.confirmed = False
+                return
+            self.source_remote_path = value
+            self.osk = None
+            self.osk_visible = False
+            self._start_operation(WizardStep.DETECT, "setup-validate", romcloud_bin)
         elif current == WizardStep.REMOTE_LOCAL:
             if not value.startswith("/"):
                 self.error = "ROMCloud data location must be an absolute path."
@@ -638,9 +685,23 @@ class WizardState:
             self.remote_reuse_source_credentials = False
             self.osk = None
             self.osk_visible = False
-            self._start_operation(
-                WizardStep.REMOTE_DISCOVER, "setup-discover", romcloud_bin
-            )
+            if self.remote_data_type == "sftp":
+                self._start_operation(
+                    WizardStep.REMOTE_SFTP_TRUST, "setup-sftp-host-key", romcloud_bin
+                )
+            else:
+                self._start_operation(
+                    WizardStep.REMOTE_DISCOVER, "setup-discover", romcloud_bin
+                )
+        elif current == WizardStep.REMOTE_SFTP_PATH:
+            if not value.startswith("/"):
+                self.error = "SFTP path must be absolute."
+                self.osk.confirmed = False
+                return
+            self.remote_data_root = value
+            self.osk = None
+            self.osk_visible = False
+            self._start_operation(WizardStep.REMOTE_VALIDATE, "setup-validate", romcloud_bin)
 
     def _cancel_osk(self) -> None:
         if self.cache_osk_field is not None:
@@ -654,11 +715,13 @@ class WizardState:
             WizardStep.PORT: WizardStep.SERVER,
             WizardStep.USERNAME: WizardStep.PORT,
             WizardStep.PASSWORD: WizardStep.USERNAME,
+            WizardStep.SFTP_PATH: WizardStep.SFTP_TRUST,
             WizardStep.REMOTE_LOCAL: WizardStep.REMOTE_DATA,
             WizardStep.REMOTE_SERVER: WizardStep.REMOTE_AUTH,
             WizardStep.REMOTE_PORT: WizardStep.REMOTE_SERVER,
             WizardStep.REMOTE_USERNAME: WizardStep.REMOTE_PORT,
             WizardStep.REMOTE_PASSWORD: WizardStep.REMOTE_USERNAME,
+            WizardStep.REMOTE_SFTP_PATH: WizardStep.REMOTE_SFTP_TRUST,
         }[self.step]
         if previous in TEXT_STEPS:
             self.enter_text_step(previous)
@@ -678,9 +741,19 @@ class WizardState:
             if self.selected_index == 0:
                 self.source_type = "smb"
                 self.enter_text_step(WizardStep.SERVER, show_osk=show_osk)
-            else:
+            elif self.selected_index == 1:
                 self.source_type = "local"
                 self._start_local_browse("source", self.rom_root if self.mode != "fresh" else "/userdata", romcloud_bin)
+            else:
+                self.source_type = "sftp"
+                self.server = ""
+                self.port = 22
+                self.username = ""
+                self.password = ""
+                self.source_remote_path = "/"
+                self.enter_text_step(WizardStep.SERVER, show_osk=show_osk)
+        elif self.step == WizardStep.SFTP_TRUST:
+            self.enter_text_step(WizardStep.SFTP_PATH, show_osk=show_osk)
         elif self.step == WizardStep.DISCOVER:
             self._start_operation(WizardStep.DISCOVER, "setup-discover", romcloud_bin)
         elif self.step == WizardStep.SHARE and self.shares:
@@ -705,6 +778,15 @@ class WizardState:
                 self.selected_index = 0
             elif self.selected_index == 1:
                 self._start_local_browse("remote_data", self.remote_data_root or "/userdata", romcloud_bin)
+            elif self.selected_index == 2:
+                self.remote_data_type = "sftp"
+                self.remote_server = ""
+                self.remote_port = 22
+                self.remote_username = ""
+                self.remote_password = ""
+                self.remote_data_root = "/"
+                self.remote_reuse_source_credentials = False
+                self.enter_text_step(WizardStep.REMOTE_SERVER, show_osk=show_osk)
             else:
                 self.remote_data_type = "none"
                 self.library_sync_enabled = False
@@ -791,10 +873,16 @@ class WizardState:
                 else WizardStep.CACHE
             ),
             WizardStep.DISCOVER: WizardStep.PASSWORD,
+            WizardStep.SFTP_TRUST: WizardStep.PASSWORD,
+            WizardStep.SFTP_PATH: WizardStep.SFTP_TRUST,
             WizardStep.SHARE: WizardStep.PASSWORD,
             WizardStep.SOURCE_BROWSE: WizardStep.SHARE,
-            WizardStep.DETECT: WizardStep.SHARE,
-            WizardStep.SYSTEMS: WizardStep.SHARE,
+            WizardStep.DETECT: (
+                WizardStep.SFTP_PATH if self.source_type == "sftp" else WizardStep.SHARE
+            ),
+            WizardStep.SYSTEMS: (
+                WizardStep.SFTP_PATH if self.source_type == "sftp" else WizardStep.SHARE
+            ),
             WizardStep.GAME_ACCESS: WizardStep.SYSTEMS,
             WizardStep.REMOTE_DATA: WizardStep.GAME_ACCESS,
             WizardStep.REMOTE_AUTH: WizardStep.REMOTE_DATA,
@@ -803,13 +891,19 @@ class WizardState:
                 if self.remote_reuse_source_credentials
                 else WizardStep.REMOTE_PASSWORD
             ),
+            WizardStep.REMOTE_SFTP_TRUST: WizardStep.REMOTE_PASSWORD,
+            WizardStep.REMOTE_SFTP_PATH: WizardStep.REMOTE_SFTP_TRUST,
             WizardStep.REMOTE_SHARE: (
                 WizardStep.REMOTE_AUTH
                 if self.remote_reuse_source_credentials
                 else WizardStep.REMOTE_PASSWORD
             ),
             WizardStep.REMOTE_BROWSE: WizardStep.REMOTE_SHARE,
-            WizardStep.REMOTE_VALIDATE: WizardStep.REMOTE_SHARE,
+            WizardStep.REMOTE_VALIDATE: (
+                WizardStep.REMOTE_SFTP_PATH
+                if self.remote_data_type == "sftp"
+                else WizardStep.REMOTE_SHARE
+            ),
             WizardStep.LIBRARY_SYNC: WizardStep.REMOTE_DATA,
             WizardStep.CACHE: (
                 WizardStep.LIBRARY_SYNC
@@ -900,6 +994,14 @@ class WizardState:
                 f"Connection successful — {count:,} "
                 f"share{'s' if count != 1 else ''} found."
             )
+        elif self.step == WizardStep.SFTP_TRUST:
+            self.sftp_host_key_type = str(result.data.get("host_key_type", ""))
+            self.sftp_host_key_fingerprint = str(result.data.get("host_key_fingerprint", ""))
+            if not self.sftp_host_key_fingerprint:
+                self.error = "The server did not provide a host-key fingerprint."
+                return drained
+            self.selected_index = 0
+            self.notice = "Verify the fingerprint, then choose Trust this host key."
         elif self.step == WizardStep.DETECT:
             self.systems = [str(system) for system in result.data.get("systems", [])]
             self.source_validation = dict(result.data.get("validation", {}))
@@ -933,6 +1035,14 @@ class WizardState:
                 f"Connection successful — {count:,} "
                 f"share{'s' if count != 1 else ''} found."
             )
+        elif self.step == WizardStep.REMOTE_SFTP_TRUST:
+            self.remote_sftp_host_key_type = str(result.data.get("host_key_type", ""))
+            self.remote_sftp_host_key_fingerprint = str(result.data.get("host_key_fingerprint", ""))
+            if not self.remote_sftp_host_key_fingerprint:
+                self.error = "The server did not provide a host-key fingerprint."
+                return drained
+            self.selected_index = 0
+            self.notice = "Verify the fingerprint, then choose Trust this host key."
         elif self.step == WizardStep.REMOTE_VALIDATE:
             self.remote_validation = dict(result.data.get("validation", {}))
             self.step = self._post_storage_step()
@@ -967,6 +1077,8 @@ class WizardState:
             "remote_server": self.remote_server,
             "remote_share": self.remote_share,
             "remote_remote_path": self.remote_remote_path,
+            "sftp_host_key_fingerprint": self.sftp_host_key_fingerprint,
+            "remote_sftp_host_key_fingerprint": self.remote_sftp_host_key_fingerprint,
             "remote_username": self.remote_username,
             "remote_password": self.remote_password,
             "remote_port": self.remote_port,
@@ -979,6 +1091,8 @@ class WizardState:
                     WizardStep.REMOTE_SHARE,
                     WizardStep.REMOTE_BROWSE,
                     WizardStep.REMOTE_VALIDATE,
+                    WizardStep.REMOTE_SFTP_TRUST,
+                    WizardStep.REMOTE_SFTP_PATH,
                 )
                 else "source"
             ),

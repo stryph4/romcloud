@@ -37,8 +37,10 @@ from romcloud.lifecycle.setup import (
     browse_local,
     browse_smb_directory,
     discover_shares,
+    probe_sftp_host_key,
     setup_state,
     validate_local_source,
+    validate_sftp_source,
     validate_share,
 )
 from romcloud.core.progress import ProgressEvent, emit_progress, redact_text
@@ -204,7 +206,21 @@ def uidata_setup_validate(ctx: click.Context) -> None:
     from romcloud.core.capabilities import Capability
 
     def validate(request, progress=None):
-        action = validate_local_source if request.get("source_type") == "local" else validate_share
+        action = (
+            validate_local_source
+            if request.get("source_type") == "local"
+            and not (
+                request.get("purpose") == "remote_data"
+                and request.get("remote_data_type") == "sftp"
+            )
+            else validate_sftp_source
+            if request.get("source_type") == "sftp"
+            or (
+                request.get("purpose") == "remote_data"
+                and request.get("remote_data_type") == "sftp"
+            )
+            else validate_share
+        )
         if action is validate_share:
             _require_capability_if_configured(
                 ctx, Capability.REMOTE_VALIDATION, "Storage validation"
@@ -212,6 +228,19 @@ def uidata_setup_validate(ctx: click.Context) -> None:
         return action(request, progress)
 
     _run_request_action(ctx, validate)
+
+
+@uidata_group.command("setup-sftp-host-key")
+@click.pass_context
+def uidata_setup_sftp_host_key(ctx: click.Context) -> None:
+    """Observe one SFTP host key for explicit wizard trust."""
+    from romcloud.core.capabilities import Capability
+
+    def probe(request, progress=None):
+        _require_capability_if_configured(ctx, Capability.REMOTE_VALIDATION, "SFTP host-key lookup")
+        return probe_sftp_host_key(request)
+
+    _run_request_action(ctx, probe)
 
 
 @uidata_group.command("setup-browse-smb")

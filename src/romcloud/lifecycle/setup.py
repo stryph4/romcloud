@@ -19,6 +19,7 @@ from romcloud.infrastructure.config import (
     RemoteDataConfig,
     SavesConfig,
     SMBConfig,
+    SFTPConfig,
     SourceConfig,
     SMART_CACHE_MODE,
     DIRECT_NAS_MODE,
@@ -30,7 +31,9 @@ from romcloud.infrastructure.credentials import (
     describe_protection,
     load_remote_data_smb_password,
     load_smb_password,
+    write_remote_data_sftp_password,
     write_remote_data_smb_password,
+    write_sftp_password,
     write_smb_password,
 )
 from romcloud.infrastructure import mount_worker
@@ -73,6 +76,8 @@ class SetupRequest:
     remote_port: int = 445
     remote_reuse_source_credentials: bool = False
     remote_remote_path: str = ""
+    sftp_host_key_fingerprint: str = ""
+    remote_sftp_host_key_fingerprint: str = ""
     game_access_mode: str = SMART_CACHE_MODE
     library_sync_enabled: bool = False
 
@@ -95,9 +100,7 @@ class SetupRequest:
             username=username,
             password=password,
             source_type=str(payload.get("source_type", "smb")).strip().lower(),
-            source_remote_path=normalize_remote_directory(
-                str(payload.get("source_remote_path", ""))
-            ),
+            source_remote_path=_source_remote_path(payload),
             rom_root=str(payload.get("rom_root", DEFAULT_ROM_ROOT)).strip(),
             cache_root=str(payload.get("cache_root", DEFAULT_CACHE_ROOT)).strip(),
             max_size_gb=_number(payload.get("max_size_gb", DEFAULT_MAX_SIZE_GB), "Maximum cache size"),
@@ -117,9 +120,9 @@ class SetupRequest:
             ),
             remote_port=(port if reuse_remote else int(payload.get("remote_port", 445))),
             remote_reuse_source_credentials=reuse_remote,
-            remote_remote_path=normalize_remote_directory(
-                str(payload.get("remote_remote_path", ""))
-            ),
+            remote_remote_path=normalize_remote_directory(str(payload.get("remote_remote_path", ""))),
+            sftp_host_key_fingerprint=str(payload.get("sftp_host_key_fingerprint", "")).strip(),
+            remote_sftp_host_key_fingerprint=str(payload.get("remote_sftp_host_key_fingerprint", "")).strip(),
             game_access_mode=str(payload.get("game_access_mode", SMART_CACHE_MODE)).strip().lower(),
             library_sync_enabled=bool(payload.get("library_sync_enabled", False)),
         )
@@ -127,8 +130,8 @@ class SetupRequest:
         return request
 
     def validate(self, *, require_share: bool = True, validate_cache: bool = True) -> None:
-        if self.source_type not in {"local", "smb"}:
-            raise ValueError("ROM source type must be local or smb.")
+        if self.source_type not in {"local", "smb", "sftp"}:
+            raise ValueError("ROM source type must be local, smb, or sftp.")
         if self.game_access_mode not in {SMART_CACHE_MODE, DIRECT_NAS_MODE}:
             raise ValueError("Game access mode must be smart_cache or direct_nas.")
         if self.source_type == "smb":
@@ -140,6 +143,15 @@ class SetupRequest:
                 raise ValueError("SMB username is required.")
             if not self.password:
                 raise ValueError("SMB password is required.")
+        if self.source_type == "sftp":
+            if not all((self.server, self.username, self.password, self.source_remote_path)):
+                raise ValueError("SFTP server, username, password, and remote path are required.")
+            if not self.source_remote_path.startswith("/"):
+                raise ValueError("SFTP ROM path must be an absolute remote path.")
+            if not self.sftp_host_key_fingerprint:
+                raise ValueError("Trust the SFTP server host key before continuing.")
+            if not 1 <= self.port <= 65535:
+                raise ValueError("SFTP port must be between 1 and 65535.")
         serialized_values = (
             self.server,
             self.share,
@@ -157,8 +169,8 @@ class SetupRequest:
             raise ValueError("Setup values cannot contain quotes or line breaks.")
         if self.source_type == "smb" and not 1 <= self.port <= 65535:
             raise ValueError("SMB port must be between 1 and 65535.")
-        if self.remote_data_type not in {"none", "local", "smb"}:
-            raise ValueError("ROMCloud data storage type must be none, local, or smb.")
+        if self.remote_data_type not in {"none", "local", "smb", "sftp"}:
+            raise ValueError("ROMCloud data storage type must be none, local, smb, or sftp.")
         if self.library_sync_enabled and self.remote_data_type == "none":
             raise ValueError("Library Sync requires writable ROMCloud data storage.")
         if self.remote_data_type == "local":
@@ -177,6 +189,15 @@ class SetupRequest:
                 raise ValueError(
                     "ROMCloud data must use a separate writable share from the ROM library."
                 )
+        if self.remote_data_type == "sftp":
+            if not all((self.remote_server, self.remote_username, self.remote_password, self.remote_data_root)):
+                raise ValueError("Remote-data SFTP server, username, password, and path are required.")
+            if not self.remote_data_root.startswith("/"):
+                raise ValueError("Remote-data SFTP path must be an absolute remote path.")
+            if not self.remote_sftp_host_key_fingerprint:
+                raise ValueError("Trust the remote-data SFTP server host key before continuing.")
+            if not 1 <= self.remote_port <= 65535:
+                raise ValueError("Remote-data SFTP port must be between 1 and 65535.")
         if validate_cache and self.max_size_gb <= 0:
             raise ValueError("Maximum cache size must be greater than zero.")
         if validate_cache and self.min_free_gb < 0:
@@ -533,6 +554,58 @@ def validate_local_source(
     }
 
 
+def probe_sftp_host_key(payload: dict[str, Any]) -> dict[str, str]:
+    """Return the host key for explicit wizard trust before credentials use."""
+    from romcloud.infrastructure.providers.sftp import probe_host_key
+
+    purpose = str(payload.get("purpose", "source"))
+    prefix = "remote_" if purpose == "remote_data" else ""
+    host = str(payload.get(f"{prefix}server", "")).strip()
+    port = int(payload.get(f"{prefix}port", 22))
+    if not host:
+        raise ValueError("SFTP server is required.")
+    key_type, fingerprint = probe_host_key(host, port)
+    return {"host_key_type": key_type, "host_key_fingerprint": fingerprint}
+
+
+def validate_sftp_source(
+    payload: dict[str, Any], progress: ProgressSink = None
+) -> dict[str, Any]:
+    """Validate an SFTP target using its existing strict host-key provider."""
+    from romcloud.infrastructure.providers.sftp import SFTPProvider
+
+    purpose = str(payload.get("purpose", "source"))
+    remote = purpose == "remote_data"
+    prefix = "remote_" if remote else ""
+    root = str(
+        payload.get("remote_data_root" if remote else "source_remote_path", "")
+    ).strip()
+    provider = SFTPProvider(
+        host=str(payload.get(f"{prefix}server", "")).strip(),
+        username=str(payload.get(f"{prefix}username", "")).strip(),
+        password=str(payload.get(f"{prefix}password", "")),
+        port=int(payload.get(f"{prefix}port", 22)),
+        trusted_host_key_fingerprint=str(
+            payload.get("remote_sftp_host_key_fingerprint" if remote else "sftp_host_key_fingerprint", "")
+        ).strip() or None,
+        probe_writable=remote,
+    )
+    emit_progress(progress, "configure", "directory", "running", "Checking the selected SFTP folder…")
+    validation = provider.validate_access(root)
+    if not validation.connected or not validation.read_verified:
+        raise ValueError(validation.detail or "Could not access the selected SFTP folder.")
+    emit_progress(progress, "configure", "directory", "success", "Directory accessible")
+    emit_progress(progress, "configure", "read", "success", "Read access verified")
+    if remote:
+        return {"systems": [], "count": 0, "validation": validation.as_dict()}
+    systems = provider.list_systems(root)
+    emit_progress(
+        progress, "configure", "systems", "success",
+        f"Library check complete — {len(systems)} system{'s' if len(systems) != 1 else ''} found",
+    )
+    return {"systems": systems, "count": len(systems), "validation": validation.as_dict()}
+
+
 def apply_setup(
     config_path: Path, payload: dict[str, Any], progress: ProgressSink = None
 ) -> dict[str, Any]:
@@ -543,10 +616,14 @@ def apply_setup(
     validation_result = (
         validate_share(payload, progress)
         if request.source_type == "smb"
+        else validate_sftp_source(payload, progress)
+        if request.source_type == "sftp"
         else validate_local_source(payload, progress)
     )
     if request.remote_data_type == "smb":
         validate_share({**payload, "purpose": "remote_data"}, progress)
+    elif request.remote_data_type == "sftp":
+        validate_sftp_source({**payload, "purpose": "remote_data"}, progress)
     state_path = config_path.parent / SETUP_STATE_FILENAME
     existing = _existing_config(config_path)
     existing_was_valid = existing is not None and not _structural_issues(existing)
@@ -567,8 +644,14 @@ def apply_setup(
         write_config(config, str(config_path))
         if request.source_type == "smb":
             write_smb_password(config.credentials_path, request.password)
+        elif request.source_type == "sftp":
+            write_sftp_password(config.credentials_path, request.password)
         if request.remote_data_type == "smb":
             write_remote_data_smb_password(
+                config.credentials_path, request.remote_password
+            )
+        elif request.remote_data_type == "sftp":
+            write_remote_data_sftp_password(
                 config.credentials_path, request.remote_password
             )
 
@@ -614,14 +697,20 @@ def apply_setup(
             if config.remote_data.provider == "local":
                 Path(config.remote_data.root).mkdir(parents=True, exist_ok=True)
             remote_probe = container.saves.validate_remote_storage()
-            if not remote_probe.ok:
+            if not remote_probe.connected or not remote_probe.read_verified:
                 raise RuntimeError(
                     "Configured ROMCloud data location failed validation: "
                     f"{remote_probe.detail}"
                 )
-            emit_progress(progress, "configure", "write", "success", "Write test created")
-            emit_progress(progress, "configure", "read_back", "success", "Read-back verified")
-            emit_progress(progress, "configure", "cleanup", "success", "Test file removed")
+            if remote_probe.ok:
+                emit_progress(progress, "configure", "write", "success", "Write test created")
+                emit_progress(progress, "configure", "read_back", "success", "Read-back verified")
+                emit_progress(progress, "configure", "cleanup", "success", "Test file removed")
+            else:
+                emit_progress(
+                    progress, "configure", "write", "warning",
+                    "Shared data is read-only; upload and publishing features remain unavailable.",
+                )
 
         step = "refresh catalog"
         emit_progress(progress, "configure", "catalog", "running", "Refreshing the game catalog…")
@@ -653,7 +742,10 @@ def apply_setup(
             "success",
             "EmulationStation entries prepared",
         )
-        if config.remote_data is not None:
+        if (
+            config.remote_data is not None
+            and container.saves._remote_supports_durable_transactions()  # noqa: SLF001
+        ):
             step = "initialize SaveSync"
             _write_state(state_path, {"status": "applying", "step": step})
             emit_progress(
@@ -774,8 +866,26 @@ def _build_config(config_path: Path, request: SetupRequest, existing: AppConfig 
                 remote_path=request.remote_remote_path,
             ),
         )
+    elif request.remote_data_type == "sftp":
+        remote_data = RemoteDataConfig(
+            provider="sftp",
+            root=request.remote_data_root,
+            sftp=SFTPConfig(
+                host=request.remote_server,
+                username=request.remote_username,
+                port=request.remote_port,
+                host_key_fingerprint=request.remote_sftp_host_key_fingerprint,
+            ),
+        )
     return AppConfig(
-        source=SourceConfig(provider="local", rom_root=request.rom_root),
+        source=SourceConfig(
+            provider="sftp" if request.source_type == "sftp" else "local",
+            rom_root=(
+                request.source_remote_path
+                if request.source_type == "sftp"
+                else request.rom_root
+            ),
+        ),
         cache=CacheConfig(
             path=request.cache_root,
             max_size_gb=request.max_size_gb,
@@ -793,6 +903,16 @@ def _build_config(config_path: Path, request: SetupRequest, existing: AppConfig 
                 remote_path=request.source_remote_path,
             )
             if request.source_type == "smb"
+            else None
+        ),
+        sftp=(
+            SFTPConfig(
+                host=request.server,
+                username=request.username,
+                port=request.port,
+                host_key_fingerprint=request.sftp_host_key_fingerprint,
+            )
+            if request.source_type == "sftp"
             else None
         ),
         remote_data=remote_data,
@@ -820,6 +940,13 @@ def _connection_values(payload: dict[str, Any]) -> tuple[str, int, str, str]:
     if not server or not username or not password:
         raise ValueError("SMB server, username, and password are required.")
     return server, port, username, password
+
+
+def _source_remote_path(payload: dict[str, Any]) -> str:
+    raw = str(payload.get("source_remote_path", "")).strip()
+    if str(payload.get("source_type", "smb")).strip().lower() == "sftp":
+        return raw
+    return normalize_remote_directory(raw)
 
 
 def _redact(detail: str, *secrets: str) -> str:

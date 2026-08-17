@@ -107,6 +107,8 @@ class Layout:
 @dataclass(frozen=True)
 class WizardRegions:
     content: Rect
+    help: Rect
+    options: Rect
     footer: Rect
     back_button: Rect
     continue_button: Rect
@@ -308,7 +310,13 @@ def compute_layout(screen_w: int, screen_h: int, item_count: int) -> Layout:
 
 
 def compute_wizard_regions(layout: Layout, *, osk_visible: bool = False) -> WizardRegions:
-    """Anchored wizard content/footer geometry for every content height."""
+    """Anchored wizard geometry shared by every setup page.
+
+    ``content`` starts below the global title/header, while ``help`` and
+    ``options`` reserve separate vertical bands inside it. Renderers must use
+    these regions instead of guessing where wrapped instructions end, keeping
+    the first option row clear on 720p TVs as well as compact displays.
+    """
     gap = int(_clamp(min(layout.screen_w, layout.screen_h) * 0.012, 8, 18))
     button_gap = gap
     button_w = max(1, (layout.navigation_rect.w - button_gap) // 2)
@@ -328,8 +336,21 @@ def compute_wizard_regions(layout: Layout, *, osk_visible: bool = False) -> Wiza
         layout.wizard_content_rect.w,
         max(1, content_bottom - layout.wizard_content_rect.y),
     )
+    help_h = min(
+        max(layout.fonts.body * 5, int(content.h * 0.34)),
+        max(1, content.h - MIN_CONTROL_HEIGHT_PX - gap),
+    )
+    help = Rect(content.x, content.y, content.w, help_h)
+    options = Rect(
+        content.x,
+        min(content.bottom, help.bottom + gap),
+        content.w,
+        max(1, content.bottom - (help.bottom + gap)),
+    )
     return WizardRegions(
         content=content,
+        help=help,
+        options=options,
         footer=footer,
         back_button=back,
         continue_button=continue_button,

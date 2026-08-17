@@ -1203,15 +1203,18 @@ def _run(  # noqa: ANN001
                         library_manager_screen.cancel_pending()
                         library_manager_screen = None
                 elif current_screen == "wizard" and wizard is not None:
-                    if ievent.action == Action.BACK and wizard.step == WizardStep.WELCOME:
-                        running = False
+                    if ievent.action == Action.BACK and wizard.step in (
+                        WizardStep.WELCOME,
+                        WizardStep.SOURCE,
+                    ):
+                        current_screen = "menu"
                     elif (
                         ievent.touch_index is not None
                         and not wizard.osk_visible
                         and ievent.touch_index == len(_wizard_option_rows(layout, wizard))
                     ):
-                        if wizard.step == WizardStep.WELCOME:
-                            running = False
+                        if wizard.step in (WizardStep.WELCOME, WizardStep.SOURCE):
+                            current_screen = "menu"
                         else:
                             wizard.back()
                     else:
@@ -2599,14 +2602,7 @@ def _wizard_option_rows(
         len(options) - 1 if options[-1] in _WIZARD_CONTINUE_LABELS else None
     )
     ordinary_count = len(options) - (1 if continuation_index is not None else 0)
-    content = regions.content
-    controls_top = content.y + min(content.h // 3, layout.fonts.body * 4)
-    controls = Rect(
-        content.x,
-        controls_top,
-        content.w,
-        max(1, content.bottom - controls_top),
-    )
+    controls = regions.options
     gap = max(6, int(controls.h * 0.012))
     max_rows = max(1, (controls.h + gap) // (MIN_CONTROL_HEIGHT_PX + gap))
     start = 0
@@ -2678,6 +2674,16 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
             *context,
             "You can switch among Direct, Cached Storage, and Offline later from the main menu.",
         ]
+    if wizard.step == WizardStep.SFTP_TRUST:
+        return [
+            *context,
+            f"{wizard.sftp_host_key_type or 'SSH'} fingerprint: {wizard.sftp_host_key_fingerprint}",
+        ]
+    if wizard.step == WizardStep.REMOTE_SFTP_TRUST:
+        return [
+            *context,
+            f"{wizard.remote_sftp_host_key_type or 'SSH'} fingerprint: {wizard.remote_sftp_host_key_fingerprint}",
+        ]
     if wizard.step == WizardStep.LIBRARY_SYNC:
         return [
             *context,
@@ -2690,6 +2696,8 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
                 f"ROM library: //{wizard.server}/{wizard.share}"
                 f"{f'/{wizard.source_remote_path}' if wizard.source_remote_path else ''} [Read only]"
                 if wizard.source_type == "smb"
+                else f"ROM library: sftp://{wizard.username}@{wizard.server}:{wizard.port}{wizard.source_remote_path} [Cached Storage]"
+                if wizard.source_type == "sftp"
                 else f"ROM library: {wizard.rom_root} [Local]"
             ),
             "\u2713 Connected  \u2713 Read access verified",
@@ -2702,6 +2710,8 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
             (
                 f"ROMCloud data: //{wizard.remote_server}/{wizard.remote_share} [Read/write]"
                 if wizard.remote_data_type == "smb"
+                else f"ROMCloud data: sftp://{wizard.remote_username}@{wizard.remote_server}:{wizard.remote_port}{wizard.remote_data_root} [Read-only features available]"
+                if wizard.remote_data_type == "sftp"
                 else f"ROMCloud data: {wizard.remote_data_root}"
                 if wizard.remote_data_type == "local"
                 else "ROMCloud data: not configured (SaveSync unavailable)"
@@ -2710,9 +2720,14 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
         ]
         if wizard.game_access_mode == "smart_cache":
             lines.append(f"Cache: {wizard.cache_root} ({wizard.max_size_gb:g} GB max)")
-        if wizard.remote_data_type == "smb" and wizard.remote_validation:
+        if wizard.remote_data_type in {"smb", "sftp"} and wizard.remote_validation:
             lines.insert(-1, "\u2713 Connected  \u2713 Read access verified")
-            lines.insert(-1, "Write and cleanup will be verified before setup completes.")
+            lines.insert(
+                -1,
+                "Write and cleanup will be verified before setup completes."
+                if wizard.remote_data_type == "smb"
+                else "SFTP upload and publishing remain unavailable without durable transactions.",
+            )
         return lines
     if wizard.step == WizardStep.DONE:
         lines = [
@@ -2720,6 +2735,8 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
             (
                 f"ROM library: //{wizard.applied_summary.get('server', wizard.server)}/{wizard.applied_summary.get('share', wizard.share)} [Read only]"
                 if wizard.source_type == "smb"
+                else f"ROM library: sftp://{wizard.username}@{wizard.server}:{wizard.port}{wizard.source_remote_path} [Cached Storage]"
+                if wizard.source_type == "sftp"
                 else f"ROM library: {wizard.rom_root} [Local]"
             ),
             f"Detected systems: {wizard.applied_summary.get('system_count', len(wizard.systems))}",
@@ -2730,12 +2747,16 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
             lines.append(
                 f"ROMCloud data: //{wizard.remote_server}/{wizard.remote_share} [Read/write]"
             )
+        elif wizard.remote_data_type == "sftp":
+            lines.append(
+                f"ROMCloud data: sftp://{wizard.remote_username}@{wizard.remote_server}:{wizard.remote_port}{wizard.remote_data_root} [Read-only features available]"
+            )
         else:
             lines.append(
                 f"ROMCloud data: {wizard.applied_summary.get('remote_data_type', wizard.remote_data_type)}"
             )
         remote_validation = wizard.applied_summary.get("remote_data_validation") or {}
-        if remote_validation:
+        if remote_validation and wizard.remote_data_type != "sftp":
             lines.extend(
                 [
                     "\u2713 Connected",
@@ -2828,7 +2849,7 @@ def _render_wizard(  # noqa: ANN001
             label = fonts["body"].render(wizard.osk.key_label(key), True, _FG_COLOR)
             screen.blit(label, label.get_rect(center=rect.center))
     else:
-        y = content.y
+        y = regions.help.y
         line_h = layout.fonts.body + 7
         max_chars = max(1, content.w // max(8, layout.fonts.body // 2))
         body_lines = _wizard_body_lines(wizard)
@@ -2838,6 +2859,8 @@ def _render_wizard(  # noqa: ANN001
             )
         for line in body_lines:
             for wrapped in wrap_lines([line], max_chars):
+                if y + line_h > regions.help.bottom:
+                    break
                 text = fonts["body"].render(wrapped, True, _FG_COLOR)
                 screen.blit(text, (content.x, y))
                 y += line_h
