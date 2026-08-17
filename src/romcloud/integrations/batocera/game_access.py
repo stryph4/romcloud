@@ -515,6 +515,11 @@ def _prepare_connected_source(config: AppConfig, progress: ProgressSink) -> Cont
         config.game_access_mode, OperatingMode.CONNECTED
     )
     container = Container(config, operating_policy=transition_policy)
+    if not container.provider.capabilities.has_filesystem_semantics:
+        raise ConfigurationError(
+            "Connected/Direct Mode requires a source with real filesystem "
+            "semantics; the configured source does not provide them."
+        )
     validate_source = getattr(container.provider, "validate_access", None)
     if validate_source is not None:
         source_probe = validate_source(config.source.rom_root)

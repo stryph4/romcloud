@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Callable, Optional
@@ -17,38 +17,31 @@ from romcloud.core.exceptions import (
     ProviderNotReachableError,
     TransferError,
 )
-from romcloud.core.storage import RemoteEntry, StorageProvider
+from romcloud.core.storage import (
+    ProviderCapabilities,
+    RemoteEntry,
+    StorageAccessResult,
+    StorageProvider,
+)
 
 _CHUNK = 1024 * 1024
 _PROBE_CONTENT = "ROMCloud writable storage probe\n"
 
+# Re-exported for existing callers/tests importing from this module.
+__all__ = [
+    "StorageAccessResult",
+    "LocalFilesystemProvider",
+    "WritableMountedFilesystemProvider",
+    "WritableLocalFilesystemProvider",
+    "probe_directory_access",
+    "probe_directory_access_bounded",
+]
 
-@dataclass(frozen=True)
-class StorageAccessResult:
-    """Detailed, credential-safe result of a non-destructive storage probe."""
-
-    connected: bool
-    read_verified: bool
-    write_verified: Optional[bool] = None
-    cleanup_verified: Optional[bool] = None
-    detail: str = ""
-
-    @property
-    def ok(self) -> bool:
-        required = [self.connected, self.read_verified]
-        if self.write_verified is not None:
-            required.append(self.write_verified)
-        if self.cleanup_verified is not None:
-            required.append(self.cleanup_verified)
-        return all(required)
-
-    def as_dict(self) -> dict[str, object]:
-        return {
-            "connected": self.connected,
-            "read_verified": self.read_verified,
-            "write_verified": self.write_verified,
-            "cleanup_verified": self.cleanup_verified,
-        }
+_LOCAL_CAPABILITIES = ProviderCapabilities(
+    has_filesystem_semantics=True,
+    can_resume_download=False,
+    supports_durable_transactions=True,
+)
 
 
 class LocalFilesystemProvider(StorageProvider):
@@ -65,6 +58,12 @@ class LocalFilesystemProvider(StorageProvider):
     @property
     def provider_id(self) -> str:
         return self.PROVIDER_ID
+
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        # Real local paths (plain local/USB, or a mounted CIFS share) —
+        # Direct/Connected Mode can symlink straight into them.
+        return _LOCAL_CAPABILITIES
 
     def is_reachable(self, root: str) -> bool:
         if self._probe_timeout is None:
@@ -157,6 +156,37 @@ class LocalFilesystemProvider(StorageProvider):
             _copy_dir(src, dst, on_progress)
         else:
             _copy_file(src, dst, on_progress)
+
+    def walk(self, root: str) -> list[RemoteEntry]:
+        base = Path(root)
+        if not base.is_dir():
+            return []
+        entries: list[RemoteEntry] = []
+        for current, directories, filenames in os.walk(base, followlinks=False):
+            current_path = Path(current)
+            directories[:] = sorted(
+                name for name in directories if not (current_path / name).is_symlink()
+            )
+            for filename in sorted(filenames):
+                candidate = current_path / filename
+                if candidate.is_symlink() or not candidate.is_file():
+                    continue
+                relative = candidate.relative_to(base).as_posix()
+                entries.append(
+                    RemoteEntry(
+                        name=filename,
+                        relative_path=relative,
+                        is_directory=False,
+                        size_bytes=candidate.stat().st_size,
+                    )
+                )
+        return entries
+
+    def open_binary(self, path: str):
+        try:
+            return Path(path).open("rb")
+        except OSError as exc:
+            raise ProviderError(f"Cannot read {path}: {exc}") from exc
 
 
 class WritableMountedFilesystemProvider(LocalFilesystemProvider):

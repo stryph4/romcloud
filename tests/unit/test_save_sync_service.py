@@ -44,6 +44,15 @@ class _FakeProvider(StorageProvider):
     def provider_id(self) -> str:
         return "fake"
 
+    @property
+    def capabilities(self):
+        from romcloud.core.storage import ProviderCapabilities
+
+        # Backs "remote" with a real local directory in every test here.
+        return ProviderCapabilities(
+            has_filesystem_semantics=True, supports_durable_transactions=True
+        )
+
     def is_reachable(self, root: str) -> bool:
         return self.reachable
 

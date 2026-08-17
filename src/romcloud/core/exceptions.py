@@ -43,6 +43,38 @@ class ProviderAuthError(ProviderError):
     """Authentication with the storage source failed."""
 
 
+class ProviderPermissionError(ProviderError):
+    """The storage source was reached and authenticated, but the requested
+    operation was denied (e.g. a read-only account/path)."""
+
+
+class ProviderHostKeyUnknownError(ProviderError):
+    """No trusted host key is on file yet for this server.
+
+    Carries ``fingerprint``/``key_type`` so a setup flow can present them for
+    explicit first-connection trust instead of connecting blindly.
+    """
+
+    def __init__(self, message: str, *, fingerprint: str, key_type: str) -> None:
+        super().__init__(message)
+        self.fingerprint = fingerprint
+        self.key_type = key_type
+
+
+class ProviderHostKeyMismatchError(ProviderError):
+    """The server's host key does not match the previously trusted key.
+
+    Never bypassed automatically — this always indicates either a
+    reconfigured server or a potential MITM and requires explicit user
+    action to re-trust.
+    """
+
+    def __init__(self, message: str, *, fingerprint: str, key_type: str) -> None:
+        super().__init__(message)
+        self.fingerprint = fingerprint
+        self.key_type = key_type
+
+
 class MountError(ProviderError):
     """Mounting or unmounting a source filesystem failed."""
 
@@ -146,6 +178,15 @@ class SaveSyncVerificationError(SaveSyncError):
     changed since the preview, or the copy was corrupted."""
 
 
+class SaveSyncWriteUnavailableError(SaveSyncError):
+    """A specific operation needs to write to remote-data, but the
+    configured remote-data provider instance does not support ROMCloud's
+    durable write-transaction requirements (see
+    ``ProviderCapabilities.supports_durable_transactions``). Read-only
+    consumption of the same remote-data target remains available and is
+    not affected by this error."""
+
+
 # ── Library Sync ────────────────────────────────────────────────────────────────────────────
 
 
@@ -155,3 +196,12 @@ class LibrarySyncError(ROMCloudError):
 
 class LibrarySyncConnectivityError(LibrarySyncError):
     """The configured canonical library store is unavailable."""
+
+
+class LibrarySyncWriteUnavailableError(LibrarySyncError):
+    """A specific operation needs to publish to remote-data, but the
+    configured remote-data provider instance does not support ROMCloud's
+    durable write-transaction requirements (see
+    ``ProviderCapabilities.supports_durable_transactions``). Reading
+    existing remote metadata/media remains available and is not affected
+    by this error."""

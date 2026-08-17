@@ -40,7 +40,7 @@ def cli(ctx: click.Context, config_path: str | None, debug: bool) -> None:
     # Individual uidata actions load it when required; setup-status must be
     # available to the graphical first-run UI on a completely fresh install.
     if ctx.invoked_subcommand not in (
-        "configure", "update", "repair", "uninstall", "purge", "_reconcile-install", "uidata", "mount"
+        "configure", "update", "repair", "uninstall", "purge", "_reconcile-install", "uidata", "mount", "sftp"
     ):
         try:
             config = load_config(config_path)
@@ -77,6 +77,7 @@ from romcloud.cli.commands.reconcile import reconcile_install_cmd
 from romcloud.cli.commands.lifecycle import repair_cmd, uninstall_cmd, purge_cmd
 from romcloud.cli.commands.autosync import autosync_group
 from romcloud.cli.commands.manager import manager_cmd
+from romcloud.cli.commands.sftp import sftp_group
 
 cli.add_command(configure_cmd, name="configure")
 cli.add_command(refresh_cmd, name="refresh")
@@ -97,6 +98,7 @@ cli.add_command(uninstall_cmd, name="uninstall")
 cli.add_command(purge_cmd, name="purge")
 cli.add_command(autosync_group, name="_autosync")
 cli.add_command(manager_cmd, name="manager")
+cli.add_command(sftp_group, name="sftp")
 
 
 if __name__ == "__main__":

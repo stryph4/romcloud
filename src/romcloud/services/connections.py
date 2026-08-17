@@ -10,6 +10,8 @@ from romcloud.infrastructure import mount, mount_worker
 
 
 def connection_status(config) -> dict[str, object]:
+    if config.source.provider == "sftp":
+        return _sftp_connection_status(config)
     targets = mount_worker.configured_mounts(config)
     if not targets:
         root = Path(config.source.rom_root)
@@ -51,6 +53,44 @@ def connection_status(config) -> dict[str, object]:
             for target in targets
         ],
         "error": diagnostics.last_detail if state == "error" else "",
+    }
+
+
+def _sftp_connection_status(config) -> dict[str, object]:
+    """SFTP has no kernel mount/background worker — connectivity is a
+    direct, bounded probe against the configured account."""
+    from romcloud.infrastructure.credentials import load_sftp_password
+    from romcloud.infrastructure.providers.sftp import SFTPProvider
+
+    sftp_cfg = config.sftp
+    source = f"sftp://{sftp_cfg.username}@{sftp_cfg.host}:{sftp_cfg.port}" if sftp_cfg else ""
+    if sftp_cfg is None:
+        return {
+            "state": "error",
+            "configured": False,
+            "source_provider": "sftp",
+            "source": source,
+            "mount_point": "",
+            "targets": [],
+            "error": "SFTP source selected but no [sftp] section is configured.",
+        }
+    provider = SFTPProvider(
+        host=sftp_cfg.host,
+        username=sftp_cfg.username,
+        port=sftp_cfg.port,
+        password=load_sftp_password(config.credentials_path),
+        private_key_path=sftp_cfg.private_key_path or None,
+        trusted_host_key_fingerprint=sftp_cfg.host_key_fingerprint or None,
+    )
+    result = provider.validate_access(config.source.rom_root)
+    return {
+        "state": "connected" if result.ok else "error",
+        "configured": True,
+        "source_provider": "sftp",
+        "source": source,
+        "mount_point": config.source.rom_root,
+        "targets": [],
+        "error": "" if result.ok else result.detail,
     }
 
 

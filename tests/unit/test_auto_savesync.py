@@ -41,6 +41,18 @@ class _Provider(StorageProvider):
     def provider_id(self) -> str:
         return "test"
 
+    @property
+    def capabilities(self):
+        from romcloud.core.storage import ProviderCapabilities
+
+        # This fixture always backs "remote" with a real local directory
+        # (see _service() below) — a local-like provider for exercising
+        # SaveSync's own reconciliation logic, not provider-capability
+        # gating (see test_savesync_capability_gating.py for that).
+        return ProviderCapabilities(
+            has_filesystem_semantics=True, supports_durable_transactions=True
+        )
+
     def is_reachable(self, root: str) -> bool:
         self.reachability_checks += 1
         return self.reachable

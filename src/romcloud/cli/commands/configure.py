@@ -17,6 +17,7 @@ from romcloud.infrastructure.config import (
     LibrarySyncConfig,
     RemoteDataConfig,
     SavesConfig,
+    SFTPConfig,
     SMBConfig,
     SourceConfig,
     SMART_CACHE_MODE,
@@ -26,13 +27,18 @@ from romcloud.infrastructure.config import (
     load_config,
     write_config,
 )
+from romcloud.core.exceptions import ProviderError
 from romcloud.infrastructure.credentials import (
     write_remote_data_smb_password,
+    write_sftp_password,
     write_smb_password,
 )
 from romcloud.infrastructure.providers.local import WritableLocalFilesystemProvider
+from romcloud.infrastructure.providers.sftp import SFTPProvider, probe_host_key
 from romcloud.infrastructure.smb_discovery_client import build_default_smb_discovery_service
 from romcloud.infrastructure.atomic_file import atomic_write_text
+
+import os
 
 
 @click.command("configure")
@@ -71,10 +77,22 @@ from romcloud.infrastructure.atomic_file import atomic_write_text
 @click.option(
     "--source-type",
     default=None,
-    type=click.Choice(["local", "smb"], case_sensitive=False),
+    type=click.Choice(["local", "smb", "sftp"], case_sensitive=False),
     help=(
-        "Where your ROMs live: 'local' (local disk or USB drive) or "
-        "'smb' (a network SMB/CIFS share, mounted locally and read from there)."
+        "Where your ROMs live: 'local' (local disk or USB drive), "
+        "'smb' (a network SMB/CIFS share, mounted locally and read from there), or "
+        "'sftp' (an SFTP account, read directly over SSH)."
+    ),
+)
+@click.option("--sftp-host", default=None, help="SFTP server hostname or IP.")
+@click.option("--sftp-port", default=22, type=int, help="SFTP server port (default: 22).")
+@click.option("--sftp-username", default=None, help="SFTP username.")
+@click.option(
+    "--sftp-host-key-fingerprint",
+    default=None,
+    help=(
+        "Trusted SHA256 host-key fingerprint (see `romcloud sftp fingerprint`). "
+        "Required for --non-interactive SFTP setup; prompted interactively otherwise."
     ),
 )
 @click.option(
@@ -92,6 +110,10 @@ def configure_cmd(
     remote_data_root: str | None,
     library_sync: bool | None,
     source_type: str | None,
+    sftp_host: str | None,
+    sftp_port: int,
+    sftp_username: str | None,
+    sftp_host_key_fingerprint: str | None,
     non_interactive: bool,
 ) -> None:
     """Interactive wizard to create or update romcloud.toml."""
@@ -119,9 +141,10 @@ def configure_cmd(
         click.echo("\nWhere are your ROMs stored?")
         click.echo("  local  Local disk or USB drive")
         click.echo("  smb    Network share (SMB/CIFS), e.g. a NAS")
+        click.echo("  sftp   SFTP account, read directly over SSH")
         source_type = click.prompt(
             "Source type",
-            type=click.Choice(["local", "smb"], case_sensitive=False),
+            type=click.Choice(["local", "smb", "sftp"], case_sensitive=False),
             default="local",
         )
     source_type = (source_type or "local").lower()
@@ -129,18 +152,27 @@ def configure_cmd(
     if game_access_mode is None and not non_interactive:
         click.echo("\nWhich initial ROMCloud operating mode should be used?")
         click.echo("  smart_cache  Cached Storage; copy to local storage on first launch")
-        click.echo("  direct_nas   Direct; launch from the configured source")
-        game_access_mode = click.prompt(
-            "Game access mode",
-            type=click.Choice([SMART_CACHE_MODE, DIRECT_NAS_MODE], case_sensitive=False),
-            default=existing.game_access_mode if existing else SMART_CACHE_MODE,
-        )
-        if game_access_mode.lower() == DIRECT_NAS_MODE:
-            click.echo("Direct launches games from the configured source.")
+        if source_type != "sftp":
+            click.echo("  direct_nas   Direct; launch from the configured source")
+            game_access_mode = click.prompt(
+                "Game access mode",
+                type=click.Choice([SMART_CACHE_MODE, DIRECT_NAS_MODE], case_sensitive=False),
+                default=existing.game_access_mode if existing else SMART_CACHE_MODE,
+            )
+            if game_access_mode.lower() == DIRECT_NAS_MODE:
+                click.echo("Direct launches games from the configured source.")
+        else:
+            click.echo("An SFTP source only supports Cached Storage (no Direct).")
+            game_access_mode = SMART_CACHE_MODE
     game_access_mode = (
         game_access_mode
         or (existing.game_access_mode if existing else SMART_CACHE_MODE)
     ).lower()
+    if source_type == "sftp" and game_access_mode == DIRECT_NAS_MODE:
+        raise click.ClickException(
+            "Direct requires filesystem semantics that an SFTP source does not "
+            "provide; choose smart_cache instead."
+        )
 
     # ── ROM root ──────────────────────────────────────────────────────────────
     if rom_root is None and not non_interactive:
@@ -148,6 +180,11 @@ def configure_cmd(
             rom_root = click.prompt(
                 "Local mount point for the SMB share",
                 default="/userdata/romcloud/source",
+            )
+        elif source_type == "sftp":
+            rom_root = click.prompt(
+                "Remote ROM path on the SFTP server",
+                default="/mnt/user/ROMs",
             )
         else:
             rom_root = click.prompt("ROM root path", default="/mnt/rom-source/ROMs")
@@ -186,6 +223,82 @@ def configure_cmd(
             source_setup_result = setup_result
         else:
             smb_cfg = SMBConfig(server="localhost", share="ROMs", username="guest")
+
+    # ── SFTP settings ─────────────────────────────────────────────────────────
+    # A genuine protocol-level provider (see
+    # romcloud.infrastructure.providers.sftp.SFTPProvider) — unlike SMB there
+    # is no local mount step. The host key is never trusted blindly: it is
+    # observed via `probe_host_key` (before any credential is sent) and must
+    # be explicitly confirmed, or supplied already-verified via
+    # --sftp-host-key-fingerprint for non-interactive setup.
+    sftp_cfg = None
+    sftp_password: str | None = None
+    if source_type == "sftp":
+        if not non_interactive:
+            click.echo()
+            host = sftp_host or click.prompt("SFTP host")
+            port = sftp_port
+            username = sftp_username or click.prompt("SFTP username")
+            password = click.prompt("SFTP password", hide_input=True)
+            fingerprint = sftp_host_key_fingerprint
+            key_type = ""
+            if not fingerprint:
+                click.echo(f"\nObserving host key for {host}:{port} ...")
+                try:
+                    key_type, fingerprint = probe_host_key(host, port)
+                except ProviderError as exc:
+                    raise click.ClickException(str(exc)) from exc
+                click.echo(f"Key type:    {key_type}")
+                click.echo(f"Fingerprint: {fingerprint}")
+                if not click.confirm(
+                    "Trust this host key? Only confirm if you have verified it "
+                    "through a trusted channel.",
+                    default=False,
+                ):
+                    click.echo("\nSetup cancelled — existing configuration left unchanged.")
+                    ctx.exit(1)
+                    return
+            sftp_cfg = SFTPConfig(
+                host=host,
+                username=username,
+                port=port,
+                host_key_type=key_type,
+                host_key_fingerprint=fingerprint,
+            )
+            sftp_password = password
+            click.echo("\nVerifying read access ...")
+            probe_provider = SFTPProvider(
+                host=sftp_cfg.host,
+                username=sftp_cfg.username,
+                port=sftp_cfg.port,
+                password=sftp_password,
+                trusted_host_key_fingerprint=sftp_cfg.host_key_fingerprint,
+            )
+            result = probe_provider.validate_access(rom_root)
+            if not result.ok:
+                raise click.ClickException(
+                    f"SFTP source failed validation: {result.detail}"
+                )
+            click.echo("\u2713 Connected")
+            click.echo("\u2713 Read access verified")
+        else:
+            if not (sftp_host and sftp_username and sftp_host_key_fingerprint):
+                raise click.ClickException(
+                    "Non-interactive SFTP setup requires --sftp-host, --sftp-username, "
+                    "and --sftp-host-key-fingerprint (see `romcloud sftp fingerprint`)."
+                )
+            sftp_password = os.environ.get("ROMCLOUD_SFTP_PASSWORD")
+            if not sftp_password:
+                raise click.ClickException(
+                    "Non-interactive SFTP setup requires the ROMCLOUD_SFTP_PASSWORD "
+                    "environment variable."
+                )
+            sftp_cfg = SFTPConfig(
+                host=sftp_host,
+                username=sftp_username,
+                port=sftp_port,
+                host_key_fingerprint=sftp_host_key_fingerprint,
+            )
 
     # ── general writable ROMCloud data storage ───────────────────────────────
     remote_data = existing.remote_data if existing is not None else None
@@ -383,6 +496,10 @@ def configure_cmd(
     if smb_password:
         creds_path = config_path.parent / "credentials.toml"
         write_smb_password(creds_path, smb_password)
+        click.echo(f"Credentials written to {creds_path} (mode 0600)")
+    if sftp_password:
+        creds_path = config_path.parent / "credentials.toml"
+        write_sftp_password(creds_path, sftp_password)
         click.echo(f"Credentials written to {creds_path} (mode 0600)")
     if remote_password:
         creds_path = config_path.parent / "credentials.toml"

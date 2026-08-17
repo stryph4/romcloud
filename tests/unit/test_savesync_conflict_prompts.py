@@ -27,6 +27,14 @@ class _Provider(StorageProvider):
     def provider_id(self) -> str:
         return "test"
 
+    @property
+    def capabilities(self):
+        from romcloud.core.storage import ProviderCapabilities
+
+        return ProviderCapabilities(
+            has_filesystem_semantics=True, supports_durable_transactions=True
+        )
+
     def is_reachable(self, root: str) -> bool:
         return True
 

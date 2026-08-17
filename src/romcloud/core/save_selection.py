@@ -12,7 +12,7 @@ import fnmatch
 import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Optional
+from typing import Callable, Optional
 
 FLATPAK_DIRNAME = "flatpak"  # compatibility constant; never traversed
 XBOX_SYSTEM = "xbox"
@@ -111,6 +111,23 @@ class SaveWatchRoot:
 
     layout_id: str
     path: Path
+    canonical_root: str
+    recursive: bool
+
+
+@dataclass(frozen=True)
+class ProviderSaveWatchRoot:
+    """Provider-relative twin of :class:`SaveWatchRoot`.
+
+    Used when the remote-data target has no real local
+    :class:`~pathlib.Path` (e.g. SFTP) — see
+    :meth:`SaveSelectionPolicy.resolve_watch_roots_from_listing`.
+    ``relative_root`` is a POSIX-relative path string under the configured
+    provider root, ``""`` meaning the root itself.
+    """
+
+    layout_id: str
+    relative_root: str
     canonical_root: str
     recursive: bool
 
@@ -762,6 +779,74 @@ class SaveSelectionPolicy:
                     SaveWatchRoot(
                         layout.layout_id,
                         physical,
+                        "/".join(canonical),
+                        layout.recursive,
+                    )
+                )
+        return tuple(sorted(resolved, key=lambda item: (item.canonical_root, item.layout_id)))
+
+    def resolve_watch_roots_from_listing(
+        self,
+        dir_exists: Callable[[str], bool],
+        list_subdirs: Callable[[str], tuple[str, ...]],
+        *,
+        enabled_optional_systems: frozenset[str] = frozenset(),
+        canonical_prefix: str = "",
+    ) -> tuple[ProviderSaveWatchRoot, ...]:
+        """Provider-relative twin of :meth:`watch_roots`.
+
+        Resolves the exact same dynamic-segment layouts (RPCS3 account IDs,
+        Dolphin regions, etc.) using *dir_exists*/*list_subdirs* callables
+        over POSIX-relative path strings (``""`` = the configured root)
+        instead of live :class:`~pathlib.Path` I/O, so a provider without
+        real filesystem semantics can resolve them from one pre-fetched
+        directory listing (see
+        :func:`romcloud.infrastructure.save_tree.scan_provider_tree_report`).
+        Matching rules are identical to :meth:`watch_roots`.
+        """
+        prefix = _segments(canonical_prefix)
+        resolved: list[ProviderSaveWatchRoot] = []
+        for layout in self._layouts:
+            if layout.requires_opt_in and layout.system not in enabled_optional_systems:
+                continue
+            pattern = (layout.system, *_segments(layout.root_pattern))
+            if prefix:
+                if len(prefix) > len(pattern) or any(
+                    segment in _TOKEN_VALIDATORS or segment != actual
+                    for segment, actual in zip(pattern[: len(prefix)], prefix)
+                ):
+                    continue
+                remaining = pattern[len(prefix) :]
+                candidates: list[tuple[str, tuple[str, ...]]] = [("", prefix)]
+            else:
+                remaining = pattern
+                candidates = [("", ())]
+
+            for segment in remaining:
+                validator = _TOKEN_VALIDATORS.get(segment)
+                next_candidates: list[tuple[str, tuple[str, ...]]] = []
+                for relative, canonical in candidates:
+                    if validator is None:
+                        candidate = f"{relative}/{segment}" if relative else segment
+                        if dir_exists(candidate):
+                            next_candidates.append((candidate, (*canonical, segment)))
+                        continue
+                    if relative and not dir_exists(relative):
+                        continue
+                    for name in list_subdirs(relative):
+                        if not validator(name):
+                            continue
+                        candidate = f"{relative}/{name}" if relative else name
+                        next_candidates.append((candidate, (*canonical, name)))
+                candidates = next_candidates
+                if not candidates:
+                    break
+
+            for relative, canonical in candidates:
+                resolved.append(
+                    ProviderSaveWatchRoot(
+                        layout.layout_id,
+                        relative,
                         "/".join(canonical),
                         layout.recursive,
                     )

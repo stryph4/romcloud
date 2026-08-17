@@ -9,6 +9,10 @@ authoritative after preview and confirmation.
 
 from __future__ import annotations
 
+import contextlib
+import posixpath
+import shutil
+import tempfile
 import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -20,6 +24,7 @@ from romcloud.core.exceptions import (
     SaveSyncConnectivityError,
     SaveSyncError,
     SaveSyncVerificationError,
+    SaveSyncWriteUnavailableError,
 )
 from romcloud.core.models.savesync import (
     SaveArtifact,
@@ -49,17 +54,40 @@ from romcloud.core.save_selection import (
     XBOX_SYSTEM,
     SaveSelectionPolicy,
 )
-from romcloud.core.storage import StorageProvider
+from romcloud.core.storage import StorageAccessResult, StorageProvider
 from romcloud.infrastructure import save_tree
 from romcloud.infrastructure import save_transaction
 from romcloud.infrastructure.logging import get_logger
-from romcloud.infrastructure.providers.local import StorageAccessResult
 from romcloud.infrastructure import savesync_state as durable_state
 from romcloud.infrastructure import savesync_journal
 
 log = get_logger("saves")
 _RPCS3_CANONICAL_PREFIX = f"ps3/{RPCS3_DEV_HDD0_PREFIX}"
 _QUICK_SYNC_HISTORY_REQUIRED = 1
+
+
+class _ScratchDir:
+    """Lazily-created, always-cleaned-up local temp dir for one locked
+    SaveSync operation's provider-fetched remote reads (see
+    :meth:`SaveSyncService._remote_path`). Never allocated at all when the
+    remote provider has real filesystem semantics."""
+
+    def __init__(self, base: Path) -> None:
+        self._base = base
+        self._path: Optional[Path] = None
+
+    def path(self) -> Path:
+        if self._path is None:
+            self._base.mkdir(parents=True, exist_ok=True)
+            self._path = Path(
+                tempfile.mkdtemp(prefix=".romcloud-remote-read-", dir=str(self._base))
+            )
+        return self._path
+
+    def cleanup(self) -> None:
+        if self._path is not None:
+            shutil.rmtree(self._path, ignore_errors=True)
+            self._path = None
 
 
 @dataclass(frozen=True)
@@ -105,6 +133,7 @@ class SaveSyncService:
         )
         self._policy = policy
         self._capabilities = capability_policy or CapabilityPolicy("smart_cache")
+        self._active_read_scratch: Optional[_ScratchDir] = None
 
     # ── connectivity and settings ────────────────────────────────────────
 
@@ -120,17 +149,7 @@ class SaveSyncService:
             return StorageAccessResult(
                 False, False, detail="ROMCloud data storage is not configured"
             )
-        validate = getattr(self._provider, "validate_access", None)
-        if validate is None:
-            reachable = self._provider.is_reachable(self._connectivity_root)
-            return StorageAccessResult(
-                reachable,
-                reachable,
-                write_verified=reachable,
-                cleanup_verified=reachable,
-                detail="" if reachable else "storage location is not writable",
-            )
-        return validate(self._connectivity_root)
+        return self._provider.validate_access(self._connectivity_root)
 
     @property
     def is_remote_configured(self) -> bool:
@@ -351,8 +370,10 @@ class SaveSyncService:
             Capability.SAVE_SYNC,
             "Upload Local Save" if direction == "upload" else "Download Remote Save",
         )
+        if direction == "upload":
+            self._require_durable_remote("Upload Local Save")
         self._require_remote()
-        with self._operation_lock():
+        with self._locked_operation():
             if not self.is_remote_reachable():
                 raise SaveSyncConnectivityError(
                     f"Remote save location is not reachable: {self._connectivity_root}"
@@ -600,6 +621,54 @@ class SaveSyncService:
     def _operation_lock(self):  # noqa: ANN202
         return durable_state.state_file_lock(self._state_path)
 
+    def _remote_has_filesystem_semantics(self) -> bool:
+        return self._provider is not None and self._provider.capabilities.has_filesystem_semantics
+
+    def _remote_supports_durable_transactions(self) -> bool:
+        return (
+            self._provider is not None
+            and self._provider.capabilities.supports_durable_transactions
+        )
+
+    def _require_durable_remote(self, operation: str) -> None:
+        if not self._remote_supports_durable_transactions():
+            raise SaveSyncWriteUnavailableError(
+                f"{operation}: the configured remote-data storage does not support "
+                "ROMCloud's durable write-transaction requirements. Read-only SaveSync "
+                "behavior remains available."
+            )
+
+    def _require_filesystem_remote(self, operation: str) -> None:
+        """Full/Quick Sync's remote change-journal uses a real local-style
+        lock file beside the remote dataset (see
+        :func:`romcloud.infrastructure.savesync_journal.journal_lock`), which
+        a protocol-only provider (e.g. SFTP) cannot provide. Ordinary
+        reconcile/preview/commit do not depend on this and remain available.
+        """
+        if not self._remote_has_filesystem_semantics():
+            raise SaveSyncWriteUnavailableError(
+                f"{operation}: the configured remote-data storage does not support "
+                "the filesystem semantics ROMCloud's change journal requires. Use "
+                "ordinary reconciliation instead."
+            )
+
+    @contextlib.contextmanager
+    def _locked_operation(self):  # noqa: ANN202
+        """The common choke point for every operation that may read remote
+        content: holds the cross-process operation lock and, only when the
+        remote provider lacks filesystem semantics, provides a scratch
+        directory for :meth:`_remote_path` to fetch into — always cleaned
+        up when the operation ends, success or failure."""
+        with self._operation_lock():
+            scratch = _ScratchDir(self._state_path.parent)
+            previous = self._active_read_scratch
+            self._active_read_scratch = scratch
+            try:
+                yield
+            finally:
+                scratch.cleanup()
+                self._active_read_scratch = previous
+
     @property
     def selection_policy(self) -> SaveSelectionPolicy:
         return self._policy
@@ -670,6 +739,15 @@ class SaveSyncService:
 
     def _scan_remote(self) -> save_tree.ScanReport:
         assert self._remote_root is not None
+        if not self._remote_has_filesystem_semantics():
+            assert self._provider is not None
+            return save_tree.scan_provider_tree_report(
+                self._provider,
+                self._remote_root.as_posix(),
+                self._policy,
+                enabled_optional_systems=self._enabled_optional_systems(),
+                enabled_optional_groups=self._enabled_optional_groups(),
+            )
         return self._scan_primary(self._remote_root)
 
     def _scan_remote_layouts(
@@ -684,6 +762,15 @@ class SaveSyncService:
         if not layouts:
             return save_tree.ScanReport({})
         selected_policy = SaveSelectionPolicy(layouts=layouts)
+        if not self._remote_has_filesystem_semantics():
+            assert self._provider is not None
+            return save_tree.scan_provider_tree_report(
+                self._provider,
+                self._remote_root.as_posix(),
+                selected_policy,
+                enabled_optional_systems=self._enabled_optional_systems(),
+                enabled_optional_groups=self._enabled_optional_groups(),
+            )
         return save_tree.scan_tree_report(
             self._remote_root,
             selected_policy,
@@ -719,8 +806,28 @@ class SaveSyncService:
         return self._local_root / relative_path
 
     def _remote_path(self, relative_path: str) -> Path:
+        """A local, readable :class:`Path` containing *relative_path*'s
+        remote content — used only as a copy *source*, never as a write
+        destination (remote writes always target ``self._remote_root``
+        itself through a :class:`_DestinationView`). When the remote
+        provider has real filesystem semantics this is the live mounted
+        path, unchanged from before. Otherwise (e.g. SFTP) the content is
+        fetched into this locked operation's scratch directory first, so
+        the existing local-only staging/verification code
+        (:mod:`romcloud.infrastructure.save_tree`/``save_transaction``)
+        never has to open a non-local path directly.
+        """
         assert self._remote_root is not None
-        return self._remote_root / relative_path
+        if self._remote_has_filesystem_semantics():
+            return self._remote_root / relative_path
+        assert self._provider is not None
+        assert self._active_read_scratch is not None, (
+            "Reading remote SaveSync content requires an active locked operation"
+        )
+        local_path = self._active_read_scratch.path() / f"{uuid.uuid4().hex}.tmp"
+        remote_full_path = posixpath.join(self._remote_root.as_posix(), relative_path)
+        self._provider.transfer_to(remote_full_path, str(local_path))
+        return local_path
 
     def _local_views(self) -> tuple[_DestinationView, ...]:
         views = [_DestinationView(self._local_root)]
@@ -765,11 +872,11 @@ class SaveSyncService:
     # ── authoritative force-operation preview ────────────────────────────
 
     def preview_upload(self) -> SaveDiff:
-        with self._operation_lock():
+        with self._locked_operation():
             return self._preview("upload")
 
     def preview_download(self) -> SaveDiff:
-        with self._operation_lock():
+        with self._locked_operation():
             return self._preview("download")
 
     def _preview(self, direction: str) -> SaveDiff:
@@ -806,11 +913,12 @@ class SaveSyncService:
     def full_sync(self, *, progress: ProgressSink = None) -> SaveReconcileReport:
         """Run authoritative reconciliation and establish Quick Sync baseline."""
         self._require_remote()
+        self._require_filesystem_remote("Full Sync")
         self._load_remote_journal(reset_on_error=True)
         report = self.reconcile(progress=progress)
         journal = self._load_remote_journal(reset_on_error=True)
         observed_generation = int(journal["generation"])
-        with self._operation_lock():
+        with self._locked_operation():
             state = self._get_state_unlocked()
             _write_state(
                 self._state_path,
@@ -833,13 +941,14 @@ class SaveSyncService:
         """Journal-driven discovery optimization for authoritative reconciliation."""
         self._capabilities.require(Capability.SAVE_SYNC, "Quick SaveSync")
         self._require_remote()
+        self._require_filesystem_remote("Quick SaveSync")
         if not self.is_remote_reachable():
             raise SaveSyncConnectivityError(
                 f"Remote save location is not reachable: {self._connectivity_root}"
             )
 
         excluded_layouts = exclude_layout_ids or frozenset()
-        with self._operation_lock():
+        with self._locked_operation():
             state = self._get_state_unlocked()
             cursor = state.quick_sync_cursor_generation
             known_groups = {group.group_id for group in state.groups}
@@ -954,7 +1063,7 @@ class SaveSyncService:
                 selected_groups = None
 
         if selected_groups == frozenset() and selected_layouts is None:
-            with self._operation_lock():
+            with self._locked_operation():
                 state = self._get_state_unlocked()
                 _write_state(
                     self._state_path,
@@ -992,7 +1101,7 @@ class SaveSyncService:
                 reason="active-session",
             )
 
-        with self._operation_lock():
+        with self._locked_operation():
             state = self._get_state_unlocked()
             cursor_after = max(
                 remote_generation,
@@ -1021,12 +1130,18 @@ class SaveSyncService:
         if path is None:
             raise SaveSyncConnectivityError("SaveSync remote location is not configured")
         with savesync_journal.journal_lock(path):
-            if reset_on_error:
-                return savesync_journal.load_or_reset(path)
+            if not reset_on_error:
+                try:
+                    return savesync_journal.load(path)
+                except SaveSyncError:
+                    return None
             try:
                 return savesync_journal.load(path)
             except SaveSyncError:
-                return None
+                # Repairing a missing/corrupt journal writes a fresh one —
+                # only ever attempted against a durable-transaction target.
+                self._require_durable_remote("Full Sync")
+                return savesync_journal.load_or_reset(path)
 
     def _quick_sync_scope(
         self,
@@ -1063,7 +1178,7 @@ class SaveSyncService:
     # ── ordinary three-way remote-data reconciliation ───────────────────
 
     def preview_reconciliation(self) -> SaveReconcilePlan:
-        with self._operation_lock():
+        with self._locked_operation():
             self._capabilities.require(
                 Capability.SAVE_SYNC, "Save/state reconciliation"
             )
@@ -1124,7 +1239,7 @@ class SaveSyncService:
         is_group_active: Optional[Callable[[str], bool]] = None,
         is_layout_active: Optional[Callable[[str], bool]] = None,
     ) -> Optional[SaveReconcileReport]:
-        with self._operation_lock():
+        with self._locked_operation():
             if selected_group_ids is not None and selected_layout_ids is not None:
                 selected_layout_ids = frozenset(selected_layout_ids)
             if selected_group_ids is not None:
@@ -1251,6 +1366,10 @@ class SaveSyncService:
             selected_views: list[save_transaction.SelectedView] = []
             try:
                 if plan.uploads:
+                    # Only this branch writes to remote-data; a plan with no
+                    # uploads (pure download/no-op) must remain available
+                    # regardless of the remote's durable-transaction support.
+                    self._require_durable_remote("Save/state reconciliation upload")
                     assert self._remote_root is not None
                     remote_views = (_DestinationView(self._remote_root),)
                     destination_views.extend(remote_views)
@@ -1565,6 +1684,7 @@ class SaveSyncService:
         if diff.direction != "upload":
             raise SaveSyncVerificationError("Upload requires an upload preview.")
         self._capabilities.require(Capability.SAVE_SYNC, "Upload All Saves")
+        self._require_durable_remote("Upload All Saves")
         self._require_remote()
         assert self._remote_root is not None
         return self._commit_force(
@@ -1599,7 +1719,7 @@ class SaveSyncService:
         destination_views: tuple[_DestinationView, ...],
         progress: ProgressSink,
     ) -> SaveSyncRecord:
-        with self._operation_lock():
+        with self._locked_operation():
             if not self.is_remote_reachable():
                 raise SaveSyncConnectivityError(
                     f"Remote save location is not reachable: {self._connectivity_root}"

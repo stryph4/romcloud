@@ -13,7 +13,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional
 
 if sys.version_info >= (3, 11):
@@ -70,26 +70,53 @@ def _validated_smb_remote_path(value: object, context: object = "configuration")
     return "/".join(parts)
 
 
+def _validated_posix_absolute(value: object, label: str, context: object) -> str:
+    """Validate a remote SFTP path independent of the local OS's path rules."""
+    raw = str(value or "").strip()
+    if not raw or not PurePosixPath(raw).is_absolute():
+        raise ConfigurationError(f"{context}: {label} must be an explicit absolute path.")
+    return raw
+
+
+def _parse_sftp_section(raw: dict, path: object, label: str) -> "SFTPConfig":
+    try:
+        return SFTPConfig(
+            host=raw["host"],
+            username=raw.get("username", ""),
+            port=int(raw.get("port", 22)),
+            host_key_type=raw.get("host_key_type", ""),
+            host_key_fingerprint=raw.get("host_key_fingerprint", ""),
+            private_key_path=raw.get("private_key_path", ""),
+        )
+    except KeyError as exc:
+        raise ConfigurationError(f"Missing required [{label}] key: {exc}") from exc
+
+
 # ── sub-configs ───────────────────────────────────────────────────────────────
 
 
 @dataclass(frozen=True)
 class SourceConfig:
     provider: str
-    """Storage provider implementation to use — currently always ``"local"``.
+    """Storage provider implementation to use: ``"local"``, ``"smb"``
+    (normalized to ``"local"`` after mounting — see below), or ``"sftp"``.
 
-    ROMCloud has exactly one implemented storage provider
-    (:class:`~romcloud.infrastructure.providers.local.LocalFilesystemProvider`). A
-    network SMB/CIFS share is mounted locally first (see
-    :mod:`romcloud.infrastructure.mount`) and then read through this same
-    local provider — ``rom_root`` is its mount point. The native
-    ``"smb"`` provider remains an unimplemented stub reserved for future
-    direct-SMB support; configs loaded with ``provider = "smb"`` are
-    transparently normalized to ``"local"`` (see :func:`load_config`).
+    A network SMB/CIFS share is mounted locally first (see
+    :mod:`romcloud.infrastructure.mount`) and then read through
+    :class:`~romcloud.infrastructure.providers.local.LocalFilesystemProvider`
+    — ``rom_root`` is its mount point, and configs loaded with
+    ``provider = "smb"`` are transparently normalized to ``"local"`` (see
+    :func:`load_config`). SFTP has no mount step: ``provider`` stays
+    ``"sftp"``, ``rom_root`` is the remote path on the server (see
+    :class:`AppConfig.sftp <SFTPConfig>`), and
+    :class:`~romcloud.infrastructure.providers.sftp.SFTPProvider` is used
+    directly. Source and remote-data provider selection are always
+    independent — see :class:`RemoteDataConfig`.
     """
     rom_root: str
-    """Absolute local filesystem path to the ROM root — either a plain
-    local/USB directory, or the local mount point of an SMB share."""
+    """ROM root path: a local/USB directory, the local mount point of an
+    SMB share, or (for ``provider = "sftp"``) the remote POSIX path on the
+    SFTP server."""
 
 
 @dataclass(frozen=True)
@@ -103,18 +130,45 @@ class SMBConfig:
 
 
 @dataclass(frozen=True)
+class SFTPConfig:
+    """Non-secret SFTP connection detail for one role (source or remote-data).
+
+    The password (and optional private-key passphrase) is stored
+    independently and separately per role in the encrypted credentials file
+    (see :mod:`romcloud.infrastructure.credentials`) — never here. The
+    trusted host key is obtained once during setup's first-connection trust
+    flow (see :func:`romcloud.infrastructure.providers.sftp.probe_host_key`)
+    and enforced on every later connection; a blank fingerprint means no key
+    has been trusted yet and every connection attempt fails closed.
+    """
+
+    host: str
+    username: str = ""
+    port: int = 22
+    host_key_type: str = ""
+    host_key_fingerprint: str = ""
+    private_key_path: str = ""
+    """Optional path to an existing SSH private key file already present on
+    this machine. ROMCloud never generates or stores key material itself."""
+
+
+@dataclass(frozen=True)
 class RemoteDataConfig:
     """General writable storage owned by ROMCloud synchronized features.
 
-    ``root`` is the filesystem path ROMCloud uses. For a local/USB target it
-    is the user-selected directory. For SMB it is the operational mount point
+    ``root`` is the path ROMCloud uses. For a local/USB target it is the
+    user-selected directory. For SMB it is the operational mount point
     (normally ``/userdata/romcloud/remote``), while ``smb`` identifies the
-    independently selected network target.
+    independently selected network target. For SFTP it is the remote POSIX
+    path on the independently configured ``sftp`` target — there is no
+    mount step. Independent of :class:`SourceConfig`: a user may freely mix
+    e.g. an SFTP ROM source with SMB remote-data or vice versa.
     """
 
     provider: str
     root: str
     smb: Optional[SMBConfig] = None
+    sftp: Optional[SFTPConfig] = None
 
 
 @dataclass(frozen=True)
@@ -160,6 +214,7 @@ class AppConfig:
     data_path: str
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     smb: Optional[SMBConfig] = None
+    sftp: Optional[SFTPConfig] = None
     remote_data: Optional[RemoteDataConfig] = None
     saves: SavesConfig = field(default_factory=SavesConfig)
     library_sync: LibrarySyncConfig = field(default_factory=LibrarySyncConfig)
@@ -309,6 +364,21 @@ def _parse(
         except KeyError as exc:
             raise ConfigurationError(f"Missing required [smb] key: {exc}") from exc
 
+    sftp = None
+    if "sftp" in data:
+        sftp = _parse_sftp_section(data["sftp"], path, "sftp")
+
+    if provider == "sftp":
+        if sftp is None:
+            raise ConfigurationError(
+                f"{path}: source.provider = \"sftp\" but no [sftp] section is present."
+            )
+        rom_root = _validated_posix_absolute(rom_root, "source.rom_root", path)
+    elif provider not in ("local", "smb"):
+        raise ConfigurationError(
+            f"{path}: source.provider must be \"local\", \"smb\", or \"sftp\"."
+        )
+
     if provider == "smb":
         # Legacy configs (written before the mounted-SMB model) used
         # provider = "smb" to mean "read ROMs from this SMB source" — but
@@ -356,15 +426,19 @@ def _parse(
     remote_raw = data.get("remote_data")
     if remote_raw is not None:
         provider_id = str(remote_raw.get("provider", "local")).lower()
-        if provider_id not in {"local", "smb"}:
+        if provider_id not in {"local", "smb", "sftp"}:
             raise ConfigurationError(
-                f"{path}: remote_data.provider must be \"local\" or \"smb\"."
+                f"{path}: remote_data.provider must be \"local\", \"smb\", or \"sftp\"."
             )
         default_root = (
             str(_DEFAULT_REMOTE_DATA_ROOT) if provider_id == "smb" else ""
         )
         remote_root = str(remote_raw.get("root", default_root)).strip()
-        if not remote_root or not Path(remote_root).is_absolute():
+        if provider_id == "sftp":
+            remote_root = _validated_posix_absolute(
+                remote_root, "remote_data.root", path
+            )
+        elif not remote_root or not Path(remote_root).is_absolute():
             raise ConfigurationError(
                 f"{path}: remote_data.root must be an explicit absolute path."
             )
@@ -391,10 +465,20 @@ def _parse(
                     f"Missing required [remote_data.smb] key: {exc}"
                 ) from exc
 
+        remote_sftp = None
+        if provider_id == "sftp":
+            remote_sftp_raw = remote_raw.get("sftp")
+            if not isinstance(remote_sftp_raw, dict):
+                raise ConfigurationError(
+                    f"{path}: remote_data.provider = \"sftp\" requires [remote_data.sftp]."
+                )
+            remote_sftp = _parse_sftp_section(remote_sftp_raw, path, "remote_data.sftp")
+
         remote_data = RemoteDataConfig(
             provider=provider_id,
             root=remote_root,
             smb=remote_smb,
+            sftp=remote_sftp,
         )
 
     saves_raw = data.get("saves", {})
@@ -431,10 +515,16 @@ def _parse(
         raise ConfigurationError(
             f"{path}: Connected Mode source.rom_root must not overlap local_roms.path."
         )
+    if game_access_mode == DIRECT_NAS_MODE and source.provider == "sftp":
+        raise ConfigurationError(
+            f"{path}: Connected Mode (Direct) requires filesystem semantics that an "
+            "SFTP source does not provide; use Cache Mode instead."
+        )
 
     validate_remote_data_boundary(
         source=source,
         source_smb=smb,
+        source_sftp=sftp,
         cache=cache,
         data_path=data_path,
         local_saves_path=saves.local_path,
@@ -450,6 +540,7 @@ def _parse(
         data_path=data_path,
         logging=logging,
         smb=smb,
+        sftp=sftp,
         remote_data=remote_data,
         saves=saves,
         library_sync=library_sync,
@@ -484,6 +575,7 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
     validate_remote_data_boundary(
         source=config.source,
         source_smb=config.smb,
+        source_sftp=config.sftp,
         cache=config.cache,
         data_path=config.data_path,
         local_saves_path=config.saves.local_path,
@@ -544,6 +636,9 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
         if config.smb.remote_path:
             lines.append(f'remote_path = "{config.smb.remote_path}"\n')
 
+    if config.sftp:
+        lines += ["\n", "[sftp]\n"] + _sftp_toml_lines(config.sftp)
+
     if config.remote_data is not None:
         lines += [
             "\n",
@@ -565,6 +660,10 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
                 lines.append(
                     f'remote_path = "{config.remote_data.smb.remote_path}"\n'
                 )
+        if config.remote_data.sftp is not None:
+            lines += ["\n", "[remote_data.sftp]\n"] + _sftp_toml_lines(
+                config.remote_data.sftp
+            )
 
     lines += [
         "\n",
@@ -590,6 +689,21 @@ def default_config_path() -> Path:
     return _DEFAULT_ROMCLOUD_HOME / "config" / "romcloud.toml"
 
 
+def _sftp_toml_lines(sftp: "SFTPConfig") -> list[str]:
+    lines = [
+        f'host = "{sftp.host}"\n',
+        f'username = "{sftp.username}"\n',
+        f"port = {sftp.port}\n",
+    ]
+    if sftp.host_key_type:
+        lines.append(f'host_key_type = "{sftp.host_key_type}"\n')
+    if sftp.host_key_fingerprint:
+        lines.append(f'host_key_fingerprint = "{sftp.host_key_fingerprint}"\n')
+    if sftp.private_key_path:
+        lines.append(f'private_key_path = "{sftp.private_key_path}"\n')
+    return lines
+
+
 def validate_remote_data_boundary(
     *,
     source: SourceConfig,
@@ -600,12 +714,18 @@ def validate_remote_data_boundary(
     remote_data: Optional[RemoteDataConfig],
     context: str,
     resolve_paths: bool = True,
+    source_sftp: Optional[SFTPConfig] = None,
 ) -> None:
     """Keep user-controlled synchronized data outside ROM/runtime state.
 
     Rejecting both parent and child relationships prevents SaveSync from
     ever treating the read-only ROM tree, local cache, or persistent system
     state as its writable ownership boundary.
+
+    SFTP remote-data has no local mount point — its ``root`` is a path on
+    the remote server, not comparable to any of the local paths checked
+    below. It is instead checked against the independently configured SFTP
+    *source* target (same host + overlapping remote path).
     """
     if remote_data is None:
         return
@@ -621,6 +741,23 @@ def validate_remote_data_boundary(
             f"{context}: remote_data.smb must not reuse the ROM source SMB target; "
             "select a separate writable share."
         )
+    if (
+        source.provider == "sftp"
+        and source_sftp is not None
+        and remote_data.provider == "sftp"
+        and remote_data.sftp is not None
+        and source_sftp.host.casefold() == remote_data.sftp.host.casefold()
+        and source_sftp.port == remote_data.sftp.port
+        and _posix_paths_overlap(source.rom_root, remote_data.root)
+    ):
+        raise ConfigurationError(
+            f"{context}: remote_data.sftp must not reuse or overlap the ROM source "
+            "SFTP target; select a separate remote path."
+        )
+    if remote_data.provider == "sftp":
+        # A path on a different host's filesystem entirely — never
+        # comparable to any of the local paths checked below.
+        return
     remote_root = Path(remote_data.root)
     if not remote_root.is_absolute():
         raise ConfigurationError(
@@ -637,6 +774,12 @@ def validate_remote_data_boundary(
             raise ConfigurationError(
                 f"{context}: remote_data.root must not overlap {label}."
             )
+
+
+def _posix_paths_overlap(first: str, second: str) -> bool:
+    a = PurePosixPath(first)
+    b = PurePosixPath(second)
+    return a == b or a in b.parents or b in a.parents
 
 
 def paths_overlap(

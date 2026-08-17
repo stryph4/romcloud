@@ -1,16 +1,23 @@
-"""Local filesystem scanning/materialization for SaveSync.
+"""Filesystem and provider-generic scanning/materialization for SaveSync.
 
-Both the local save root and the configured remote SaveSync dataset are plain
-local filesystem paths. For SMB, the remote path is on the independently
-configured read-write ROMCloud-data mount (see
-:mod:`romcloud.infrastructure.mount`). This module therefore operates on real
-:class:`~pathlib.Path` objects and can keep staging beside the live dataset.
+The local save root, and the remote SaveSync dataset when its provider has
+real filesystem semantics (Local, mounted SMB), are plain local filesystem
+paths — this module operates on real :class:`~pathlib.Path` objects for
+those and can keep staging beside the live dataset. A remote dataset served
+by a protocol-only provider without filesystem semantics (e.g. SFTP) is
+scanned/hashed instead through :func:`scan_provider_tree_report`, using only
+the generic :meth:`~romcloud.core.storage.StorageProvider.walk`/
+``open_binary`` read primitives — see
+:mod:`romcloud.infrastructure.providers.sftp`. Materializing content *from*
+either kind of remote source into a local destination is unaffected: the
+destination is always a real local path, staged/committed exactly as today.
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
+import posixpath
 import shutil
 import uuid
 from dataclasses import dataclass
@@ -20,6 +27,7 @@ from typing import Optional
 from romcloud.core.exceptions import SaveSyncError
 from romcloud.core.models.savesync import SaveArtifact
 from romcloud.core.save_selection import SaveSelectionPolicy
+from romcloud.core.storage import StorageProvider
 
 _CHUNK = 1024 * 1024
 
@@ -169,6 +177,124 @@ def _scan_watch_roots(
                 raise SaveSyncError(f"SaveSync found duplicate canonical path: {canonical}")
             size_bytes = file_path.stat().st_size
             artifacts[canonical] = SaveArtifact(canonical, size_bytes, hash_file(file_path))
+    return ScanReport(artifacts)
+
+
+class ProviderTreeIndex:
+    """Flat index of one :meth:`StorageProvider.walk` call.
+
+    Resolves directory existence/listing for
+    :meth:`~romcloud.core.save_selection.SaveSelectionPolicy.resolve_watch_roots_from_listing`
+    and enumerates approved files, all from a single round-trip instead of
+    per-directory I/O — important for a network provider like SFTP.
+    """
+
+    def __init__(self, entries) -> None:  # noqa: ANN001 - list[RemoteEntry]
+        self._file_sizes: dict[str, int] = {}
+        self._child_dirs: dict[str, set[str]] = {}
+        self._known_dirs: set[str] = set()
+        for entry in entries:
+            if entry.is_directory:
+                continue
+            relative = entry.relative_path
+            self._file_sizes[relative] = entry.size_bytes or 0
+            parent = ""
+            for part in relative.split("/")[:-1]:
+                child = f"{parent}/{part}" if parent else part
+                self._known_dirs.add(child)
+                self._child_dirs.setdefault(parent, set()).add(part)
+                parent = child
+
+    def dir_exists(self, relative: str) -> bool:
+        return relative == "" or relative in self._known_dirs
+
+    def list_subdirs(self, relative: str) -> tuple[str, ...]:
+        return tuple(sorted(self._child_dirs.get(relative, ())))
+
+    def files_under(
+        self, relative_root: str, *, recursive: bool
+    ) -> list[tuple[str, int]]:
+        """Return ``(relative_to_root, size)`` for every file under
+        *relative_root*, one level deep unless *recursive*."""
+        prefix = f"{relative_root}/" if relative_root else ""
+        results: list[tuple[str, int]] = []
+        for path, size in self._file_sizes.items():
+            if prefix:
+                if not path.startswith(prefix):
+                    continue
+                remainder = path[len(prefix) :]
+            else:
+                remainder = path
+            if not remainder or (not recursive and "/" in remainder):
+                continue
+            results.append((remainder, size))
+        return results
+
+
+def hash_provider_file(provider: StorageProvider, root: str, relative_path: str) -> str:
+    """sha256 hex digest of a provider-hosted file, streamed without
+    materializing a local temporary copy."""
+    full_path = posixpath.join(root.rstrip("/"), relative_path) if relative_path else root
+    digest = hashlib.sha256()
+    with provider.open_binary(full_path) as fh:
+        while True:
+            chunk = fh.read(_CHUNK)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def scan_provider_tree_report(
+    provider: StorageProvider,
+    root: str,
+    policy: SaveSelectionPolicy,
+    *,
+    enabled_optional_systems: frozenset[str] = frozenset(),
+    enabled_optional_groups: frozenset[str] = frozenset(),
+) -> ScanReport:
+    """Provider-generic twin of :func:`scan_tree_report`.
+
+    Used when the remote SaveSync dataset's provider has no real
+    filesystem semantics (e.g. SFTP): enumerates the whole tree with one
+    :meth:`~romcloud.core.storage.StorageProvider.walk` call, resolves the
+    same dynamic-segment layouts via
+    :meth:`~romcloud.core.save_selection.SaveSelectionPolicy.resolve_watch_roots_from_listing`,
+    and hashes eligible files by streaming them through
+    :meth:`~romcloud.core.storage.StorageProvider.open_binary` — never via
+    a raw local :class:`~pathlib.Path`. Eligibility rules are identical to
+    the local scanner; only the I/O primitives differ.
+    """
+    index = ProviderTreeIndex(provider.walk(root))
+    watch_roots = policy.resolve_watch_roots_from_listing(
+        index.dir_exists,
+        index.list_subdirs,
+        enabled_optional_systems=enabled_optional_systems,
+    )
+    artifacts: dict[str, SaveArtifact] = {}
+    for watch in watch_roots:
+        for relative, size_bytes in index.files_under(
+            watch.relative_root, recursive=watch.recursive
+        ):
+            canonical = f"{watch.canonical_root}/{relative}".strip("/")
+            system, separator, policy_relative = canonical.partition("/")
+            if not separator:
+                continue
+            decision = policy.classify(
+                system,
+                policy_relative,
+                enabled_optional_groups=enabled_optional_groups,
+            )
+            if not decision.included or not policy.is_canonical_path_supported(canonical):
+                continue
+            if canonical in artifacts:
+                raise SaveSyncError(f"SaveSync found duplicate canonical path: {canonical}")
+            full_relative = (
+                f"{watch.relative_root}/{relative}" if watch.relative_root else relative
+            )
+            artifacts[canonical] = SaveArtifact(
+                canonical, size_bytes, hash_provider_file(provider, root, full_relative)
+            )
     return ScanReport(artifacts)
 
 

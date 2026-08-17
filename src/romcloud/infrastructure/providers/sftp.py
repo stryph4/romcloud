@@ -1,0 +1,516 @@
+"""SFTP storage provider — a genuine protocol-level :class:`StorageProvider`.
+
+Role-agnostic: the exact same class is used whether SFTP is configured as
+the ROM source or as remote-data (see
+:mod:`romcloud.bootstrap.container`). Only the *validated target state*
+differs per configured instance/credentials/path — see
+``probe_writable`` below and :class:`~romcloud.core.storage.StorageAccessResult`.
+
+No local mount/filesystem is involved (unlike SMB, which is a real CIFS
+kernel mount read through :class:`~romcloud.infrastructure.providers.local.LocalFilesystemProvider`).
+Every operation opens a short-lived, bounded SSH/SFTP session — no
+persistent background connection or reconnect daemon is maintained.
+
+Host-key verification is always enforced. A caller must supply the
+fingerprint trusted for this target (obtained once via
+:func:`probe_host_key` during setup's first-connection trust flow);
+connecting without one, or to a server presenting a different key, fails
+closed with :class:`~romcloud.core.exceptions.ProviderHostKeyUnknownError`
+or :class:`~romcloud.core.exceptions.ProviderHostKeyMismatchError`.
+"""
+
+from __future__ import annotations
+
+import base64
+import contextlib
+import hashlib
+import posixpath
+import socket
+import stat as stat_module
+import time
+import uuid
+from pathlib import Path, PurePosixPath
+from typing import Callable, Optional
+
+import paramiko
+
+from romcloud.core.exceptions import (
+    ProviderAuthError,
+    ProviderError,
+    ProviderHostKeyMismatchError,
+    ProviderHostKeyUnknownError,
+    ProviderNotReachableError,
+    ProviderPermissionError,
+    TransferError,
+)
+from romcloud.core.storage import (
+    ProviderCapabilities,
+    RemoteEntry,
+    StorageAccessResult,
+    StorageProvider,
+)
+
+DEFAULT_CONNECT_TIMEOUT = 10.0
+"""Bounds DNS/TCP connect, SSH banner exchange, and authentication."""
+
+DEFAULT_OPERATION_TIMEOUT = 30.0
+"""Bounds each individual list/stat/read call on the established channel."""
+
+_CONNECT_RETRY_DELAY = 1.0
+_PROBE_CONTENT = b"ROMCloud writable storage probe\n"
+
+_SFTP_CAPABILITIES = ProviderCapabilities(
+    has_filesystem_semantics=False, can_resume_download=False
+)
+
+
+def fingerprint_of(key: paramiko.PKey) -> str:
+    """OpenSSH-style ``SHA256:...`` fingerprint of *key*."""
+    digest = hashlib.sha256(key.asbytes()).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
+def probe_host_key(
+    host: str, port: int = 22, *, timeout: float = DEFAULT_CONNECT_TIMEOUT
+) -> tuple[str, str]:
+    """Observe the server's host key without authenticating.
+
+    Used by setup's first-connection trust flow: obtain and display the key
+    type/fingerprint *before* any credential is used, so the user can make
+    an informed trust decision. Returns ``(key_type, fingerprint)``.
+    """
+    sock = socket.create_connection((host, port), timeout=timeout)
+    transport = paramiko.Transport(sock)
+    try:
+        transport.start_client(timeout=timeout)
+        key = transport.get_remote_server_key()
+        if key is None:
+            raise ProviderError(f"{host}:{port} did not present a host key")
+        return key.get_name(), fingerprint_of(key)
+    except (paramiko.SSHException, socket.error, OSError) as exc:
+        raise ProviderNotReachableError(
+            f"Could not reach {host}:{port} to read its host key: {exc}"
+        ) from exc
+    finally:
+        transport.close()
+
+
+class _PinnedHostKeyPolicy(paramiko.MissingHostKeyPolicy):
+    """Fail closed unless the presented key matches the trusted fingerprint."""
+
+    def __init__(self, host: str, trusted_fingerprint: Optional[str]) -> None:
+        self._host = host
+        self._trusted_fingerprint = trusted_fingerprint
+
+    def missing_host_key(self, client, hostname, key) -> None:  # noqa: ANN001
+        observed = fingerprint_of(key)
+        if self._trusted_fingerprint is None:
+            raise ProviderHostKeyUnknownError(
+                f"No trusted host key is configured for {self._host}. "
+                "Run setup again to review and trust its fingerprint.",
+                fingerprint=observed,
+                key_type=key.get_name(),
+            )
+        if observed != self._trusted_fingerprint:
+            raise ProviderHostKeyMismatchError(
+                f"Host key for {self._host} does not match the trusted "
+                f"fingerprint ({self._trusted_fingerprint}); refusing to "
+                "connect. Re-run setup only if this change is expected.",
+                fingerprint=observed,
+                key_type=key.get_name(),
+            )
+        # Matches the pinned fingerprint — accept for this session only.
+
+
+class SFTPProvider(StorageProvider):
+    """Storage provider backed directly by an SFTP account.
+
+    ``probe_writable`` governs :meth:`validate_access`: a source-role
+    instance (the default) never probes writes; a remote-data instance is
+    constructed with ``probe_writable=True`` so its write-dependent
+    subsystem (SaveSync/Library Sync) can validate the exact target before
+    enabling write-dependent operations. This mirrors
+    :class:`~romcloud.infrastructure.providers.local.WritableLocalFilesystemProvider`
+    without needing a parallel class hierarchy.
+    """
+
+    PROVIDER_ID = "sftp"
+
+    def __init__(
+        self,
+        *,
+        host: str,
+        username: str,
+        port: int = 22,
+        password: Optional[str] = None,
+        private_key_path: Optional[str] = None,
+        private_key_passphrase: Optional[str] = None,
+        trusted_host_key_fingerprint: Optional[str] = None,
+        probe_writable: bool = False,
+        connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
+        operation_timeout: float = DEFAULT_OPERATION_TIMEOUT,
+    ) -> None:
+        self._host = host
+        self._username = username
+        self._port = port
+        self._password = password
+        self._private_key_path = private_key_path
+        self._private_key_passphrase = private_key_passphrase
+        self._trusted_fingerprint = trusted_host_key_fingerprint
+        self._probe_writable = probe_writable
+        self._connect_timeout = connect_timeout
+        self._operation_timeout = operation_timeout
+
+    @property
+    def provider_id(self) -> str:
+        return self.PROVIDER_ID
+
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        return _SFTP_CAPABILITIES
+
+    # ── connection lifecycle ─────────────────────────────────────────────
+
+    def _connect_once(self) -> tuple[paramiko.SSHClient, paramiko.SFTPClient]:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(
+            _PinnedHostKeyPolicy(self._host, self._trusted_fingerprint)
+        )
+        try:
+            client.connect(
+                self._host,
+                port=self._port,
+                username=self._username,
+                password=self._password,
+                key_filename=self._private_key_path,
+                passphrase=self._private_key_passphrase,
+                timeout=self._connect_timeout,
+                banner_timeout=self._connect_timeout,
+                auth_timeout=self._connect_timeout,
+                allow_agent=False,
+                look_for_keys=False,
+            )
+        except paramiko.AuthenticationException as exc:
+            client.close()
+            raise ProviderAuthError(
+                f"{self._username}@{self._host}:{self._port} rejected the "
+                "configured SFTP credentials"
+            ) from exc
+        except (ProviderHostKeyUnknownError, ProviderHostKeyMismatchError):
+            client.close()
+            raise
+        except (paramiko.SSHException, socket.error, OSError) as exc:
+            client.close()
+            raise ProviderNotReachableError(
+                f"Could not reach {self._host}:{self._port}: {exc}"
+            ) from exc
+
+        try:
+            sftp = client.open_sftp()
+        except (paramiko.SSHException, OSError) as exc:
+            client.close()
+            raise ProviderNotReachableError(
+                f"SFTP session negotiation with {self._host}:{self._port} failed: {exc}"
+            ) from exc
+        sftp.get_channel().settimeout(self._operation_timeout)
+        return client, sftp
+
+    def _connect(self) -> tuple[paramiko.SSHClient, paramiko.SFTPClient]:
+        """Connect with exactly one bounded retry for transient failures.
+
+        Authentication and host-key failures are permanent for the current
+        configuration and are never retried.
+        """
+        try:
+            return self._connect_once()
+        except ProviderNotReachableError:
+            time.sleep(_CONNECT_RETRY_DELAY)
+            return self._connect_once()
+
+    class _Session:
+        """Context manager guaranteeing the transport is always closed."""
+
+        def __init__(self, provider: "SFTPProvider") -> None:
+            self._provider = provider
+            self._client: Optional[paramiko.SSHClient] = None
+
+        def __enter__(self) -> paramiko.SFTPClient:
+            self._client, sftp = self._provider._connect()
+            return sftp
+
+        def __exit__(self, *exc_info: object) -> None:
+            if self._client is not None:
+                self._client.close()
+
+    def _session(self) -> "SFTPProvider._Session":
+        return SFTPProvider._Session(self)
+
+    # ── path safety ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _safe_join(root: str, relative: str) -> str:
+        rel = PurePosixPath(str(relative).replace("\\", "/"))
+        if rel.is_absolute() or any(part in ("", ".", "..") for part in rel.parts):
+            raise ProviderError(f"Unsafe relative SFTP path: {relative!r}")
+        return posixpath.join(root.rstrip("/"), *rel.parts) if rel.parts else root
+
+    # ── StorageProvider contract ──────────────────────────────────────────
+
+    def is_reachable(self, root: str) -> bool:
+        """Bounded existence/connectivity probe.
+
+        Only collapses genuine unreachability/missing-path outcomes to
+        ``False`` — authentication, permission, and host-key trust failures
+        are distinct, actionable conditions and always propagate instead of
+        being silently reported as "unreachable" (see
+        :class:`~romcloud.core.exceptions.ProviderAuthError`,
+        :class:`~romcloud.core.exceptions.ProviderPermissionError`,
+        :class:`~romcloud.core.exceptions.ProviderHostKeyUnknownError`,
+        :class:`~romcloud.core.exceptions.ProviderHostKeyMismatchError`).
+        """
+        try:
+            with self._session() as sftp:
+                sftp.stat(root)
+            return True
+        except ProviderNotReachableError:
+            return False
+        except OSError:
+            return False
+
+    def validate_access(self, root: str) -> StorageAccessResult:
+        try:
+            with self._session() as sftp:
+                try:
+                    sftp.listdir(root)
+                except FileNotFoundError:
+                    return StorageAccessResult(
+                        True, False, detail=f"configured remote path does not exist: {root}"
+                    )
+                except PermissionError:
+                    return StorageAccessResult(
+                        True, False, detail="read access denied to the configured remote path"
+                    )
+                if not self._probe_writable:
+                    return StorageAccessResult(True, True)
+                return self._probe_write(sftp, root)
+        except ProviderHostKeyUnknownError as exc:
+            return StorageAccessResult(False, False, detail=str(exc))
+        except ProviderHostKeyMismatchError as exc:
+            return StorageAccessResult(False, False, detail=str(exc))
+        except ProviderAuthError as exc:
+            return StorageAccessResult(False, False, detail=str(exc))
+        except ProviderNotReachableError as exc:
+            return StorageAccessResult(False, False, detail=str(exc))
+
+    def _probe_write(self, sftp: paramiko.SFTPClient, root: str) -> StorageAccessResult:
+        """Create/write/flush/stat/read-back/delete a ROMCloud-owned probe
+        object inside *root* — never touches any pre-existing file."""
+        probe = posixpath.join(root.rstrip("/"), f".romcloud-write-probe-{uuid.uuid4().hex}")
+        created = False
+        write_verified = False
+        detail = ""
+        try:
+            # "x" alone only requests SFTP_FLAG_CREATE|EXCL without WRITE per
+            # paramiko's mode parsing; "w" is required to also request write.
+            with sftp.open(probe, "wxb") as fh:
+                created = True
+                fh.write(_PROBE_CONTENT)
+                fh.flush()
+            write_verified = True
+        except PermissionError:
+            detail = "write access denied to the configured remote path"
+        except OSError as exc:
+            detail = f"write access failed: {exc}"
+
+        if write_verified:
+            try:
+                with sftp.open(probe, "rb") as fh:
+                    content = fh.read()
+                if content != _PROBE_CONTENT:
+                    write_verified = False
+                    detail = "write verification failed: probe content did not match"
+            except OSError as exc:
+                write_verified = False
+                detail = f"write verification failed: {exc}"
+
+        cleanup_verified: Optional[bool] = None
+        if created:
+            try:
+                sftp.remove(probe)
+                cleanup_verified = True
+            except OSError as exc:
+                cleanup_verified = False
+                cleanup_detail = f"cleanup failed for ROMCloud probe {probe!r}: {exc}"
+                detail = f"{detail}; {cleanup_detail}" if detail else cleanup_detail
+
+        return StorageAccessResult(
+            True,
+            True,
+            write_verified=write_verified,
+            cleanup_verified=cleanup_verified,
+            detail=detail,
+        )
+
+    def list_systems(self, rom_root: str) -> list[str]:
+        with self._session() as sftp:
+            try:
+                entries = sftp.listdir_attr(rom_root)
+            except FileNotFoundError as exc:
+                raise ProviderNotReachableError(
+                    f"ROM root not accessible: {rom_root}"
+                ) from exc
+            except PermissionError as exc:
+                raise ProviderPermissionError(
+                    f"Permission denied listing ROM root: {rom_root}"
+                ) from exc
+            return sorted(
+                entry.filename
+                for entry in entries
+                if _is_dir(entry) and not _is_symlink(entry) and not entry.filename.startswith(".")
+            )
+
+    def list_entries(self, rom_root: str, system: str) -> list[RemoteEntry]:
+        system_path = self._safe_join(rom_root, system)
+        relative = PurePosixPath(str(system).replace("\\", "/"))
+        with self._session() as sftp:
+            try:
+                raw_entries = sftp.listdir_attr(system_path)
+            except FileNotFoundError as exc:
+                raise ProviderError(f"System path not found: {system_path}") from exc
+            except PermissionError as exc:
+                raise ProviderPermissionError(
+                    f"Permission denied listing: {system_path}"
+                ) from exc
+
+            entries: list[RemoteEntry] = []
+            for entry in sorted(raw_entries, key=lambda item: item.filename.lower()):
+                if entry.filename.startswith("."):
+                    continue
+                is_symlink = _is_symlink(entry)
+                is_directory = _is_dir(entry)
+                entries.append(
+                    RemoteEntry(
+                        name=entry.filename,
+                        relative_path=PurePosixPath(relative, entry.filename).as_posix(),
+                        is_directory=is_directory,
+                        size_bytes=(
+                            None if is_symlink or is_directory else entry.st_size
+                        ),
+                        is_symlink=is_symlink,
+                    )
+                )
+            return entries
+
+    def get_size(self, path: str) -> Optional[int]:
+        try:
+            with self._session() as sftp:
+                return self._size_of(sftp, path)
+        except (ProviderError, OSError):
+            return None
+
+    def _size_of(self, sftp: paramiko.SFTPClient, path: str) -> Optional[int]:
+        try:
+            attr = sftp.stat(path)
+        except OSError:
+            return None
+        if attr.st_mode is not None and _is_dir(attr):
+            total = 0
+            for entry in sftp.listdir_attr(path):
+                child_size = self._size_of(sftp, posixpath.join(path, entry.filename))
+                total += child_size or 0
+            return total
+        return attr.st_size
+
+    def read_text(self, path: str) -> str:
+        try:
+            with self._session() as sftp:
+                with sftp.open(path, "r") as fh:
+                    raw = fh.read()
+        except FileNotFoundError as exc:
+            raise ProviderError(f"Cannot read {path}: not found") from exc
+        except PermissionError as exc:
+            raise ProviderPermissionError(f"Cannot read {path}: permission denied") from exc
+        except OSError as exc:
+            raise ProviderError(f"Cannot read {path}: {exc}") from exc
+        return raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+
+    def transfer_to(
+        self,
+        source_path: str,
+        dest_path: str,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+    ) -> None:
+        dst = Path(dest_path)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with self._session() as sftp:
+                sftp.get(source_path, str(dst), callback=on_progress)
+        except FileNotFoundError as exc:
+            raise TransferError(f"Source does not exist: {source_path}") from exc
+        except PermissionError as exc:
+            raise TransferError(
+                f"Permission denied reading {source_path}: {exc}"
+            ) from exc
+        except (paramiko.SSHException, OSError) as exc:
+            raise TransferError(f"Copy failed {source_path} → {dest_path}: {exc}") from exc
+
+    def walk(self, root: str) -> list[RemoteEntry]:
+        entries: list[RemoteEntry] = []
+        with self._session() as sftp:
+            try:
+                sftp.stat(root)
+            except OSError:
+                return []
+            stack = [""]
+            while stack:
+                relative_dir = stack.pop()
+                current = (
+                    posixpath.join(root.rstrip("/"), relative_dir) if relative_dir else root
+                )
+                try:
+                    children = sftp.listdir_attr(current)
+                except OSError:
+                    continue
+                for child in children:
+                    if _is_symlink(child):
+                        continue
+                    child_relative = (
+                        posixpath.join(relative_dir, child.filename)
+                        if relative_dir
+                        else child.filename
+                    )
+                    if _is_dir(child):
+                        stack.append(child_relative)
+                        continue
+                    entries.append(
+                        RemoteEntry(
+                            name=child.filename,
+                            relative_path=child_relative,
+                            is_directory=False,
+                            size_bytes=child.st_size,
+                        )
+                    )
+        return entries
+
+    @contextlib.contextmanager
+    def open_binary(self, path: str):
+        with self._session() as sftp:
+            try:
+                with sftp.open(path, "rb") as fh:
+                    yield fh
+            except FileNotFoundError as exc:
+                raise ProviderError(f"Cannot read {path}: not found") from exc
+            except PermissionError as exc:
+                raise ProviderPermissionError(
+                    f"Cannot read {path}: permission denied"
+                ) from exc
+            except OSError as exc:
+                raise ProviderError(f"Cannot read {path}: {exc}") from exc
+
+
+def _is_dir(attr: paramiko.SFTPAttributes) -> bool:
+    return attr.st_mode is not None and stat_module.S_ISDIR(attr.st_mode)
+
+
+def _is_symlink(attr: paramiko.SFTPAttributes) -> bool:
+    return attr.st_mode is not None and stat_module.S_ISLNK(attr.st_mode)

@@ -46,7 +46,7 @@ else:
 log = get_logger("credentials")
 
 _LEGACY_CREDENTIALS_FILENAME = "smb.credentials"
-_SECTIONS = ("smb", "remote_data_smb")
+_SECTIONS = ("smb", "remote_data_smb", "sftp", "remote_data_sftp")
 
 
 def load_smb_password(credentials_path: Path) -> Optional[str]:
@@ -186,6 +186,27 @@ def write_smb_password(credentials_path: Path, password: str) -> None:
 def write_remote_data_smb_password(credentials_path: Path, password: str) -> None:
     """Store the remote-data SMB password without replacing source credentials."""
     _write_password_section(credentials_path, "remote_data_smb", password)
+
+
+def load_sftp_password(credentials_path: Path) -> Optional[str]:
+    """Read the ROM-source SFTP password from the credentials file."""
+    return _read_password(credentials_path, "sftp")
+
+
+def load_remote_data_sftp_password(credentials_path: Path) -> Optional[str]:
+    """Read the independent remote-data SFTP password, if configured."""
+    return _read_password(credentials_path, "remote_data_sftp")
+
+
+def write_sftp_password(credentials_path: Path, password: str) -> None:
+    """Store the ROM-source SFTP password, independent of any other section."""
+    _write_password_section(credentials_path, "sftp", password)
+
+
+def write_remote_data_sftp_password(credentials_path: Path, password: str) -> None:
+    """Store the remote-data SFTP password, independent of the source's own
+    SFTP credentials (or of any SMB credentials)."""
+    _write_password_section(credentials_path, "remote_data_sftp", password)
 
 
 def cifs_credentials_path(main_credentials_path: Path) -> Path:
@@ -375,10 +396,7 @@ def _encrypt_or_fallback(password: str) -> dict:
 
 
 def _write_password_section(credentials_path: Path, section: str, password: str) -> None:
-    passwords = {
-        "smb": load_smb_password(credentials_path),
-        "remote_data_smb": load_remote_data_smb_password(credentials_path),
-    }
+    passwords = {name: _read_password(credentials_path, name) for name in _SECTIONS}
     passwords[section] = password
 
     lines: list[str] = []

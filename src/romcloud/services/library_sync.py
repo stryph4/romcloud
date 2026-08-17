@@ -26,6 +26,7 @@ from xml.etree import ElementTree as ET
 from romcloud.core.exceptions import (
     LibrarySyncConnectivityError,
     LibrarySyncError,
+    LibrarySyncWriteUnavailableError,
 )
 from romcloud.core.capabilities import Capability, CapabilityPolicy
 from romcloud.core.models.game import Game
@@ -198,6 +199,57 @@ class LibrarySyncService:
             and self._provider.is_reachable(self._connectivity_root)
         )
 
+    def _remote_has_filesystem_semantics(self) -> bool:
+        return self._provider is not None and self._provider.capabilities.has_filesystem_semantics
+
+    def _remote_supports_durable_transactions(self) -> bool:
+        return (
+            self._provider is not None
+            and self._provider.capabilities.supports_durable_transactions
+        )
+
+    def _require_durable_remote(self, operation: str) -> None:
+        if not self._remote_supports_durable_transactions():
+            raise LibrarySyncWriteUnavailableError(
+                f"{operation}: the configured remote-data storage does not support "
+                "ROMCloud's durable write-transaction requirements. Reading existing "
+                "remote metadata/media remains available."
+            )
+
+    def _read_remote_dataset(self, remote_path: Path) -> dict:
+        if self._remote_has_filesystem_semantics():
+            return _read_dataset(remote_path)
+        assert self._provider is not None and self._remote_root is not None
+        remote_full_path = posixpath.join(self._remote_root.as_posix(), CANONICAL_FILENAME)
+        if self._provider.get_size(remote_full_path) is None:
+            return _empty_dataset()
+        self._local_root.mkdir(parents=True, exist_ok=True)
+        scratch = self._local_root / f".romcloud-remote-dataset-{uuid.uuid4().hex}.json"
+        try:
+            self._provider.transfer_to(remote_full_path, str(scratch))
+            return _read_dataset(scratch)
+        finally:
+            scratch.unlink(missing_ok=True)
+
+    def _copy_remote_media(
+        self, safe_blob: str, destination: Path, digest: str, size: int
+    ) -> None:
+        """Fetch+verify one remote media blob when the remote provider has
+        no real local path (e.g. SFTP) \u2014 same commit shape as
+        :func:`_copy_verified`: stage locally, verify, atomic rename onto
+        *destination*, which is always local regardless of the source."""
+        assert self._provider is not None and self._remote_root is not None
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        remote_full_path = posixpath.join(self._remote_root.as_posix(), safe_blob)
+        temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.partial")
+        try:
+            self._provider.transfer_to(remote_full_path, str(temporary))
+            if _hash_file(temporary) != (digest, size):
+                raise LibrarySyncError(f"Media verification failed: {safe_blob}")
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+
     def status(self) -> dict[str, object]:
         state: dict[str, object] = {}
         try:
@@ -343,6 +395,8 @@ class LibrarySyncService:
         full: bool = False,
     ) -> LibrarySyncReport:
         self._require_available()
+        if write_remote:
+            self._require_durable_remote("Library Sync publish")
         assert self._remote_root is not None
         report = LibrarySyncReport(
             direction=direction,
@@ -354,7 +408,7 @@ class LibrarySyncService:
         local_path = self._local_root / CANONICAL_FILENAME
         lock = _exclusive_lock(self._remote_root / ".library-sync.lock") if write_remote else nullcontext()
         with lock:
-            remote = _read_dataset(remote_path)
+            remote = self._read_remote_dataset(remote_path)
             local = _read_dataset(local_path)
 
             # Remote is authoritative for existing non-empty values. Local/source
@@ -1062,9 +1116,12 @@ class LibrarySyncService:
             return None
         if self._remote_root is None:
             return None
-        source = self._remote_root / safe_blob
-        if not _within(source, self._remote_root):
-            return None
+        if self._remote_has_filesystem_semantics():
+            source = self._remote_root / safe_blob
+            if not _within(source, self._remote_root):
+                return None
+        else:
+            source = None
         if not verify_existing and media_presence.contains(destination):
             report.media_skipped += 1
             report.unchanged += 1
@@ -1093,7 +1150,10 @@ class LibrarySyncService:
             if destination_matches:
                 report.unchanged += 1
             else:
-                _copy_verified(source, destination, digest, size)
+                if source is not None:
+                    _copy_verified(source, destination, digest, size)
+                else:
+                    self._copy_remote_media(safe_blob, destination, digest, size)
                 _record_media_hash(report, size)  # temporary verification
                 _record_media_copy(report, size)
                 media_presence.add(destination)

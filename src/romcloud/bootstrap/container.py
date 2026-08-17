@@ -13,7 +13,7 @@ loaded config.  This keeps tests simple and avoids cross-request state.
 
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional
 
 from romcloud.core.capabilities import CapabilityPolicy, OperatingMode
@@ -38,6 +38,30 @@ from romcloud.services.library_sync import LibrarySyncService
 from romcloud.services.transfer import TransferService
 
 _NETWORK_STORAGE_PROBE_TIMEOUT = 5.0
+
+
+def _remote_data_base_path(remote_data) -> object:  # noqa: ANN001
+    """``remote_data.root`` for SFTP is a remote POSIX path on another host,
+    never a local one — join it with :class:`PurePosixPath` regardless of
+    ROMCloud's own OS. Local/mounted-SMB roots remain real local
+    :class:`~pathlib.Path` objects, unchanged."""
+    if remote_data is None:
+        return None
+    if remote_data.provider == "sftp":
+        return PurePosixPath(remote_data.root)
+    return Path(remote_data.root)
+
+
+def _remote_data_base_path(remote_data) -> "Path | PurePosixPath | None":  # noqa: ANN001
+    """``remote_data.root`` for SFTP is a remote POSIX path on another host,
+    never a local one — join it with :class:`PurePosixPath` regardless of
+    ROMCloud's own OS. Local/mounted-SMB roots remain real local
+    :class:`~pathlib.Path` objects, unchanged."""
+    if remote_data is None:
+        return None
+    if remote_data.provider == "sftp":
+        return PurePosixPath(remote_data.root)
+    return Path(remote_data.root)
 
 
 class Container:
@@ -136,10 +160,12 @@ class Container:
                 )
             elif provider_id == "smb":
                 self._provider = self._build_smb_provider()
+            elif provider_id == "sftp":
+                self._provider = self._build_sftp_provider()
             else:
                 raise ConfigurationError(
                     f"Unknown storage provider: {provider_id!r}. "
-                    "Valid options: local, smb"
+                    "Valid options: local, smb, sftp"
                 )
         return self._provider
 
@@ -195,13 +221,14 @@ class Container:
             validate_remote_data_boundary(
                 source=self._config.source,
                 source_smb=self._config.smb,
+                source_sftp=self._config.sftp,
                 cache=self._config.cache,
                 data_path=self._config.data_path,
                 local_saves_path=self._config.saves.local_path,
                 remote_data=remote_data,
                 context="ROMCloud configuration",
             )
-            remote_base = Path(remote_data.root) if remote_data is not None else None
+            remote_base = _remote_data_base_path(remote_data)
             if remote_data is None:
                 saves_provider = None
             elif remote_data.provider == "smb":
@@ -212,6 +239,8 @@ class Container:
                     expected_share=remote_data.smb.share,
                     probe_timeout=_NETWORK_STORAGE_PROBE_TIMEOUT,
                 )
+            elif remote_data.provider == "sftp":
+                saves_provider = self._build_writable_sftp_provider(remote_data.sftp)
             else:
                 saves_provider = WritableLocalFilesystemProvider()
             data_path = Path(self._config.data_path)
@@ -258,13 +287,14 @@ class Container:
             validate_remote_data_boundary(
                 source=self._config.source,
                 source_smb=self._config.smb,
+                source_sftp=self._config.sftp,
                 cache=self._config.cache,
                 data_path=self._config.data_path,
                 local_saves_path=self._config.saves.local_path,
                 remote_data=remote_data,
                 context="ROMCloud configuration",
             )
-            remote_base = Path(remote_data.root) if remote_data is not None else None
+            remote_base = _remote_data_base_path(remote_data)
             if remote_data is None:
                 provider = None
             elif remote_data.provider == "smb":
@@ -275,6 +305,8 @@ class Container:
                     expected_share=remote_data.smb.share,
                     probe_timeout=_NETWORK_STORAGE_PROBE_TIMEOUT,
                 )
+            elif remote_data.provider == "sftp":
+                provider = self._build_writable_sftp_provider(remote_data.sftp)
             else:
                 provider = WritableLocalFilesystemProvider()
             self._library_sync = LibrarySyncService(
@@ -336,4 +368,48 @@ class Container:
             username=smb_cfg.username,
             password=password,
             port=smb_cfg.port,
+        )
+
+    def _build_sftp_provider(self) -> StorageProvider:
+        from romcloud.infrastructure.credentials import load_sftp_password
+        from romcloud.infrastructure.providers.sftp import SFTPProvider
+
+        sftp_cfg = self._config.sftp
+        if sftp_cfg is None:
+            raise ConfigurationError(
+                "SFTP provider selected but [sftp] section is missing in config."
+            )
+        password = load_sftp_password(self._config.credentials_path)
+        return SFTPProvider(
+            host=sftp_cfg.host,
+            username=sftp_cfg.username,
+            port=sftp_cfg.port,
+            password=password,
+            private_key_path=sftp_cfg.private_key_path or None,
+            trusted_host_key_fingerprint=sftp_cfg.host_key_fingerprint or None,
+            probe_writable=False,
+        )
+
+    def _build_writable_sftp_provider(self, sftp_cfg) -> StorageProvider:  # noqa: ANN001
+        """Independent remote-data SFTP instance: its own host/credentials,
+        never coupled to the source SFTP target. Write-dependent
+        SaveSync/Library Sync operations remain gated by
+        ``capabilities.supports_durable_transactions`` (False for SFTP) at
+        the service layer, not here — read-only consumption and write
+        *validation* both still need a real, independently-probed instance.
+        """
+        from romcloud.infrastructure.credentials import load_remote_data_sftp_password
+        from romcloud.infrastructure.providers.sftp import SFTPProvider
+
+        if sftp_cfg is None:
+            raise ConfigurationError("SFTP remote data requires an [remote_data.sftp] target")
+        password = load_remote_data_sftp_password(self._config.credentials_path)
+        return SFTPProvider(
+            host=sftp_cfg.host,
+            username=sftp_cfg.username,
+            port=sftp_cfg.port,
+            password=password,
+            private_key_path=sftp_cfg.private_key_path or None,
+            trusted_host_key_fingerprint=sftp_cfg.host_key_fingerprint or None,
+            probe_writable=True,
         )
