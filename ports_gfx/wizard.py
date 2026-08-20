@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from pathlib import PurePosixPath
 from typing import Any, Sequence
 
 from ports_gfx.actions import ACTION_DIRECTIONS, Action
@@ -25,6 +26,7 @@ class WizardStep(Enum):
     USERNAME = "username"
     PASSWORD = "password"
     SFTP_TRUST = "sftp_trust"
+    SFTP_BROWSE = "sftp_browse"
     SFTP_PATH = "sftp_path"
     DISCOVER = "discover"
     SHARE = "share"
@@ -40,6 +42,7 @@ class WizardStep(Enum):
     REMOTE_USERNAME = "remote_username"
     REMOTE_PASSWORD = "remote_password"
     REMOTE_SFTP_TRUST = "remote_sftp_trust"
+    REMOTE_SFTP_BROWSE = "remote_sftp_browse"
     REMOTE_SFTP_PATH = "remote_sftp_path"
     REMOTE_DISCOVER = "remote_discover"
     REMOTE_SHARE = "remote_share"
@@ -143,6 +146,10 @@ STEP_CONTEXT: dict[WizardStep, WizardStepContext] = {
         "Review the SFTP server host-key fingerprint before trusting it.",
         "Only trust a fingerprint you verified through your server or NAS administration tools.",
     ),
+    WizardStep.SFTP_BROWSE: WizardStepContext(
+        "Choose the SFTP folder containing your Batocera system folders.",
+        "Open folders to browse, select this folder, or enter an absolute path manually.",
+    ),
     WizardStep.SFTP_PATH: WizardStepContext(
         "Enter the absolute SFTP path containing your Batocera system folders.",
         "ROMCloud will validate read access and use Cached Storage for this source.",
@@ -203,6 +210,10 @@ STEP_CONTEXT: dict[WizardStep, WizardStepContext] = {
         "Review the remote-data SFTP server host-key fingerprint before trusting it.",
         "Read-only remote data remains usable for safe downloads; publishing depends on its validated capabilities.",
     ),
+    WizardStep.REMOTE_SFTP_BROWSE: WizardStepContext(
+        "Choose the SFTP folder for ROMCloud shared data.",
+        "This browser is independent from the ROM source and only performs read-only listing.",
+    ),
     WizardStep.REMOTE_SFTP_PATH: WizardStepContext(
         "Enter the absolute SFTP path for ROMCloud shared data.",
         "ROMCloud will verify read access and report any write limitations during setup.",
@@ -250,9 +261,11 @@ _RUNNING_MESSAGES = {
     WizardStep.LOCAL_BROWSE: "Opening the selected folder…",
     WizardStep.DISCOVER: "Connecting to your ROM library…",
     WizardStep.SOURCE_BROWSE: "Opening the ROM share…",
+    WizardStep.SFTP_BROWSE: "Opening the SFTP folder…",
     WizardStep.DETECT: "Testing access to your ROM library…",
     WizardStep.REMOTE_DISCOVER: "Connecting to shared data storage…",
     WizardStep.REMOTE_BROWSE: "Opening the shared-data folder…",
+    WizardStep.REMOTE_SFTP_BROWSE: "Opening the shared-data SFTP folder…",
     WizardStep.REMOTE_VALIDATE: "Testing access to shared data storage…",
     WizardStep.APPLY: "Saving configuration and initializing SaveSync…",
 }
@@ -262,9 +275,11 @@ _FAILURE_MESSAGES = {
     WizardStep.LOCAL_BROWSE: "Could not open that folder. Check that it is available, then retry.",
     WizardStep.DISCOVER: "Could not connect. Check the ROM server and account, then retry.",
     WizardStep.SOURCE_BROWSE: "Could not open the ROM share. Check access, then retry.",
+    WizardStep.SFTP_BROWSE: "Could not open that SFTP folder. Check access, then retry.",
     WizardStep.DETECT: "Could not read that ROM folder. Check the folder and permissions, then retry.",
     WizardStep.REMOTE_DISCOVER: "Could not connect. Check the shared-data server and account, then retry.",
     WizardStep.REMOTE_BROWSE: "Could not open the shared-data share. Check access, then retry.",
+    WizardStep.REMOTE_SFTP_BROWSE: "Could not open that shared-data SFTP folder. Check access, then retry.",
     WizardStep.REMOTE_VALIDATE: "Could not verify that data folder. Check access, then retry.",
     WizardStep.APPLY: "Setup could not finish. Your earlier settings were preserved when possible; review details and retry.",
 }
@@ -287,6 +302,8 @@ class WizardState:
         self.source_remote_path = str(data.get("source_remote_path", ""))
         self.sftp_host_key_fingerprint = ""
         self.sftp_host_key_type = ""
+        self.source_sftp_browse_path = "/"
+        self.source_sftp_browse_entries: list[dict[str, Any]] = []
         self.rom_root = str(data.get("rom_root", "/userdata/romcloud/source"))
         self.shares: list[dict[str, str]] = []
         self.systems: list[str] = []
@@ -309,6 +326,8 @@ class WizardState:
         self.remote_remote_path = str(data.get("remote_remote_path", ""))
         self.remote_sftp_host_key_fingerprint = ""
         self.remote_sftp_host_key_type = ""
+        self.remote_sftp_browse_path = "/"
+        self.remote_sftp_browse_entries: list[dict[str, Any]] = []
         self.remote_shares: list[dict[str, str]] = []
         self.browser_path = ""
         self.browser_entries: list[dict[str, Any]] = []
@@ -355,6 +374,7 @@ class WizardState:
             WizardStep.USERNAME: "SFTP Username" if self.source_type == "sftp" else "SMB Username",
             WizardStep.PASSWORD: "SFTP Password" if self.source_type == "sftp" else "SMB Password",
             WizardStep.SFTP_TRUST: "Trust SFTP Host Key",
+            WizardStep.SFTP_BROWSE: "Browse SFTP ROM Folders",
             WizardStep.SFTP_PATH: "SFTP ROM Folder",
             WizardStep.DISCOVER: "Discover Shares",
             WizardStep.SHARE: "Select Share",
@@ -370,6 +390,7 @@ class WizardState:
             WizardStep.REMOTE_USERNAME: "Data SFTP Username" if self.remote_data_type == "sftp" else "Data SMB Username",
             WizardStep.REMOTE_PASSWORD: "Data SFTP Password" if self.remote_data_type == "sftp" else "Data SMB Password",
             WizardStep.REMOTE_SFTP_TRUST: "Trust Data SFTP Host Key",
+            WizardStep.REMOTE_SFTP_BROWSE: "Browse SFTP Data Folders",
             WizardStep.REMOTE_SFTP_PATH: "SFTP Data Folder",
             WizardStep.REMOTE_DISCOVER: "Discover Data Shares",
             WizardStep.REMOTE_SHARE: "Select Data Share",
@@ -458,13 +479,36 @@ class WizardState:
             WizardStep.SOURCE_BROWSE,
             WizardStep.REMOTE_BROWSE,
             WizardStep.LOCAL_BROWSE,
+            WizardStep.SFTP_BROWSE,
+            WizardStep.REMOTE_SFTP_BROWSE,
         ) and self.runner is None:
+            entries = (
+                self.source_sftp_browse_entries
+                if self.step == WizardStep.SFTP_BROWSE
+                else self.remote_sftp_browse_entries
+                if self.step == WizardStep.REMOTE_SFTP_BROWSE
+                else self.browser_entries
+            )
             directories = [
                 entry["name"]
-                for entry in self.browser_entries
+                for entry in entries
                 if entry.get("is_directory")
             ]
-            return ["Select this folder", "Up one folder", *[f"Folder: {name}" for name in directories]]
+            if self.step in (
+                WizardStep.SFTP_BROWSE,
+                WizardStep.REMOTE_SFTP_BROWSE,
+            ):
+                return [
+                    "Select This Folder",
+                    "Type Path Manually",
+                    "Up one folder",
+                    *[f"Folder: {name}" for name in directories],
+                ]
+            return [
+                "Select this folder",
+                "Up one folder",
+                *[f"Folder: {name}" for name in directories],
+            ]
         if self.step == WizardStep.CACHE and self.osk is None:
             return [
                 f"Browse location: {self.cache_root}",
@@ -551,7 +595,7 @@ class WizardState:
                 show_osk=event.source not in ("mouse", "keyboard"),
             )
         elif event.action == Action.BACK:
-            self.back()
+            self.back(romcloud_bin)
         elif event.action == Action.MENU:
             self.show_details = not self.show_details
 
@@ -663,8 +707,10 @@ class WizardState:
             else:
                 self._start_operation(WizardStep.DISCOVER, "setup-discover", romcloud_bin)
         elif current == WizardStep.SFTP_PATH:
-            if not value.startswith("/"):
-                self.error = "SFTP path must be absolute."
+            try:
+                value = _normalize_sftp_path(value)
+            except ValueError as exc:
+                self.error = str(exc)
                 self.osk.confirmed = False
                 return
             self.source_remote_path = value
@@ -715,8 +761,10 @@ class WizardState:
                     WizardStep.REMOTE_DISCOVER, "setup-discover", romcloud_bin
                 )
         elif current == WizardStep.REMOTE_SFTP_PATH:
-            if not value.startswith("/"):
-                self.error = "SFTP path must be absolute."
+            try:
+                value = _normalize_sftp_path(value)
+            except ValueError as exc:
+                self.error = str(exc)
                 self.osk.confirmed = False
                 return
             self.remote_data_root = value
@@ -736,13 +784,13 @@ class WizardState:
             WizardStep.PORT: WizardStep.SERVER,
             WizardStep.USERNAME: WizardStep.PORT,
             WizardStep.PASSWORD: WizardStep.USERNAME,
-            WizardStep.SFTP_PATH: WizardStep.SFTP_TRUST,
+            WizardStep.SFTP_PATH: WizardStep.SFTP_BROWSE,
             WizardStep.REMOTE_LOCAL: WizardStep.REMOTE_DATA,
             WizardStep.REMOTE_SERVER: WizardStep.REMOTE_AUTH,
             WizardStep.REMOTE_PORT: WizardStep.REMOTE_SERVER,
             WizardStep.REMOTE_USERNAME: WizardStep.REMOTE_PORT,
             WizardStep.REMOTE_PASSWORD: WizardStep.REMOTE_USERNAME,
-            WizardStep.REMOTE_SFTP_PATH: WizardStep.REMOTE_SFTP_TRUST,
+            WizardStep.REMOTE_SFTP_PATH: WizardStep.REMOTE_SFTP_BROWSE,
         }[self.step]
         if previous in TEXT_STEPS:
             self.enter_text_step(previous)
@@ -774,14 +822,22 @@ class WizardState:
                 self.source_remote_path = "/"
                 self.enter_text_step(WizardStep.SERVER, show_osk=show_osk)
         elif self.step == WizardStep.SFTP_TRUST:
-            self.enter_text_step(WizardStep.SFTP_PATH, show_osk=show_osk)
+            self._start_sftp_browse("source", "/", romcloud_bin)
+        elif self.step == WizardStep.REMOTE_SFTP_TRUST:
+            self._start_sftp_browse("remote_data", "/", romcloud_bin)
         elif self.step == WizardStep.DISCOVER:
             self._start_operation(WizardStep.DISCOVER, "setup-discover", romcloud_bin)
         elif self.step == WizardStep.SHARE and self.shares:
             self.share = self.shares[self.selected_index]["name"]
             self.source_remote_path = ""
             self._start_operation(WizardStep.SOURCE_BROWSE, "setup-browse-smb", romcloud_bin)
-        elif self.step in (WizardStep.SOURCE_BROWSE, WizardStep.REMOTE_BROWSE, WizardStep.LOCAL_BROWSE):
+        elif self.step in (
+            WizardStep.SOURCE_BROWSE,
+            WizardStep.REMOTE_BROWSE,
+            WizardStep.LOCAL_BROWSE,
+            WizardStep.SFTP_BROWSE,
+            WizardStep.REMOTE_SFTP_BROWSE,
+        ):
             self._confirm_browser(romcloud_bin)
         elif self.step == WizardStep.DETECT:
             self._start_operation(WizardStep.DETECT, "setup-validate", romcloud_bin)
@@ -891,10 +947,33 @@ class WizardState:
         elif self.step == WizardStep.DONE:
             self.finished = True
 
-    def back(self) -> None:
+    def back(self, romcloud_bin: str | None = None) -> None:
         if self.runner is not None:
             self.runner.cancel()
             self.runner = None
+        if self.step in (WizardStep.SFTP_BROWSE, WizardStep.REMOTE_SFTP_BROWSE):
+            current = (
+                self.source_sftp_browse_path
+                if self.step == WizardStep.SFTP_BROWSE
+                else self.remote_sftp_browse_path
+            )
+            if current != "/":
+                parent = _sftp_parent(current)
+                if romcloud_bin is None:
+                    if self.step == WizardStep.SFTP_BROWSE:
+                        self.source_sftp_browse_path = parent
+                    else:
+                        self.remote_sftp_browse_path = parent
+                    self.browser_path = parent
+                else:
+                    purpose = (
+                        "source"
+                        if self.step == WizardStep.SFTP_BROWSE
+                        else "remote_data"
+                    )
+                    self._start_sftp_browse(purpose, parent, romcloud_bin)
+                self.selected_index = 0
+                return
         previous = {
             WizardStep.SOURCE: WizardStep.WELCOME,
             WizardStep.LOCAL_BROWSE: (
@@ -906,14 +985,19 @@ class WizardState:
             ),
             WizardStep.DISCOVER: WizardStep.PASSWORD,
             WizardStep.SFTP_TRUST: WizardStep.PASSWORD,
-            WizardStep.SFTP_PATH: WizardStep.SFTP_TRUST,
+            WizardStep.SFTP_BROWSE: WizardStep.SFTP_TRUST,
+            WizardStep.SFTP_PATH: WizardStep.SFTP_BROWSE,
             WizardStep.SHARE: WizardStep.PASSWORD,
             WizardStep.SOURCE_BROWSE: WizardStep.SHARE,
             WizardStep.DETECT: (
-                WizardStep.SFTP_PATH if self.source_type == "sftp" else WizardStep.SHARE
+                WizardStep.SFTP_BROWSE
+                if self.source_type == "sftp"
+                else WizardStep.SHARE
             ),
             WizardStep.SYSTEMS: (
-                WizardStep.SFTP_PATH if self.source_type == "sftp" else WizardStep.SHARE
+                WizardStep.SFTP_BROWSE
+                if self.source_type == "sftp"
+                else WizardStep.SHARE
             ),
             WizardStep.GAME_ACCESS: WizardStep.SYSTEMS,
             WizardStep.REMOTE_DATA: WizardStep.GAME_ACCESS,
@@ -924,7 +1008,8 @@ class WizardState:
                 else WizardStep.REMOTE_PASSWORD
             ),
             WizardStep.REMOTE_SFTP_TRUST: WizardStep.REMOTE_PASSWORD,
-            WizardStep.REMOTE_SFTP_PATH: WizardStep.REMOTE_SFTP_TRUST,
+            WizardStep.REMOTE_SFTP_BROWSE: WizardStep.REMOTE_SFTP_TRUST,
+            WizardStep.REMOTE_SFTP_PATH: WizardStep.REMOTE_SFTP_BROWSE,
             WizardStep.REMOTE_SHARE: (
                 WizardStep.REMOTE_AUTH
                 if self.remote_reuse_source_credentials
@@ -932,7 +1017,7 @@ class WizardState:
             ),
             WizardStep.REMOTE_BROWSE: WizardStep.REMOTE_SHARE,
             WizardStep.REMOTE_VALIDATE: (
-                WizardStep.REMOTE_SFTP_PATH
+                WizardStep.REMOTE_SFTP_BROWSE
                 if self.remote_data_type == "sftp"
                 else WizardStep.REMOTE_SHARE
             ),
@@ -1056,11 +1141,19 @@ class WizardState:
             WizardStep.SOURCE_BROWSE,
             WizardStep.REMOTE_BROWSE,
             WizardStep.LOCAL_BROWSE,
+            WizardStep.SFTP_BROWSE,
+            WizardStep.REMOTE_SFTP_BROWSE,
         ):
             self.browser_path = str(result.data.get("path", ""))
             self.browser_entries = [
                 dict(entry) for entry in result.data.get("entries", [])
             ]
+            if self.step == WizardStep.SFTP_BROWSE:
+                self.source_sftp_browse_path = self.browser_path
+                self.source_sftp_browse_entries = list(self.browser_entries)
+            elif self.step == WizardStep.REMOTE_SFTP_BROWSE:
+                self.remote_sftp_browse_path = self.browser_path
+                self.remote_sftp_browse_entries = list(self.browser_entries)
             self.selected_index = 0
             self.notice = "Folder loaded. Choose this folder or open another folder."
         elif self.step == WizardStep.REMOTE_DISCOVER:
@@ -1123,6 +1216,11 @@ class WizardState:
             "remote_password": self.remote_password,
             "remote_port": self.remote_port,
             "remote_reuse_source_credentials": self.remote_reuse_source_credentials,
+            "sftp_browse_path": (
+                self.remote_sftp_browse_path
+                if self.step == WizardStep.REMOTE_SFTP_BROWSE
+                else self.source_sftp_browse_path
+            ),
             "library_sync_enabled": self.library_sync_enabled,
             "selected_systems": [
                 system for system in self.systems if system in self.selected_systems
@@ -1135,6 +1233,7 @@ class WizardState:
                     WizardStep.REMOTE_BROWSE,
                     WizardStep.REMOTE_VALIDATE,
                     WizardStep.REMOTE_SFTP_TRUST,
+                    WizardStep.REMOTE_SFTP_BROWSE,
                     WizardStep.REMOTE_SFTP_PATH,
                 )
                 else "source"
@@ -1164,10 +1263,37 @@ class WizardState:
             {"path": path, "progress": True},
         )
 
+    def _start_sftp_browse(
+        self, purpose: str, path: str, romcloud_bin: str
+    ) -> None:
+        path = _normalize_sftp_path(path)
+        if purpose == "remote_data":
+            self.step = WizardStep.REMOTE_SFTP_BROWSE
+            self.remote_sftp_browse_path = path
+            self.remote_sftp_browse_entries = []
+        else:
+            self.step = WizardStep.SFTP_BROWSE
+            self.source_sftp_browse_path = path
+            self.source_sftp_browse_entries = []
+        self.browser_path = path
+        self.browser_entries = []
+        self.error = ""
+        self.technical_error = ""
+        self.notice = ""
+        self._progress_event = None
+        self.runner = start_backend_operation(
+            romcloud_bin, "setup-browse-sftp", self.request_payload()
+        )
+
     def _start_current_browser_operation(self, romcloud_bin: str) -> None:
         action = (
             "setup-browse-local"
             if self.step == WizardStep.LOCAL_BROWSE
+            else "setup-browse-sftp"
+            if self.step in (
+                WizardStep.SFTP_BROWSE,
+                WizardStep.REMOTE_SFTP_BROWSE,
+            )
             else "setup-browse-smb"
         )
         payload = (
@@ -1184,8 +1310,20 @@ class WizardState:
     def _confirm_browser(self, romcloud_bin: str) -> None:
         if self.runner is not None:
             return
+        is_sftp = self.step in (
+            WizardStep.SFTP_BROWSE,
+            WizardStep.REMOTE_SFTP_BROWSE,
+        )
         if self.selected_index == 0:
-            if self.step == WizardStep.SOURCE_BROWSE:
+            if self.step == WizardStep.SFTP_BROWSE:
+                self.source_remote_path = self.source_sftp_browse_path
+                self._start_operation(WizardStep.DETECT, "setup-validate", romcloud_bin)
+            elif self.step == WizardStep.REMOTE_SFTP_BROWSE:
+                self.remote_data_root = self.remote_sftp_browse_path
+                self._start_operation(
+                    WizardStep.REMOTE_VALIDATE, "setup-validate", romcloud_bin
+                )
+            elif self.step == WizardStep.SOURCE_BROWSE:
                 self.source_remote_path = self.browser_path
                 self._start_operation(WizardStep.DETECT, "setup-validate", romcloud_bin)
             elif self.step == WizardStep.REMOTE_BROWSE:
@@ -1207,7 +1345,30 @@ class WizardState:
                 self.selected_index = 0
             return
 
-        if self.selected_index == 1:
+        if is_sftp and self.selected_index == 1:
+            self.enter_text_step(
+                WizardStep.SFTP_PATH
+                if self.step == WizardStep.SFTP_BROWSE
+                else WizardStep.REMOTE_SFTP_PATH
+            )
+            return
+
+        up_index = 2 if is_sftp else 1
+        if self.selected_index == up_index:
+            if is_sftp:
+                current = (
+                    self.source_sftp_browse_path
+                    if self.step == WizardStep.SFTP_BROWSE
+                    else self.remote_sftp_browse_path
+                )
+                parent = _sftp_parent(current)
+                purpose = (
+                    "source"
+                    if self.step == WizardStep.SFTP_BROWSE
+                    else "remote_data"
+                )
+                self._start_sftp_browse(purpose, parent, romcloud_bin)
+                return
             if self.step == WizardStep.LOCAL_BROWSE:
                 from pathlib import Path
 
@@ -1224,9 +1385,32 @@ class WizardState:
             return
 
         directories = [
-            entry for entry in self.browser_entries if entry.get("is_directory")
+            entry
+            for entry in (
+                self.source_sftp_browse_entries
+                if self.step == WizardStep.SFTP_BROWSE
+                else self.remote_sftp_browse_entries
+                if self.step == WizardStep.REMOTE_SFTP_BROWSE
+                else self.browser_entries
+            )
+            if entry.get("is_directory")
         ]
-        directory = directories[self.selected_index - 2]
+        directory = directories[self.selected_index - (3 if is_sftp else 2)]
+        if is_sftp:
+            current = (
+                self.source_sftp_browse_path
+                if self.step == WizardStep.SFTP_BROWSE
+                else self.remote_sftp_browse_path
+            )
+            name = str(directory["name"])
+            child = _sftp_join(current, name)
+            purpose = (
+                "source"
+                if self.step == WizardStep.SFTP_BROWSE
+                else "remote_data"
+            )
+            self._start_sftp_browse(purpose, child, romcloud_bin)
+            return
         if self.step == WizardStep.LOCAL_BROWSE:
             self.browser_path = str(directory.get("path", ""))
         else:
@@ -1242,3 +1426,33 @@ class WizardState:
 
     def _post_storage_step(self) -> WizardStep:
         return WizardStep.LIBRARY_SYNC
+
+
+def _normalize_sftp_path(path: str) -> str:
+    raw = str(path or "").strip().replace("\\", "/")
+    if "://" in raw or raw.startswith("//") or (
+        not raw.startswith("/") and ":/" in raw
+    ):
+        raise ValueError(
+            "Enter only an absolute SFTP path such as /Roms, without "
+            "sftp:// or a server name."
+        )
+    if not raw.startswith("/"):
+        raise ValueError("SFTP path must be an absolute POSIX path such as /Roms.")
+    parts = PurePosixPath(raw).parts
+    if any(part == ".." for part in parts):
+        raise ValueError("SFTP path must stay within the server-visible root.")
+    components = [part for part in parts if part not in ("/", "", ".")]
+    return "/" + "/".join(components) if components else "/"
+
+
+def _sftp_parent(path: str) -> str:
+    normalized = _normalize_sftp_path(path)
+    return "/" if normalized == "/" else str(PurePosixPath(normalized).parent)
+
+
+def _sftp_join(parent: str, name: str) -> str:
+    if not name or name in (".", "..") or "/" in name or "\\" in name:
+        raise ValueError("SFTP directory name is not a safe path component.")
+    base = _normalize_sftp_path(parent).rstrip("/")
+    return _normalize_sftp_path(f"{base}/{name}")

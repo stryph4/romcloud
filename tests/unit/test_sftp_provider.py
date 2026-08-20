@@ -261,6 +261,19 @@ class TestAuthentication:
 
 
 class TestReadOperations:
+    def test_directory_listing_preserves_case_and_excludes_files(
+        self, sftp_server
+    ):
+        server, root = sftp_server
+        (root / "Roms").mkdir()
+        (root / "PlayStation2").mkdir()
+        (root / "README.txt").write_text("not a directory", encoding="utf-8")
+
+        assert _provider(server).list_systems(root.as_posix()) == [
+            "PlayStation2",
+            "Roms",
+        ]
+
     def test_list_systems_and_entries(self, sftp_server):
         server, root = sftp_server
         (root / "psx").mkdir()

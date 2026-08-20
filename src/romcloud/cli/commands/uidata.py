@@ -35,6 +35,7 @@ from romcloud.cli.context import get_container
 from romcloud.lifecycle.setup import (
     apply_setup,
     browse_local,
+    browse_sftp_directory,
     browse_smb_directory,
     discover_shares,
     probe_sftp_host_key,
@@ -266,6 +267,21 @@ def uidata_setup_browse_smb(ctx: click.Context) -> None:
 def uidata_setup_browse_local(ctx: click.Context) -> None:
     """Enumerate a local filesystem directory for the setup folder picker."""
     _run_request_action(ctx, lambda request, progress=None: browse_local(request))
+
+
+@uidata_group.command("setup-browse-sftp")
+@click.pass_context
+def uidata_setup_browse_sftp(ctx: click.Context) -> None:
+    """Enumerate one read-only directory through an authenticated SFTP account."""
+    from romcloud.core.capabilities import Capability
+
+    def browse(request, progress=None):
+        _require_capability_if_configured(
+            ctx, Capability.REMOTE_VALIDATION, "SFTP browsing"
+        )
+        return browse_sftp_directory(request, progress)
+
+    _run_request_action(ctx, browse)
 
 
 @uidata_group.command("setup-apply")

@@ -324,6 +324,45 @@ class TestSetupBridge:
         assert result.exit_code == 0, result.output
         assert calls == [("sftp", request)]
 
+    def test_sftp_browse_action_forwards_independent_remote_request(
+        self, tmp_path, monkeypatch
+    ):
+        import romcloud.cli.commands.uidata as uidata_module
+
+        captured = []
+        monkeypatch.setattr(
+            uidata_module,
+            "browse_sftp_directory",
+            lambda payload, progress=None: captured.append(dict(payload))
+            or {"path": "/Data", "parent": "/", "entries": []},
+        )
+        monkeypatch.setattr(
+            uidata_module, "_require_capability_if_configured", lambda *args: None
+        )
+        request = {
+            "purpose": "remote_data",
+            "source_type": "sftp",
+            "server": "roms.example",
+            "remote_data_type": "sftp",
+            "remote_server": "data.example",
+            "sftp_browse_path": "/Data",
+        }
+
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--config",
+                str(tmp_path / "missing.toml"),
+                "uidata",
+                "setup-browse-sftp",
+            ],
+            input=json.dumps(request),
+        )
+
+        assert result.exit_code == 0, result.output
+        assert captured == [request]
+        assert json.loads(result.output)["path"] == "/Data"
+
 
 class TestStatus:
     def test_emits_single_json_object(self, tmp_path):

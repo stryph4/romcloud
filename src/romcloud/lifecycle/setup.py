@@ -45,7 +45,9 @@ from romcloud.services.smb_discovery import SMBErrorKind, SMBCredentials, SMBSer
 from romcloud.services.directory_browser import (
     browse_local_directory,
     normalize_remote_directory,
+    normalize_sftp_directory,
     remote_parent,
+    sftp_parent,
 )
 
 DEFAULT_ROM_ROOT = "/userdata/romcloud/source"
@@ -110,7 +112,7 @@ class SetupRequest:
             min_free_gb=_number(payload.get("min_free_gb", DEFAULT_MIN_FREE_GB), "Minimum free space"),
             port=port,
             remote_data_type=str(payload.get("remote_data_type", "none")).strip().lower(),
-            remote_data_root=str(payload.get("remote_data_root", "")).strip(),
+            remote_data_root=_remote_data_root(payload),
             remote_server=(
                 server if reuse_remote else str(payload.get("remote_server", "")).strip()
             ),
@@ -602,9 +604,9 @@ def validate_sftp_source(
     purpose = str(payload.get("purpose", "source"))
     remote = purpose == "remote_data"
     prefix = "remote_" if remote else ""
-    root = str(
-        payload.get("remote_data_root" if remote else "source_remote_path", "")
-    ).strip()
+    root = normalize_sftp_directory(
+        str(payload.get("remote_data_root" if remote else "source_remote_path", ""))
+    )
     provider = SFTPProvider(
         host=str(payload.get(f"{prefix}server", "")).strip(),
         username=str(payload.get(f"{prefix}username", "")).strip(),
@@ -635,6 +637,45 @@ def validate_sftp_source(
         f"Library check complete — {len(systems)} system{'s' if len(systems) != 1 else ''} found",
     )
     return {"systems": systems, "count": len(systems), "validation": validation.as_dict()}
+
+
+def browse_sftp_directory(
+    payload: dict[str, Any], progress: ProgressSink = None
+) -> dict[str, Any]:
+    """List directories at one absolute, account-visible SFTP path."""
+    from romcloud.infrastructure.providers.sftp import SFTPProvider
+
+    purpose = str(payload.get("purpose", "source"))
+    remote = purpose == "remote_data"
+    prefix = "remote_" if remote else ""
+    path = normalize_sftp_directory(str(payload.get("sftp_browse_path", "/")))
+    provider = SFTPProvider(
+        host=str(payload.get(f"{prefix}server", "")).strip(),
+        username=str(payload.get(f"{prefix}username", "")).strip(),
+        password=str(payload.get(f"{prefix}password", "")),
+        port=int(payload.get(f"{prefix}port", 22)),
+        trusted_host_key_fingerprint=str(
+            payload.get(
+                "remote_sftp_host_key_fingerprint"
+                if remote
+                else "sftp_host_key_fingerprint",
+                "",
+            )
+        ).strip()
+        or None,
+        probe_writable=False,
+    )
+    emit_progress(progress, "browse", "directory", "running", f"Opening {path}…")
+    directories = provider.list_systems(path)
+    emit_progress(progress, "browse", "directory", "success", "Folder contents loaded")
+    return {
+        "path": path,
+        "parent": sftp_parent(path),
+        "entries": [
+            {"name": name, "is_directory": True}
+            for name in directories
+        ],
+    }
 
 
 def apply_setup(
@@ -1005,8 +1046,15 @@ def _connection_values(payload: dict[str, Any]) -> tuple[str, int, str, str]:
 def _source_remote_path(payload: dict[str, Any]) -> str:
     raw = str(payload.get("source_remote_path", "")).strip()
     if str(payload.get("source_type", "smb")).strip().lower() == "sftp":
-        return raw
+        return normalize_sftp_directory(raw)
     return normalize_remote_directory(raw)
+
+
+def _remote_data_root(payload: dict[str, Any]) -> str:
+    raw = str(payload.get("remote_data_root", "")).strip()
+    if str(payload.get("remote_data_type", "none")).strip().lower() == "sftp":
+        return normalize_sftp_directory(raw)
+    return raw
 
 
 def _redact(detail: str, *secrets: str) -> str:

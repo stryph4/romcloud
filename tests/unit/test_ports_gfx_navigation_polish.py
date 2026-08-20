@@ -115,7 +115,7 @@ def test_first_wizard_pages_back_to_main_menu_but_later_pages_navigate_back():
         wizard.step = step
         assert _wizard_back_returns_to_menu(wizard)
 
-    wizard.step = WizardStep.SFTP_PATH
+    wizard.step = WizardStep.SFTP_BROWSE
     assert not _wizard_back_returns_to_menu(wizard)
     wizard.back()
     assert wizard.step == WizardStep.SFTP_TRUST

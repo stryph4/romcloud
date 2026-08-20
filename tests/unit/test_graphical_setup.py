@@ -288,6 +288,117 @@ class TestSetupState:
         assert result["state"] == "configured"
 
 
+class TestSFTPDirectoryBrowsing:
+    def test_setup_request_normalizes_posix_separators_without_changing_case(
+        self, tmp_path
+    ):
+        request = graphical_setup.SetupRequest.from_payload(
+            _payload(
+                source_type="sftp",
+                server="roms.example",
+                port=22,
+                username="reader",
+                password="secret",
+                source_remote_path=r"\Roms\PlayStation2",
+                sftp_host_key_fingerprint="SHA256:key",
+                rom_root=str(tmp_path / "source"),
+                cache_root=str(tmp_path / "cache"),
+            )
+        )
+
+        assert request.source_remote_path == "/Roms/PlayStation2"
+
+    def test_setup_request_rejects_protocol_prefixed_manual_path(self):
+        with pytest.raises(ValueError, match="without sftp:// or a server name"):
+            graphical_setup.SetupRequest.from_payload(
+                _payload(
+                    source_type="sftp",
+                    server="roms.example",
+                    port=22,
+                    username="reader",
+                    password="secret",
+                    source_remote_path="sftp://roms.example/Roms",
+                    sftp_host_key_fingerprint="SHA256:key",
+                )
+            )
+
+    def test_root_listing_uses_read_only_provider_and_preserves_case(
+        self, monkeypatch
+    ):
+        captured = {}
+
+        class Provider:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def list_systems(self, path):
+                captured["path"] = path
+                return ["Roms", "PlayStation2"]
+
+        monkeypatch.setattr(
+            "romcloud.infrastructure.providers.sftp.SFTPProvider", Provider
+        )
+
+        result = graphical_setup.browse_sftp_directory(
+            {
+                "purpose": "source",
+                "server": "roms.example",
+                "port": 2222,
+                "username": "reader",
+                "password": "secret",
+                "sftp_host_key_fingerprint": "SHA256:key",
+                "sftp_browse_path": "/",
+            }
+        )
+
+        assert captured["path"] == "/"
+        assert captured["probe_writable"] is False
+        assert [entry["name"] for entry in result["entries"]] == [
+            "Roms",
+            "PlayStation2",
+        ]
+        assert result["parent"] == "/"
+
+    def test_remote_data_listing_uses_only_remote_role_credentials(
+        self, monkeypatch
+    ):
+        captured = {}
+
+        class Provider:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def list_systems(self, path):
+                captured["path"] = path
+                return ["SharedData"]
+
+        monkeypatch.setattr(
+            "romcloud.infrastructure.providers.sftp.SFTPProvider", Provider
+        )
+
+        graphical_setup.browse_sftp_directory(
+            {
+                "purpose": "remote_data",
+                "server": "roms.example",
+                "username": "rom-reader",
+                "password": "source-secret",
+                "sftp_host_key_fingerprint": "SHA256:source",
+                "remote_server": "data.example",
+                "remote_port": 2200,
+                "remote_username": "data-reader",
+                "remote_password": "remote-secret",
+                "remote_sftp_host_key_fingerprint": "SHA256:remote",
+                "sftp_browse_path": "/SharedData",
+            }
+        )
+
+        assert captured["host"] == "data.example"
+        assert captured["username"] == "data-reader"
+        assert captured["password"] == "remote-secret"
+        assert captured["trusted_host_key_fingerprint"] == "SHA256:remote"
+        assert captured["path"] == "/SharedData"
+
+
 class TestDiscovery:
     def test_successful_discovery(self, monkeypatch):
         monkeypatch.setattr(graphical_setup, "build_default_smb_discovery_service", lambda: _Discovery())

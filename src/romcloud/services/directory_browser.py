@@ -49,6 +49,49 @@ def join_remote_directory(parent: str, name: str) -> str:
     return normalize_remote_directory(str(PurePosixPath(parent) / name))
 
 
+def normalize_sftp_directory(path: str) -> str:
+    """Return an absolute POSIX SFTP path without protocol/host data.
+
+    SFTP paths are paths as seen by the authenticated account (including a
+    chrooted ``/``), never URLs. Case is deliberately preserved.
+    """
+    raw = str(path or "").strip().replace("\\", "/")
+    lowered = raw.casefold()
+    if "://" in raw or raw.startswith("//") or (
+        not raw.startswith("/") and ":/" in raw
+    ):
+        raise ValueError(
+            "Enter only an absolute SFTP path such as /Roms, without "
+            "sftp:// or a server name."
+        )
+    if "\x00" in raw or "\n" in raw or "\r" in raw:
+        raise ValueError("SFTP path contains invalid control characters.")
+    if not raw.startswith("/"):
+        raise ValueError("SFTP path must be an absolute POSIX path such as /Roms.")
+    if lowered.startswith(("/sftp:", "/ssh:")):
+        raise ValueError(
+            "Enter only an absolute SFTP path such as /Roms, without "
+            "sftp:// or a server name."
+        )
+    parts = PurePosixPath(raw).parts
+    if any(part in (".", "..") for part in parts):
+        raise ValueError("SFTP path must stay within the server-visible root.")
+    components = [part for part in parts if part not in ("/", "")]
+    return "/" + "/".join(components) if components else "/"
+
+
+def sftp_parent(path: str, *, boundary: str = "/") -> str:
+    """Return a parent path without crossing the configured browse root."""
+    current = normalize_sftp_directory(path)
+    root = normalize_sftp_directory(boundary)
+    if current != root and not current.startswith(root.rstrip("/") + "/"):
+        raise ValueError("SFTP path is outside the configured browse root.")
+    if current == root:
+        return root
+    parent = str(PurePosixPath(current).parent)
+    return root if parent == "." or len(parent) < len(root) else parent
+
+
 def browse_local_directory(path: str) -> dict[str, object]:
     current = Path(path).expanduser()
     if not current.is_absolute():

@@ -1262,7 +1262,7 @@ def _run(  # noqa: ANN001
                         if _wizard_back_returns_to_menu(wizard):
                             current_screen = "menu"
                         else:
-                            wizard.back()
+                            wizard.back(romcloud_bin)
                     else:
                         if ievent.touch_index is not None and not wizard.osk_visible:
                             rows = _wizard_option_rows(layout, wizard)
@@ -2803,6 +2803,8 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
         WizardStep.SOURCE_BROWSE,
         WizardStep.REMOTE_BROWSE,
         WizardStep.LOCAL_BROWSE,
+        WizardStep.SFTP_BROWSE,
+        WizardStep.REMOTE_SFTP_BROWSE,
     ):
         location = wizard.browser_path or "/ (share root)"
         files = [

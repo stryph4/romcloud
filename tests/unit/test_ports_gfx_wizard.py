@@ -272,6 +272,12 @@ def test_sftp_is_a_source_option_and_only_offers_cached_storage():
 
 
 def test_sftp_host_key_requires_explicit_fingerprint_trust(monkeypatch):
+    started = []
+    monkeypatch.setattr(
+        "ports_gfx.wizard.start_backend_operation",
+        lambda binary, action, payload: started.append((action, dict(payload)))
+        or _Runner(finished=False),
+    )
     wizard = WizardState()
     wizard.source_type = "sftp"
     wizard.step = WizardStep.SFTP_TRUST
@@ -294,7 +300,9 @@ def test_sftp_host_key_requires_explicit_fingerprint_trust(monkeypatch):
     assert wizard.step == WizardStep.SFTP_TRUST
     assert wizard.options == ["Trust this host key"]
     wizard._confirm("romcloud", show_osk=False)  # noqa: SLF001
-    assert wizard.step == WizardStep.SFTP_PATH
+    assert wizard.step == WizardStep.SFTP_BROWSE
+    assert started[-1][0] == "setup-browse-sftp"
+    assert started[-1][1]["sftp_browse_path"] == "/"
 
 
 def test_sftp_source_and_remote_payloads_remain_independent():
@@ -341,7 +349,169 @@ def test_later_back_returns_to_the_previous_sftp_wizard_step():
 
     wizard.back()
 
-    assert wizard.step == WizardStep.SFTP_TRUST
+    assert wizard.step == WizardStep.SFTP_BROWSE
+
+
+def test_sftp_source_browser_lists_root_and_enters_case_sensitive_folder(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "ports_gfx.wizard.start_backend_operation",
+        lambda binary, action, payload: calls.append((action, dict(payload)))
+        or _Runner(finished=False),
+    )
+    wizard = WizardState()
+    wizard.source_type = "sftp"
+    wizard.server = "roms.example"
+    wizard.port = 2222
+    wizard.username = "reader"
+    wizard.password = "secret"
+    wizard.sftp_host_key_fingerprint = "SHA256:key"
+    wizard.step = WizardStep.SFTP_BROWSE
+    wizard.source_sftp_browse_path = "/"
+    wizard.source_sftp_browse_entries = [
+        {"name": "Roms", "is_directory": True},
+        {"name": "lowercase", "is_directory": True},
+    ]
+    wizard.selected_index = 3
+
+    wizard._confirm("romcloud")  # noqa: SLF001
+
+    assert wizard.source_sftp_browse_path == "/Roms"
+    assert calls[-1][0] == "setup-browse-sftp"
+    assert calls[-1][1]["sftp_browse_path"] == "/Roms"
+    assert calls[-1][1]["purpose"] == "source"
+
+
+def test_sftp_browser_parent_and_root_boundary_are_safe(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "ports_gfx.wizard.start_backend_operation",
+        lambda binary, action, payload: calls.append(dict(payload))
+        or _Runner(finished=False),
+    )
+    wizard = WizardState()
+    wizard.step = WizardStep.SFTP_BROWSE
+    wizard.source_sftp_browse_path = "/Roms/PS2"
+    wizard.browser_path = "/Roms/PS2"
+
+    wizard.back()
+    assert wizard.source_sftp_browse_path == "/Roms"
+    wizard.back()
+    assert wizard.source_sftp_browse_path == "/"
+    wizard.selected_index = 2  # Up one folder at root
+    wizard._confirm("romcloud")  # noqa: SLF001
+
+    assert calls[-1]["sftp_browse_path"] == "/"
+    assert "/.." not in calls[-1]["sftp_browse_path"]
+
+
+def test_sftp_select_folder_persists_path_and_starts_source_validation(monkeypatch):
+    started = []
+    wizard = WizardState()
+    wizard.step = WizardStep.SFTP_BROWSE
+    wizard.source_sftp_browse_path = "/CaseSensitive/Roms"
+    monkeypatch.setattr(
+        wizard,
+        "_start_operation",
+        lambda step, action, binary: started.append((step, action)),
+    )
+
+    wizard._confirm("romcloud")  # noqa: SLF001
+
+    assert wizard.source_remote_path == "/CaseSensitive/Roms"
+    assert started == [(WizardStep.DETECT, "setup-validate")]
+
+
+def test_sftp_manual_path_fallback_accepts_paths_and_rejects_urls(monkeypatch):
+    wizard = WizardState()
+    wizard.step = WizardStep.SFTP_BROWSE
+    wizard.selected_index = 1
+    wizard._confirm("romcloud", show_osk=False)  # noqa: SLF001
+    assert wizard.step == WizardStep.SFTP_PATH
+
+    wizard.osk.text = "sftp://roms.example/Roms"
+    wizard._commit_osk("romcloud")  # noqa: SLF001
+    assert "without sftp:// or a server name" in wizard.error
+    assert wizard.step == WizardStep.SFTP_PATH
+
+    started = []
+    monkeypatch.setattr(
+        wizard,
+        "_start_operation",
+        lambda step, action, binary: started.append((step, action)),
+    )
+    wizard.osk.text = "/Roms/PS2"
+    wizard._commit_osk("romcloud")  # noqa: SLF001
+    assert wizard.source_remote_path == "/Roms/PS2"
+    assert started == [(WizardStep.DETECT, "setup-validate")]
+
+
+def test_remote_sftp_browser_state_and_credentials_are_independent(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "ports_gfx.wizard.start_backend_operation",
+        lambda binary, action, payload: calls.append((action, dict(payload)))
+        or _Runner(finished=False),
+    )
+    wizard = WizardState()
+    wizard.source_type = "sftp"
+    wizard.server = "roms.example"
+    wizard.username = "rom-reader"
+    wizard.password = "source-secret"
+    wizard.source_sftp_browse_path = "/Roms/PS2"
+    wizard.source_sftp_browse_entries = [{"name": "Games", "is_directory": True}]
+    wizard.sftp_host_key_fingerprint = "SHA256:source"
+    wizard.remote_data_type = "sftp"
+    wizard.remote_server = "data.example"
+    wizard.remote_port = 2200
+    wizard.remote_username = "data-reader"
+    wizard.remote_password = "remote-secret"
+    wizard.remote_sftp_host_key_fingerprint = "SHA256:remote"
+
+    wizard._start_sftp_browse("remote_data", "/SharedData", "romcloud")  # noqa: SLF001
+
+    assert wizard.remote_sftp_browse_path == "/SharedData"
+    assert wizard.source_sftp_browse_path == "/Roms/PS2"
+    assert wizard.source_sftp_browse_entries == [
+        {"name": "Games", "is_directory": True}
+    ]
+    assert calls[-1][1]["purpose"] == "remote_data"
+    assert calls[-1][1]["remote_server"] == "data.example"
+    assert calls[-1][1]["server"] == "roms.example"
+
+
+def test_remote_sftp_browser_appears_after_host_key_trust(monkeypatch):
+    monkeypatch.setattr(
+        "ports_gfx.wizard.start_backend_operation",
+        lambda binary, action, payload: _Runner(finished=False),
+    )
+    wizard = WizardState()
+    wizard.remote_data_type = "sftp"
+    wizard.remote_sftp_host_key_fingerprint = "SHA256:remote"
+    wizard.step = WizardStep.REMOTE_SFTP_TRUST
+
+    wizard._confirm("romcloud")  # noqa: SLF001
+
+    assert wizard.step == WizardStep.REMOTE_SFTP_BROWSE
+    assert wizard.remote_sftp_browse_path == "/"
+
+
+def test_remote_sftp_select_folder_starts_remote_validation(monkeypatch):
+    started = []
+    wizard = WizardState()
+    wizard.remote_data_type = "sftp"
+    wizard.step = WizardStep.REMOTE_SFTP_BROWSE
+    wizard.remote_sftp_browse_path = "/Shared/Data"
+    monkeypatch.setattr(
+        wizard,
+        "_start_operation",
+        lambda step, action, binary: started.append((step, action)),
+    )
+
+    wizard._confirm("romcloud")  # noqa: SLF001
+
+    assert wizard.remote_data_root == "/Shared/Data"
+    assert started == [(WizardStep.REMOTE_VALIDATE, "setup-validate")]
 
 
 def test_system_multi_select_persists_canonical_ids_in_request():
