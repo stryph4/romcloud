@@ -9,7 +9,15 @@ import pytest
 
 from romcloud.core.models.game import Game, GameAsset
 from romcloud.core.models.cache import CacheEntry, CachePolicy, CacheStatus
-from romcloud.core.exceptions import GameNotFoundError, GamePinnedError, CacheError, InsufficientSpaceError
+from romcloud.core.cancellation import TransferCancellationToken
+from romcloud.core.exceptions import (
+    CacheError,
+    GameNotFoundError,
+    GamePinnedError,
+    InsufficientSpaceError,
+    TransferCancelledError,
+    TransferError,
+)
 
 
 @pytest.fixture
@@ -184,6 +192,95 @@ class TestCacheGameCaching:
     def test_cache_game_not_in_catalog_raises(self, cache_service):
         with pytest.raises(GameNotFoundError):
             cache_service.cache_game("does-not-exist")
+
+
+class TestCacheGameCancellation:
+    def test_pre_requested_cancel_does_not_start_or_lock_transfer(
+        self, cache_service, cache_repo, game_with_file, monkeypatch
+    ):
+        cancellation = TransferCancellationToken()
+        cancellation.cancel()
+        transfer_calls = []
+        monkeypatch.setattr(
+            cache_service._transfer,
+            "transfer",
+            lambda *args, **kwargs: transfer_calls.append((args, kwargs)),
+        )
+
+        with pytest.raises(TransferCancelledError):
+            cache_service.cache_game(game_with_file.id, cancellation=cancellation)
+
+        assert transfer_calls == []
+        assert cache_repo.get(game_with_file.id) is None
+
+    def test_cancelled_file_is_incomplete_staged_and_retryable(
+        self, cache_service, cache_repo, game_with_file, cache_dir
+    ):
+        cancellation = TransferCancellationToken()
+
+        with pytest.raises(TransferCancelledError):
+            cache_service.cache_game(
+                game_with_file.id,
+                on_progress=lambda done, total: cancellation.cancel(),
+                cancellation=cancellation,
+            )
+
+        entry = cache_repo.get(game_with_file.id)
+        staging = cache_dir / ".partial" / "ps2" / "Final Fantasy X.iso"
+        final = cache_dir / "ps2" / "Final Fantasy X.iso"
+        assert entry.status is CacheStatus.INCOMPLETE
+        assert entry.is_evictable
+        assert cache_service.is_cached(game_with_file.id) is False
+        assert cache_service.get_launch_path(game_with_file.id) is None
+        assert staging.exists()
+        assert not final.exists()
+        assert game_with_file.id not in cache_service._active_launches
+
+        launch_path = cache_service.cache_game(game_with_file.id)
+        assert Path(launch_path).is_file()
+        assert cache_service.is_cached(game_with_file.id) is True
+
+    def test_cancelled_directory_package_is_not_a_valid_cache_entry(
+        self, cache_service, cache_repo, game_repo, tmp_path, cache_dir
+    ):
+        source = tmp_path / "packages" / "ps3" / "Example.ps3"
+        source.mkdir(parents=True)
+        (source / "EBOOT.BIN").write_bytes(b"e" * 250)
+        (source / "data.pkg").write_bytes(b"d" * 800)
+        game = Game.create(
+            "ps3",
+            "Example",
+            "local",
+            str(tmp_path / "packages"),
+            [GameAsset("Example.ps3", "ps3/Example.ps3", size_bytes=1050, is_primary=True)],
+        )
+        game_repo.save(game)
+        cancellation = TransferCancellationToken()
+
+        with pytest.raises(TransferCancelledError):
+            cache_service.cache_game(
+                game.id,
+                on_progress=lambda done, total: cancellation.cancel(),
+                cancellation=cancellation,
+            )
+
+        assert cache_repo.get(game.id).status is CacheStatus.INCOMPLETE
+        assert (cache_dir / ".partial" / "ps3" / "Example.ps3").is_dir()
+        assert not (cache_dir / "ps3" / "Example.ps3").exists()
+        assert cache_service.is_cached(game.id) is False
+
+    def test_real_transfer_failure_remains_distinct_from_cancellation(
+        self, cache_service, cache_repo, game_with_file, monkeypatch
+    ):
+        def fail_transfer(*args, **kwargs):
+            raise TransferError("network unavailable")
+
+        monkeypatch.setattr(cache_service._transfer, "transfer", fail_transfer)
+
+        with pytest.raises(TransferError, match="network unavailable"):
+            cache_service.cache_game(game_with_file.id)
+
+        assert cache_repo.get(game_with_file.id).status is CacheStatus.FAILED
 
 
 class TestPinUnpin:

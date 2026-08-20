@@ -22,12 +22,14 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from romcloud.core.cache_paths import resolve_cache_path
+from romcloud.core.cancellation import TransferCancellationToken
 from romcloud.core.dependency_resolvers import DESCRIPTOR_EXTENSIONS
 from romcloud.core.exceptions import (
     CacheError,
     GameNotFoundError,
     GamePinnedError,
     InsufficientSpaceError,
+    TransferCancelledError,
 )
 from romcloud.core.capabilities import Capability, CapabilityPolicy
 from romcloud.core.models.cache import CacheEntry, CacheMember, CachePolicy, CacheStatus
@@ -273,6 +275,7 @@ class CacheService:
         self,
         game_id: str,
         on_progress: Optional[Callable[[int, int], None]] = None,
+        cancellation: Optional[TransferCancellationToken] = None,
     ) -> str:
         """Ensure *game_id* is cached and return its launch path.
 
@@ -288,6 +291,9 @@ class CacheService:
         TransferError
             The transfer failed.
         """
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
+
         if self.is_cached(game_id):
             self._touch_accessed(game_id)
             launch_path = self.get_launch_path(game_id)
@@ -323,6 +329,8 @@ class CacheService:
                 - sum(actual_before.values()),
             )
         self._ensure_space(needed, protected_game_id=game_id)
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
 
         # cache_path is fully determined by (system, primary asset's relative
         # path) — see romcloud.core.cache_paths — so it is already correct
@@ -344,7 +352,13 @@ class CacheService:
         )
 
         try:
-            final_path = self._transfer.transfer(resolved_game, on_progress)
+            if cancellation is None:
+                final_path = self._transfer.transfer(resolved_game, on_progress)
+            else:
+                final_path = self._transfer.transfer(
+                    resolved_game, on_progress, cancellation=cancellation
+                )
+                cancellation.raise_if_cancelled()
             # Size recorded against the quota must cover *every* asset of
             # the logical game (e.g. .cue + all .bin tracks), never just
             # the primary/launch asset. Entry size remains a logical-game
@@ -360,11 +374,15 @@ class CacheService:
                 for asset in resolved_game.assets
             }
             actual_size = sum(actual_sizes.values())
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
             self._cache_repo.update_member_sizes(game_id, actual_sizes)
             self._cache_repo.update_cache_path(game_id, final_path)
             self._cache_repo.update_status(game_id, CacheStatus.COMPLETE)
             self._cache_repo.update_size(game_id, actual_size)
             self._touch_accessed(game_id)
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
 
             updated_entry = self._cache_repo.get(game_id)
             assert updated_entry is not None
@@ -373,8 +391,15 @@ class CacheService:
                 raise CacheError(
                     f"Cache completed but the primary launch asset could not be resolved for {game_id}"
                 )
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
             return str(launch_path)
 
+        except TransferCancelledError:
+            # Staging remains isolated under .partial for a safe subsequent
+            # retry. It is neither a valid cache hit nor a transfer failure.
+            self._cache_repo.update_status(game_id, CacheStatus.INCOMPLETE)
+            raise
         except Exception:
             self._cache_repo.update_status(game_id, CacheStatus.FAILED)
             raise

@@ -45,7 +45,8 @@ import threading
 from pathlib import Path
 from typing import Callable, Optional
 
-from romcloud.core.exceptions import ROMCloudError
+from romcloud.core.cancellation import TransferCancellationToken
+from romcloud.core.exceptions import ROMCloudError, TransferCancelledError
 from romcloud.core.models.game import Game
 from romcloud.services.cache import CacheService
 from romcloud.infrastructure.mount_worker import romcloud_home_from_config
@@ -84,8 +85,8 @@ def run_graphical_progress_transfer(
     cannot even be launched — the caller should fall back to the
     curses/plain-text progress path, never treat it as a transfer failure.
     Raises :class:`~romcloud.core.exceptions.ROMCloudError` on a genuine
-    transfer failure. Raises ``KeyboardInterrupt`` if the user cancels via
-    the graphical UI.
+    transfer failure. Raises :class:`TransferCancelledError` if the user
+    cancels via the graphical UI.
     """
     try:
         proc = popen(
@@ -98,13 +99,13 @@ def run_graphical_progress_transfer(
     except OSError as exc:
         raise GraphicalProgressUnavailable(str(exc)) from exc
 
-    cancelled = threading.Event()
+    cancellation = TransferCancellationToken()
 
     def watch_cancel() -> None:
         try:
             for line in iter(proc.stdout.readline, ""):
                 if line.strip() == "cancel":
-                    cancelled.set()
+                    cancellation.cancel()
                     return
         except Exception:  # noqa: BLE001 — a broken pipe just stops the watch
             return
@@ -120,8 +121,7 @@ def run_graphical_progress_transfer(
             pass  # UI process gone — the transfer itself must still proceed
 
     def on_progress(done: int, total: int) -> None:
-        if cancelled.is_set():
-            raise KeyboardInterrupt("Transfer cancelled by user")
+        cancellation.raise_if_cancelled()
         send({
             "phase": "downloading",
             "done": done,
@@ -140,9 +140,13 @@ def run_graphical_progress_transfer(
 
     try:
         try:
-            path = cache_service.cache_game(game.id, on_progress=on_progress)
-        except KeyboardInterrupt:
-            send({"event": "error", "message": "Cancelled"})
+            path = cache_service.cache_game(
+                game.id,
+                on_progress=on_progress,
+                cancellation=cancellation,
+            )
+            cancellation.raise_if_cancelled()
+        except TransferCancelledError:
             raise
         except ROMCloudError as exc:
             send({"event": "error", "message": str(exc)})

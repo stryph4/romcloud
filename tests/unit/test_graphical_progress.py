@@ -14,7 +14,7 @@ import time
 
 import pytest
 
-from romcloud.core.exceptions import ROMCloudError
+from romcloud.core.exceptions import ROMCloudError, TransferCancelledError
 from romcloud.core.models.game import Game, GameAsset
 from romcloud.ui.graphical_progress import (
     GraphicalProgressUnavailable,
@@ -79,11 +79,15 @@ class _FakeCacheService:
     def __init__(self, *, path="/cache/ps2/game.iso", error: Exception | None = None) -> None:
         self.path = path
         self.error = error
+        self.progress_calls = 0
 
-    def cache_game(self, game_id, on_progress=None):
+    def cache_game(self, game_id, on_progress=None, cancellation=None):
         for i in range(50):
+            if cancellation:
+                cancellation.raise_if_cancelled()
             if on_progress:
                 on_progress(i * 10, 500)
+            self.progress_calls += 1
             time.sleep(0.005)
         if self.error:
             raise self.error
@@ -146,18 +150,21 @@ class TestRunGraphicalProgressTransfer:
         events = proc.stdin.events
         assert events[-1] == {"event": "error", "message": "disk full"}
 
-    def test_cancel_from_ui_raises_keyboard_interrupt_and_sends_error(self, dummy_game):
+    def test_cancel_from_ui_stops_transfer_without_reporting_failure(self, dummy_game):
         proc = _FakeProcess(stdout_lines=["cancel\n"])
 
         def fake_popen(*a, **k):
             return proc
 
         cache_service = _FakeCacheService()
-        with pytest.raises(KeyboardInterrupt):
+        with pytest.raises(TransferCancelledError):
             run_graphical_progress_transfer(cache_service, dummy_game, launcher_bin="/x", popen=fake_popen)
 
         events = proc.stdin.events
-        assert events[-1] == {"event": "error", "message": "Cancelled"}
+        assert not any(event.get("event") == "error" for event in events)
+        assert not any(event.get("event") == "launching" for event in events)
+        assert cache_service.progress_calls < 50
+        assert proc.wait_calls
 
     def test_broken_pipe_while_sending_does_not_crash_transfer(self, dummy_game):
         proc = _FakeProcess()
@@ -193,7 +200,7 @@ class TestRunGraphicalProgressTransfer:
             """Simulates TransferService's aggregated on_progress callback
             across three assets (cumulative bytes, not reset per asset)."""
 
-            def cache_game(self, game_id, on_progress=None):
+            def cache_game(self, game_id, on_progress=None, cancellation=None):
                 # cue: 0..100 of grand total 400
                 for d in (25, 50, 100):
                     if on_progress:

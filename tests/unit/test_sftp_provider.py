@@ -17,11 +17,13 @@ from pathlib import Path
 import paramiko
 import pytest
 
+from romcloud.core.cancellation import TransferCancellationToken
 from romcloud.core.exceptions import (
     ProviderAuthError,
     ProviderHostKeyMismatchError,
     ProviderHostKeyUnknownError,
     ProviderNotReachableError,
+    TransferCancelledError,
 )
 from romcloud.infrastructure.providers.sftp import (
     SFTPProvider,
@@ -284,6 +286,26 @@ class TestReadOperations:
         dest = tmp_path / "downloaded.bin"
         provider.transfer_to((root / "rom.bin").as_posix(), str(dest))
         assert dest.read_bytes() == b"payload-bytes"
+
+    def test_transfer_to_propagates_provider_neutral_cancellation(
+        self, sftp_server, tmp_path
+    ):
+        server, root = sftp_server
+        payload = b"x" * (512 * 1024)
+        (root / "large.bin").write_bytes(payload)
+        provider = _provider(server)
+        dest = tmp_path / "partial.bin"
+        cancellation = TransferCancellationToken()
+
+        def cancel(done, total):
+            cancellation.cancel()
+            cancellation.raise_if_cancelled()
+
+        with pytest.raises(TransferCancelledError):
+            provider.transfer_to((root / "large.bin").as_posix(), str(dest), cancel)
+
+        assert dest.exists()
+        assert dest.stat().st_size < len(payload)
 
     def test_walk_enumerates_nested_files(self, sftp_server):
         server, root = sftp_server

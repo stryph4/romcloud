@@ -852,6 +852,32 @@ class TestLaunchModeIsolation:
 
 
 class TestRunLauncherWrapperCancellation:
+    def test_explicit_transfer_cancel_exits_successfully_without_launching(
+        self, monkeypatch, capsys
+    ):
+        import romcloud.integrations.batocera.launcher as launcher_module
+        from romcloud.core.exceptions import TransferCancelledError
+
+        def fake_resolve_and_cache(proxy_path):
+            raise TransferCancelledError("Transfer cancelled by user")
+
+        launched = []
+        monkeypatch.setattr(launcher_module, "_resolve_and_cache", fake_resolve_and_cache)
+        monkeypatch.setattr(
+            launcher_module.EmulatorLauncher,
+            "exec_with_rom",
+            lambda *args, **kwargs: launched.append((args, kwargs)),
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            launcher_module.run_launcher_wrapper(list(_ROMCLOUD_ARGV))
+
+        assert exc_info.value.code == 0
+        assert launched == []
+        captured = capsys.readouterr()
+        assert "cancelled" in captured.err.lower()
+        assert "error preparing game" not in captured.err.lower()
+
     def test_cancelled_transfer_exits_cleanly_without_traceback(self, monkeypatch, capsys):
         import romcloud.integrations.batocera.launcher as launcher_module
 

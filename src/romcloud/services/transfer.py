@@ -38,7 +38,12 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from romcloud.core.cache_paths import resolve_cache_path
-from romcloud.core.exceptions import TransferError, TransferValidationError
+from romcloud.core.cancellation import TransferCancellationToken
+from romcloud.core.exceptions import (
+    TransferCancelledError,
+    TransferError,
+    TransferValidationError,
+)
 from romcloud.core.models.game import Game, GameAsset
 from romcloud.core.storage import StorageProvider
 from romcloud.infrastructure.logging import get_logger
@@ -78,6 +83,7 @@ class TransferService:
         self,
         game: Game,
         on_progress: Optional[Callable[[int, int], None]] = None,
+        cancellation: Optional[TransferCancellationToken] = None,
     ) -> str:
         """Transfer all game assets and return the final cache path.
 
@@ -98,7 +104,9 @@ class TransferService:
         cumulative_done = 0
 
         try:
+            _check_cancelled(cancellation)
             for asset in game.assets:
+                _check_cancelled(cancellation)
                 final = self._final_path(game.system, asset.relative_path)
                 final_size = _existing_size(final)
 
@@ -108,8 +116,10 @@ class TransferService:
                     # Already fully cached (from a previous run, or another
                     # asset of this same game) — repair only what's missing.
                     cumulative_done += final_size
+                    _check_cancelled(cancellation)
                     if on_progress:
                         on_progress(cumulative_done, grand_total or cumulative_done)
+                    _check_cancelled(cancellation)
                     continue
 
                 # Preserve the original filename verbatim, and mirror its
@@ -125,19 +135,32 @@ class TransferService:
                 base_done = cumulative_done
 
                 def _asset_progress(done: int, total: int, _base: int = base_done) -> None:
+                    _check_cancelled(cancellation)
                     if on_progress:
                         on_progress(_base + done, grand_total or (_base + total))
+                    _check_cancelled(cancellation)
 
                 log.debug("Transferring asset %s → %s", asset.relative_path, dst)
                 self._provider.transfer_to(src, str(dst), _asset_progress)
+                _check_cancelled(cancellation)
                 cumulative_done = base_done + (_existing_size(dst) or 0)
 
+            _check_cancelled(cancellation)
             self._validate(game)
+            _check_cancelled(cancellation)
 
             final = self._promote(game)
+            _check_cancelled(cancellation)
             log.info("Transfer complete for %r → %s", game.title, final)
             return final
 
+        except TransferCancelledError:
+            log.info(
+                "Transfer cancelled for %r (%s); staging preserved for retry",
+                game.title,
+                game.id,
+            )
+            raise
         except Exception as exc:
             log.warning(
                 "Transfer failed for %r (%s): %s — staging preserved for resume",
@@ -258,3 +281,8 @@ def _existing_size(path: Path) -> Optional[int]:
     if path.is_dir():
         return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
     return None
+
+
+def _check_cancelled(cancellation: Optional[TransferCancellationToken]) -> None:
+    if cancellation is not None:
+        cancellation.raise_if_cancelled()

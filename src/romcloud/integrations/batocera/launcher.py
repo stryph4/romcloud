@@ -66,7 +66,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from romcloud.core.exceptions import LaunchError
+from romcloud.core.exceptions import LaunchError, TransferCancelledError
 from romcloud.infrastructure.logging import get_logger
 
 log = get_logger("batocera.launcher")
@@ -212,6 +212,10 @@ def run_launcher_wrapper(argv: list[str]) -> None:
     # .romcloud proxy — resolve, cache, then hand off to emulatorlauncher.
     try:
         cached_path = _resolve_and_cache(rom_path)
+    except TransferCancelledError:
+        log.info("Launch cancelled by user for %r", rom_path)
+        print("romcloud-run: launch cancelled", file=sys.stderr)
+        sys.exit(0)
     except KeyboardInterrupt:
         log.info("Launch cancelled by user for %r", rom_path)
         print("romcloud-run: launch cancelled", file=sys.stderr)

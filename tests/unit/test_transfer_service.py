@@ -8,7 +8,53 @@ import pytest
 
 from romcloud.core.models.game import Game, GameAsset
 from romcloud.services.transfer import TransferService
-from romcloud.core.exceptions import TransferValidationError
+from romcloud.core.cancellation import TransferCancellationToken
+from romcloud.core.exceptions import TransferCancelledError, TransferValidationError
+
+
+class _ChunkedProvider:
+    """Deterministic fake using the shared provider progress contract."""
+
+    def __init__(self, provider_id: str = "local", chunk_size: int = 100) -> None:
+        self.provider_id = provider_id
+        self.chunk_size = chunk_size
+        self.calls = 0
+
+    def transfer_to(self, source_path, dest_path, on_progress=None):
+        self.calls += 1
+        source = Path(source_path)
+        destination = Path(dest_path)
+        if source.is_dir():
+            files = sorted(path for path in source.rglob("*") if path.is_file())
+            total = sum(path.stat().st_size for path in files)
+            done = 0
+            destination.mkdir(parents=True, exist_ok=True)
+            for source_file in files:
+                target = destination / source_file.relative_to(source)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with source_file.open("rb") as src, target.open("wb") as dst:
+                    while chunk := src.read(self.chunk_size):
+                        dst.write(chunk)
+                        done += len(chunk)
+                        if on_progress:
+                            on_progress(done, total)
+            return
+
+        total = source.stat().st_size
+        done = 0
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with source.open("rb") as src, destination.open("wb") as dst:
+            while chunk := src.read(self.chunk_size):
+                dst.write(chunk)
+                done += len(chunk)
+                if on_progress:
+                    on_progress(done, total)
+
+    def get_size(self, path):
+        source = Path(path)
+        if source.is_file():
+            return source.stat().st_size
+        return sum(item.stat().st_size for item in source.rglob("*") if item.is_file())
 
 
 @pytest.fixture
@@ -50,6 +96,69 @@ def dir_game(tmp_path) -> tuple[Game, Path]:
 
 
 class TestTransferService:
+    @pytest.mark.parametrize("provider_id", ["local", "smb", "sftp"])
+    def test_cancellation_is_provider_neutral_and_stops_before_completion(
+        self, provider_id, simple_game, cache_dir
+    ):
+        game, _ = simple_game
+        provider = _ChunkedProvider(provider_id)
+        service = TransferService(provider=provider, cache_root=str(cache_dir))
+        cancellation = TransferCancellationToken()
+
+        def cancel_after_first_chunk(done, total):
+            assert done < total
+            cancellation.cancel()
+
+        with pytest.raises(TransferCancelledError):
+            service.transfer(game, cancel_after_first_chunk, cancellation)
+
+        staging = cache_dir / ".partial" / "ps2" / "Test Game.iso"
+        final = cache_dir / "ps2" / "Test Game.iso"
+        assert 0 < staging.stat().st_size < game.total_size_bytes
+        assert not final.exists()
+        assert provider.calls == 1
+
+    def test_cancelled_directory_package_stays_staged_and_invalid(
+        self, dir_game, cache_dir
+    ):
+        game, _ = dir_game
+        service = TransferService(
+            provider=_ChunkedProvider("sftp"), cache_root=str(cache_dir)
+        )
+        cancellation = TransferCancellationToken()
+
+        def cancel_after_first_chunk(done, total):
+            cancellation.cancel()
+
+        with pytest.raises(TransferCancelledError):
+            service.transfer(game, cancel_after_first_chunk, cancellation)
+
+        staging = cache_dir / ".partial" / "ps3" / "BCES00000"
+        final = cache_dir / "ps3" / "BCES00000"
+        assert staging.is_dir()
+        assert service.staging_size(game) < game.total_size_bytes
+        assert not final.exists()
+
+    def test_subsequent_transfer_reuses_safe_staging_path_and_completes(
+        self, simple_game, cache_dir
+    ):
+        game, _ = simple_game
+        service = TransferService(
+            provider=_ChunkedProvider("sftp"), cache_root=str(cache_dir)
+        )
+        cancellation = TransferCancellationToken()
+
+        with pytest.raises(TransferCancelledError):
+            service.transfer(
+                game,
+                lambda done, total: cancellation.cancel(),
+                cancellation,
+            )
+
+        final = Path(service.transfer(game))
+        assert final.read_bytes() == b"rom_content" * 100
+        assert not (cache_dir / ".partial" / "ps2" / "Test Game.iso").exists()
+
     def test_estimates_unknown_directory_size_only_when_requested(
         self, dir_game, cache_dir
     ):

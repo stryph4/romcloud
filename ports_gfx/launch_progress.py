@@ -227,12 +227,7 @@ def _run(pygame, state: LaunchProgressState) -> int:  # noqa: ANN001
                 if event.type == pygame.QUIT:
                     state.request_cancel()
                     running = False
-                elif event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_q):
-                    state.request_cancel()
-                elif event.type in (
-                    getattr(pygame, "JOYBUTTONDOWN", object()),
-                    getattr(pygame, "CONTROLLERBUTTONDOWN", object()),
-                ) and getattr(event, "button", None) == 1:
+                elif _is_cancel_input(pygame, event):
                     state.request_cancel()
 
             if state.cancelled:
@@ -261,6 +256,16 @@ def _run(pygame, state: LaunchProgressState) -> int:  # noqa: ANN001
         return 0
     finally:
         pygame.quit()
+
+
+def _is_cancel_input(pygame, event) -> bool:  # noqa: ANN001
+    """Return whether an input event is the Preparing Game cancel action."""
+    if event.type == pygame.KEYDOWN:
+        return event.key in (pygame.K_ESCAPE, pygame.K_q)
+    return event.type in (
+        getattr(pygame, "JOYBUTTONDOWN", object()),
+        getattr(pygame, "CONTROLLERBUTTONDOWN", object()),
+    ) and getattr(event, "button", None) == 1
 
 
 def _render(pygame, screen, layout: Layout, font_title, font_body, font_hint, state: LaunchProgressState) -> None:  # noqa: ANN001

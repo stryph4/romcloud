@@ -128,6 +128,15 @@ class TransferInterruptedError(TransferError):
     """Transfer was interrupted; partial data remains for resume."""
 
 
+class TransferCancelledError(TransferInterruptedError):
+    """The user explicitly cancelled an active transfer.
+
+    Staged data may remain, but it must not be treated as a completed cache
+    entry. Keeping cancellation distinct from transport failures lets launch
+    surfaces return quietly instead of reporting a network/storage error.
+    """
+
+
 class TransferValidationError(TransferError):
     """Transferred data failed validation (size mismatch, etc.)."""
 

@@ -8,6 +8,7 @@ import io
 
 from ports_gfx.launch_progress import (
     LaunchProgressState,
+    _is_cancel_input,
     _open_display,
     main,
     parse_event,
@@ -94,6 +95,40 @@ class TestProgressFraction:
         state = LaunchProgressState()
         state.apply({"done": 2000, "total": 1000})
         assert progress_fraction(state) == 1.0
+
+
+class TestCancelInput:
+    def test_escape_requests_the_shared_cancel_action(self):
+        pygame = type(
+            "Pygame",
+            (),
+            {
+                "KEYDOWN": 1,
+                "K_ESCAPE": 27,
+                "K_q": 113,
+                "JOYBUTTONDOWN": 2,
+                "CONTROLLERBUTTONDOWN": 3,
+            },
+        )()
+        event = type("Event", (), {"type": pygame.KEYDOWN, "key": pygame.K_ESCAPE})()
+
+        assert _is_cancel_input(pygame, event) is True
+
+    def test_controller_b_requests_the_shared_cancel_action(self):
+        pygame = type(
+            "Pygame",
+            (),
+            {
+                "KEYDOWN": 1,
+                "K_ESCAPE": 27,
+                "K_q": 113,
+                "JOYBUTTONDOWN": 2,
+                "CONTROLLERBUTTONDOWN": 3,
+            },
+        )()
+        for event_type in (pygame.JOYBUTTONDOWN, pygame.CONTROLLERBUTTONDOWN):
+            event = type("Event", (), {"type": event_type, "button": 1})()
+            assert _is_cancel_input(pygame, event) is True
 
 
 class TestReadEvents:
