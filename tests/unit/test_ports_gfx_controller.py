@@ -115,6 +115,22 @@ class TestLogicalControllerNavigation:
         assert manager.handle_event(back) == Action.BACK
         assert manager.handle_event(menu) == Action.MENU
 
+    def test_l3_uses_the_shared_text_shift_action(self):
+        pygame = make_fake_pygame(
+            joysticks={0: FakeJoystick(guid="g1")},
+            controller_indices=frozenset({0}),
+        )
+        manager = ControllerManager(pygame)
+        manager.handle_event(_added_event(pygame, 0, use_controller=True))
+
+        l3 = FakeEvent(
+            type=pygame.CONTROLLERBUTTONDOWN,
+            instance_id=1,
+            button=pygame.CONTROLLER_BUTTON_LEFTSTICK,
+        )
+
+        assert manager.handle_event(l3) == Action.TEXT_TOGGLE_SHIFT
+
     def test_shoulders_use_shared_page_actions(self):
         pygame = make_fake_pygame(joysticks={0: FakeJoystick(guid="g1")}, controller_indices=frozenset({0}))
         manager = ControllerManager(pygame)

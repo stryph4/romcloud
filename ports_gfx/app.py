@@ -2996,7 +2996,7 @@ def _render_wizard(  # noqa: ANN001
             context_y += layout.fonts.hint + 4
         text_rect = compute_osk_text_rect(regions.osk)
         pygame.draw.rect(screen, _CARD_BG, (text_rect.x, text_rect.y, text_rect.w, text_rect.h), border_radius=6)
-        display_value = wizard.osk.displayed_text or " "
+        display_value = wizard.osk.displayed_text_for_font(fonts["body"]) or " "
         max_chars = max(1, text_rect.w // max(8, layout.fonts.body // 2))
         value = fonts["body"].render(display_value[-max_chars:], True, _FG_COLOR)
         screen.blit(value, (text_rect.x + 12, text_rect.y + max(4, (text_rect.h - value.get_height()) // 2)))
@@ -3016,8 +3016,13 @@ def _render_wizard(  # noqa: ANN001
         max_chars = max(1, content.w // max(8, layout.fonts.body // 2))
         body_lines = _wizard_body_lines(wizard)
         if wizard.osk is not None:
+            displayed_value = wizard.osk.displayed_text_for_font(fonts["body"])
             body_lines.extend(
-                ["", f"Current value: {wizard.osk.displayed_text}", "Start/options controller button opens the on-screen keyboard"]
+                [
+                    "",
+                    f"Current value: {displayed_value}",
+                    "Enter or Start/options submits without moving to Confirm",
+                ]
             )
         for line in body_lines:
             for wrapped in wrap_lines([line], max_chars):

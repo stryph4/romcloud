@@ -570,6 +570,10 @@ class WizardState:
                 return
             self._cancel_osk()
             return
+        if self.osk.handle_shortcut(event.action, source=event.source):
+            if self.osk.confirmed:
+                self._commit_osk(romcloud_bin)
+            return
         if event.action == Action.MENU:
             self.osk_visible = not self.osk_visible
             return

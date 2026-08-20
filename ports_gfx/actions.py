@@ -37,6 +37,7 @@ class Action(Enum):
     # raw keycode.
     TEXT_INPUT = "text_input"
     TEXT_BACKSPACE = "text_backspace"
+    TEXT_SUBMIT = "text_submit"
     TEXT_TOGGLE_SHIFT = "text_toggle_shift"
     TEXT_TOGGLE_SYMBOLS = "text_toggle_symbols"
     TEXT_TOGGLE_MASK = "text_toggle_mask"

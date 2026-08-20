@@ -28,6 +28,18 @@ class TestActionForKey:
         assert action_for_key(pygame, pygame.K_SPACE) == Action.CONFIRM
         assert action_for_key(pygame, pygame.K_KP_ENTER) == Action.CONFIRM
 
+    def test_enter_submits_but_space_does_not_confirm_in_text_mode(self):
+        pygame = make_fake_pygame()
+        assert (
+            action_for_key(pygame, pygame.K_RETURN, text_mode=True)
+            == Action.TEXT_SUBMIT
+        )
+        assert (
+            action_for_key(pygame, pygame.K_KP_ENTER, text_mode=True)
+            == Action.TEXT_SUBMIT
+        )
+        assert action_for_key(pygame, pygame.K_SPACE, text_mode=True) is None
+
     def test_escape_is_back(self):
         pygame = make_fake_pygame()
         assert action_for_key(pygame, pygame.K_ESCAPE) == Action.BACK

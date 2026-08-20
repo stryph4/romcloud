@@ -5,7 +5,7 @@ from ports_gfx.activity import ActivityEvent
 from ports_gfx.client import BackendResult
 from ports_gfx.input_manager import InputEvent
 from ports_gfx.layout import Rect
-from ports_gfx.osk import MASK_CHAR
+from ports_gfx.osk import MASK_FALLBACK_CHAR
 from ports_gfx.wizard import STEP_CONTEXT, STEPS, WizardState, WizardStep
 
 
@@ -126,11 +126,66 @@ def test_password_is_masked_and_cancel_returns_without_saving():
     wizard = WizardState()
     wizard.enter_text_step(WizardStep.PASSWORD)
     wizard.handle_event(InputEvent(Action.TEXT_INPUT, text="secret"), RECTS, "romcloud")
-    assert wizard.osk.displayed_text == MASK_CHAR * 6
+    assert wizard.osk.displayed_text == MASK_FALLBACK_CHAR * 6
     wizard.handle_event(InputEvent(Action.BACK), RECTS, "romcloud")
     assert wizard.step == WizardStep.USERNAME
     assert wizard.password == ""
     assert "secret" not in repr(wizard)
+
+
+def test_keyboard_enter_submits_wizard_password_without_confirm_focus(monkeypatch):
+    wizard = WizardState()
+    wizard.enter_text_step(WizardStep.PASSWORD)
+    wizard.handle_event(
+        InputEvent(Action.TEXT_INPUT, text="secret", source="keyboard"),
+        RECTS,
+        "romcloud",
+    )
+    started = []
+    monkeypatch.setattr(
+        wizard,
+        "_start_operation",
+        lambda step, action, binary: started.append((step, action)),
+    )
+
+    wizard.handle_event(
+        InputEvent(Action.TEXT_SUBMIT, source="keyboard"), RECTS, "romcloud"
+    )
+
+    assert wizard.password == "secret"
+    assert wizard.osk is None
+    assert started == [(WizardStep.DISCOVER, "setup-discover")]
+
+
+def test_controller_start_submits_wizard_text_without_confirm_focus():
+    wizard = WizardState()
+    wizard.enter_text_step(WizardStep.SERVER)
+    wizard.handle_event(
+        InputEvent(Action.TEXT_INPUT, text="nas.local", source="keyboard"),
+        RECTS,
+        "romcloud",
+    )
+
+    wizard.handle_event(
+        InputEvent(Action.MENU, source="controller"), RECTS, "romcloud"
+    )
+
+    assert wizard.server == "nas.local"
+    assert wizard.step == WizardStep.PORT
+
+
+def test_controller_l3_toggles_wizard_osk_shift():
+    wizard = WizardState()
+    wizard.enter_text_step(WizardStep.USERNAME)
+
+    wizard.handle_event(
+        InputEvent(Action.TEXT_TOGGLE_SHIFT, source="controller"),
+        RECTS,
+        "romcloud",
+    )
+
+    assert wizard.osk is not None
+    assert wizard.osk.shift is True
 
 
 def test_share_discovery_success_and_failure(monkeypatch):

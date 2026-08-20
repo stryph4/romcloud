@@ -19,9 +19,29 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+from ports_gfx.actions import Action
 from ports_gfx.layout import Rect, compute_safe_area
 
 MASK_CHAR = "\u2022"  # "•"
+
+
+MASK_FALLBACK_CHAR = "*"
+
+
+def mask_character_for_font(font) -> str:  # noqa: ANN001
+    """Return a mask glyph the active renderer can display safely."""
+    metrics = getattr(font, "metrics", None)
+    if not callable(metrics):
+        return MASK_FALLBACK_CHAR
+    try:
+        glyph_metrics = metrics(MASK_CHAR)
+    except Exception:  # noqa: BLE001 - font backends vary across Batocera builds
+        return MASK_FALLBACK_CHAR
+    return (
+        MASK_CHAR
+        if glyph_metrics and glyph_metrics[0] is not None
+        else MASK_FALLBACK_CHAR
+    )
 
 
 @dataclass(frozen=True)
@@ -137,7 +157,13 @@ class OskState:
     @property
     def displayed_text(self) -> str:
         if self.masked and not self.mask_revealed:
-            return MASK_CHAR * len(self.text)
+            return MASK_FALLBACK_CHAR * len(self.text)
+        return self.text
+
+    def displayed_text_for_font(self, font) -> str:  # noqa: ANN001
+        """Return render-safe text using the active font's supported mask."""
+        if self.masked and not self.mask_revealed:
+            return mask_character_for_font(font) * len(self.text)
         return self.text
 
     def key_label(self, key: OskKey) -> str:
@@ -180,6 +206,23 @@ class OskState:
     def toggle_mask_reveal(self) -> None:
         if self.masked:
             self.mask_revealed = not self.mask_revealed
+
+    def handle_shortcut(self, action: Action | None, *, source: str | None) -> bool:
+        """Handle focus-independent submit and Shift shortcuts.
+
+        Keyboard Enter is translated to ``TEXT_SUBMIT`` and controller
+        Start/Options to ``MENU``. The input source distinguishes those
+        shortcuts from controller A/touch activation and keyboard Tab.
+        """
+        if action == Action.TEXT_TOGGLE_SHIFT:
+            self.toggle_shift()
+            return True
+        keyboard_submit = action == Action.TEXT_SUBMIT and source == "keyboard"
+        controller_submit = action == Action.MENU and source == "controller"
+        if keyboard_submit or controller_submit:
+            self.confirmed = True
+            return True
+        return False
 
     # ── activation (controller/touch/on-screen click) ──────────────────────
 

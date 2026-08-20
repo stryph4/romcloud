@@ -65,6 +65,7 @@ _LOGICAL_BUTTON_ACTION_NAMES: dict[str, Action] = {
     "CONTROLLER_BUTTON_LEFTSHOULDER": Action.PREVIOUS_PAGE,
     "CONTROLLER_BUTTON_RIGHTSHOULDER": Action.NEXT_PAGE,
     "CONTROLLER_BUTTON_START": Action.MENU,
+    "CONTROLLER_BUTTON_LEFTSTICK": Action.TEXT_TOGGLE_SHIFT,
 }
 
 # Left analog stick logical axis constant names -> which axis ("x"/"y").

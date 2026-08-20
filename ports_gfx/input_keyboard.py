@@ -23,6 +23,7 @@ _DIRECTION_KEY_NAMES = {
     "K_d": Action.RIGHT,
 }
 _CONFIRM_KEY_NAMES = ("K_RETURN", "K_SPACE", "K_KP_ENTER")
+_TEXT_SUBMIT_KEY_NAMES = ("K_RETURN", "K_KP_ENTER")
 _BACK_KEY_NAMES = ("K_ESCAPE", "K_BACKSPACE")
 _MENU_KEY_NAMES = ("K_TAB",)
 _BACKSPACE_KEY_NAMES = ("K_BACKSPACE",)
@@ -47,6 +48,11 @@ def action_for_key(pygame, key: int, *, text_mode: bool = False) -> Optional[Act
     """
     if text_mode and key in _keys_by_name(pygame, _BACKSPACE_KEY_NAMES):
         return Action.TEXT_BACKSPACE
+    if text_mode and key in _keys_by_name(pygame, _TEXT_SUBMIT_KEY_NAMES):
+        return Action.TEXT_SUBMIT
+    if text_mode and key == getattr(pygame, "K_SPACE", None):
+        # TEXTINPUT supplies the actual space character for the active field.
+        return None
 
     for name, action in _DIRECTION_KEY_NAMES.items():
         value = getattr(pygame, name, None)

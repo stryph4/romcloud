@@ -2,8 +2,15 @@
 
 from __future__ import annotations
 
+from ports_gfx.actions import Action
 from ports_gfx.layout import compute_safe_area, find_next_focus_index
-from ports_gfx.osk import MASK_CHAR, OskState, compute_layout_rects, compute_osk_layout
+from ports_gfx.osk import (
+    MASK_CHAR,
+    MASK_FALLBACK_CHAR,
+    OskState,
+    compute_layout_rects,
+    compute_osk_layout,
+)
 
 
 class TestBasicTextEntry:
@@ -107,6 +114,34 @@ class TestConfirmCancel:
         assert state.cancelled is True
         assert state.confirmed is False
 
+    def test_keyboard_enter_shortcut_submits_without_confirm_focus(self):
+        state = OskState(initial_text="hello")
+        assert state.keys[state.selected_index].kind == "char"
+
+        handled = state.handle_shortcut(Action.TEXT_SUBMIT, source="keyboard")
+
+        assert handled is True
+        assert state.confirmed is True
+        assert state.text == "hello"
+
+    def test_controller_start_shortcut_submits_without_confirm_focus(self):
+        state = OskState(initial_text="hello")
+
+        handled = state.handle_shortcut(Action.MENU, source="controller")
+
+        assert handled is True
+        assert state.confirmed is True
+
+    def test_l3_shortcut_toggles_shift(self):
+        state = OskState()
+
+        assert state.handle_shortcut(
+            Action.TEXT_TOGGLE_SHIFT, source="controller"
+        )
+        assert state.shift is True
+        state.handle_shortcut(Action.TEXT_TOGGLE_SHIFT, source="controller")
+        assert state.shift is False
+
 
 class TestSpecialKeyLabels:
     def test_special_key_labels_are_ascii_portable(self):
@@ -125,7 +160,7 @@ class TestMaskedPassword:
 
     def test_masked_field_hides_text_by_default(self):
         state = OskState(initial_text="secret", masked=True)
-        assert state.displayed_text == MASK_CHAR * len("secret")
+        assert state.displayed_text == MASK_FALLBACK_CHAR * len("secret")
 
     def test_mask_toggle_key_present_only_when_masked(self):
         masked_state = OskState(masked=True)
@@ -139,12 +174,35 @@ class TestMaskedPassword:
         state.activate(mask_index)
         assert state.displayed_text == "secret"
         state.activate(mask_index)
-        assert state.displayed_text == MASK_CHAR * len("secret")
+        assert state.displayed_text == MASK_FALLBACK_CHAR * len("secret")
 
     def test_mask_toggle_is_a_no_op_on_unmasked_field(self):
         state = OskState(initial_text="hello", masked=False)
         state.toggle_mask_reveal()
         assert state.displayed_text == "hello"
+
+    def test_rendering_prefers_bullet_when_the_active_font_supports_it(self):
+        font = type("Font", (), {"metrics": lambda self, text: [(0, 1, 0, 1, 1)]})()
+        state = OskState(initial_text="secret", masked=True)
+
+        assert state.displayed_text_for_font(font) == MASK_CHAR * len("secret")
+
+    def test_rendering_falls_back_to_ascii_when_bullet_is_unsupported(self):
+        font = type("Font", (), {"metrics": lambda self, text: [None]})()
+        state = OskState(initial_text="secret", masked=True)
+
+        assert state.displayed_text_for_font(font) == MASK_FALLBACK_CHAR * len(
+            "secret"
+        )
+
+    def test_plain_text_rendering_is_unchanged_and_does_not_probe_mask_glyph(self):
+        class Font:
+            def metrics(self, text):
+                raise AssertionError("plain text must not probe password mask glyphs")
+
+        state = OskState(initial_text="Visible Text", masked=False)
+
+        assert state.displayed_text_for_font(Font()) == "Visible Text"
 
 
 class TestPhysicalKeyboardWhileOskActive:
