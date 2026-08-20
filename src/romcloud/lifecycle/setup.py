@@ -585,10 +585,9 @@ def probe_sftp_host_key(payload: dict[str, Any]) -> dict[str, str]:
     """Return the host key for explicit wizard trust before credentials use."""
     from romcloud.infrastructure.providers.sftp import probe_host_key
 
-    purpose = str(payload.get("purpose", "source"))
-    prefix = "remote_" if purpose == "remote_data" else ""
-    host = str(payload.get(f"{prefix}server", "")).strip()
-    port = int(payload.get(f"{prefix}port", 22))
+    connection = _sftp_setup_connection(payload)
+    host = connection["host"]
+    port = connection["port"]
     if not host:
         raise ValueError("SFTP server is required.")
     key_type, fingerprint = probe_host_key(host, port)
@@ -601,20 +600,17 @@ def validate_sftp_source(
     """Validate an SFTP target using its existing strict host-key provider."""
     from romcloud.infrastructure.providers.sftp import SFTPProvider
 
-    purpose = str(payload.get("purpose", "source"))
-    remote = purpose == "remote_data"
-    prefix = "remote_" if remote else ""
+    connection = _sftp_setup_connection(payload)
+    remote = connection["purpose"] == "remote_data"
     root = normalize_sftp_directory(
         str(payload.get("remote_data_root" if remote else "source_remote_path", ""))
     )
     provider = SFTPProvider(
-        host=str(payload.get(f"{prefix}server", "")).strip(),
-        username=str(payload.get(f"{prefix}username", "")).strip(),
-        password=str(payload.get(f"{prefix}password", "")),
-        port=int(payload.get(f"{prefix}port", 22)),
-        trusted_host_key_fingerprint=str(
-            payload.get("remote_sftp_host_key_fingerprint" if remote else "sftp_host_key_fingerprint", "")
-        ).strip() or None,
+        host=connection["host"],
+        username=connection["username"],
+        password=connection["password"],
+        port=connection["port"],
+        trusted_host_key_fingerprint=connection["trusted_fingerprint"],
         probe_writable=remote,
     )
     emit_progress(progress, "configure", "directory", "running", "Checking the selected SFTP folder…")
@@ -645,24 +641,14 @@ def browse_sftp_directory(
     """List directories at one absolute, account-visible SFTP path."""
     from romcloud.infrastructure.providers.sftp import SFTPProvider
 
-    purpose = str(payload.get("purpose", "source"))
-    remote = purpose == "remote_data"
-    prefix = "remote_" if remote else ""
+    connection = _sftp_setup_connection(payload)
     path = normalize_sftp_directory(str(payload.get("sftp_browse_path", "/")))
     provider = SFTPProvider(
-        host=str(payload.get(f"{prefix}server", "")).strip(),
-        username=str(payload.get(f"{prefix}username", "")).strip(),
-        password=str(payload.get(f"{prefix}password", "")),
-        port=int(payload.get(f"{prefix}port", 22)),
-        trusted_host_key_fingerprint=str(
-            payload.get(
-                "remote_sftp_host_key_fingerprint"
-                if remote
-                else "sftp_host_key_fingerprint",
-                "",
-            )
-        ).strip()
-        or None,
+        host=connection["host"],
+        username=connection["username"],
+        password=connection["password"],
+        port=connection["port"],
+        trusted_host_key_fingerprint=connection["trusted_fingerprint"],
         probe_writable=False,
     )
     emit_progress(progress, "browse", "directory", "running", f"Opening {path}…")
@@ -1055,6 +1041,35 @@ def _remote_data_root(payload: dict[str, Any]) -> str:
     if str(payload.get("remote_data_type", "none")).strip().lower() == "sftp":
         return normalize_sftp_directory(raw)
     return raw
+
+
+def _sftp_setup_connection(payload: dict[str, Any]) -> dict[str, Any]:
+    """Resolve one wizard SFTP role without mixing source and data fields.
+
+    Host-key observation, directory browsing, and final validation all use
+    this same extraction path so a wizard transition cannot silently switch
+    credentials or fingerprints. Remote paths remain separate because the
+    provider accepts absolute server-visible POSIX paths directly.
+    """
+    purpose = str(payload.get("purpose", "source")).strip().lower()
+    if purpose not in ("source", "remote_data"):
+        raise ValueError(f"Unsupported SFTP setup role: {purpose or 'missing'}")
+    remote = purpose == "remote_data"
+    prefix = "remote_" if remote else ""
+    fingerprint_key = (
+        "remote_sftp_host_key_fingerprint"
+        if remote
+        else "sftp_host_key_fingerprint"
+    )
+    return {
+        "purpose": purpose,
+        "host": str(payload.get(f"{prefix}server", "")).strip(),
+        "port": int(payload.get(f"{prefix}port", 22)),
+        "username": str(payload.get(f"{prefix}username", "")).strip(),
+        "password": str(payload.get(f"{prefix}password", "")),
+        "trusted_fingerprint": str(payload.get(fingerprint_key, "")).strip()
+        or None,
+    }
 
 
 def _redact(detail: str, *secrets: str) -> str:

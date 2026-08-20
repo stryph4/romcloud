@@ -372,7 +372,7 @@ def test_sftp_source_browser_lists_root_and_enters_case_sensitive_folder(monkeyp
         {"name": "Roms", "is_directory": True},
         {"name": "lowercase", "is_directory": True},
     ]
-    wizard.selected_index = 3
+    wizard.selected_index = 2
 
     wizard._confirm("romcloud")  # noqa: SLF001
 
@@ -398,11 +398,10 @@ def test_sftp_browser_parent_and_root_boundary_are_safe(monkeypatch):
     assert wizard.source_sftp_browse_path == "/Roms"
     wizard.back()
     assert wizard.source_sftp_browse_path == "/"
-    wizard.selected_index = 2  # Up one folder at root
-    wizard._confirm("romcloud")  # noqa: SLF001
-
-    assert calls[-1]["sftp_browse_path"] == "/"
-    assert "/.." not in calls[-1]["sftp_browse_path"]
+    assert "Up one folder" not in wizard.options
+    wizard.back()
+    assert wizard.step == WizardStep.SFTP_TRUST
+    assert calls == []
 
 
 def test_sftp_select_folder_persists_path_and_starts_source_validation(monkeypatch):

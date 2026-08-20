@@ -289,6 +289,150 @@ class TestSetupState:
 
 
 class TestSFTPDirectoryBrowsing:
+    def test_trust_browse_select_and_validate_preserve_one_source_session(
+        self, tmp_path, monkeypatch
+    ):
+        from click.testing import CliRunner
+        from ports_gfx.client import BackendResult
+        from ports_gfx.wizard import WizardState, WizardStep
+        import ports_gfx.wizard as wizard_module
+        from romcloud.cli.main import cli
+
+        fingerprint = "SHA256:observed-and-trusted"
+        expected_connection = {
+            "host": "nas.example",
+            "port": 2222,
+            "username": "rom-reader",
+            "password": "source-secret",
+            "trusted_host_key_fingerprint": fingerprint,
+        }
+        provider_calls = []
+        provider_paths = []
+        requests = []
+
+        class Provider:
+            def __init__(self, **kwargs):
+                provider_calls.append(dict(kwargs))
+
+            def list_systems(self, path):
+                provider_paths.append(("list", path))
+                return ["Roms"] if path == "/" else ["ps2"]
+
+            def validate_access(self, path):
+                provider_paths.append(("validate", path))
+                return StorageAccessResult(True, True)
+
+        class Runner:
+            is_finished = True
+
+            def __init__(self, result):
+                self.result = result
+
+            def poll(self):
+                return []
+
+        monkeypatch.setattr(
+            "romcloud.infrastructure.providers.sftp.probe_host_key",
+            lambda host, port: ("ssh-ed25519", fingerprint),
+        )
+        monkeypatch.setattr(
+            "romcloud.infrastructure.providers.sftp.SFTPProvider", Provider
+        )
+
+        def start(_binary, action, payload):
+            # Exercise the same JSON boundary as the graphical subprocess bridge.
+            request = json.loads(json.dumps(payload))
+            requests.append((action, request))
+            result = CliRunner().invoke(
+                cli,
+                [
+                    "--config",
+                    str(tmp_path / "not-configured.toml"),
+                    "uidata",
+                    action,
+                ],
+                input=json.dumps(request),
+            )
+            assert result.exit_code == 0, result.output
+            response = json.loads(result.stdout.splitlines()[-1])
+            return Runner(BackendResult(True, response))
+
+        monkeypatch.setattr(wizard_module, "start_backend_operation", start)
+        monkeypatch.setattr(
+            wizard_module, "operation_result", lambda runner: runner.result
+        )
+
+        wizard = WizardState()
+        wizard.source_type = "sftp"
+        wizard.server = expected_connection["host"]
+        wizard.port = expected_connection["port"]
+        wizard.username = expected_connection["username"]
+        wizard.enter_text_step(WizardStep.PASSWORD, show_osk=False)
+        wizard.osk.text = expected_connection["password"]
+
+        wizard._commit_osk("romcloud")  # noqa: SLF001
+        wizard.poll()
+        assert wizard.sftp_host_key_fingerprint == fingerprint
+
+        wizard._confirm("romcloud")  # noqa: SLF001 - trust and list root
+        wizard.poll()
+        assert wizard.source_sftp_browse_path == "/"
+        assert wizard.options == [
+            "Select This Folder",
+            "Type Path Manually",
+            "Folder: Roms",
+        ]
+
+        wizard.selected_index = 2
+        wizard._confirm("romcloud")  # noqa: SLF001 - enter /Roms
+        wizard.poll()
+        assert wizard.source_sftp_browse_path == "/Roms"
+
+        wizard.selected_index = 0
+        wizard._confirm("romcloud")  # noqa: SLF001 - validate /Roms
+        wizard.poll()
+
+        assert wizard.step == WizardStep.SYSTEMS
+        assert wizard.systems == ["ps2"]
+        assert [request["purpose"] for _, request in requests] == [
+            "source",
+            "source",
+            "source",
+            "source",
+        ]
+        assert [
+            request["sftp_browse_path"]
+            for action, request in requests
+            if action == "setup-browse-sftp"
+        ] == [
+            "/",
+            "/Roms",
+        ]
+        assert all(
+            request["sftp_host_key_fingerprint"] == fingerprint
+            for action, request in requests
+            if action != "setup-sftp-host-key"
+        )
+        assert all(
+            request["server"] == expected_connection["host"]
+            and request["port"] == expected_connection["port"]
+            and request["username"] == expected_connection["username"]
+            and request["password"] == expected_connection["password"]
+            for _, request in requests
+        )
+        assert provider_paths == [
+            ("list", "/"),
+            ("list", "/Roms"),
+            ("validate", "/Roms"),
+            ("list", "/Roms"),
+        ]
+        assert len(provider_calls) == 3
+        for call in provider_calls:
+            assert {
+                key: call[key] for key in expected_connection
+            } == expected_connection
+            assert call["probe_writable"] is False
+
     def test_setup_request_normalizes_posix_separators_without_changing_case(
         self, tmp_path
     ):

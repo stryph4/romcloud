@@ -498,12 +498,18 @@ class WizardState:
                 WizardStep.SFTP_BROWSE,
                 WizardStep.REMOTE_SFTP_BROWSE,
             ):
-                return [
+                options = [
                     "Select This Folder",
                     "Type Path Manually",
-                    "Up one folder",
-                    *[f"Folder: {name}" for name in directories],
                 ]
+                current = (
+                    self.source_sftp_browse_path
+                    if self.step == WizardStep.SFTP_BROWSE
+                    else self.remote_sftp_browse_path
+                )
+                if current != "/":
+                    options.append("Up one folder")
+                return [*options, *[f"Folder: {name}" for name in directories]]
             return [
                 "Select this folder",
                 "Up one folder",
@@ -1282,8 +1288,22 @@ class WizardState:
         self.notice = ""
         self._progress_event = None
         self.runner = start_backend_operation(
-            romcloud_bin, "setup-browse-sftp", self.request_payload()
+            romcloud_bin,
+            "setup-browse-sftp",
+            self._sftp_request_payload(purpose, browse_path=path),
         )
+
+    def _sftp_request_payload(
+        self, purpose: str, *, browse_path: str | None = None
+    ) -> dict[str, Any]:
+        """Snapshot one explicit SFTP role for a backend setup operation."""
+        if purpose not in ("source", "remote_data"):
+            raise ValueError(f"Unsupported SFTP setup role: {purpose}")
+        payload = self.request_payload()
+        payload["purpose"] = purpose
+        if browse_path is not None:
+            payload["sftp_browse_path"] = _normalize_sftp_path(browse_path)
+        return payload
 
     def _start_current_browser_operation(self, romcloud_bin: str) -> None:
         action = (
@@ -1299,6 +1319,13 @@ class WizardState:
         payload = (
             {"path": self.browser_path, "progress": True}
             if action == "setup-browse-local"
+            else self._sftp_request_payload(
+                "source"
+                if self.step == WizardStep.SFTP_BROWSE
+                else "remote_data",
+                browse_path=self.browser_path,
+            )
+            if action == "setup-browse-sftp"
             else self.request_payload()
         )
         self.error = ""
@@ -1353,8 +1380,16 @@ class WizardState:
             )
             return
 
-        up_index = 2 if is_sftp else 1
-        if self.selected_index == up_index:
+        sftp_path = (
+            self.source_sftp_browse_path
+            if self.step == WizardStep.SFTP_BROWSE
+            else self.remote_sftp_browse_path
+            if self.step == WizardStep.REMOTE_SFTP_BROWSE
+            else ""
+        )
+        sftp_has_parent = is_sftp and sftp_path != "/"
+        up_index = 2 if sftp_has_parent else 1 if not is_sftp else None
+        if up_index is not None and self.selected_index == up_index:
             if is_sftp:
                 current = (
                     self.source_sftp_browse_path
@@ -1395,7 +1430,8 @@ class WizardState:
             )
             if entry.get("is_directory")
         ]
-        directory = directories[self.selected_index - (3 if is_sftp else 2)]
+        directory_offset = 3 if sftp_has_parent else 2
+        directory = directories[self.selected_index - directory_offset]
         if is_sftp:
             current = (
                 self.source_sftp_browse_path
