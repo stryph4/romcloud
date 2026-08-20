@@ -257,6 +257,73 @@ class TestSetupBridge:
         assert password not in result.output
         assert "***" in result.output
 
+    def test_sftp_source_with_smb_remote_data_dispatches_smb_validation(
+        self, tmp_path, monkeypatch
+    ):
+        import romcloud.cli.commands.uidata as uidata_module
+
+        calls = []
+        monkeypatch.setattr(
+            uidata_module,
+            "validate_share",
+            lambda payload, progress=None: calls.append(("smb", payload))
+            or {"systems": [], "count": 0, "validation": {"connected": True}},
+        )
+        monkeypatch.setattr(
+            uidata_module,
+            "validate_sftp_source",
+            lambda payload, progress=None: calls.append(("sftp", payload)) or {},
+        )
+        monkeypatch.setattr(
+            uidata_module, "_require_capability_if_configured", lambda *args: None
+        )
+        request = {
+            "purpose": "remote_data",
+            "source_type": "sftp",
+            "remote_data_type": "smb",
+        }
+
+        result = CliRunner().invoke(
+            cli,
+            ["--config", str(tmp_path / "missing.toml"), "uidata", "setup-validate"],
+            input=json.dumps(request),
+        )
+
+        assert result.exit_code == 0, result.output
+        assert calls == [("smb", request)]
+
+    def test_smb_source_with_sftp_remote_data_dispatches_sftp_validation(
+        self, tmp_path, monkeypatch
+    ):
+        import romcloud.cli.commands.uidata as uidata_module
+
+        calls = []
+        monkeypatch.setattr(
+            uidata_module,
+            "validate_share",
+            lambda payload, progress=None: calls.append(("smb", payload)) or {},
+        )
+        monkeypatch.setattr(
+            uidata_module,
+            "validate_sftp_source",
+            lambda payload, progress=None: calls.append(("sftp", payload))
+            or {"systems": [], "count": 0, "validation": {"connected": True}},
+        )
+        request = {
+            "purpose": "remote_data",
+            "source_type": "smb",
+            "remote_data_type": "sftp",
+        }
+
+        result = CliRunner().invoke(
+            cli,
+            ["--config", str(tmp_path / "missing.toml"), "uidata", "setup-validate"],
+            input=json.dumps(request),
+        )
+
+        assert result.exit_code == 0, result.output
+        assert calls == [("sftp", request)]
+
 
 class TestStatus:
     def test_emits_single_json_object(self, tmp_path):

@@ -511,6 +511,23 @@ class TestWizardValidationPresentation:
             assert primary in lines
             assert secondary in lines
 
+    def test_sftp_trust_pages_display_the_observed_fingerprint(self):
+        wizard = WizardState()
+        wizard.step = WizardStep.SFTP_TRUST
+        wizard.sftp_host_key_type = "ssh-ed25519"
+        wizard.sftp_host_key_fingerprint = "SHA256:source-key"
+        assert "ssh-ed25519 fingerprint: SHA256:source-key" in _wizard_body_lines(
+            wizard
+        )
+
+        wizard.step = WizardStep.REMOTE_SFTP_TRUST
+        wizard.remote_sftp_host_key_type = "ecdsa-sha2-nistp256"
+        wizard.remote_sftp_host_key_fingerprint = "SHA256:remote-key"
+        assert (
+            "ecdsa-sha2-nistp256 fingerprint: SHA256:remote-key"
+            in _wizard_body_lines(wizard)
+        )
+
     def test_review_labels_source_read_only_and_remote_read_write(self):
         wizard = WizardState()
         wizard.step = WizardStep.REVIEW

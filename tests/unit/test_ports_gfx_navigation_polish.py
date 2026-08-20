@@ -3,7 +3,12 @@ from __future__ import annotations
 import pytest
 
 from ports_gfx.actions import Action
-from ports_gfx.app import MENU_CATEGORIES, ROOT_MENU_ITEMS, _wizard_option_rows
+from ports_gfx.app import (
+    MENU_CATEGORIES,
+    ROOT_MENU_ITEMS,
+    _wizard_back_returns_to_menu,
+    _wizard_option_rows,
+)
 from ports_gfx.input_manager import InputEvent
 from ports_gfx.layout import compute_layout, compute_wizard_regions
 from ports_gfx.menu import BACK_ACTION, CATEGORY_ACTION_PREFIX, NavigationState
@@ -97,10 +102,23 @@ def test_control_panel_and_static_wizard_footer_are_valid(width, height):
     assert layout.activity_rect is not None
     assert layout.activity_rect.w > 0 and not layout.activity_rect.intersects(layout.navigation_rect)
     assert not regions.content.intersects(regions.footer)
+    assert not regions.help.intersects(regions.options)
     assert not regions.back_button.intersects(regions.continue_button)
     assert regions.osk is not None
     assert not regions.osk.intersects(regions.footer)
     assert regions.content.bottom <= regions.osk.y
+
+
+def test_first_wizard_pages_back_to_main_menu_but_later_pages_navigate_back():
+    wizard = WizardState()
+    for step in (WizardStep.WELCOME, WizardStep.SOURCE):
+        wizard.step = step
+        assert _wizard_back_returns_to_menu(wizard)
+
+    wizard.step = WizardStep.SFTP_PATH
+    assert not _wizard_back_returns_to_menu(wizard)
+    wizard.back()
+    assert wizard.step == WizardStep.SFTP_TRUST
 
 
 def test_activity_degrades_to_compact_mode_without_negative_regions():
@@ -122,9 +140,11 @@ def test_long_wizard_option_lists_scroll_above_the_static_footer():
     wizard.selected_index = len(wizard.options) - 1
 
     rows = _wizard_option_rows(layout, wizard)
+    regions = compute_wizard_regions(layout)
 
     assert len(rows) < len(wizard.options)
     assert rows[-1][0] == wizard.selected_index
+    assert all(row[2].y >= regions.options.y for row in rows[:-1])
     assert all(row[2].bottom <= layout.footer_rect.y for row in rows)
 
 

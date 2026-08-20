@@ -23,10 +23,13 @@ from romcloud.infrastructure.config import (
     SavesConfig,
     SMBConfig,
     SourceConfig,
+    SFTPConfig,
     write_config,
 )
 from romcloud.infrastructure.credentials import (
+    load_remote_data_sftp_password,
     load_remote_data_smb_password,
+    load_sftp_password,
     load_smb_password,
     write_smb_password,
 )
@@ -113,6 +116,7 @@ class _Container:
         remote_probe=None,
         save_sync_calls=None,
         full_sync_error=None,
+        remote_durable=True,
     ):
         self.config = config
         self.provider = SimpleNamespace(
@@ -171,6 +175,7 @@ class _Container:
                 ),
             full_sync=full_sync,
             get_state=lambda: save_sync_state,
+            _remote_supports_durable_transactions=lambda: remote_durable,
         )
 
 
@@ -184,6 +189,7 @@ def _patch_apply_dependencies(
     remote_probe=None,
     save_sync_calls=None,
     full_sync_error=None,
+    remote_durable=True,
 ):
     monkeypatch.setattr(
         graphical_setup,
@@ -213,9 +219,12 @@ def _patch_apply_dependencies(
             remote_probe=remote_probe,
             save_sync_calls=save_sync_calls,
             full_sync_error=full_sync_error,
+            remote_durable=remote_durable,
         ),
     )
-    monkeypatch.setattr(graphical_setup.es_config, "install", lambda systems: None)
+    monkeypatch.setattr(
+        graphical_setup.es_config, "install", lambda *args, **kwargs: None
+    )
 
 
 class TestSetupState:
@@ -614,6 +623,81 @@ class TestApply:
 
         assert config.source.rom_root == str(rom_root)
         assert config.smb is None
+
+    def test_independent_sftp_roles_persist_payloads_credentials_and_skip_full_sync(
+        self, tmp_path, monkeypatch
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        save_sync_calls = []
+        _patch_apply_dependencies(
+            monkeypatch,
+            save_sync_calls=save_sync_calls,
+            remote_durable=False,
+        )
+        validations = []
+
+        def validate_sftp(payload, progress=None):
+            purpose = payload.get("purpose", "source")
+            validations.append(purpose)
+            return {
+                "systems": [] if purpose == "remote_data" else ["psx", "snes"],
+                "count": 0 if purpose == "remote_data" else 2,
+                "validation": {"connected": True, "read_verified": True},
+            }
+
+        monkeypatch.setattr(graphical_setup, "validate_sftp_source", validate_sftp)
+        result = graphical_setup.apply_setup(
+            config_path,
+            _payload(
+                source_type="sftp",
+                server="roms.example",
+                port=2222,
+                username="rom-reader",
+                password="source-sftp-secret",
+                source_remote_path="/srv/roms",
+                sftp_host_key_fingerprint="SHA256:source-key",
+                remote_data_type="sftp",
+                remote_server="data.example",
+                remote_port=2200,
+                remote_username="data-reader",
+                remote_password="remote-sftp-secret",
+                remote_data_root="/srv/romcloud-data",
+                remote_sftp_host_key_fingerprint="SHA256:remote-key",
+            ),
+        )
+        config = graphical_setup.load_config(str(config_path))
+
+        assert validations == ["source", "remote_data"]
+        assert config.source == SourceConfig(
+            provider="sftp",
+            rom_root="/srv/roms",
+            selected_systems=("psx", "snes"),
+        )
+        assert config.sftp == SFTPConfig(
+            host="roms.example",
+            username="rom-reader",
+            port=2222,
+            host_key_fingerprint="SHA256:source-key",
+        )
+        assert config.remote_data == RemoteDataConfig(
+            provider="sftp",
+            root="/srv/romcloud-data",
+            sftp=SFTPConfig(
+                host="data.example",
+                username="data-reader",
+                port=2200,
+                host_key_fingerprint="SHA256:remote-key",
+            ),
+        )
+        assert load_sftp_password(config.credentials_path) == "source-sftp-secret"
+        assert (
+            load_remote_data_sftp_password(config.credentials_path)
+            == "remote-sftp-secret"
+        )
+        assert save_sync_calls == []
+        assert result["save_sync_initialized"] is False
+        assert result["quick_sync_ready"] is False
+        assert graphical_setup.setup_state(config_path)["source_type"] == "sftp"
 
     def test_source_read_validation_failure_is_clean_and_redacted(
         self, tmp_path, monkeypatch

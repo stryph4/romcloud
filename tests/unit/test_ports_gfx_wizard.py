@@ -202,6 +202,93 @@ def test_detected_systems_lead_to_explicit_game_access_and_remote_data_choices()
     ]
 
 
+def test_sftp_is_a_source_option_and_only_offers_cached_storage():
+    wizard = WizardState()
+    wizard.step = WizardStep.SOURCE
+
+    assert "SFTP server" in wizard.options
+    wizard.selected_index = wizard.options.index("SFTP server")
+    wizard._confirm("romcloud", show_osk=False)  # noqa: SLF001
+
+    assert wizard.source_type == "sftp"
+    assert wizard.step == WizardStep.SERVER
+    wizard.step = WizardStep.GAME_ACCESS
+    assert wizard.options == ["Cached Storage"]
+
+
+def test_sftp_host_key_requires_explicit_fingerprint_trust(monkeypatch):
+    wizard = WizardState()
+    wizard.source_type = "sftp"
+    wizard.step = WizardStep.SFTP_TRUST
+    wizard.runner = _Runner()
+    monkeypatch.setattr(
+        "ports_gfx.wizard.operation_result",
+        lambda runner: BackendResult(
+            True,
+            {
+                "host_key_type": "ssh-ed25519",
+                "host_key_fingerprint": "SHA256:trusted-key",
+            },
+        ),
+    )
+
+    wizard.poll()
+
+    assert wizard.sftp_host_key_type == "ssh-ed25519"
+    assert wizard.sftp_host_key_fingerprint == "SHA256:trusted-key"
+    assert wizard.step == WizardStep.SFTP_TRUST
+    assert wizard.options == ["Trust this host key"]
+    wizard._confirm("romcloud", show_osk=False)  # noqa: SLF001
+    assert wizard.step == WizardStep.SFTP_PATH
+
+
+def test_sftp_source_and_remote_payloads_remain_independent():
+    wizard = WizardState()
+    wizard.source_type = "sftp"
+    wizard.server = "roms.example"
+    wizard.port = 2222
+    wizard.username = "rom-reader"
+    wizard.password = "source-secret"
+    wizard.source_remote_path = "/srv/roms"
+    wizard.sftp_host_key_fingerprint = "SHA256:source-key"
+    wizard.remote_data_type = "sftp"
+    wizard.remote_server = "data.example"
+    wizard.remote_port = 2200
+    wizard.remote_username = "data-reader"
+    wizard.remote_password = "remote-secret"
+    wizard.remote_data_root = "/srv/data"
+    wizard.remote_sftp_host_key_fingerprint = "SHA256:remote-key"
+    wizard.step = WizardStep.REMOTE_VALIDATE
+
+    payload = wizard.request_payload()
+
+    assert payload["purpose"] == "remote_data"
+    assert (payload["server"], payload["port"], payload["username"]) == (
+        "roms.example",
+        2222,
+        "rom-reader",
+    )
+    assert payload["source_remote_path"] == "/srv/roms"
+    assert payload["sftp_host_key_fingerprint"] == "SHA256:source-key"
+    assert (
+        payload["remote_server"],
+        payload["remote_port"],
+        payload["remote_username"],
+    ) == ("data.example", 2200, "data-reader")
+    assert payload["remote_data_root"] == "/srv/data"
+    assert payload["remote_sftp_host_key_fingerprint"] == "SHA256:remote-key"
+
+
+def test_later_back_returns_to_the_previous_sftp_wizard_step():
+    wizard = WizardState()
+    wizard.source_type = "sftp"
+    wizard.step = WizardStep.SFTP_PATH
+
+    wizard.back()
+
+    assert wizard.step == WizardStep.SFTP_TRUST
+
+
 def test_system_multi_select_persists_canonical_ids_in_request():
     wizard = WizardState()
     wizard.step = WizardStep.SYSTEMS

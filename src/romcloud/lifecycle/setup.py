@@ -286,7 +286,13 @@ def setup_state(config_path: Path) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "state": "partial" if issues else "configured",
         "issues": issues,
-        "source_type": "smb" if config.smb is not None else "local",
+        "source_type": (
+            "smb"
+            if config.smb is not None
+            else "sftp"
+            if config.source.provider == "sftp"
+            else "local"
+        ),
         "game_access_mode": config.game_access_mode,
         "library_sync_enabled": config.library_sync.enabled,
         "selected_systems": (

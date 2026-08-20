@@ -202,25 +202,26 @@ def uidata_setup_discover(ctx: click.Context) -> None:
 @uidata_group.command("setup-validate")
 @click.pass_context
 def uidata_setup_validate(ctx: click.Context) -> None:
-    """Validate a selected SMB share and report recognized systems."""
+    """Validate the selected source or remote-data storage target."""
     from romcloud.core.capabilities import Capability
 
     def validate(request, progress=None):
-        action = (
-            validate_local_source
-            if request.get("source_type") == "local"
-            and not (
-                request.get("purpose") == "remote_data"
-                and request.get("remote_data_type") == "sftp"
+        purpose = str(request.get("purpose", "source")).strip().lower()
+        provider = str(
+            request.get(
+                "remote_data_type" if purpose == "remote_data" else "source_type",
+                "smb",
             )
-            else validate_sftp_source
-            if request.get("source_type") == "sftp"
-            or (
-                request.get("purpose") == "remote_data"
-                and request.get("remote_data_type") == "sftp"
+        ).strip().lower()
+        action = {
+            "local": validate_local_source,
+            "sftp": validate_sftp_source,
+            "smb": validate_share,
+        }.get(provider)
+        if action is None:
+            raise ValueError(
+                f"Unsupported {purpose} storage provider: {provider or 'none'}"
             )
-            else validate_share
-        )
         if action is validate_share:
             _require_capability_if_configured(
                 ctx, Capability.REMOTE_VALIDATION, "Storage validation"

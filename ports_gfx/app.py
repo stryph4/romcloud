@@ -601,6 +601,11 @@ def initial_screen_for_status(status: BackendResult) -> str:
     return "menu"
 
 
+def _wizard_back_returns_to_menu(wizard: WizardState) -> bool:
+    """Whether Back exits setup instead of navigating to an earlier page."""
+    return wizard.step in (WizardStep.WELCOME, WizardStep.SOURCE)
+
+
 def run_app(
     romcloud_bin: str,
     *,
@@ -1245,9 +1250,8 @@ def _run(  # noqa: ANN001
                         system_selection_screen.cancel_pending()
                         system_selection_screen = None
                 elif current_screen == "wizard" and wizard is not None:
-                    if ievent.action == Action.BACK and wizard.step in (
-                        WizardStep.WELCOME,
-                        WizardStep.SOURCE,
+                    if ievent.action == Action.BACK and _wizard_back_returns_to_menu(
+                        wizard
                     ):
                         current_screen = "menu"
                     elif (
@@ -1255,7 +1259,7 @@ def _run(  # noqa: ANN001
                         and not wizard.osk_visible
                         and ievent.touch_index == len(_wizard_option_rows(layout, wizard))
                     ):
-                        if wizard.step in (WizardStep.WELCOME, WizardStep.SOURCE):
+                        if _wizard_back_returns_to_menu(wizard):
                             current_screen = "menu"
                         else:
                             wizard.back()
