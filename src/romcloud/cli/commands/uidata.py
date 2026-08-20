@@ -280,6 +280,32 @@ def uidata_setup_apply(ctx: click.Context) -> None:
     _run_request_action(ctx, apply)
 
 
+@uidata_group.command("system-selection-status")
+@click.pass_context
+def uidata_system_selection_status(ctx: click.Context) -> None:
+    """Return detected and currently selected source systems."""
+    from romcloud.services.system_selection import selection_status
+
+    _run_action(
+        ctx,
+        lambda: selection_status(Path(ctx.obj["config_path"])),
+    )
+
+
+@uidata_group.command("system-selection-apply")
+@click.pass_context
+def uidata_system_selection_apply(ctx: click.Context) -> None:
+    """Persist selected systems and reconcile catalog/game access."""
+    from romcloud.services.system_selection import update_selection
+
+    _run_request_action(
+        ctx,
+        lambda request, progress=None: update_selection(
+            Path(ctx.obj["config_path"]), request, progress
+        ),
+    )
+
+
 @uidata_group.command("status")
 @click.pass_context
 def uidata_status(ctx: click.Context) -> None:

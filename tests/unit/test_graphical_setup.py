@@ -517,6 +517,21 @@ class TestApply:
         assert graphical_setup.setup_state(config_path)["state"] == "configured"
         assert not (config_path.parent / graphical_setup.SETUP_STATE_FILENAME).exists()
 
+    def test_setup_persists_selected_system_ids(self, tmp_path, monkeypatch):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        _patch_apply_dependencies(monkeypatch)
+
+        result = graphical_setup.apply_setup(
+            config_path,
+            _payload(selected_systems=["psx"]),
+        )
+
+        assert result["selected_systems"] == ["psx"]
+        assert result["selected_system_count"] == 1
+        assert graphical_setup.load_config(str(config_path)).source.selected_systems == (
+            "psx",
+        )
+
     def test_setup_streams_phase_and_catalog_progress_to_the_gui(
         self, tmp_path, monkeypatch
     ):

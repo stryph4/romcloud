@@ -290,6 +290,13 @@ class WizardState:
         self.rom_root = str(data.get("rom_root", "/userdata/romcloud/source"))
         self.shares: list[dict[str, str]] = []
         self.systems: list[str] = []
+        configured_selection = data.get("selected_systems")
+        self._configured_selected_systems: tuple[str, ...] | None = (
+            tuple(str(system).strip().lower() for system in configured_selection)
+            if isinstance(configured_selection, list)
+            else None
+        )
+        self.selected_systems: set[str] = set()
         self.game_access_mode = str(data.get("game_access_mode", "smart_cache"))
         self.remote_data_type = str(data.get("remote_data_type", "none"))
         self.remote_data_root = str(data.get("remote_data_root", ""))
@@ -466,7 +473,17 @@ class WizardState:
                 f"Minimum free: {self.min_free_gb:g} GB",
                 "Continue",
             ]
-        if self.step in (WizardStep.SYSTEMS, WizardStep.REVIEW, WizardStep.DONE):
+        if self.step == WizardStep.SYSTEMS:
+            return [
+                "Select All",
+                "Clear All",
+                *[
+                    f"[{'x' if system in self.selected_systems else ' '}] {system}"
+                    for system in self.systems
+                ],
+                "Continue",
+            ]
+        if self.step in (WizardStep.REVIEW, WizardStep.DONE):
             return ["Continue" if self.step != WizardStep.DONE else "Finish"]
         if self.step in (
             WizardStep.DISCOVER,
@@ -765,8 +782,19 @@ class WizardState:
         elif self.step == WizardStep.DETECT:
             self._start_operation(WizardStep.DETECT, "setup-validate", romcloud_bin)
         elif self.step == WizardStep.SYSTEMS:
-            self.step = WizardStep.GAME_ACCESS
-            self.selected_index = 0 if self.game_access_mode == "smart_cache" else 1
+            if self.selected_index == 0:
+                self.selected_systems = set(self.systems)
+            elif self.selected_index == 1:
+                self.selected_systems.clear()
+            elif self.selected_index < len(self.systems) + 2:
+                system = self.systems[self.selected_index - 2]
+                if system in self.selected_systems:
+                    self.selected_systems.remove(system)
+                else:
+                    self.selected_systems.add(system)
+            else:
+                self.step = WizardStep.GAME_ACCESS
+                self.selected_index = 0 if self.game_access_mode == "smart_cache" else 1
         elif self.step == WizardStep.GAME_ACCESS:
             self.game_access_mode = "smart_cache" if self.selected_index == 0 else "direct_nas"
             self.step = WizardStep.REMOTE_DATA
@@ -1003,7 +1031,15 @@ class WizardState:
             self.selected_index = 0
             self.notice = "Verify the fingerprint, then choose Trust this host key."
         elif self.step == WizardStep.DETECT:
-            self.systems = [str(system) for system in result.data.get("systems", [])]
+            self.systems = list(dict.fromkeys(
+                str(system).strip().lower()
+                for system in result.data.get("systems", [])
+            ))
+            self.selected_systems = (
+                set(self.systems)
+                if self._configured_selected_systems is None
+                else set(self.systems).intersection(self._configured_selected_systems)
+            )
             self.source_validation = dict(result.data.get("validation", {}))
             self.step = WizardStep.SYSTEMS
             self.selected_index = 0
@@ -1084,6 +1120,9 @@ class WizardState:
             "remote_port": self.remote_port,
             "remote_reuse_source_credentials": self.remote_reuse_source_credentials,
             "library_sync_enabled": self.library_sync_enabled,
+            "selected_systems": [
+                system for system in self.systems if system in self.selected_systems
+            ],
             "purpose": (
                 "remote_data"
                 if self.step in (

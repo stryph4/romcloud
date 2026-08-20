@@ -74,6 +74,13 @@ from ports_gfx.library_sync_screen import (
     LibrarySyncScreenState,
 )
 from ports_gfx.library_manager_screen import LibraryManagerScreenState
+from ports_gfx.system_selection_screen import (
+    APPLYING as SYSTEMS_APPLYING,
+    LOADING as SYSTEMS_LOADING,
+    RESULT as SYSTEMS_RESULT,
+    SELECTING as SYSTEMS_SELECTING,
+    SystemSelectionScreenState,
+)
 from ports_gfx.menu import (
     BACK_ACTION,
     CATEGORY_ACTION_PREFIX,
@@ -133,6 +140,7 @@ SETUP_ACTION = "setup"
 LIBRARY_QUICK_SYNC_ACTION = "library-sync-quick"
 LIBRARY_FULL_SYNC_ACTION = "library-sync-full"
 LIBRARY_MANAGER_ACTION = "library-manager"
+SELECT_SYSTEMS_ACTION = "select-systems"
 STARTUP_RESTART_SCREEN = "startup-restart"
 
 MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
@@ -142,6 +150,11 @@ MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
             "Library Manager",
             LIBRARY_MANAGER_ACTION,
             "Open the browser library and cache manager on this network.",
+        ),
+        MenuItem(
+            "Select Systems",
+            SELECT_SYSTEMS_ACTION,
+            "Choose which detected source systems ROMCloud manages.",
         ),
         MenuItem("Refresh Catalog", "refresh"),
         MenuItem("Cache Status", "cache-status"),
@@ -248,6 +261,11 @@ def menu_categories_for_state(
             "Library Manager",
             LIBRARY_MANAGER_ACTION,
             "Open the browser library and cache manager on this network.",
+        ),
+        MenuItem(
+            "Select Systems",
+            SELECT_SYSTEMS_ACTION,
+            "Choose which detected source systems ROMCloud manages.",
         ),
     ]
     if capabilities.get("catalog_refresh", True):
@@ -872,6 +890,7 @@ def cancel_owned_background_work(
     savesync_screen: SaveSyncScreenState | None,
     library_sync_screen: LibrarySyncScreenState | None,
     library_manager_screen: LibraryManagerScreenState | None = None,
+    system_selection_screen: SystemSelectionScreenState | None = None,
 ) -> None:
     """Cancel every subprocess still owned by this GUI session."""
     owners = (
@@ -881,6 +900,7 @@ def cancel_owned_background_work(
         (savesync_screen, "cancel_pending"),
         (library_sync_screen, "cancel_pending"),
         (library_manager_screen, "cancel_pending"),
+        (system_selection_screen, "cancel_pending"),
     )
     for owner, method_name in owners:
         if owner is None:
@@ -927,6 +947,7 @@ def _run(  # noqa: ANN001
     savesync_screen: Optional[SaveSyncScreenState] = None
     library_sync_screen: Optional[LibrarySyncScreenState] = None
     library_manager_screen: Optional[LibraryManagerScreenState] = None
+    system_selection_screen: Optional[SystemSelectionScreenState] = None
     startup_restart: StartupRestartPromptState | None = None
     update_check: UpdateCheckState | None = None
 
@@ -1055,6 +1076,8 @@ def _run(  # noqa: ANN001
                     rects = (layout.safe_area,)
                 elif current_screen == "library_manager":
                     rects = (layout.safe_area,)
+                elif current_screen == "system_selection":
+                    rects = (layout.safe_area,)
                 elif current_screen == STARTUP_RESTART_SCREEN:
                     rects = tuple(_startup_restart_action_rects(layout))
                 else:
@@ -1116,6 +1139,15 @@ def _run(  # noqa: ANN001
                         )
                         library_manager_screen.start_or_refresh()
                         current_screen = "library_manager"
+                    elif (
+                        ievent.action == Action.CONFIRM
+                        and item.action == SELECT_SYSTEMS_ACTION
+                    ):
+                        system_selection_screen = SystemSelectionScreenState(
+                            romcloud_bin=romcloud_bin
+                        )
+                        system_selection_screen.start_loading()
+                        current_screen = "system_selection"
                     elif (
                         ievent.action == Action.CONFIRM
                         and item.action
@@ -1202,6 +1234,16 @@ def _run(  # noqa: ANN001
                     if current_screen == "menu":
                         library_manager_screen.cancel_pending()
                         library_manager_screen = None
+                elif (
+                    current_screen == "system_selection"
+                    and system_selection_screen is not None
+                ):
+                    current_screen = _handle_system_selection_event(
+                        ievent, system_selection_screen
+                    )
+                    if current_screen == "menu":
+                        system_selection_screen.cancel_pending()
+                        system_selection_screen = None
                 elif current_screen == "wizard" and wizard is not None:
                     if ievent.action == Action.BACK and wizard.step in (
                         WizardStep.WELCOME,
@@ -1333,6 +1375,12 @@ def _run(  # noqa: ANN001
             ):
                 for line in library_manager_screen.poll():
                     activity.ingest(line.text)
+            elif (
+                current_screen == "system_selection"
+                and system_selection_screen is not None
+            ):
+                for line in system_selection_screen.poll():
+                    activity.ingest(line.text)
             elif current_screen == "wizard" and wizard is not None:
                 for line in wizard.poll():
                     activity.ingest(line.text)
@@ -1427,6 +1475,13 @@ def _run(  # noqa: ANN001
                 _render_library_manager(
                     pygame, screen, fonts, layout, library_manager_screen
                 )
+            elif (
+                current_screen == "system_selection"
+                and system_selection_screen is not None
+            ):
+                _render_system_selection(
+                    pygame, screen, fonts, layout, system_selection_screen
+                )
             elif current_screen == "wizard" and wizard is not None:
                 _render_wizard(
                     pygame, screen, fonts, layout, wizard, wizard.activity
@@ -1447,6 +1502,7 @@ def _run(  # noqa: ANN001
             savesync_screen=savesync_screen,
             library_sync_screen=library_sync_screen,
             library_manager_screen=library_manager_screen,
+            system_selection_screen=system_selection_screen,
         )
         if input_debug is not None:
             try:
@@ -1679,6 +1735,71 @@ def _handle_library_manager_event(
         elif ievent.action == Action.CONFIRM:
             screen.activate()
     return "library_manager"
+
+
+def _handle_system_selection_event(
+    ievent: InputEvent, screen: SystemSelectionScreenState
+) -> str:
+    if ievent.action == Action.BACK and screen.step != SYSTEMS_APPLYING:
+        return "menu"
+    if screen.step == SYSTEMS_SELECTING:
+        if ievent.action in (Action.UP, Action.LEFT):
+            screen.move(-1)
+        elif ievent.action in (Action.DOWN, Action.RIGHT):
+            screen.move(1)
+        elif ievent.action == Action.CONFIRM:
+            screen.activate()
+    elif screen.step == SYSTEMS_RESULT and ievent.action == Action.CONFIRM:
+        if screen.error:
+            screen.activate()
+        else:
+            return "menu"
+    return "system_selection"
+
+
+def _system_selection_body_lines(
+    screen: SystemSelectionScreenState,
+) -> list[str]:
+    if screen.step == SYSTEMS_LOADING:
+        return ["Detecting systems in the configured ROM source…"]
+    if screen.step == SYSTEMS_APPLYING:
+        return [
+            "Saving selection and reconciling the catalog…",
+            "Cached game payloads are not removed.",
+        ]
+    if screen.step == SYSTEMS_RESULT:
+        if screen.error:
+            return [
+                f"Selection failed: {screen.error}",
+                "Confirm retries; Back returns.",
+            ]
+        return [
+            "System selection updated.",
+            f"Selected: {len(screen.result.get('selected_systems', []))}",
+            f"Added: {len(screen.result.get('newly_selected', []))}",
+            f"Removed: {len(screen.result.get('newly_deselected', []))}",
+            "Confirm or Back returns to Library.",
+        ]
+
+    options = screen.options
+    if not options:
+        return ["No recognized Batocera systems were detected."]
+    # Keep controller focus visible on libraries with many system folders.
+    window_size = 12
+    start = max(
+        0,
+        min(screen.selected_index - window_size // 2, len(options) - window_size),
+    )
+    visible = options[start : start + window_size]
+    return [
+        f"{len(screen.selected_systems)} of {len(screen.detected_systems)} systems selected",
+        "Only selected systems receive ROMCloud catalog/access entries.",
+        "",
+        *[
+            ("> " if start + index == screen.selected_index else "  ") + label
+            for index, label in enumerate(visible)
+        ],
+    ]
 
 
 def _library_manager_body_lines(screen: LibraryManagerScreenState) -> list[str]:
@@ -2434,6 +2555,40 @@ def _render_library_manager(  # noqa: ANN001
     pygame.display.flip()
 
 
+def _render_system_selection(  # noqa: ANN001
+    pygame,
+    screen_surface,
+    fonts: dict,
+    layout: Layout,
+    state: SystemSelectionScreenState,
+) -> None:
+    screen_surface.fill(_BG_COLOR)
+    title = fonts["title"].render("Select Systems", True, _FG_COLOR)
+    screen_surface.blit(title, (layout.header_rect.x, layout.header_rect.y))
+
+    y = layout.navigation_rect.y
+    line_h = layout.fonts.body + 6
+    max_chars = max(24, layout.navigation_rect.w // max(8, layout.fonts.body // 2))
+    for line in wrap_lines(_system_selection_body_lines(state), max_chars):
+        color = (
+            _ERROR_COLOR
+            if state.error and line.startswith("Selection failed:")
+            else _FG_COLOR
+        )
+        text = fonts["body"].render(line, True, color)
+        screen_surface.blit(text, (layout.navigation_rect.x, y))
+        y += line_h
+
+    hint_text = (
+        "Please wait…"
+        if state.step in (SYSTEMS_LOADING, SYSTEMS_APPLYING)
+        else "D-pad choose   A/Enter select   B/Esc back"
+    )
+    hint = fonts["hint"].render(hint_text, True, _HINT_COLOR)
+    screen_surface.blit(hint, (layout.hint_rect.x, layout.hint_rect.y))
+    pygame.display.flip()
+
+
 def _render_startup_restart(  # noqa: ANN001
     pygame,
     screen_surface,
@@ -2666,7 +2821,9 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
         systems = (
             ["No recognized Batocera system folders were found."]
             if not wizard.systems
-            else [f"{len(wizard.systems)} systems: {', '.join(wizard.systems)}"]
+            else [
+                f"{len(wizard.selected_systems)} of {len(wizard.systems)} systems selected"
+            ]
         )
         return [*context, *validation, *systems]
     if wizard.step == WizardStep.GAME_ACCESS:
@@ -2701,7 +2858,7 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
                 else f"ROM library: {wizard.rom_root} [Local]"
             ),
             "\u2713 Connected  \u2713 Read access verified",
-            f"Systems: {len(wizard.systems)}",
+            f"Systems: {len(wizard.selected_systems)} selected",
             "Game access: " + (
                 "Direct (source required while playing)"
                 if wizard.game_access_mode == "direct_nas"
@@ -2739,7 +2896,8 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
                 if wizard.source_type == "sftp"
                 else f"ROM library: {wizard.rom_root} [Local]"
             ),
-            f"Detected systems: {wizard.applied_summary.get('system_count', len(wizard.systems))}",
+            "Selected systems: "
+            f"{wizard.applied_summary.get('selected_system_count', len(wizard.selected_systems))}",
         ]
         if wizard.applied_summary.get("source_validation", {}).get("connected"):
             lines.extend(["\u2713 Connected", "\u2713 Read access verified"])

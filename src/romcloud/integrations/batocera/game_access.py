@@ -37,6 +37,19 @@ class DirectLinkConflictError(RuntimeError):
     """The reserved Connected Mode path is not a verified ROMCloud link."""
 
 
+def _system_is_selected(config: AppConfig, system: str) -> bool:
+    selected = config.source.selected_systems
+    return selected is None or system in selected
+
+
+def _selected_catalog_games(config: AppConfig, container: Container):  # noqa: ANN202
+    return [
+        game
+        for game in container.game_repo.list_all()
+        if _system_is_selected(config, game.system)
+    ]
+
+
 @dataclass(frozen=True)
 class DirectLinkReport:
     created: int = 0
@@ -303,11 +316,11 @@ def reconcile_game_access(
         config,
         operating_policy=CapabilityPolicy(config.game_access_mode, mode),
     )
-    systems = [
-        system
-        for system in container.game_repo.list_systems()
-        if system in BATOCERA_SYSTEMS
-    ]
+    selected_games = _selected_catalog_games(config, container)
+    systems = sorted(
+        {game.system for game in selected_games if game.system in BATOCERA_SYSTEMS}
+    )
+    selected_game_ids = {game.id for game in selected_games}
     if mode is OperatingMode.CONNECTED:
         report = reconcile_direct_links(config, systems)
         remove_owned_proxies(config)
@@ -323,7 +336,8 @@ def reconcile_game_access(
     if mode is OperatingMode.OFFLINE:
         reconcile_library_presentation(config, offline=True)
     else:
-        restore_owned_proxies(config)
+        restore_owned_proxies(config, game_ids=selected_game_ids)
+        remove_owned_proxies(config, keep_game_ids=selected_game_ids)
     if (
         render_library_metadata
         and getattr(getattr(config, "library_sync", None), "enabled", False)
@@ -376,7 +390,9 @@ def _valid_cached_game_ids(
     """
     container = Container(config)
     entries = container.cache_repo.list_complete()
-    games = {game.id: game for game in container.game_repo.list_all()}
+    games = {
+        game.id: game for game in _selected_catalog_games(config, container)
+    }
     memberships = container.cache_repo.list_resolved_memberships()
     valid: set[str] = set()
     total = len(entries)
@@ -438,7 +454,10 @@ def reconcile_library_presentation(
         if offline
         # Full catalog, not just already-registered proxies — same fix as
         # `_apply_mode_presentation`'s Cache Mode branch, kept consistent.
-        else {game.id for game in Container(config).game_repo.list_all()}
+        else {
+            game.id
+            for game in _selected_catalog_games(config, Container(config))
+        }
     )
     # Materialize the desired set before removing anything else, so an
     # already-correct proxy is never unlinked-then-recreated on a no-op
@@ -553,18 +572,17 @@ def _apply_mode_presentation(
         config,
         operating_policy=CapabilityPolicy(config.game_access_mode, mode),
     )
-    systems = [
-        system
-        for system in container.game_repo.list_systems()
-        if system in BATOCERA_SYSTEMS
-    ]
+    selected_games = _selected_catalog_games(config, container)
+    systems = sorted(
+        {game.system for game in selected_games if game.system in BATOCERA_SYSTEMS}
+    )
     if mode is OperatingMode.CONNECTED:
         reconcile_direct_links(config, systems, progress=progress)
         removed = remove_owned_proxies(config)
         report = LibraryPresentationReport(
             offline=False,
             removed=removed,
-            visible=container.game_repo.count(),
+            visible=len(selected_games),
             save_sync_available=config.remote_data is not None,
         )
     else:
@@ -575,7 +593,7 @@ def _apply_mode_presentation(
             # already happen to have a proxy registration — a game with no
             # prior registration (e.g. an interrupted catalog refresh) must
             # still be created, not silently excluded from the visible set.
-            else {game.id for game in container.game_repo.list_all()}
+            else {game.id for game in selected_games}
         )
         restored = restore_owned_proxies(
             config,
@@ -633,7 +651,11 @@ def _update_emulationstation(
         )
     _refresh_emulationstation(
         config,
-        container.game_repo.list_systems(),
+        [
+            system
+            for system in container.game_repo.list_systems()
+            if _system_is_selected(config, system)
+        ],
         mode=mode,
     )
     if restart:

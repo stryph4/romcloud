@@ -16,7 +16,7 @@ import posixpath
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Callable, Optional
+from typing import Callable, Collection, Optional
 from xml.etree import ElementTree as ET
 
 from romcloud.core.cue_parser import resolve_cue_dependencies
@@ -92,6 +92,7 @@ class CatalogService:
         source_root: str,
         system_registry: Optional[EffectiveSystemRegistry] = None,
         registry_loader: Optional[Callable[[], EffectiveSystemRegistry]] = None,
+        selected_systems: Optional[Collection[str]] = None,
         write_proxies: bool = True,
         capability_policy: Optional[CapabilityPolicy] = None,
     ) -> None:
@@ -102,6 +103,9 @@ class CatalogService:
         self._source_root = source_root
         self._system_registry = system_registry
         self._registry_loader = registry_loader
+        self._selected_systems = (
+            None if selected_systems is None else frozenset(selected_systems)
+        )
         self._write_proxies_enabled = write_proxies
         self._capabilities = capability_policy or CapabilityPolicy("smart_cache")
 
@@ -157,7 +161,25 @@ class CatalogService:
             )
             return CatalogRefreshResult(added, skipped, removed, errors, warnings=warnings, updated=updated)
 
-        matched = [s for s in remote_systems if s in registry.names]
+        detected_launchable = [s for s in remote_systems if s in registry.names]
+        matched = [
+            system
+            for system in detected_launchable
+            if self._selected_systems is None or system in self._selected_systems
+        ]
+        if self._selected_systems is not None:
+            newly_hidden = [
+                system
+                for system in self._game_repo.list_systems()
+                if system not in self._selected_systems
+            ]
+            for system in newly_hidden:
+                removed += self._suppress_entire_system(system)
+            ignored = sorted(set(detected_launchable) - set(matched))
+            if ignored:
+                log.debug(
+                    "Ignoring systems excluded by source allowlist: %s", ignored
+                )
         unmatched = [s for s in remote_systems if s not in registry.names]
         if unmatched:
             log.debug("Ignoring systems absent from effective Batocera config: %s", unmatched)
@@ -859,10 +881,11 @@ class CatalogService:
         ]
         self._suppress_games(games)
 
-    def _suppress_entire_system(self, system: str) -> None:
-        self._suppress_games(
-            self._game_repo.find_by_system(system, include_ineligible=True)
-        )
+    def _suppress_entire_system(self, system: str) -> int:
+        games = self._game_repo.find_by_system(system, include_ineligible=True)
+        removed = sum(1 for game in games if game.is_eligible)
+        self._suppress_games(games)
+        return removed
 
     def _suppress_games(self, games: list[Game]) -> None:
         """Hide retained rows and remove only their owned presentation."""

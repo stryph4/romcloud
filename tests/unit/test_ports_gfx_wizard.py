@@ -170,12 +170,21 @@ def test_multiple_or_no_detected_systems_are_reviewable(monkeypatch):
         wizard.poll()
         assert wizard.step == WizardStep.SYSTEMS
         assert wizard.systems == systems
-        assert wizard.options == ["Continue"]
+        assert wizard.selected_systems == set(systems)
+        assert wizard.options == [
+            "Select All",
+            "Clear All",
+            *[f"[x] {system}" for system in systems],
+            "Continue",
+        ]
 
 
 def test_detected_systems_lead_to_explicit_game_access_and_remote_data_choices():
     wizard = WizardState()
     wizard.step = WizardStep.SYSTEMS
+    wizard.systems = ["ps2"]
+    wizard.selected_systems = {"ps2"}
+    wizard.selected_index = len(wizard.options) - 1
 
     wizard._confirm("romcloud")  # noqa: SLF001 - pure navigation test
 
@@ -188,14 +197,29 @@ def test_detected_systems_lead_to_explicit_game_access_and_remote_data_choices()
     assert wizard.options == [
         "SMB network location",
         "Local / external directory",
+        "SFTP server",
         "Skip (sync features unavailable)",
     ]
+
+
+def test_system_multi_select_persists_canonical_ids_in_request():
+    wizard = WizardState()
+    wizard.step = WizardStep.SYSTEMS
+    wizard.systems = ["nes", "ps2", "snes"]
+    wizard.selected_systems = set(wizard.systems)
+
+    wizard.selected_index = 3  # ps2 row
+    wizard._confirm("romcloud")  # noqa: SLF001
+    assert wizard.selected_systems == {"nes", "snes"}
+
+    payload = wizard.request_payload()
+    assert payload["selected_systems"] == ["nes", "snes"]
 
 
 def test_skipping_remote_data_makes_choice_explicit():
     wizard = WizardState()
     wizard.step = WizardStep.REMOTE_DATA
-    wizard.selected_index = 2
+    wizard.selected_index = 3
 
     wizard._confirm("romcloud")  # noqa: SLF001 - pure navigation test
 
@@ -224,7 +248,7 @@ def test_direct_mode_skips_cache_settings_and_explains_source_requirement():
     wizard.step = WizardStep.GAME_ACCESS
     wizard.selected_index = 1
     wizard._confirm("romcloud")  # noqa: SLF001
-    wizard.selected_index = 2
+    wizard.selected_index = 3
     wizard._confirm("romcloud")  # noqa: SLF001
 
     assert wizard.game_access_mode == "direct_nas"

@@ -209,6 +209,7 @@ class Container:
                 local_roms_root=self._config.local_roms_path,
                 source_root=self._config.source.rom_root,
                 registry_loader=lambda: self.system_registry,
+                selected_systems=self._config.source.selected_systems,
                 write_proxies=operating_mode(self._config) is OperatingMode.CACHE,
                 capability_policy=self._policy(),
             )

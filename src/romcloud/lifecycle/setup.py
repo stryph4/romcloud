@@ -23,6 +23,7 @@ from romcloud.infrastructure.config import (
     SourceConfig,
     SMART_CACHE_MODE,
     DIRECT_NAS_MODE,
+    canonical_system_ids,
     paths_overlap,
     load_config,
     write_config,
@@ -39,6 +40,7 @@ from romcloud.infrastructure.credentials import (
 from romcloud.infrastructure import mount_worker
 from romcloud.infrastructure.smb_discovery_client import build_default_smb_discovery_service
 from romcloud.integrations.batocera import es_config, mount_service
+from romcloud.integrations.batocera.systems import BATOCERA_SYSTEMS
 from romcloud.services.smb_discovery import SMBErrorKind, SMBCredentials, SMBServerTarget
 from romcloud.services.directory_browser import (
     browse_local_directory,
@@ -80,6 +82,7 @@ class SetupRequest:
     remote_sftp_host_key_fingerprint: str = ""
     game_access_mode: str = SMART_CACHE_MODE
     library_sync_enabled: bool = False
+    selected_systems: tuple[str, ...] | None = None
 
     @classmethod
     def from_payload(
@@ -125,6 +128,11 @@ class SetupRequest:
             remote_sftp_host_key_fingerprint=str(payload.get("remote_sftp_host_key_fingerprint", "")).strip(),
             game_access_mode=str(payload.get("game_access_mode", SMART_CACHE_MODE)).strip().lower(),
             library_sync_enabled=bool(payload.get("library_sync_enabled", False)),
+            selected_systems=(
+                canonical_system_ids(payload["selected_systems"], "setup request")
+                if "selected_systems" in payload
+                else None
+            ),
         )
         request.validate(require_share=require_share, validate_cache=validate_cache)
         return request
@@ -281,6 +289,11 @@ def setup_state(config_path: Path) -> dict[str, Any]:
         "source_type": "smb" if config.smb is not None else "local",
         "game_access_mode": config.game_access_mode,
         "library_sync_enabled": config.library_sync.enabled,
+        "selected_systems": (
+            list(config.source.selected_systems)
+            if config.source.selected_systems is not None
+            else None
+        ),
         "offline_library_mode": offline_library_enabled(config),
         "operating_state": capability_policy(config).serialize(),
         "rom_root": config.source.rom_root,
@@ -539,7 +552,13 @@ def validate_local_source(
         raise ValueError(validation.detail or "Could not access the selected folder.")
     emit_progress(progress, "configure", "directory", "success", "Directory accessible")
     emit_progress(progress, "configure", "read", "success", "Read access verified")
-    systems = provider.list_systems(root)
+    systems = [
+        system
+        for system in canonical_system_ids(
+            provider.list_systems(root), "detected systems"
+        )
+        if system in BATOCERA_SYSTEMS
+    ]
     emit_progress(
         progress,
         "configure",
@@ -598,7 +617,13 @@ def validate_sftp_source(
     emit_progress(progress, "configure", "read", "success", "Read access verified")
     if remote:
         return {"systems": [], "count": 0, "validation": validation.as_dict()}
-    systems = provider.list_systems(root)
+    systems = [
+        system
+        for system in canonical_system_ids(
+            provider.list_systems(root), "detected systems"
+        )
+        if system in BATOCERA_SYSTEMS
+    ]
     emit_progress(
         progress, "configure", "systems", "success",
         f"Library check complete — {len(systems)} system{'s' if len(systems) != 1 else ''} found",
@@ -620,6 +645,20 @@ def apply_setup(
         if request.source_type == "sftp"
         else validate_local_source(payload, progress)
     )
+    detected_systems = canonical_system_ids(
+        validation_result["systems"], "detected systems"
+    )
+    selected_systems = (
+        detected_systems
+        if request.selected_systems is None
+        else request.selected_systems
+    )
+    unknown_systems = sorted(set(selected_systems) - set(detected_systems))
+    if unknown_systems:
+        raise ValueError(
+            "Selected systems were not detected in this source: "
+            + ", ".join(unknown_systems)
+        )
     if request.remote_data_type == "smb":
         validate_share({**payload, "purpose": "remote_data"}, progress)
     elif request.remote_data_type == "sftp":
@@ -634,7 +673,9 @@ def apply_setup(
         if previous_credentials_path is not None and previous_credentials_path.exists()
         else None
     )
-    config = _build_config(config_path, request, existing)
+    config = _build_config(
+        config_path, request, existing, selected_systems=selected_systems
+    )
     mounted_during_setup: list[str] = []
 
     step = "write configuration"
@@ -823,6 +864,8 @@ def apply_setup(
         "share": request.share,
         "systems": validation_result["systems"],
         "system_count": validation_result["count"],
+        "selected_systems": list(selected_systems),
+        "selected_system_count": len(selected_systems),
         "max_size_gb": request.max_size_gb,
         "remote_data_type": request.remote_data_type,
         "library_sync_enabled": request.library_sync_enabled,
@@ -849,7 +892,13 @@ def _existing_config(config_path: Path) -> AppConfig | None:
         return None
 
 
-def _build_config(config_path: Path, request: SetupRequest, existing: AppConfig | None) -> AppConfig:
+def _build_config(
+    config_path: Path,
+    request: SetupRequest,
+    existing: AppConfig | None,
+    *,
+    selected_systems: tuple[str, ...] | None = None,
+) -> AppConfig:
     home = config_path.parent.parent
     remote_data = None
     if request.remote_data_type == "local":
@@ -884,6 +933,11 @@ def _build_config(config_path: Path, request: SetupRequest, existing: AppConfig 
                 request.source_remote_path
                 if request.source_type == "sftp"
                 else request.rom_root
+            ),
+            selected_systems=(
+                request.selected_systems
+                if selected_systems is None
+                else selected_systems
             ),
         ),
         cache=CacheConfig(

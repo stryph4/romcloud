@@ -52,6 +52,33 @@ _LEGACY_SAVES_KEYS = frozenset({"remote_mount_path", "remote_subdir"})
 SMART_CACHE_MODE = "smart_cache"
 DIRECT_NAS_MODE = "direct_nas"
 GAME_ACCESS_MODES = frozenset({SMART_CACHE_MODE, DIRECT_NAS_MODE})
+_SYSTEM_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._+-]*$")
+
+
+def canonical_system_ids(
+    values: object, context: object = "configuration"
+) -> tuple[str, ...]:
+    """Validate, canonicalize, and de-duplicate Batocera system IDs."""
+    if not isinstance(values, (list, tuple)):
+        raise ConfigurationError(
+            f"{context}: selected_systems must be an array of system IDs."
+        )
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            raise ConfigurationError(
+                f"{context}: selected_systems entries must be strings."
+            )
+        system = value.strip().lower()
+        if not _SYSTEM_ID_RE.fullmatch(system):
+            raise ConfigurationError(
+                f"{context}: invalid Batocera system ID: {value!r}."
+            )
+        if system not in seen:
+            seen.add(system)
+            result.append(system)
+    return tuple(result)
 
 
 def _validated_smb_remote_path(value: object, context: object = "configuration") -> str:
@@ -117,6 +144,12 @@ class SourceConfig:
     """ROM root path: a local/USB directory, the local mount point of an
     SMB share, or (for ``provider = "sftp"``) the remote POSIX path on the
     SFTP server."""
+    selected_systems: Optional[tuple[str, ...]] = None
+    """Canonical Batocera IDs managed from this source.
+
+    ``None`` preserves the legacy behaviour of managing every detected
+    system. An empty tuple explicitly selects no systems.
+    """
 
 
 @dataclass(frozen=True)
@@ -397,7 +430,16 @@ def _parse(
             )
         provider = "local"
 
-    source = SourceConfig(provider=provider, rom_root=rom_root)
+    selected_systems = (
+        canonical_system_ids(src["selected_systems"], path)
+        if "selected_systems" in src
+        else None
+    )
+    source = SourceConfig(
+        provider=provider,
+        rom_root=rom_root,
+        selected_systems=selected_systems,
+    )
 
     cache_raw = data.get("cache", {})
     cache = CacheConfig(
@@ -591,6 +633,14 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
         "[source]\n",
         f'provider = "{config.source.provider}"\n',
         f'rom_root = "{config.source.rom_root}"\n',
+    ]
+    if config.source.selected_systems is not None:
+        selected_systems = canonical_system_ids(
+            config.source.selected_systems, path
+        )
+        rendered = ", ".join(f'"{system}"' for system in selected_systems)
+        lines.append(f"selected_systems = [{rendered}]\n")
+    lines += [
         "\n",
         "[game_access]\n",
         "# smart_cache downloads games on demand; direct_nas plays from the source.\n",

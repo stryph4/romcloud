@@ -458,7 +458,13 @@ def configure_cmd(
     # remain exactly as they were.
     _default_home = config_path.parent.parent
     config = AppConfig(
-        source=SourceConfig(provider="local", rom_root=rom_root),
+        source=SourceConfig(
+            provider="local",
+            rom_root=rom_root,
+            selected_systems=(
+                existing.source.selected_systems if existing else None
+            ),
+        ),
         cache=CacheConfig(path=cache_root, max_size_gb=max_gb, min_free_gb=min_free_gb),
         local_roms_path=existing.local_roms_path if existing else "/userdata/roms",
         data_path=existing.data_path if existing else str(_default_home / "data"),
