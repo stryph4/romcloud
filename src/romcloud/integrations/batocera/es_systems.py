@@ -28,14 +28,11 @@ Format (verified on Batocera 42)
 Transformation applied per managed system
 ------------------------------------------
 - ``<extension>``: the existing space-separated token list is kept as-is;
-    ``.romcloud`` is appended only if no case-insensitive match for it is
-    already present.
-  - ``<command>``: only the *first whitespace-separated token* (the
-    executable, e.g. ``emulatorlauncher``) is replaced with the ROMCloud
-    wrapper path. Every other token — ``%CONTROLLERSCONFIG%``, ``-system``,
-    ``%SYSTEM%``, and any future argument Batocera adds — is preserved
-    exactly, in order. The argument count is never assumed or hardcoded.
-
+  ``.romcloud`` is appended only if no case-insensitive match for it is
+  already present.
+- ``<command>``: the ROMCloud wrapper is prepended to the complete native
+  command. This preserves custom launchers such as ``python switchlauncher.py``
+  instead of assuming every Batocera system uses ``emulatorlauncher``.
 - Each generated system contains only ``<name>``, ``<extension>``, and
   ``<command>``. Batocera merges those fields over the matching stock system,
   so all other metadata remains inherited from Batocera rather than copied.
@@ -85,15 +82,23 @@ def _ensure_romcloud_extension(extension_text: str) -> str:
 
 
 def _rewrite_command(command_text: str, wrapper_path: str) -> str:
-    tokens = (command_text or "").split()
-    if not tokens:
+    """Route a native ES command through ROMCloud without losing its launcher.
+
+    Older ROMCloud builds replaced the first token with ``romcloud-run``.
+    That worked for stock ``emulatorlauncher`` commands because the wrapper
+    always handed off to emulatorlauncher, but broke third-party systems whose
+    command begins with something else (for example BUA Switch's
+    ``python .../switchlauncher.py``).
+
+    Keep the entire original command after the wrapper so ``romcloud-run`` can
+    execute the same launcher after it resolves a proxy to its cached path.
+    """
+    command = (command_text or "").strip()
+    if not command:
         return wrapper_path
-    if tokens[0] == wrapper_path:
-        # Already routed through the wrapper (e.g. re-processing our own
-        # previous output) — leave every token untouched.
-        return " ".join(tokens)
-    tokens[0] = wrapper_path
-    return " ".join(tokens)
+    if command == wrapper_path or command.startswith(wrapper_path + " "):
+        return command
+    return f"{wrapper_path} {command}"
 
 
 def _parse_stock_systems(stock_xml: str) -> dict[str, ET.Element]:
@@ -121,7 +126,6 @@ def generate_override(
     """
     stock_systems = _parse_stock_systems(stock_xml)
 
-    # Sorted for deterministic output regardless of input ordering/set iteration.
     requested = sorted(set(managed_systems))
 
     included: list[str] = []
@@ -136,9 +140,6 @@ def generate_override(
             missing.append(name)
             continue
 
-        # Named Batocera overlays merge individual fields for a matching
-        # <name>. Keep this minimal so all unrelated stock metadata remains
-        # inherited and follows future Batocera updates.
         system_el = ET.Element("system")
         ET.SubElement(system_el, "name").text = name
         stock_ext_el = stock_el.find("extension")
