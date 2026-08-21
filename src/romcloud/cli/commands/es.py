@@ -1,8 +1,8 @@
 """romcloud es — EmulationStation integration sub-commands.
 
-Manages ROMCloud's own, separate EmulationStation override file
-(``es_systems_romcloud.cfg``) — see :mod:`romcloud.integrations.batocera.es_config`.
-Never touches Batocera's stock ``es_systems.cfg`` or any other override file.
+Manages ROMCloud's EmulationStation override and reversible field-level repairs
+for third-party overlays that would otherwise supersede it. Batocera's stock
+``es_systems.cfg`` is never modified.
 """
 
 from __future__ import annotations
@@ -96,7 +96,7 @@ def es_status_cmd(ctx: click.Context) -> None:
 @es_group.command("remove")
 @click.pass_context
 def es_remove_cmd(ctx: click.Context) -> None:
-    """Remove ROMCloud's ES override file (only the file ROMCloud owns)."""
+    """Remove the ES integration and restore ROMCloud-owned overlay fields."""
     removed = es_config.remove()
     if removed:
         click.echo(f"Removed {es_config.ROMCLOUD_OVERRIDE_PATH}")

@@ -8,6 +8,7 @@ file is missing.
 from __future__ import annotations
 
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 import pytest
 
@@ -15,6 +16,7 @@ from romcloud.integrations.batocera import es_config
 from romcloud.integrations.batocera.system_registry import (
     EffectiveSystemRegistry,
     SystemLaunchSpec,
+    load_effective_system_registry,
 )
 
 _WRAPPER = Path("/userdata/system/romcloud/bin/romcloud-run")
@@ -204,3 +206,228 @@ class TestStatus:
             ["snes"], stock_path=stock_path, override_path=override_path, wrapper_path=wrapper
         )
         assert st_after.wrapper_installed is True
+
+
+_SWITCH_COMMAND = (
+    "python /userdata/system/switch/configgen/switchlauncher.py "
+    "%CONTROLLERSCONFIG% -gameinfoxml %GAMEINFOXML% -system %SYSTEM% "
+    "-rom %ROM% -emulator %EMULATOR% -systemname %SYSTEMNAME%"
+)
+
+
+def _switch_registry(tmp_path: Path, user_dir: Path, share_dir: Path):
+    return load_effective_system_registry(
+        cache_path=tmp_path / "data" / "registry.json",
+        user_config_dir=user_dir,
+        system_config_dir=share_dir,
+        legacy_config_dir=tmp_path / "missing-legacy",
+    )
+
+
+class TestThirdPartyOverlayPrecedence:
+    def _layout(self, tmp_path: Path):
+        user = tmp_path / "user"
+        share = tmp_path / "share"
+        user.mkdir()
+        share.mkdir()
+        stock = share / "es_systems.cfg"
+        stock.write_text(
+            "<systemList><system><name>switch</name>"
+            "<extension>.nro .xci</extension>"
+            "<command>emulatorlauncher -system %SYSTEM% -rom %ROM%</command>"
+            "</system></systemList>",
+            encoding="utf-8",
+        )
+        bua = user / "es_systems_switch.cfg"
+        bua.write_text(
+            "<systemList><system><name>switch</name><path>/userdata/roms/switch</path>"
+            "<extension>.nro .NRO .xci .XCI .xcz .XCZ .nsp .NSP .nsz .NSZ "
+            ".xci_config</extension>"
+            f"<command>{_SWITCH_COMMAND}</command>"
+            "</system></systemList>",
+            encoding="utf-8",
+        )
+        return user, share, stock, bua, user / "es_systems_romcloud.cfg"
+
+    def test_refresh_repairs_later_custom_overlay_and_tracks_restore(self, tmp_path):
+        user, share, stock, bua, override = self._layout(tmp_path)
+        registry = _switch_registry(tmp_path, user, share)
+
+        es_config.install(
+            ["switch"],
+            stock_path=stock,
+            override_path=override,
+            wrapper_path=_WRAPPER,
+            system_registry=registry,
+        )
+
+        root = ET.fromstring(bua.read_text(encoding="utf-8"))
+        switch = root.find("system")
+        assert switch is not None
+        assert ".romcloud" in (switch.findtext("extension") or "").split()
+        assert switch.findtext("command") == f"{_WRAPPER} {_SWITCH_COMMAND}"
+        assert switch.findtext("path") == "/userdata/roms/switch"
+        assert (user / "es_systems_romcloud.patches.json").exists()
+
+        # Discovery still observes the native launcher/extensions while the
+        # reversible repair is active.
+        native = _switch_registry(tmp_path, user, share).get("switch")
+        assert native is not None
+        assert native.command == _SWITCH_COMMAND
+        assert ".romcloud" not in native.extensions
+
+    def test_remove_restores_native_fields_without_deleting_third_party_file(
+        self, tmp_path
+    ):
+        user, share, stock, bua, override = self._layout(tmp_path)
+        es_config.install(
+            ["switch"],
+            stock_path=stock,
+            override_path=override,
+            wrapper_path=_WRAPPER,
+            system_registry=_switch_registry(tmp_path, user, share),
+        )
+
+        assert es_config.remove(override_path=override) is True
+
+        root = ET.fromstring(bua.read_text(encoding="utf-8"))
+        assert root.findtext("system/command") == _SWITCH_COMMAND
+        assert ".romcloud" not in (root.findtext("system/extension") or "").split()
+        assert root.findtext("system/path") == "/userdata/roms/switch"
+        assert bua.exists()
+        assert not override.exists()
+        assert not (user / "es_systems_romcloud.patches.json").exists()
+
+    def test_refresh_rebases_after_third_party_reinstall(self, tmp_path):
+        user, share, stock, bua, override = self._layout(tmp_path)
+        es_config.install(
+            ["switch"],
+            stock_path=stock,
+            override_path=override,
+            wrapper_path=_WRAPPER,
+            system_registry=_switch_registry(tmp_path, user, share),
+        )
+        updated_command = _SWITCH_COMMAND + " --bua-new %NEWARG%"
+        bua.write_text(
+            "<systemList><system><name>switch</name><path>/custom/updated path</path>"
+            "<extension>.xci .nsp .updated</extension>"
+            f"<command>{updated_command}</command>"
+            "</system></systemList>",
+            encoding="utf-8",
+        )
+
+        es_config.refresh(
+            ["switch"],
+            stock_path=stock,
+            override_path=override,
+            wrapper_path=_WRAPPER,
+            system_registry=_switch_registry(tmp_path, user, share),
+        )
+        patched = ET.fromstring(bua.read_text(encoding="utf-8"))
+        assert patched.findtext("system/command") == f"{_WRAPPER} {updated_command}"
+        assert ".updated" in (patched.findtext("system/extension") or "").split()
+        assert ".romcloud" in (patched.findtext("system/extension") or "").split()
+
+        es_config.remove(override_path=override)
+        restored = ET.fromstring(bua.read_text(encoding="utf-8"))
+        assert restored.findtext("system/command") == updated_command
+        assert restored.findtext("system/extension") == ".xci .nsp .updated"
+        assert restored.findtext("system/path") == "/custom/updated path"
+
+    def test_refresh_and_remove_are_idempotent(self, tmp_path):
+        user, share, stock, bua, override = self._layout(tmp_path)
+        for _ in range(2):
+            es_config.refresh(
+                ["switch"],
+                stock_path=stock,
+                override_path=override,
+                wrapper_path=_WRAPPER,
+                system_registry=_switch_registry(tmp_path, user, share),
+            )
+        once = bua.read_bytes()
+        es_config.refresh(
+            ["switch"],
+            stock_path=stock,
+            override_path=override,
+            wrapper_path=_WRAPPER,
+            system_registry=_switch_registry(tmp_path, user, share),
+        )
+        assert bua.read_bytes() == once
+        assert es_config.remove(override_path=override) is True
+        assert es_config.remove(override_path=override) is False
+
+    def test_remove_preserves_third_party_field_changed_after_refresh(self, tmp_path):
+        user, share, stock, bua, override = self._layout(tmp_path)
+        es_config.install(
+            ["switch"],
+            stock_path=stock,
+            override_path=override,
+            wrapper_path=_WRAPPER,
+            system_registry=_switch_registry(tmp_path, user, share),
+        )
+        root = ET.fromstring(bua.read_text(encoding="utf-8"))
+        command = root.find("system/command")
+        assert command is not None
+        command.text = "third-party-new-launcher -rom %ROM%"
+        bua.write_text(ET.tostring(root, encoding="unicode"), encoding="utf-8")
+
+        es_config.remove(override_path=override)
+
+        restored = ET.fromstring(bua.read_text(encoding="utf-8"))
+        assert restored.findtext("system/command") == "third-party-new-launcher -rom %ROM%"
+        assert ".romcloud" not in (restored.findtext("system/extension") or "").split()
+
+    def test_status_detects_third_party_overlay_overwrite(self, tmp_path):
+        user, share, stock, bua, override = self._layout(tmp_path)
+        es_config.install(
+            ["switch"],
+            stock_path=stock,
+            override_path=override,
+            wrapper_path=_WRAPPER,
+            system_registry=_switch_registry(tmp_path, user, share),
+        )
+        assert es_config.status(
+            ["switch"],
+            stock_path=stock,
+            override_path=override,
+            wrapper_path=_WRAPPER,
+            system_registry=_switch_registry(tmp_path, user, share),
+        ).up_to_date
+        bua.write_text(
+            "<systemList><system><name>switch</name><extension>.xci</extension>"
+            f"<command>{_SWITCH_COMMAND}</command></system></systemList>",
+            encoding="utf-8",
+        )
+
+        assert not es_config.status(
+            ["switch"],
+            stock_path=stock,
+            override_path=override,
+            wrapper_path=_WRAPPER,
+            system_registry=_switch_registry(tmp_path, user, share),
+        ).up_to_date
+
+    def test_refresh_migrates_old_manual_wrapper_and_direct_restores_native(
+        self, tmp_path
+    ):
+        user, share, stock, bua, override = self._layout(tmp_path)
+        legacy = _SWITCH_COMMAND.removeprefix("python ")
+        root = ET.fromstring(bua.read_text(encoding="utf-8"))
+        command = root.find("system/command")
+        assert command is not None
+        command.text = f"{_WRAPPER} {legacy}"
+        bua.write_text(ET.tostring(root, encoding="unicode"), encoding="utf-8")
+
+        es_config.refresh(
+            ["switch"],
+            stock_path=stock,
+            override_path=override,
+            wrapper_path=_WRAPPER,
+            system_registry=_switch_registry(tmp_path, user, share),
+        )
+        patched = ET.fromstring(bua.read_text(encoding="utf-8"))
+        assert patched.findtext("system/command") == f"{_WRAPPER} {_SWITCH_COMMAND}"
+
+        es_config.remove(override_path=override)
+        restored = ET.fromstring(bua.read_text(encoding="utf-8"))
+        assert restored.findtext("system/command") == _SWITCH_COMMAND

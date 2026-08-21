@@ -24,11 +24,15 @@ using Batocera's persistent override mechanism:
 This file contains **only** the systems actually managed by the ROMCloud
 catalog (see the ``managed_systems`` argument below — callers typically pass
 ``container.game_repo.list_systems()``). Each entry contains only its name,
-the stock extension list with ``.romcloud`` appended, and the stock command
-with its executable swapped for ``romcloud-run``. Batocera inherits every
-other field from its stock definition. Every other Batocera system, and any
-other user override file, is left completely untouched. Removing ROMCloud's
-integration (:func:`remove`) only ever deletes this one file.
+the effective native extension list with ``.romcloud`` appended, and the
+complete native command prefixed by ``romcloud-run``.
+
+Because Batocera uses filesystem enumeration order for named overlays, a
+third-party file encountered later can replace those two fields. ROMCloud
+repairs only ``extension`` and ``command`` in matching user overlays and keeps
+a field-level ownership manifest. Direct mode/removal restores a field only if
+it still has ROMCloud's applied value, so unrelated or subsequently updated
+third-party configuration is preserved.
 
 Known limitation — folder-specific settings
 ----------------------------------------------
@@ -46,10 +50,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+from xml.etree import ElementTree as ET
 
 from romcloud.core.exceptions import ProviderError
 from romcloud.infrastructure.atomic_file import atomic_write_text
 from romcloud.infrastructure.logging import get_logger
+from romcloud.integrations.batocera.es_overlay_patches import (
+    overlays_match,
+    patch_user_overlays,
+    restore_owned_patches,
+)
 from romcloud.integrations.batocera.es_systems import (
     GeneratedOverride,
     generate_override,
@@ -128,6 +138,10 @@ def install(
     Idempotent: writing the same *managed_systems* against an unchanged stock
     file always produces the same file content.
     """
+    # Return any fields owned by the previous refresh to their native values
+    # first. The supplied effective registry projects those tracked values
+    # away in memory, so it remains a trustworthy native snapshot.
+    restore_owned_patches(override_path.parent)
     result = _generate(
         managed_systems,
         stock_path=stock_path,
@@ -136,12 +150,22 @@ def install(
     )
     override_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(override_path, result.xml)
+    patched_overlays = patch_user_overlays(
+        override_path.parent,
+        override_path=override_path,
+        desired=_desired_fields(result.xml),
+    )
     log.info(
         "Wrote ES override for %d system(s) to %s (missing from stock: %s)",
         len(result.included_systems),
         override_path,
         result.missing_systems or "none",
     )
+    if patched_overlays:
+        log.info(
+            "Repaired ROMCloud-owned fields in %d conflicting ES overlay(s)",
+            patched_overlays,
+        )
     return result
 
 
@@ -195,7 +219,11 @@ def status(
                 wrapper_path=wrapper_path,
                 system_registry=system_registry,
             )
-            up_to_date = fresh.xml == current_xml
+            up_to_date = fresh.xml == current_xml and overlays_match(
+                override_path.parent,
+                override_path=override_path,
+                desired=_desired_fields(fresh.xml),
+            )
         except ESConfigError:
             up_to_date = False
 
@@ -209,13 +237,32 @@ def status(
 
 
 def remove(*, override_path: Path = ROMCLOUD_OVERRIDE_PATH) -> bool:
-    """Delete ROMCloud's override file only.
+    """Remove ROMCloud's override and restore its tracked overlay fields.
 
-    Never touches the stock ``es_systems.cfg`` or any other override file.
-    Returns True if a file was removed, False if there was nothing to do.
+    Never touches the stock ``es_systems.cfg``. Third-party fields are restored
+    only while they still match ROMCloud's recorded applied values. Returns
+    True if an owned integration value was removed, otherwise False.
     """
-    if not override_path.exists():
-        return False
-    override_path.unlink()
-    log.info("Removed ES override: %s", override_path)
-    return True
+    restored = restore_owned_patches(override_path.parent)
+    removed = False
+    if override_path.exists():
+        override_path.unlink()
+        log.info("Removed ES override: %s", override_path)
+        removed = True
+    if restored:
+        log.info("Restored ROMCloud-owned fields in third-party ES overlays")
+    return removed or restored
+
+
+def _desired_fields(xml: str) -> dict[str, dict[str, str]]:
+    root = ET.fromstring(xml)
+    desired: dict[str, dict[str, str]] = {}
+    for system in root.findall("system"):
+        name = (system.findtext("name") or "").strip()
+        if not name:
+            continue
+        desired[name] = {
+            "extension": (system.findtext("extension") or "").strip(),
+            "command": (system.findtext("command") or "").strip(),
+        }
+    return desired

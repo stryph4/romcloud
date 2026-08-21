@@ -10,7 +10,8 @@ This module mirrors the relevant parts of Batocera EmulationStation's
 
 ROMCloud's own ``es_systems_romcloud.cfg`` overlay is deliberately excluded.
 Its ``.romcloud`` extension describes ROMCloud's presentation layer, not a
-native source-ROM type.
+native source-ROM type. Fields reversibly repaired in a later third-party
+overlay are likewise projected back to their recorded native values here.
 """
 
 from __future__ import annotations
@@ -25,6 +26,11 @@ from xml.etree import ElementTree as ET
 from romcloud.core.exceptions import ROMCloudError
 from romcloud.infrastructure.atomic_file import atomic_write_text
 from romcloud.infrastructure.logging import get_logger
+from romcloud.integrations.batocera.es_overlay_patches import (
+    patch_state_path,
+    project_native_root,
+    read_patch_state,
+)
 
 log = get_logger("batocera.system_registry")
 
@@ -138,7 +144,11 @@ def _load_live_registry(
     if base_path is None:
         raise FileNotFoundError("no Batocera es_systems.cfg base file was found")
 
+    patch_state = read_patch_state(patch_state_path(user_config_dir))
+    resolved_user_dir = user_config_dir.resolve(strict=False)
     root = _parse_system_list(base_path)
+    if base_path.parent.resolve(strict=False) == resolved_user_dir:
+        root = project_native_root(base_path, root, patch_state)
     systems: dict[str, ET.Element] = {}
     order: list[str] = []
     for element in root.findall("system"):
@@ -167,6 +177,10 @@ def _load_live_registry(
         )
         for overlay_path in overlays:
             overlay_root = _parse_system_list(overlay_path)
+            if overlay_path.parent.resolve(strict=False) == resolved_user_dir:
+                overlay_root = project_native_root(
+                    overlay_path, overlay_root, patch_state
+                )
             for patch in overlay_root.findall("system"):
                 name = (patch.findtext("name") or "").strip()
                 if not name:

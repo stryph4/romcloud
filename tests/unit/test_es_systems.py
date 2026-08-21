@@ -119,13 +119,13 @@ class TestExtensionPreservation:
 
         assert result.included_systems == ["custom"]
         assert ".bar .foo .romcloud" in result.xml
-        assert f"{_WRAPPER} --system %SYSTEM% --rom %ROM%" in result.xml
+        assert f"{_WRAPPER} custom-launch --system %SYSTEM% --rom %ROM%" in result.xml
 
 
 class TestCommandArgvPreservation:
-    def test_executable_replaced_with_wrapper(self):
+    def test_wrapper_is_prepended_and_executable_is_preserved(self):
         result = generate_override(_STOCK_XML, ["snes"], _WRAPPER)
-        assert f"<command>{_WRAPPER} %CONTROLLERSCONFIG%" in result.xml
+        assert f"<command>{_WRAPPER} emulatorlauncher %CONTROLLERSCONFIG%" in result.xml
 
     def test_all_original_arguments_preserved_in_order(self):
         result = generate_override(_STOCK_XML, ["snes"], _WRAPPER)
@@ -139,16 +139,71 @@ class TestCommandArgvPreservation:
         """gba's stock command has fewer arguments than snes's — both must
         just have their leading token swapped, whatever the length."""
         result = generate_override(_STOCK_XML, ["gba"], _WRAPPER)
-        assert f"<command>{_WRAPPER} -system %SYSTEM% -rom %ROM%</command>" in result.xml
+        assert (
+            f"<command>{_WRAPPER} emulatorlauncher -system %SYSTEM% "
+            "-rom %ROM%</command>" in result.xml
+        )
 
     def test_does_not_hardcode_argument_count_longer_command(self):
         """ps2's stock command has an extra trailing argument — it must be
         preserved even though it doesn't appear in any other system."""
         result = generate_override(_STOCK_XML, ["ps2"], _WRAPPER)
         assert (
-            f"<command>{_WRAPPER} %CONTROLLERSCONFIG% -system %SYSTEM% -rom %ROM% "
+            f"<command>{_WRAPPER} emulatorlauncher %CONTROLLERSCONFIG% "
+            "-system %SYSTEM% -rom %ROM% "
             "-gameinfoxml %GAMEINFOXML% -systemname %SYSTEMNAME% "
             "-extra %EXTRA%</command>" in result.xml
+        )
+
+    def test_custom_interpreter_and_script_are_preserved(self):
+        command = (
+            "python /userdata/system/switch/configgen/switchlauncher.py "
+            "%CONTROLLERSCONFIG% -gameinfoxml %GAMEINFOXML% -system %SYSTEM% "
+            "-rom %ROM% -emulator %EMULATOR% -systemname %SYSTEMNAME%"
+        )
+        registry = EffectiveSystemRegistry(
+            {
+                "switch": SystemLaunchSpec(
+                    "switch", frozenset({".xci", ".nsp"}), command
+                )
+            }
+        )
+
+        result = generate_override_from_registry(registry, ["switch"], _WRAPPER)
+
+        assert f"<command>{_WRAPPER} {command}</command>" in result.xml
+
+    def test_legacy_wrapper_that_lost_python_is_migrated(self):
+        script_and_args = (
+            "/userdata/system/switch/configgen/switchlauncher.py "
+            "%CONTROLLERSCONFIG% -system %SYSTEM% -rom %ROM%"
+        )
+        registry = EffectiveSystemRegistry(
+            {
+                "switch": SystemLaunchSpec(
+                    "switch",
+                    frozenset({".xci"}),
+                    f"{_WRAPPER} {script_and_args}",
+                )
+            }
+        )
+
+        result = generate_override_from_registry(registry, ["switch"], _WRAPPER)
+
+        assert f"<command>{_WRAPPER} python {script_and_args}</command>" in result.xml
+
+    def test_legacy_standard_wrapper_that_lost_launcher_is_migrated(self):
+        legacy = (
+            "<systemList><system><name>snes</name><extension>.sfc</extension>"
+            f"<command>{_WRAPPER} -system %SYSTEM% -rom %ROM%</command>"
+            "</system></systemList>"
+        )
+
+        result = generate_override(legacy, ["snes"], _WRAPPER)
+
+        assert (
+            f"<command>{_WRAPPER} emulatorlauncher -system %SYSTEM% "
+            "-rom %ROM%</command>" in result.xml
         )
 
     def test_non_overridden_fields_are_left_for_batocera_to_inherit(self):

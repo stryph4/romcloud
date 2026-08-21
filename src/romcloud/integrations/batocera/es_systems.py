@@ -30,11 +30,10 @@ Transformation applied per managed system
 - ``<extension>``: the existing space-separated token list is kept as-is;
     ``.romcloud`` is appended only if no case-insensitive match for it is
     already present.
-  - ``<command>``: only the *first whitespace-separated token* (the
-    executable, e.g. ``emulatorlauncher``) is replaced with the ROMCloud
-    wrapper path. Every other token — ``%CONTROLLERSCONFIG%``, ``-system``,
-    ``%SYSTEM%``, and any future argument Batocera adds — is preserved
-    exactly, in order. The argument count is never assumed or hardcoded.
+- ``<command>``: the ROMCloud wrapper is prepended to the complete native
+    command. The executable (including interpreter/script pairs), every
+    argument, and their order are preserved. The argument count is never
+    assumed or hardcoded.
 
 - Each generated system contains only ``<name>``, ``<extension>``, and
   ``<command>``. Batocera merges those fields over the matching stock system,
@@ -85,15 +84,25 @@ def _ensure_romcloud_extension(extension_text: str) -> str:
 
 
 def _rewrite_command(command_text: str, wrapper_path: str) -> str:
-    tokens = (command_text or "").split()
-    if not tokens:
+    command = (command_text or "").strip()
+    if not command:
         return wrapper_path
-    if tokens[0] == wrapper_path:
+    first = command.split(maxsplit=1)[0]
+    if first == wrapper_path:
+        remainder = command[len(first) :].lstrip()
+        if not remainder:
+            return command
+        legacy_first = remainder.split(maxsplit=1)[0].strip("\"'")
+        # Older ROMCloud releases replaced the native executable. Repair the
+        # generic legacy shapes whose missing executable is unambiguous.
+        if legacy_first.casefold().endswith(".py"):
+            return f"{wrapper_path} python {remainder}"
+        if legacy_first.startswith(("%", "-")):
+            return f"{wrapper_path} emulatorlauncher {remainder}"
         # Already routed through the wrapper (e.g. re-processing our own
         # previous output) — leave every token untouched.
-        return " ".join(tokens)
-    tokens[0] = wrapper_path
-    return " ".join(tokens)
+        return command
+    return f"{wrapper_path} {command}"
 
 
 def _parse_stock_systems(stock_xml: str) -> dict[str, ET.Element]:

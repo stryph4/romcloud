@@ -2,11 +2,10 @@
 
 Key invariants proved here:
 
-1. A normal (non-.romcloud) argv reaches emulatorlauncher byte-for-byte
-   unchanged — only argv[0] (the wrapper script name) is replaced with
-   "emulatorlauncher".
+1. A normal (non-.romcloud) argv reaches its native launcher byte-for-byte
+   unchanged after the ROMCloud wrapper argv[0] is removed.
 
-2. A .romcloud argv reaches emulatorlauncher differing from the normal
+2. A .romcloud argv reaches its native launcher differing from the normal
    argv in *exactly one element*: the value immediately following "-rom".
    Every other argument — %CONTROLLERSCONFIG%, -system, -gameinfoxml,
    -systemname, their positions, and any unknown future args — is identical.
@@ -41,6 +40,7 @@ _SYSTEMNAME = "Super Nintendo Entertainment System"
 # Argv exactly as EmulationStation would produce it (normal ROM, no ROMCloud)
 _NORMAL_ARGV: list[str] = [
     _WRAPPER,
+    "emulatorlauncher",
     _CTRLS,
     "-system", "snes",
     "-rom", "/userdata/roms/snes/Chrono Trigger.sfc",
@@ -51,6 +51,7 @@ _NORMAL_ARGV: list[str] = [
 # Same argv but with a .romcloud proxy as the -rom value
 _ROMCLOUD_ARGV: list[str] = [
     _WRAPPER,
+    "emulatorlauncher",
     _CTRLS,
     "-system", "snes",
     "-rom", "/userdata/roms/snes/Chrono Trigger.romcloud",
@@ -132,7 +133,7 @@ class TestReplaceRomPath:
 
     def test_controllersconfig_preserved(self):
         result = replace_rom_path(_ROMCLOUD_ARGV, _CACHED_ROM)
-        assert result[1] == _CTRLS
+        assert result[2] == _CTRLS
 
     def test_system_arg_preserved(self):
         result = replace_rom_path(_ROMCLOUD_ARGV, _CACHED_ROM)
@@ -226,7 +227,7 @@ class TestEmulatorLauncherPassthrough:
         EmulatorLauncher().exec_passthrough(_NORMAL_ARGV)
 
         assert captured["args"][0] == _EL
-        assert captured["args"][1:] == _NORMAL_ARGV[1:]
+        assert captured["args"] == _NORMAL_ARGV[1:]
 
     def test_passthrough_argv_identical_to_original_minus_wrapper_name(
         self, monkeypatch, fake_launcher
@@ -240,13 +241,13 @@ class TestEmulatorLauncherPassthrough:
 
         EmulatorLauncher().exec_passthrough(_NORMAL_ARGV)
 
-        # Every element except argv[0] must be the same as _NORMAL_ARGV[1:]
-        assert captured_args[1:] == _NORMAL_ARGV[1:]
+        # Only ROMCloud's wrapper argv[0] is removed.
+        assert captured_args == _NORMAL_ARGV[1:]
 
     def test_passthrough_not_found_raises_launch_error(self, monkeypatch):
         monkeypatch.setenv("PATH", "/nonexistent")
         monkeypatch.setenv("ROMCLOUD_EMULATORLAUNCHER", "emulatorlauncher")
-        with pytest.raises(LaunchError, match="emulatorlauncher not found"):
+        with pytest.raises(LaunchError, match="native launcher executable not found"):
             EmulatorLauncher().exec_passthrough(_NORMAL_ARGV)
 
 
@@ -257,7 +258,7 @@ class TestEmulatorLauncherWithRom:
         _, bin_dir = fake_launcher
         monkeypatch.setenv("PATH", bin_dir)
         xbox_argv = [
-            _WRAPPER, "-system", "xbox", "-rom",
+            _WRAPPER, "emulatorlauncher", "-system", "xbox", "-rom",
             "/userdata/roms/xbox/Aeon Flux.romcloud",
         ]
         cached_iso = "/userdata/romcloud/cache/xbox/Aeon Flux.iso"
@@ -350,7 +351,7 @@ class TestEmulatorLauncherWithRom:
     def test_exec_with_rom_not_found_raises_launch_error(self, monkeypatch):
         monkeypatch.setenv("PATH", "/nonexistent")
         monkeypatch.setenv("ROMCLOUD_EMULATORLAUNCHER", "emulatorlauncher")
-        with pytest.raises(LaunchError, match="emulatorlauncher not found"):
+        with pytest.raises(LaunchError, match="native launcher executable not found"):
             EmulatorLauncher().exec_with_rom(_ROMCLOUD_ARGV, _CACHED_ROM)
 
     def test_exec_with_rom_unknown_future_args_preserved(self, monkeypatch, fake_launcher):
@@ -367,6 +368,43 @@ class TestEmulatorLauncherWithRom:
 
         assert "-newfeature" in captured["args"]
         assert "somevalue" in captured["args"]
+
+    def test_custom_python_launcher_and_every_argument_are_preserved(self, monkeypatch):
+        script = "/userdata/system/switch/configgen/switchlauncher.py"
+        proxy = "/userdata/roms/switch/Metroid Dread.romcloud"
+        cached = "/userdata/romcloud/cache/switch/Metroid Dread.xci"
+        argv = [
+            _WRAPPER,
+            "python",
+            script,
+            _CTRLS,
+            "-gameinfoxml",
+            "/tmp/game info/switch.xml",
+            "-system",
+            "switch",
+            "-rom",
+            proxy,
+            "-emulator",
+            "yuzu",
+            "-systemname",
+            "Nintendo Switch",
+            "--future-option",
+            "value with spaces",
+        ]
+        captured = {}
+        monkeypatch.setattr(
+            "romcloud.integrations.batocera.launcher.shutil.which",
+            lambda command: "/usr/bin/python" if command == "python" else None,
+        )
+        monkeypatch.setattr(
+            "os.execvp", lambda file, args: captured.update(file=file, args=list(args))
+        )
+
+        EmulatorLauncher().exec_with_rom(argv, cached)
+
+        expected = list(argv[1:])
+        expected[expected.index(proxy)] = cached
+        assert captured == {"file": "/usr/bin/python", "args": expected}
 
 
 # ── _transfer_with_progress: graphical > curses > plain fallback order ───────

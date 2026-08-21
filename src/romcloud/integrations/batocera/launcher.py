@@ -11,12 +11,12 @@ Verified command format on Batocera 42
 
 ROMCloud as a transparent pass-through wrapper
 -----------------------------------------------
-The ``romcloud-run`` script receives the exact same argv that EmulationStation
-would have passed to ``emulatorlauncher``.  Its only job is:
+The ``romcloud-run`` script receives the complete native system command after
+its own wrapper path. Its only job is:
 
-* **Non-.romcloud ROM** → ``exec emulatorlauncher`` with argv unchanged.
+* **Non-.romcloud ROM** → exec the native launcher with argv unchanged.
 * **.romcloud proxy** → resolve/cache the real ROM, replace *only* the value
-  immediately following ``-rom``, then ``exec emulatorlauncher`` with every
+  immediately following ``-rom``, then exec the same native launcher with every
   other argument preserved exactly — including its position.
 
 ``%CONTROLLERSCONFIG%``, ``-system``, ``-gameinfoxml``, ``-systemname``, and
@@ -71,10 +71,6 @@ from romcloud.infrastructure.logging import get_logger
 
 log = get_logger("batocera.launcher")
 
-# Override via environment variable for testing on non-Batocera machines.
-_EMULATOR_LAUNCHER: str = os.environ.get("ROMCLOUD_EMULATORLAUNCHER", "emulatorlauncher")
-
-
 def _source_sha256(path: Path) -> str:
     try:
         return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -121,32 +117,31 @@ def is_romcloud_proxy(path: str) -> bool:
 
 
 class EmulatorLauncher:
-    """Delegates to Batocera's ``emulatorlauncher`` with argv pass-through.
+    """Delegates to the effective native launcher with argv pass-through.
 
     The only element that may differ between the received argv and the argv
-    forwarded to ``emulatorlauncher`` is the value of ``-rom``.  All other
+    forwarded to that launcher is the value of ``-rom``. All other
     arguments — count, order, content — are preserved exactly.
     """
 
     def exec_passthrough(self, original_argv: list[str]) -> None:
-        """Exec ``emulatorlauncher`` with *original_argv* unchanged.
+        """Exec the native command in *original_argv* unchanged.
 
-        ``argv[0]`` (the wrapper script path) is replaced with
-        ``"emulatorlauncher"`` as the new program name; every other element
-        is forwarded as-is.
+        ``argv[0]`` is the wrapper path. ``argv[1]`` is the native executable
+        and becomes the new program name; every later element is forwarded.
 
         **Does not return on success.**
 
-        Raises :class:`~romcloud.core.exceptions.LaunchError` if
-        ``emulatorlauncher`` is not found on ``PATH``.
+        Raises :class:`~romcloud.core.exceptions.LaunchError` if the native
+        command is absent or its executable is not found on ``PATH``.
         """
-        launcher = _require_launcher()
-        target_argv = ["emulatorlauncher"] + list(original_argv[1:])
-        log.info("passthrough: %s", launcher)
+        target_argv = _native_argv(original_argv)
+        launcher = _require_launcher(target_argv[0])
+        log.info("passthrough: %s [%d args total]", launcher, len(target_argv))
         os.execvp(launcher, target_argv)
 
     def exec_with_rom(self, original_argv: list[str], cached_rom_path: str) -> None:
-        """Exec ``emulatorlauncher`` with the ``-rom`` value replaced by *cached_rom_path*.
+        """Exec the native launcher with ``-rom`` replaced by *cached_rom_path*.
 
         Every other argument — including ``%CONTROLLERSCONFIG%``, ``-system``,
         ``-gameinfoxml``, ``-systemname``, and their positions — is preserved
@@ -154,12 +149,12 @@ class EmulatorLauncher:
 
         **Does not return on success.**
 
-        Raises :class:`~romcloud.core.exceptions.LaunchError` if
-        ``emulatorlauncher`` is not found on ``PATH``.
+        Raises :class:`~romcloud.core.exceptions.LaunchError` if the native
+        command is absent or its executable is not found on ``PATH``.
         """
-        launcher = _require_launcher()
         patched = replace_rom_path(list(original_argv), cached_rom_path)
-        target_argv = ["emulatorlauncher"] + patched[1:]
+        target_argv = _native_argv(patched)
+        launcher = _require_launcher(target_argv[0])
         log.info(
             "launch diagnostic: final Batocera/configgen path=%r regular_file=%s",
             find_rom_path(target_argv),
@@ -174,12 +169,20 @@ class EmulatorLauncher:
         os.execvp(launcher, target_argv)
 
 
-def _require_launcher() -> str:
-    launcher = shutil.which(_EMULATOR_LAUNCHER)
+def _native_argv(original_argv: list[str]) -> list[str]:
+    """Remove the ROMCloud wrapper element, retaining the native argv exactly."""
+    if len(original_argv) < 2 or not original_argv[1]:
+        raise LaunchError("native launcher command is missing after romcloud-run")
+    return list(original_argv[1:])
+
+
+def _require_launcher(command: str) -> str:
+    launcher = shutil.which(command)
     if launcher is None:
         raise LaunchError(
-            f"emulatorlauncher not found: {_EMULATOR_LAUNCHER!r}. "
-            "Is ROMCloud running on Batocera?"
+            f"native launcher executable not found: {command!r}. "
+            "Refresh the ROMCloud EmulationStation integration after changing "
+            "or reinstalling a custom system launcher."
         )
     return launcher
 
@@ -190,9 +193,8 @@ def _require_launcher() -> str:
 def run_launcher_wrapper(argv: list[str]) -> None:
     """Entry point called by the ``romcloud-run`` wrapper script.
 
-    *argv* is ``sys.argv`` as received from EmulationStation — identical to
-    what ``emulatorlauncher`` would have received, except ``argv[0]`` is the
-    wrapper script path.
+    *argv* is ``sys.argv`` as received from EmulationStation. ``argv[0]`` is
+    the wrapper path and ``argv[1:]`` is the complete native launcher command.
 
     Exits the process via ``os.execvp`` or ``sys.exit``; **never returns**.
     """
@@ -209,7 +211,7 @@ def run_launcher_wrapper(argv: list[str]) -> None:
             sys.exit(1)
         sys.exit(1)  # unreachable if exec succeeded
 
-    # .romcloud proxy — resolve, cache, then hand off to emulatorlauncher.
+    # .romcloud proxy — resolve, cache, then hand off to the native launcher.
     try:
         cached_path = _resolve_and_cache(rom_path)
     except TransferCancelledError:
