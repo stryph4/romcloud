@@ -42,6 +42,7 @@ def remove_owned_proxy_files(
     manifest_records: Iterable[tuple[str, Path]] = (),
     keep_game_ids: Optional[set[str]] = None,
     remove_game_ids: Optional[set[str]] = None,
+    verified_payloads: Optional[dict[Path, dict]] = None,
 ) -> int:
     """Remove only identity-matching ROMCloud proxies beneath *local_root*.
 
@@ -75,6 +76,8 @@ def remove_owned_proxy_files(
         if not selected(game_id):
             continue
         payload = proxy_payload(candidate)
+        if payload is not None and verified_payloads is not None:
+            verified_payloads[candidate] = payload
         if (
             payload is not None
             and payload["game_id"] == game_id
@@ -87,6 +90,8 @@ def remove_owned_proxy_files(
         if path_key(path) in inspected:
             continue
         payload = proxy_payload(path)
+        if payload is not None and verified_payloads is not None:
+            verified_payloads[path] = payload
         if (
             payload is not None
             and selected(payload["game_id"])

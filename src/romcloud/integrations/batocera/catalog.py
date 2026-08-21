@@ -28,6 +28,7 @@ from romcloud.core.exceptions import (
     ProxyError,
     ProxyNotOwnedError,
 )
+from romcloud.core.models.cache import CacheEntry
 from romcloud.core.models.game import Game, GameAsset, derive_title
 from romcloud.core.models.proxy import ProxyRecord
 from romcloud.core.progress import ProgressSink, emit_progress
@@ -60,6 +61,29 @@ _IGNORED_SOURCE_DIRECTORY_NAMES = frozenset({"@eadir", "#recycle", "@recycle"})
 
 
 @dataclass
+class CatalogRefreshMetrics:
+    """Lightweight, path-safe timing and reconciliation operation totals."""
+
+    games_processed: int = 0
+    total_seconds: float = 0.0
+    normal_scan_catalog_seconds: float = 0.0
+    migration_identity_seconds: float = 0.0
+    cache_lookup_seconds: float = 0.0
+    duplicate_retirement_seconds: float = 0.0
+    proxy_ownership_verification_seconds: float = 0.0
+    proxy_restoration_seconds: float = 0.0
+    stale_source_suppression_seconds: float = 0.0
+    catalog_row_prefetches: int = 0
+    cache_prefetches: int = 0
+    proxy_manifest_prefetches: int = 0
+    game_row_writes: int = 0
+    game_write_batches: int = 0
+    duplicate_rows_retired: int = 0
+    duplicate_delete_batches: int = 0
+    ownership_scans: int = 0
+
+
+@dataclass
 class CatalogRefreshResult:
     added: int
     skipped: int
@@ -72,6 +96,7 @@ class CatalogRefreshResult:
     updated: int = 0
     """Existing games whose companion-asset set changed (e.g. a
     previously-independent .bin now recognised as part of a .cue set)."""
+    metrics: CatalogRefreshMetrics = field(default_factory=CatalogRefreshMetrics)
 
     def __str__(self) -> str:
         lines = [
@@ -136,6 +161,8 @@ class CatalogService:
         change are pruned here (see ``removed``).
         """
         self._capabilities.require(Capability.CATALOG_REFRESH, "Catalog refresh")
+        refresh_started_at = time.perf_counter()
+        metrics = CatalogRefreshMetrics()
         added = skipped = removed = updated = 0
         errors: list[tuple[str, str]] = []
         warnings: list[str] = []
@@ -172,7 +199,17 @@ class CatalogService:
                 total=0,
                 metadata={"succeeded": 0, "failed": 1},
             )
-            return CatalogRefreshResult(added, skipped, removed, errors, warnings=warnings, updated=updated)
+            metrics.total_seconds = time.perf_counter() - refresh_started_at
+            metrics.normal_scan_catalog_seconds = metrics.total_seconds
+            return CatalogRefreshResult(
+                added,
+                skipped,
+                removed,
+                errors,
+                warnings=warnings,
+                updated=updated,
+                metrics=metrics,
+            )
 
         detected_launchable = [s for s in remote_systems if s in registry.names]
         matched = [
@@ -260,10 +297,56 @@ class CatalogService:
                         system, entries, entry_metadata
                     )
                 warnings.extend(group_warnings)
-                legacy_matches = self._legacy_container_matches(
-                    system, games, ordinary_directories
+                identity_started_at = time.perf_counter()
+                existing_system_games = self._game_repo.find_by_system(
+                    system, include_ineligible=True
                 )
-                existing_by_primary = self._existing_games_by_primary(system)
+                metrics.catalog_row_prefetches += 1
+                legacy_matches = self._legacy_container_matches(
+                    system,
+                    games,
+                    ordinary_directories,
+                    existing_system_games,
+                )
+                existing_by_primary = self._existing_games_by_primary(
+                    existing_system_games
+                )
+                has_duplicate_identities = any(
+                    len(candidates) > 1
+                    for candidates in existing_by_primary.values()
+                )
+                metrics.migration_identity_seconds += (
+                    time.perf_counter() - identity_started_at
+                )
+                cache_started_at = time.perf_counter()
+                cache_entries_by_id = (
+                    {
+                        entry.game_id: entry
+                        for entry in self._cache_repo.list_all()
+                    }
+                    if has_duplicate_identities and self._cache_repo is not None
+                    else {}
+                )
+                if has_duplicate_identities and self._cache_repo is not None:
+                    metrics.cache_prefetches += 1
+                metrics.cache_lookup_seconds += time.perf_counter() - cache_started_at
+                needs_proxy_index = has_duplicate_identities or any(
+                    game.source_provider != self._provider.provider_id
+                    or game.source_root != self._source_root
+                    for game in existing_system_games
+                )
+                proxy_records = (
+                    self._proxy_repo.list_all() if needs_proxy_index else []
+                )
+                if needs_proxy_index:
+                    metrics.proxy_manifest_prefetches += 1
+                proxy_records_by_id = {
+                    record.game_id: record for record in proxy_records
+                }
+                duplicate_games: dict[str, Game] = {}
+                duplicate_survivors: dict[str, Game] = {}
+                migration_updates: dict[str, Game] = {}
+                migration_proxy_rewrites: dict[str, Game] = {}
 
                 game_total = len(games)
                 emit_progress(
@@ -286,6 +369,7 @@ class CatalogService:
 
                 progress_interval = max(1, game_total // 100)
                 for game_index, game in enumerate(games, start=1):
+                    metrics.games_processed += 1
                     primary = game.primary_asset
                     if primary is None:
                         self._emit_system_progress(
@@ -296,7 +380,13 @@ class CatalogService:
                     identity_matches = existing_by_primary.get(
                         primary.relative_path, []
                     )
-                    existing = self._select_existing_identity(identity_matches)
+                    identity_started_at = time.perf_counter()
+                    existing = self._select_existing_identity(
+                        identity_matches, cache_entries_by_id
+                    )
+                    metrics.migration_identity_seconds += (
+                        time.perf_counter() - identity_started_at
+                    )
                     if existing is None:
                         existing = legacy_matches.get(primary.relative_path)
                     if existing is not None:
@@ -320,8 +410,18 @@ class CatalogService:
                             game.added_at = existing.added_at
                             game.last_played = existing.last_played
                             game.is_eligible = True
-                            self._game_repo.save(game)
-                            self._rewrite_owned_proxy(game)
+                            metrics.game_row_writes += 1
+                            if source_changed:
+                                migration_updates[game.id] = game
+                                if not duplicates:
+                                    migration_proxy_rewrites[game.id] = game
+                            else:
+                                self._game_repo.save(game)
+                                metrics.game_write_batches += 1
+                                if not duplicates:
+                                    self._rewrite_owned_proxy(
+                                        game, proxy_records_by_id.get(game.id)
+                                    )
                             updated += 1
                             log.info(
                                 "Updated catalog identity for %r [%s]%s",
@@ -332,16 +432,19 @@ class CatalogService:
                         else:
                             skipped += 1
                         if duplicates:
-                            removed += self._retire_duplicate_games(duplicates)
-                            self._canonicalize_proxy_path(
-                                game if changed else existing
+                            duplicate_games.update(
+                                (candidate.id, candidate) for candidate in duplicates
                             )
+                            survivor = game if changed else existing
+                            duplicate_survivors[survivor.id] = survivor
                         self._emit_system_progress(
                             progress, system, game_index, game_total, progress_interval
                         )
                         continue
 
                     self._game_repo.save(game)
+                    metrics.game_row_writes += 1
+                    metrics.game_write_batches += 1
                     self._write_proxy(game)
                     added += 1
                     log.info("Catalogued %r [%s]", game.title, system)
@@ -349,6 +452,52 @@ class CatalogService:
                     self._emit_system_progress(
                         progress, system, game_index, game_total, progress_interval
                     )
+
+                if migration_updates:
+                    self._game_repo.save_many(list(migration_updates.values()))
+                    metrics.game_write_batches += 1
+                    for migrated in migration_proxy_rewrites.values():
+                        self._rewrite_owned_proxy(
+                            migrated, proxy_records_by_id.get(migrated.id)
+                        )
+
+                if duplicate_games:
+                    retired_ids = set(duplicate_games)
+                    verified_proxy_payloads: dict[Path, dict] = {}
+                    duplicate_started_at = time.perf_counter()
+                    retired = self._retire_duplicate_games(
+                        list(duplicate_games.values()),
+                        proxy_records,
+                        metrics,
+                        verified_proxy_payloads,
+                    )
+                    removed += retired
+                    metrics.duplicate_rows_retired += retired
+                    metrics.duplicate_delete_batches += 1
+                    metrics.duplicate_retirement_seconds += (
+                        time.perf_counter() - duplicate_started_at
+                    )
+                    proxy_records_by_path = {
+                        record.proxy_path: record
+                        for record in proxy_records
+                        if record.game_id not in retired_ids
+                    }
+                    for survivor in duplicate_survivors.values():
+                        restoration_started_at = time.perf_counter()
+                        self._canonicalize_proxy_path(
+                            survivor,
+                            proxy_records_by_id.get(survivor.id),
+                            proxy_records_by_path,
+                            metrics,
+                            verified_proxy_payloads.get(
+                                Path(proxy_records_by_id[survivor.id].proxy_path)
+                            )
+                            if survivor.id in proxy_records_by_id
+                            else None,
+                        )
+                        metrics.proxy_restoration_seconds += (
+                            time.perf_counter() - restoration_started_at
+                        )
 
                 # Only paths positively observed and rejected during this
                 # complete system traversal are suppressed. Missing source
@@ -411,6 +560,7 @@ class CatalogService:
         # new root), while retaining cache/pin/history for possible future
         # re-adoption. Current-source rows are never swept merely because a
         # game disappeared during an ordinary same-source refresh.
+        stale_started_at = time.perf_counter()
         stale_source_games = self._stale_previous_source_games(
             remote_systems=remote_systems,
             successfully_scanned_systems=successfully_scanned_systems,
@@ -418,6 +568,9 @@ class CatalogService:
         if stale_source_games:
             removed += sum(1 for game in stale_source_games if game.is_eligible)
             self._suppress_games(stale_source_games)
+        metrics.stale_source_suppression_seconds += (
+            time.perf_counter() - stale_started_at
+        )
 
         final_status = "error" if errors else "success"
         summary = f"Catalog refresh complete: {completed_systems} succeeded"
@@ -434,7 +587,51 @@ class CatalogService:
             metadata={"succeeded": completed_systems, "failed": failed_systems},
         )
 
-        return CatalogRefreshResult(added, skipped, removed, errors, warnings=warnings, updated=updated)
+        metrics.total_seconds = time.perf_counter() - refresh_started_at
+        migration_seconds = (
+            metrics.migration_identity_seconds
+            + metrics.cache_lookup_seconds
+            + metrics.duplicate_retirement_seconds
+            + metrics.proxy_restoration_seconds
+            + metrics.stale_source_suppression_seconds
+        )
+        metrics.normal_scan_catalog_seconds = max(
+            0.0, metrics.total_seconds - migration_seconds
+        )
+        log.info(
+            "Catalog refresh metrics games=%d total_ms=%.1f normal_ms=%.1f "
+            "identity_ms=%.1f cache_ms=%.1f duplicate_ms=%.1f ownership_ms=%.1f "
+            "proxy_restore_ms=%.1f stale_ms=%.1f catalog_prefetches=%d "
+            "cache_prefetches=%d proxy_manifest_prefetches=%d game_writes=%d "
+            "game_write_batches=%d "
+            "duplicate_rows=%d duplicate_delete_batches=%d ownership_scans=%d",
+            metrics.games_processed,
+            metrics.total_seconds * 1000,
+            metrics.normal_scan_catalog_seconds * 1000,
+            metrics.migration_identity_seconds * 1000,
+            metrics.cache_lookup_seconds * 1000,
+            metrics.duplicate_retirement_seconds * 1000,
+            metrics.proxy_ownership_verification_seconds * 1000,
+            metrics.proxy_restoration_seconds * 1000,
+            metrics.stale_source_suppression_seconds * 1000,
+            metrics.catalog_row_prefetches,
+            metrics.cache_prefetches,
+            metrics.proxy_manifest_prefetches,
+            metrics.game_row_writes,
+            metrics.game_write_batches,
+            metrics.duplicate_rows_retired,
+            metrics.duplicate_delete_batches,
+            metrics.ownership_scans,
+        )
+        return CatalogRefreshResult(
+            added,
+            skipped,
+            removed,
+            errors,
+            warnings=warnings,
+            updated=updated,
+            metrics=metrics,
+        )
 
     @staticmethod
     def _emit_system_progress(
@@ -952,6 +1149,7 @@ class CatalogService:
         system: str,
         games: list[Game],
         ordinary_directories: set[str],
+        existing_games: Collection[Game],
     ) -> dict[str, Game]:
         """Map one nested launchable to an old opaque-directory identity.
 
@@ -965,9 +1163,7 @@ class CatalogService:
             if game.primary_asset is not None
         }
         legacy_dirs: dict[str, Game] = {}
-        for existing in self._game_repo.find_by_system(
-            system, include_ineligible=True
-        ):
+        for existing in existing_games:
             primary = existing.primary_asset
             if (
                 primary is not None
@@ -988,18 +1184,22 @@ class CatalogService:
                 matches[descendants[0]] = existing
         return matches
 
-    def _existing_games_by_primary(self, system: str) -> dict[str, list[Game]]:
+    @staticmethod
+    def _existing_games_by_primary(
+        existing_games: Collection[Game],
+    ) -> dict[str, list[Game]]:
         """Index every retained identity by its provider-neutral source path."""
         indexed: dict[str, list[Game]] = {}
-        for game in self._game_repo.find_by_system(
-            system, include_ineligible=True
-        ):
+        for game in existing_games:
             primary = game.primary_asset
             if primary is not None:
                 indexed.setdefault(primary.relative_path, []).append(game)
         return indexed
 
-    def _select_existing_identity(self, candidates: list[Game]) -> Optional[Game]:
+    @staticmethod
+    def _select_existing_identity(
+        candidates: list[Game], cache_entries_by_id: dict[str, CacheEntry]
+    ) -> Optional[Game]:
         """Choose the durable identity to carry across a source transition.
 
         A normal catalog has zero or one candidate. Historical regressions
@@ -1014,11 +1214,7 @@ class CatalogService:
             return candidates[0]
 
         def identity_key(game: Game) -> tuple[bool, bool, datetime, str]:
-            cache_entry = (
-                self._cache_repo.get(game.id)
-                if self._cache_repo is not None
-                else None
-            )
+            cache_entry = cache_entries_by_id.get(game.id)
             return (
                 cache_entry is None,
                 not bool(cache_entry and cache_entry.is_pinned),
@@ -1028,24 +1224,43 @@ class CatalogService:
 
         return min(candidates, key=identity_key)
 
-    def _retire_duplicate_games(self, games: Collection[Game]) -> int:
+    def _retire_duplicate_games(
+        self,
+        games: Collection[Game],
+        proxy_records: Collection[ProxyRecord],
+        metrics: CatalogRefreshMetrics,
+        verified_proxy_payloads: dict[Path, dict],
+    ) -> int:
         """Remove duplicate rows and only strictly owned proxy exposure."""
         if not games:
             return 0
         game_ids = {game.id for game in games}
         manifest_records = [
             (record.game_id, Path(record.proxy_path))
-            for record in self._proxy_repo.list_all()
+            for record in proxy_records
             if record.game_id in game_ids
         ]
-        removed_files = remove_owned_proxy_files(
-            self._local_roms_root,
-            manifest_records=manifest_records,
-            remove_game_ids=game_ids,
+        systems = {game.system for game in games}
+        ownership_root = (
+            self._local_roms_root / next(iter(systems))
+            if len(systems) == 1
+            else self._local_roms_root
         )
+        ownership_started_at = time.perf_counter()
+        try:
+            removed_files = remove_owned_proxy_files(
+                ownership_root,
+                manifest_records=manifest_records,
+                remove_game_ids=game_ids,
+                verified_payloads=verified_proxy_payloads,
+            )
+        finally:
+            metrics.ownership_scans += 1
+            metrics.proxy_ownership_verification_seconds += (
+                time.perf_counter() - ownership_started_at
+            )
+        self._game_repo.delete_many(sorted(game_ids))
         for game in games:
-            self._proxy_repo.delete(game.id)
-            self._game_repo.delete(game.id)
             log.info(
                 "Retired duplicate catalog identity %s for %r [%s]",
                 game.id,
@@ -1059,7 +1274,14 @@ class CatalogService:
         )
         return len(games)
 
-    def _canonicalize_proxy_path(self, game: Game) -> None:
+    def _canonicalize_proxy_path(
+        self,
+        game: Game,
+        record: Optional[ProxyRecord],
+        proxy_records_by_path: dict[str, ProxyRecord],
+        metrics: CatalogRefreshMetrics,
+        verified_current_payload: Optional[dict],
+    ) -> None:
         """Move a surviving owned proxy back to its unsuffixed title path.
 
         A cached newer identity may legitimately win duplicate reconciliation
@@ -1068,7 +1290,6 @@ class CatalogService:
         it only when the current file is signed for this exact game and the
         destination has no foreign/other owner.
         """
-        record = self._proxy_repo.get(game.id)
         if record is None:
             self._write_proxy(game)
             return
@@ -1078,12 +1299,21 @@ class CatalogService:
             / game.system
             / f"{_safe_filename(game.title)}.romcloud"
         )
-        if current == desired:
+        desired_owner = proxy_records_by_path.get(str(desired))
+        if desired_owner is not None and desired_owner.game_id != game.id:
             return
-        if self._proxy_path_conflicts(desired, game.id):
+        if current != desired and desired.exists():
             return
 
-        current_payload = proxy_payload(current) if current.exists() else None
+        ownership_started_at = time.perf_counter()
+        current_payload = (
+            verified_current_payload
+            if verified_current_payload is not None
+            else proxy_payload(current) if current.exists() else None
+        )
+        metrics.proxy_ownership_verification_seconds += (
+            time.perf_counter() - ownership_started_at
+        )
         if current.exists() and (
             current_payload is None
             or current_payload["game_id"] != game.id
@@ -1098,6 +1328,8 @@ class CatalogService:
         if self._write_proxies_enabled:
             desired.parent.mkdir(parents=True, exist_ok=True)
             self._write_proxy_payload(desired, game)
+        if current == desired:
+            return
         self._proxy_repo.save(
             ProxyRecord.create(game_id=game.id, proxy_path=str(desired))
         )
@@ -1248,9 +1480,12 @@ class CatalogService:
         # must never be adopted or overwritten.
         return path.exists()
 
-    def _rewrite_owned_proxy(self, game: Game) -> None:
+    def _rewrite_owned_proxy(
+        self, game: Game, record: Optional[ProxyRecord] = None
+    ) -> None:
         """Refresh an existing owned proxy without changing its path."""
-        record = self._proxy_repo.get(game.id)
+        if record is None:
+            record = self._proxy_repo.get(game.id)
         if record is None:
             self._write_proxy(game)
             return

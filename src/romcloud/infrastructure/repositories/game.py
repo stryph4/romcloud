@@ -43,50 +43,61 @@ class GameRepository:
         game's catalog data (e.g. its asset list) is updated in place.
         """
         with self._db.connect() as conn:
+            self._save_with_connection(conn, game)
+
+    def save_many(self, games: list[Game]) -> None:
+        """Upsert multiple games and their assets in one transaction."""
+        if not games:
+            return
+        with self._db.connect() as conn:
+            for game in games:
+                self._save_with_connection(conn, game)
+
+    @staticmethod
+    def _save_with_connection(conn, game: Game) -> None:  # type: ignore[no-untyped-def]
+        conn.execute(
+            """
+            INSERT INTO games
+                (id, system, title, source_provider, source_root, last_played,
+                 added_at, is_eligible)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                system          = excluded.system,
+                title           = excluded.title,
+                source_provider = excluded.source_provider,
+                source_root     = excluded.source_root,
+                last_played     = excluded.last_played,
+                added_at        = excluded.added_at,
+                is_eligible     = excluded.is_eligible
+            """,
+            (
+                game.id,
+                game.system,
+                game.title,
+                game.source_provider,
+                game.source_root,
+                _fmt_dt(game.last_played),
+                _fmt_dt(game.added_at),
+                1 if game.is_eligible else 0,
+            ),
+        )
+        conn.execute("DELETE FROM game_assets WHERE game_id = ?", (game.id,))
+        for asset in game.assets:
             conn.execute(
                 """
-                INSERT INTO games
-                    (id, system, title, source_provider, source_root, last_played,
-                     added_at, is_eligible)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    system          = excluded.system,
-                    title           = excluded.title,
-                    source_provider = excluded.source_provider,
-                    source_root     = excluded.source_root,
-                    last_played     = excluded.last_played,
-                    added_at        = excluded.added_at,
-                    is_eligible     = excluded.is_eligible
+                INSERT INTO game_assets
+                    (id, game_id, relative_path, filename, size_bytes, is_primary)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    str(uuid.uuid4()),
                     game.id,
-                    game.system,
-                    game.title,
-                    game.source_provider,
-                    game.source_root,
-                    _fmt_dt(game.last_played),
-                    _fmt_dt(game.added_at),
-                    1 if game.is_eligible else 0,
+                    asset.relative_path,
+                    asset.filename,
+                    asset.size_bytes,
+                    1 if asset.is_primary else 0,
                 ),
             )
-            # Delete existing assets then re-insert.
-            conn.execute("DELETE FROM game_assets WHERE game_id = ?", (game.id,))
-            for asset in game.assets:
-                conn.execute(
-                    """
-                    INSERT INTO game_assets
-                        (id, game_id, relative_path, filename, size_bytes, is_primary)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        str(uuid.uuid4()),
-                        game.id,
-                        asset.relative_path,
-                        asset.filename,
-                        asset.size_bytes,
-                        1 if asset.is_primary else 0,
-                    ),
-                )
 
     def update_last_played(self, game_id: str, dt: datetime) -> None:
         with self._db.connect() as conn:
@@ -98,6 +109,15 @@ class GameRepository:
     def delete(self, game_id: str) -> None:
         with self._db.connect() as conn:
             conn.execute("DELETE FROM games WHERE id = ?", (game_id,))
+
+    def delete_many(self, game_ids: list[str]) -> None:
+        """Delete multiple ROMCloud catalog identities in one transaction."""
+        if not game_ids:
+            return
+        with self._db.connect() as conn:
+            conn.executemany(
+                "DELETE FROM games WHERE id = ?", [(value,) for value in game_ids]
+            )
 
     def set_eligible(self, game_id: str, eligible: bool) -> None:
         with self._db.connect() as conn:
@@ -127,7 +147,22 @@ class GameRepository:
                 + "ORDER BY title",
                 (system,),
             ).fetchall()
-            return [self._row_to_game(conn, r) for r in rows]
+            asset_rows = conn.execute(
+                """
+                SELECT a.* FROM game_assets a
+                JOIN games g ON g.id = a.game_id
+                WHERE g.system = ?
+                ORDER BY a.game_id, a.is_primary DESC, a.filename
+                """,
+                (system,),
+            ).fetchall()
+            assets_by_game: dict[str, list] = defaultdict(list)
+            for asset in asset_rows:
+                assets_by_game[asset["game_id"]].append(asset)
+            return [
+                self._game_from_rows(row, assets_by_game[row["id"]])
+                for row in rows
+            ]
 
     def find_by_source_path(
         self,
