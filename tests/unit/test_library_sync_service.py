@@ -1122,9 +1122,9 @@ def test_malformed_local_xml_and_unsafe_media_fail_safely(tmp_path: Path):
     assert "manual" not in record["media"]
 
 
-def test_library_identity_ignores_device_id_root_and_launch_path():
+def test_library_identity_ignores_provider_device_id_root_and_launch_path():
     first = Game.create("ps2", "One", "local", "/mnt/a", [GameAsset("Game.chd", "ps2/Game.chd", is_primary=True)])
-    second = Game.create("ps2", "Renamed", "local", "/different/mount", [GameAsset("Game.chd", "ps2/Game.chd", is_primary=True)])
+    second = Game.create("ps2", "Renamed", "sftp", "/different/mount", [GameAsset("Game.chd", "ps2/Game.chd", is_primary=True)])
 
     assert first.id != second.id
     assert library_id_for_game(first) == library_id_for_game(second)

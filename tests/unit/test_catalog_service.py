@@ -14,6 +14,7 @@ from romcloud.core.models.game import Game, GameAsset
 from romcloud.core.models.proxy import ProxyRecord
 from romcloud.core.models.cache import CacheEntry, CacheStatus
 from romcloud.integrations.batocera.system_registry import EffectiveSystemRegistry
+from romcloud.infrastructure.providers.local import LocalFilesystemProvider
 from tests.system_registry_fixture import TEST_SYSTEM_REGISTRY
 
 
@@ -132,6 +133,252 @@ class TestCatalogServiceRefresh:
         assert cue_game.primary_asset.relative_path == "psx/Game.cue"
         companion_paths = [a.relative_path for a in cue_game.assets if not a.is_primary]
         assert companion_paths == ["psx/Game.bin"]
+
+
+class _SftpFilesystemView(LocalFilesystemProvider):
+    """Filesystem-backed test double with SFTP's provider identity."""
+
+    PROVIDER_ID = "sftp"
+
+    def __init__(self, physical_root: Path) -> None:
+        super().__init__()
+        self._physical_root = physical_root
+
+    def list_systems(self, rom_root: str):  # noqa: ANN201
+        del rom_root
+        return super().list_systems(str(self._physical_root))
+
+    def list_entries(self, rom_root: str, system: str):  # noqa: ANN201
+        del rom_root
+        return super().list_entries(str(self._physical_root), system)
+
+
+class TestSourceProviderMigration:
+    def test_smb_to_sftp_reuses_identity_and_proxy_without_touching_local_rom(
+        self,
+        provider,
+        game_repo,
+        cache_repo,
+        proxy_repo,
+        local_roms_dir,
+        tmp_path,
+    ):
+        source = tmp_path / "same-library"
+        (source / "xbox").mkdir(parents=True)
+        (source / "xbox" / "007 - Agent Under Fire.iso").write_bytes(b"game")
+
+        smb_catalog = CatalogService(
+            provider,
+            game_repo,
+            proxy_repo,
+            str(local_roms_dir),
+            str(source),
+            system_registry=TEST_SYSTEM_REGISTRY,
+            cache_repo=cache_repo,
+        )
+        assert smb_catalog.refresh().added == 1
+        original = game_repo.find_by_system("xbox")[0]
+        original_proxy = Path(proxy_repo.get(original.id).proxy_path)
+        local_rom = local_roms_dir / "xbox" / "User-owned local game.iso"
+        local_rom.write_bytes(b"do not touch")
+        cached_payload = tmp_path / "cache" / "007.iso"
+        cached_payload.parent.mkdir()
+        cached_payload.write_bytes(b"cached")
+        cached = CacheEntry.create(original.id, str(cached_payload))
+        cached.status = CacheStatus.COMPLETE
+        cached.size_bytes = len(b"cached")
+        cached.is_pinned = True
+        cache_repo.save(cached)
+
+        sftp_catalog = CatalogService(
+            _SftpFilesystemView(source),
+            game_repo,
+            proxy_repo,
+            str(local_roms_dir),
+            "/Roms",
+            system_registry=TEST_SYSTEM_REGISTRY,
+            cache_repo=cache_repo,
+        )
+        result = sftp_catalog.refresh()
+
+        assert result.added == 0 and result.updated == 1
+        games = game_repo.find_by_system("xbox", include_ineligible=True)
+        assert len(games) == 1
+        migrated = games[0]
+        assert migrated.id == original.id
+        assert migrated.source_provider == "sftp"
+        assert cache_repo.get(original.id).is_pinned is True
+        records = proxy_repo.list_all()
+        assert len(records) == 1 and records[0].game_id == original.id
+        assert Path(records[0].proxy_path) == original_proxy
+        assert list((local_roms_dir / "xbox").glob("*.romcloud")) == [
+            original_proxy
+        ]
+        assert json.loads(original_proxy.read_text(encoding="utf-8"))[
+            "source_provider"
+        ] == "sftp"
+        assert local_rom.read_bytes() == b"do not touch"
+
+    def test_existing_collision_suffixed_duplicate_converges_to_cached_identity(
+        self,
+        provider,
+        game_repo,
+        cache_repo,
+        proxy_repo,
+        local_roms_dir,
+        tmp_path,
+    ):
+        source = tmp_path / "same-library"
+        (source / "xbox").mkdir(parents=True)
+        filename = "007 - Agent Under Fire.iso"
+        (source / "xbox" / filename).write_bytes(b"game")
+        old_catalog = CatalogService(
+            provider,
+            game_repo,
+            proxy_repo,
+            str(local_roms_dir),
+            str(source),
+            system_registry=TEST_SYSTEM_REGISTRY,
+            cache_repo=cache_repo,
+        )
+        old_catalog.refresh()
+        old_game = game_repo.find_by_system("xbox")[0]
+        old_proxy = Path(proxy_repo.get(old_game.id).proxy_path)
+
+        # Reproduce the pre-fix state: the first SFTP refresh created a new
+        # UUID and therefore a collision-suffixed second signed proxy.
+        duplicate = Game.create(
+            "xbox",
+            old_game.title,
+            "sftp",
+            "/Roms",
+            [GameAsset(filename, f"xbox/{filename}", size_bytes=4, is_primary=True)],
+        )
+        game_repo.save(duplicate)
+        sftp_catalog = CatalogService(
+            _SftpFilesystemView(source),
+            game_repo,
+            proxy_repo,
+            str(local_roms_dir),
+            "/Roms",
+            system_registry=TEST_SYSTEM_REGISTRY,
+            cache_repo=cache_repo,
+        )
+        duplicate_proxy = Path(sftp_catalog.ensure_proxy(duplicate).proxy_path)
+        assert duplicate_proxy != old_proxy and duplicate_proxy.is_file()
+        cached = CacheEntry.create(
+            duplicate.id, str(tmp_path / "cache" / "007.iso")
+        )
+        cached.is_pinned = True
+        cache_repo.save(cached)
+
+        result = sftp_catalog.refresh()
+
+        assert result.added == 0 and result.removed == 1
+        games = game_repo.find_by_system("xbox", include_ineligible=True)
+        assert [game.id for game in games] == [duplicate.id]
+        assert games[0].source_provider == "sftp"
+        assert cache_repo.get(duplicate.id) is not None
+        assert game_repo.get(old_game.id) is None
+        assert proxy_repo.get(old_game.id) is None
+        assert Path(proxy_repo.get(duplicate.id).proxy_path) == old_proxy
+        assert old_proxy.is_file() and not duplicate_proxy.exists()
+        assert list((local_roms_dir / "xbox").glob("*.romcloud")) == [old_proxy]
+
+    def test_unmatched_previous_source_game_is_hidden_without_deleting_cache(
+        self,
+        provider,
+        game_repo,
+        cache_repo,
+        proxy_repo,
+        local_roms_dir,
+        tmp_path,
+    ):
+        source = tmp_path / "changed-library"
+        (source / "xbox").mkdir(parents=True)
+        stale_rom = source / "xbox" / "Old Game.iso"
+        stale_rom.write_bytes(b"old")
+        old_catalog = CatalogService(
+            provider,
+            game_repo,
+            proxy_repo,
+            str(local_roms_dir),
+            str(source),
+            system_registry=TEST_SYSTEM_REGISTRY,
+            cache_repo=cache_repo,
+        )
+        old_catalog.refresh()
+        old_game = game_repo.find_by_system("xbox")[0]
+        old_proxy = Path(proxy_repo.get(old_game.id).proxy_path)
+        cached = CacheEntry.create(old_game.id, str(tmp_path / "cache" / "old.iso"))
+        cached.is_pinned = True
+        cache_repo.save(cached)
+        stale_rom.unlink()
+        (source / "xbox" / "New Game.iso").write_bytes(b"new")
+
+        result = CatalogService(
+            _SftpFilesystemView(source),
+            game_repo,
+            proxy_repo,
+            str(local_roms_dir),
+            "/Roms",
+            system_registry=TEST_SYSTEM_REGISTRY,
+            cache_repo=cache_repo,
+        ).refresh()
+
+        assert result.added == 1 and result.removed == 1
+        retained = game_repo.get(old_game.id)
+        assert retained is not None and retained.is_eligible is False
+        assert cache_repo.get(old_game.id) is not None
+        assert proxy_repo.get(old_game.id) is None and not old_proxy.exists()
+        assert [game.title for game in game_repo.find_by_system("xbox")] == [
+            "New Game"
+        ]
+
+    def test_failed_replacement_scan_keeps_previous_source_exposure(
+        self,
+        provider,
+        game_repo,
+        cache_repo,
+        proxy_repo,
+        local_roms_dir,
+        tmp_path,
+        monkeypatch,
+    ):
+        source = tmp_path / "same-library"
+        (source / "xbox").mkdir(parents=True)
+        (source / "xbox" / "Game.iso").write_bytes(b"game")
+        CatalogService(
+            provider,
+            game_repo,
+            proxy_repo,
+            str(local_roms_dir),
+            str(source),
+            system_registry=TEST_SYSTEM_REGISTRY,
+            cache_repo=cache_repo,
+        ).refresh()
+        old_game = game_repo.find_by_system("xbox")[0]
+        old_proxy = Path(proxy_repo.get(old_game.id).proxy_path)
+        replacement = _SftpFilesystemView(source)
+        monkeypatch.setattr(
+            replacement,
+            "list_entries",
+            lambda *_args: (_ for _ in ()).throw(OSError("scan interrupted")),
+        )
+
+        result = CatalogService(
+            replacement,
+            game_repo,
+            proxy_repo,
+            str(local_roms_dir),
+            "/Roms",
+            system_registry=TEST_SYSTEM_REGISTRY,
+            cache_repo=cache_repo,
+        ).refresh()
+
+        assert result.errors == [("xbox", "scan interrupted")]
+        assert game_repo.get(old_game.id).is_eligible is True
+        assert proxy_repo.get(old_game.id) is not None and old_proxy.is_file()
 
 
 class TestPositiveRecursiveDiscovery:

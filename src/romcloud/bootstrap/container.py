@@ -212,6 +212,7 @@ class Container:
                 selected_systems=self._config.source.selected_systems,
                 write_proxies=operating_mode(self._config) is OperatingMode.CACHE,
                 capability_policy=self._policy(),
+                cache_repo=self.cache_repo,
             )
         return self._catalog
 

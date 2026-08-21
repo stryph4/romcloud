@@ -37,8 +37,13 @@ from romcloud.integrations.batocera.system_registry import (
     SystemLaunchSpec,
     SystemRegistryError,
 )
-from romcloud.integrations.batocera.proxy_ownership import remove_owned_proxy_files
+from romcloud.integrations.batocera.proxy_ownership import (
+    is_within,
+    proxy_payload,
+    remove_owned_proxy_files,
+)
 from romcloud.infrastructure.logging import get_logger
+from romcloud.infrastructure.repositories.cache import CacheRepository
 from romcloud.infrastructure.repositories.game import GameRepository
 from romcloud.infrastructure.repositories.proxy import ProxyRepository
 
@@ -101,6 +106,7 @@ class CatalogService:
         selected_systems: Optional[Collection[str]] = None,
         write_proxies: bool = True,
         capability_policy: Optional[CapabilityPolicy] = None,
+        cache_repo: Optional[CacheRepository] = None,
     ) -> None:
         self._provider = provider
         self._game_repo = game_repo
@@ -114,6 +120,7 @@ class CatalogService:
         )
         self._write_proxies_enabled = write_proxies
         self._capabilities = capability_policy or CapabilityPolicy("smart_cache")
+        self._cache_repo = cache_repo
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -226,6 +233,7 @@ class CatalogService:
 
         completed_systems = 0
         failed_systems = 0
+        successfully_scanned_systems: set[str] = set()
         for system in matched:
             system_started_at = time.perf_counter()
             system_succeeded = False
@@ -255,6 +263,7 @@ class CatalogService:
                 legacy_matches = self._legacy_container_matches(
                     system, games, ordinary_directories
                 )
+                existing_by_primary = self._existing_games_by_primary(system)
 
                 game_total = len(games)
                 emit_progress(
@@ -284,17 +293,27 @@ class CatalogService:
                         )
                         continue
 
-                    existing = self._game_repo.find_by_source_path(
-                        game.source_provider,
-                        game.source_root,
-                        primary.relative_path,
+                    identity_matches = existing_by_primary.get(
+                        primary.relative_path, []
                     )
+                    existing = self._select_existing_identity(identity_matches)
                     if existing is None:
                         existing = legacy_matches.get(primary.relative_path)
                     if existing is not None:
+                        duplicates = [
+                            candidate
+                            for candidate in identity_matches
+                            if candidate.id != existing.id
+                        ]
+                        source_changed = (
+                            existing.source_provider != game.source_provider
+                            or existing.source_root != game.source_root
+                        )
                         changed = (
                             _asset_paths_differ(existing.assets, game.assets)
                             or not existing.is_eligible
+                            or source_changed
+                            or existing.title != game.title
                         )
                         if changed:
                             game.id = existing.id
@@ -305,10 +324,18 @@ class CatalogService:
                             self._rewrite_owned_proxy(game)
                             updated += 1
                             log.info(
-                                "Updated asset metadata for %r [%s]", game.title, system
+                                "Updated catalog identity for %r [%s]%s",
+                                game.title,
+                                system,
+                                " after source migration" if source_changed else "",
                             )
                         else:
                             skipped += 1
+                        if duplicates:
+                            removed += self._retire_duplicate_games(duplicates)
+                            self._canonicalize_proxy_path(
+                                game if changed else existing
+                            )
                         self._emit_system_progress(
                             progress, system, game_index, game_total, progress_interval
                         )
@@ -333,6 +360,7 @@ class CatalogService:
                 # terminal state; percentages are only based on the known
                 # grouped-game denominator above.
                 completed_systems += 1
+                successfully_scanned_systems.add(system)
                 system_succeeded = True
                 emit_progress(
                     progress,
@@ -376,6 +404,20 @@ class CatalogService:
                 total=system_total,
                 metadata={"succeeded": completed_systems, "failed": failed_systems},
             )
+
+        # A provider/root transition is authoritative only where the new
+        # root was positively enumerated. Hide unmatched rows from the prior
+        # source after successful scans (and systems proven absent at the
+        # new root), while retaining cache/pin/history for possible future
+        # re-adoption. Current-source rows are never swept merely because a
+        # game disappeared during an ordinary same-source refresh.
+        stale_source_games = self._stale_previous_source_games(
+            remote_systems=remote_systems,
+            successfully_scanned_systems=successfully_scanned_systems,
+        )
+        if stale_source_games:
+            removed += sum(1 for game in stale_source_games if game.is_eligible)
+            self._suppress_games(stale_source_games)
 
         final_status = "error" if errors else "success"
         summary = f"Catalog refresh complete: {completed_systems} succeeded"
@@ -945,6 +987,150 @@ class CatalogService:
             if len(descendants) == 1 and descendants[0] not in matches:
                 matches[descendants[0]] = existing
         return matches
+
+    def _existing_games_by_primary(self, system: str) -> dict[str, list[Game]]:
+        """Index every retained identity by its provider-neutral source path."""
+        indexed: dict[str, list[Game]] = {}
+        for game in self._game_repo.find_by_system(
+            system, include_ineligible=True
+        ):
+            primary = game.primary_asset
+            if primary is not None:
+                indexed.setdefault(primary.relative_path, []).append(game)
+        return indexed
+
+    def _select_existing_identity(self, candidates: list[Game]) -> Optional[Game]:
+        """Choose the durable identity to carry across a source transition.
+
+        A normal catalog has zero or one candidate. Historical regressions
+        may have both an older SMB/local row and a newer SFTP row for the
+        same system-relative launch path. Prefer an identity with retained
+        cache state, then the oldest identity, so pins/history/cache remain
+        attached whenever the match is unambiguous.
+        """
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+
+        def identity_key(game: Game) -> tuple[bool, bool, datetime, str]:
+            cache_entry = (
+                self._cache_repo.get(game.id)
+                if self._cache_repo is not None
+                else None
+            )
+            return (
+                cache_entry is None,
+                not bool(cache_entry and cache_entry.is_pinned),
+                game.added_at,
+                game.id,
+            )
+
+        return min(candidates, key=identity_key)
+
+    def _retire_duplicate_games(self, games: Collection[Game]) -> int:
+        """Remove duplicate rows and only strictly owned proxy exposure."""
+        if not games:
+            return 0
+        game_ids = {game.id for game in games}
+        manifest_records = [
+            (record.game_id, Path(record.proxy_path))
+            for record in self._proxy_repo.list_all()
+            if record.game_id in game_ids
+        ]
+        removed_files = remove_owned_proxy_files(
+            self._local_roms_root,
+            manifest_records=manifest_records,
+            remove_game_ids=game_ids,
+        )
+        for game in games:
+            self._proxy_repo.delete(game.id)
+            self._game_repo.delete(game.id)
+            log.info(
+                "Retired duplicate catalog identity %s for %r [%s]",
+                game.id,
+                game.title,
+                game.system,
+            )
+        log.debug(
+            "Retired %d duplicate catalog row(s) and %d owned proxy file(s)",
+            len(games),
+            removed_files,
+        )
+        return len(games)
+
+    def _canonicalize_proxy_path(self, game: Game) -> None:
+        """Move a surviving owned proxy back to its unsuffixed title path.
+
+        A cached newer identity may legitimately win duplicate reconciliation
+        while its proxy still has the collision suffix created by the old
+        bug. The old base path is free after duplicate retirement, so adopt
+        it only when the current file is signed for this exact game and the
+        destination has no foreign/other owner.
+        """
+        record = self._proxy_repo.get(game.id)
+        if record is None:
+            self._write_proxy(game)
+            return
+        current = Path(record.proxy_path)
+        desired = (
+            self._local_roms_root
+            / game.system
+            / f"{_safe_filename(game.title)}.romcloud"
+        )
+        if current == desired:
+            return
+        if self._proxy_path_conflicts(desired, game.id):
+            return
+
+        current_payload = proxy_payload(current) if current.exists() else None
+        if current.exists() and (
+            current_payload is None
+            or current_payload["game_id"] != game.id
+            or not is_within(current, self._local_roms_root)
+        ):
+            log.warning(
+                "Left unverified proxy path untouched during source migration: %s",
+                current,
+            )
+            return
+
+        if self._write_proxies_enabled:
+            desired.parent.mkdir(parents=True, exist_ok=True)
+            self._write_proxy_payload(desired, game)
+        self._proxy_repo.save(
+            ProxyRecord.create(game_id=game.id, proxy_path=str(desired))
+        )
+        if current.exists() and current_payload is not None:
+            current.unlink()
+        log.info("Canonicalized migrated proxy path for %r [%s]", game.title, game.system)
+
+    def _stale_previous_source_games(
+        self,
+        *,
+        remote_systems: Collection[str],
+        successfully_scanned_systems: set[str],
+    ) -> list[Game]:
+        """Find prior-source rows the new source has authoritatively replaced."""
+        remote = set(remote_systems)
+        stale: list[Game] = []
+        for game in self._game_repo.list_all(include_ineligible=True):
+            if (
+                game.source_provider == self._provider.provider_id
+                and game.source_root == self._source_root
+            ):
+                continue
+            if (
+                self._selected_systems is not None
+                and game.system not in self._selected_systems
+            ):
+                continue
+            if (
+                game.system in successfully_scanned_systems
+                or game.system not in remote
+            ):
+                stale.append(game)
+        return stale
 
     def _suppress_ineligible_paths(
         self, system: str, known_ineligible: set[str]
