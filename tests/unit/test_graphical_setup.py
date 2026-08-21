@@ -357,7 +357,11 @@ class TestSFTPDirectoryBrowsing:
 
             def list_systems(self, path):
                 provider_paths.append(("list", path))
-                return ["Roms"] if path == "/" else ["ps2"]
+                return (
+                    ["Roms"]
+                    if path == "/"
+                    else ["@eaDir", "PS2", "System Volume Information"]
+                )
 
             def validate_access(self, path):
                 provider_paths.append(("validate", path))
@@ -473,6 +477,47 @@ class TestSFTPDirectoryBrowsing:
                 key: call[key] for key in expected_connection
             } == expected_connection
             assert call["probe_writable"] is False
+
+    def test_detect_system_listing_failure_reports_safe_exact_context(
+        self, monkeypatch
+    ):
+        password = "do-not-leak-detect-secret"
+
+        class Provider:
+            def __init__(self, **_kwargs):
+                pass
+
+            def validate_access(self, _path):
+                return StorageAccessResult(True, True)
+
+            def list_systems(self, _path):
+                raise OSError(f"system enumeration failed for {password}")
+
+        monkeypatch.setattr(
+            "romcloud.infrastructure.providers.sftp.SFTPProvider", Provider
+        )
+
+        with pytest.raises(ValueError) as raised:
+            graphical_setup.validate_sftp_source(
+                {
+                    "purpose": "source",
+                    "server": "nas.example",
+                    "port": 2222,
+                    "username": "rom-reader",
+                    "password": password,
+                    "sftp_host_key_fingerprint": "SHA256:trusted",
+                    "source_remote_path": "/Roms",
+                }
+            )
+
+        detail = str(raised.value)
+        assert "SFTP detect systems listing OSError: system enumeration failed" in detail
+        assert "provider=SFTPProvider" in detail
+        assert "role=source" in detail
+        assert "password_present=True" in detail
+        assert "trusted_fingerprint=SHA256:trusted" in detail
+        assert "path=/Roms" in detail
+        assert password not in detail
 
     def test_setup_request_normalizes_posix_separators_without_changing_case(
         self, tmp_path

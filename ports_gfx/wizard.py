@@ -1095,8 +1095,11 @@ class WizardState:
             if self.step in (
                 WizardStep.SFTP_BROWSE,
                 WizardStep.REMOTE_SFTP_BROWSE,
-            ) and self.technical_error:
-                self.error = f"{self.error} Details: {self.technical_error}"
+            ) or (
+                self.step == WizardStep.DETECT and self.source_type == "sftp"
+            ):
+                if self.technical_error:
+                    self.error = f"{self.error} Details: {self.technical_error}"
             if self._progress_event is None or self._progress_event.status != "error":
                 self.activity.append(
                     ActivityEvent(

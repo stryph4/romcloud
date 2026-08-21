@@ -405,6 +405,30 @@ def test_sftp_browser_failure_surfaces_backend_diagnostic(monkeypatch):
     assert wizard.technical_error in wizard.error
 
 
+def test_sftp_detect_failure_surfaces_backend_diagnostic(monkeypatch):
+    wizard = WizardState()
+    wizard.source_type = "sftp"
+    wizard.step = WizardStep.DETECT
+    wizard.runner = _Runner()
+    monkeypatch.setattr(
+        "ports_gfx.wizard.operation_result",
+        lambda _runner: BackendResult(
+            False,
+            error=(
+                "SFTP detect systems listing OSError: enumeration failed; "
+                "password_present=True; path=/Roms"
+            ),
+        ),
+    )
+
+    wizard.poll()
+
+    assert "Could not read that ROM folder" in wizard.error
+    assert "SFTP detect systems listing OSError" in wizard.error
+    assert "path=/Roms" in wizard.error
+    assert wizard.technical_error in wizard.error
+
+
 def test_sftp_browser_parent_and_root_boundary_are_safe(monkeypatch):
     calls = []
     monkeypatch.setattr(

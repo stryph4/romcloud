@@ -614,20 +614,48 @@ def validate_sftp_source(
         probe_writable=remote,
     )
     emit_progress(progress, "configure", "directory", "running", "Checking the selected SFTP folder…")
-    validation = provider.validate_access(root)
+    try:
+        validation = provider.validate_access(root)
+    except Exception as exc:
+        raise ValueError(
+            _sftp_operation_diagnostic(
+                "detect systems access check", connection, root, exc
+            )
+        ) from None
     if not validation.connected or not validation.read_verified:
-        raise ValueError(validation.detail or "Could not access the selected SFTP folder.")
+        detail = validation.detail or "Could not access the selected SFTP folder."
+        raise ValueError(
+            _sftp_operation_diagnostic(
+                "detect systems access check",
+                connection,
+                root,
+                RuntimeError(detail),
+            )
+        ) from None
     emit_progress(progress, "configure", "directory", "success", "Directory accessible")
     emit_progress(progress, "configure", "read", "success", "Read access verified")
     if remote:
         return {"systems": [], "count": 0, "validation": validation.as_dict()}
-    systems = [
-        system
-        for system in canonical_system_ids(
-            provider.list_systems(root), "detected systems"
+    try:
+        directory_names = provider.list_systems(root)
+    except Exception as exc:
+        raise ValueError(
+            _sftp_operation_diagnostic("detect systems listing", connection, root, exc)
+        ) from None
+    # Storage providers enumerate directories, not pre-validated configuration
+    # values. Ignore NAS metadata and unrelated folders before applying strict
+    # Batocera-ID validation (for example Synology's ``@eaDir``).
+    systems = list(
+        canonical_system_ids(
+            [
+                name.strip().lower()
+                for name in directory_names
+                if isinstance(name, str)
+                and name.strip().lower() in BATOCERA_SYSTEMS
+            ],
+            "detected systems",
         )
-        if system in BATOCERA_SYSTEMS
-    ]
+    )
     emit_progress(
         progress, "configure", "systems", "success",
         f"Library check complete — {len(systems)} system{'s' if len(systems) != 1 else ''} found",
@@ -655,17 +683,9 @@ def browse_sftp_directory(
     try:
         directories = provider.list_systems(path)
     except Exception as exc:
-        detail = _redact(str(exc), connection["password"])
-        diagnostic = (
-            f"SFTP browser {type(exc).__name__}: {detail or '(no message)'}; "
-            f"provider=SFTPProvider; role={connection['purpose']}; "
-            f"host={connection['host']}; port={connection['port']}; "
-            f"username={connection['username']}; "
-            f"password_present={bool(connection['password'])}; "
-            f"trusted_fingerprint={connection['trusted_fingerprint'] or 'missing'}; "
-            f"path={path}"
-        )
-        raise ValueError(diagnostic) from None
+        raise ValueError(
+            _sftp_operation_diagnostic("browser", connection, path, exc)
+        ) from None
     emit_progress(progress, "browse", "directory", "success", "Folder contents loaded")
     return {
         "path": path,
@@ -1083,6 +1103,25 @@ def _sftp_setup_connection(payload: dict[str, Any]) -> dict[str, Any]:
         "trusted_fingerprint": str(payload.get(fingerprint_key, "")).strip()
         or None,
     }
+
+
+def _sftp_operation_diagnostic(
+    operation: str,
+    connection: dict[str, Any],
+    path: str,
+    exc: Exception,
+) -> str:
+    """Return password-safe context for one setup-time SFTP operation."""
+    detail = _redact(str(exc), connection["password"])
+    return (
+        f"SFTP {operation} {type(exc).__name__}: {detail or '(no message)'}; "
+        f"provider=SFTPProvider; role={connection['purpose']}; "
+        f"host={connection['host']}; port={connection['port']}; "
+        f"username={connection['username']}; "
+        f"password_present={bool(connection['password'])}; "
+        f"trusted_fingerprint={connection['trusted_fingerprint'] or 'missing'}; "
+        f"path={path}"
+    )
 
 
 def _redact(detail: str, *secrets: str) -> str:
