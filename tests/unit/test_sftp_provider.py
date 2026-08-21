@@ -25,6 +25,8 @@ from romcloud.core.exceptions import (
     ProviderNotReachableError,
     TransferCancelledError,
 )
+from romcloud.integrations.batocera.catalog import CatalogService
+from romcloud.integrations.batocera.system_registry import EffectiveSystemRegistry
 from romcloud.infrastructure.providers.sftp import (
     SFTPProvider,
     fingerprint_of,
@@ -340,6 +342,186 @@ class TestReadOperations:
         server, root = sftp_server
         provider = _provider(server)
         assert provider.is_reachable((root / "does-not-exist").as_posix()) is False
+
+
+class TestCatalogScanPerformance:
+    """Round-trip budgets for representative remote ROM layouts."""
+
+    @staticmethod
+    def _refresh(
+        server,
+        root: Path,
+        system: str,
+        extensions: set[str],
+        game_repo,
+        proxy_repo,
+        local_roms_dir: Path,
+    ):
+        provider = _provider(server)
+        service = CatalogService(
+            provider=provider,
+            game_repo=game_repo,
+            proxy_repo=proxy_repo,
+            local_roms_root=str(local_roms_dir),
+            source_root=root.as_posix(),
+            system_registry=EffectiveSystemRegistry.from_extensions(
+                {system: extensions}
+            ),
+        )
+        result = service.refresh()
+        assert result.errors == []
+        metrics = provider.catalog_scan_metrics[system]
+        assert metrics.connections == 1
+        assert metrics.elapsed_seconds >= 0
+        return result, metrics
+
+    def test_scan_scope_caches_duplicate_listing_and_file_attributes(
+        self, sftp_server
+    ):
+        server, root = sftp_server
+        (root / "nes").mkdir()
+        rom = root / "nes" / "Mario.nes"
+        rom.write_bytes(b"rom")
+        provider = _provider(server)
+
+        with provider.catalog_system_scan("nes"):
+            assert len(provider.list_entries(root.as_posix(), "nes")) == 1
+            assert len(provider.list_entries(root.as_posix(), "nes")) == 1
+            assert provider.get_size(rom.as_posix()) == 3
+
+        metrics = provider.catalog_scan_metrics["nes"]
+        assert metrics.connections == 1
+        assert metrics.directory_listings == 1
+        assert metrics.entries_examined == 1
+        assert metrics.stat_calls == 0
+
+    def test_single_file_system_uses_one_listing_and_no_metadata_calls(
+        self, sftp_server, game_repo, proxy_repo, local_roms_dir
+    ):
+        server, root = sftp_server
+        (root / "nes").mkdir()
+        (root / "nes" / "Mario.nes").write_bytes(b"rom")
+
+        result, metrics = self._refresh(
+            server, root, "nes", {".nes"}, game_repo, proxy_repo, local_roms_dir
+        )
+
+        assert result.added == 1
+        assert metrics.directory_listings == 1
+        assert metrics.recursive_directory_visits == 1
+        assert metrics.entries_examined == 1
+        assert metrics.stat_calls == metrics.file_opens == metrics.content_reads == 0
+
+    def test_directory_game_stops_at_launchable_package(
+        self, sftp_server, game_repo, proxy_repo, local_roms_dir
+    ):
+        server, root = sftp_server
+        payload = root / "ps3" / "Example.ps3" / "PS3_GAME" / "USRDIR"
+        payload.mkdir(parents=True)
+        (payload / "EBOOT.BIN").write_bytes(b"payload")
+
+        result, metrics = self._refresh(
+            server, root, "ps3", {".ps3"}, game_repo, proxy_repo, local_roms_dir
+        )
+
+        assert result.added == 1
+        assert metrics.directory_listings == 1
+        assert metrics.entries_examined == 1
+        assert metrics.stat_calls == metrics.file_opens == metrics.content_reads == 0
+
+    def test_cue_multitrack_reuses_listdir_metadata_instead_of_stat_per_track(
+        self, sftp_server, game_repo, proxy_repo, local_roms_dir
+    ):
+        server, root = sftp_server
+        system_root = root / "dreamcast"
+        system_root.mkdir()
+        (system_root / "Game.cue").write_text(
+            'FILE "Track 01.bin" BINARY\n'
+            'FILE "Track 02.bin" BINARY\n'
+            'FILE "Track 03.bin" BINARY\n',
+            encoding="utf-8",
+        )
+        for number in range(1, 4):
+            (system_root / f"Track {number:02d}.bin").write_bytes(b"track")
+
+        result, metrics = self._refresh(
+            server,
+            root,
+            "dreamcast",
+            {".cue", ".bin"},
+            game_repo,
+            proxy_repo,
+            local_roms_dir,
+        )
+
+        assert result.added == 1
+        assert metrics.directory_listings == 1
+        assert metrics.entries_examined == 4
+        # Before snapshot reuse this layout made four separate stat calls:
+        # one for the cue and one for every referenced track.
+        assert metrics.stat_calls == 0
+        assert metrics.file_opens == metrics.content_reads == 1
+
+    def test_m3u_multidisc_needs_only_name_and_size_metadata(
+        self, sftp_server, game_repo, proxy_repo, local_roms_dir
+    ):
+        server, root = sftp_server
+        system_root = root / "dreamcast"
+        system_root.mkdir()
+        (system_root / "Collection.m3u").write_text(
+            "Disc 1.chd\nDisc 2.chd\n", encoding="utf-8"
+        )
+        (system_root / "Disc 1.chd").write_bytes(b"one")
+        (system_root / "Disc 2.chd").write_bytes(b"two")
+
+        result, metrics = self._refresh(
+            server,
+            root,
+            "dreamcast",
+            {".m3u", ".chd"},
+            game_repo,
+            proxy_repo,
+            local_roms_dir,
+        )
+
+        # Preserve current catalog semantics: the playlist and its launchable
+        # members remain independently discoverable.
+        assert result.added == 3
+        assert metrics.directory_listings == 1
+        assert metrics.entries_examined == 3
+        assert metrics.stat_calls == metrics.file_opens == metrics.content_reads == 0
+
+    def test_nas_and_gamelist_metadata_directories_are_not_recursed(
+        self, sftp_server, game_repo, proxy_repo, local_roms_dir
+    ):
+        server, root = sftp_server
+        system_root = root / "neogeocd"
+        (system_root / "@eaDir" / "thumbs").mkdir(parents=True)
+        (system_root / "@eaDir" / "thumbs" / "index.jpg").write_bytes(b"thumb")
+        (system_root / "images").mkdir()
+        (system_root / "images" / "Game.png").write_bytes(b"image")
+        (system_root / "Game.chd").write_bytes(b"game")
+        (system_root / "gamelist.xml").write_text(
+            "<gameList><game><image>./images/Game.png</image></game></gameList>",
+            encoding="utf-8",
+        )
+
+        result, metrics = self._refresh(
+            server,
+            root,
+            "neogeocd",
+            {".chd"},
+            game_repo,
+            proxy_repo,
+            local_roms_dir,
+        )
+
+        assert result.added == 1
+        assert metrics.directory_listings == 1
+        assert metrics.recursive_directory_visits == 1
+        assert metrics.entries_examined == 4
+        assert metrics.stat_calls == 0
+        assert metrics.file_opens == metrics.content_reads == 1
 
 
 class TestWriteValidation:

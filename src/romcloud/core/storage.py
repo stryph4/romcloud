@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional
 
 
 @dataclass(frozen=True)
@@ -135,6 +136,18 @@ class StorageProvider(ABC):
             reachable,
             detail="" if reachable else "storage location is not accessible",
         )
+
+    @contextmanager
+    def catalog_system_scan(self, system: str) -> Iterator[None]:
+        """Bound one system's catalog enumeration work.
+
+        Most providers need no lifecycle around a scan. Protocol providers
+        may override this narrow scope to reuse a connection, retain
+        directory snapshots, and emit operation diagnostics without leaking
+        provider-specific behavior into the catalog service.
+        """
+        del system
+        yield
 
     @abstractmethod
     def list_systems(self, rom_root: str) -> list[str]:

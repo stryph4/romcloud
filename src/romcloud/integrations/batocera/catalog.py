@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import posixpath
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -46,6 +47,11 @@ log = get_logger("catalog")
 _PROXY_VERSION = "1"
 
 _CUE_EXTENSION = ".cue"
+
+# Provider-neutral exclusions for directories created by common NAS indexers
+# and recycle-bin services. These containers cannot be Batocera games and can
+# contain very large trees (especially Synology's @eaDir thumbnails).
+_IGNORED_SOURCE_DIRECTORY_NAMES = frozenset({"@eadir", "#recycle", "@recycle"})
 
 
 @dataclass
@@ -221,6 +227,8 @@ class CatalogService:
         completed_systems = 0
         failed_systems = 0
         for system in matched:
+            system_started_at = time.perf_counter()
+            system_succeeded = False
             emit_progress(
                 progress,
                 "catalog_refresh",
@@ -233,10 +241,16 @@ class CatalogService:
                 spec = registry.get(system)
                 if spec is None:  # guarded by `matched`; keeps narrowing explicit
                     continue
-                entries, known_ineligible, ordinary_directories = (
-                    self._discover_entries(system, spec)
-                )
-                games, consumed_paths, group_warnings = self._group_entries(system, entries)
+                with self._provider.catalog_system_scan(system):
+                    (
+                        entries,
+                        known_ineligible,
+                        ordinary_directories,
+                        entry_metadata,
+                    ) = self._discover_entries(system, spec)
+                    games, consumed_paths, group_warnings = self._group_entries(
+                        system, entries, entry_metadata
+                    )
                 warnings.extend(group_warnings)
                 legacy_matches = self._legacy_container_matches(
                     system, games, ordinary_directories
@@ -319,6 +333,7 @@ class CatalogService:
                 # terminal state; percentages are only based on the known
                 # grouped-game denominator above.
                 completed_systems += 1
+                system_succeeded = True
                 emit_progress(
                     progress,
                     "catalog_refresh",
@@ -343,6 +358,13 @@ class CatalogService:
                     detail=str(exc),
                     metadata={"system": system},
                 )
+
+            log.info(
+                "Catalog refresh timing system=%s elapsed_ms=%.1f status=%s",
+                system,
+                (time.perf_counter() - system_started_at) * 1000,
+                "success" if system_succeeded else "failed",
+            )
 
             emit_progress(
                 progress,
@@ -512,14 +534,23 @@ class CatalogService:
 
     # ── grouping ──────────────────────────────────────────────────────────────
 
-    def _source_metadata_entries(self, system: str) -> set[str]:
+    def _source_metadata_entries(
+        self, system: str, root_entries: Collection[RemoteEntry]
+    ) -> set[str]:
         """Exclude source gamelist/media containers from ROM discovery.
 
         Media directory names are derived from safe references in the source
         gamelist rather than from one scraper's fixed directory convention.
+        The root listing is consulted first so systems without a gamelist do
+        not pay for a guaranteed-failing remote file-open round trip.
         """
         gamelist_rel = PurePosixPath(system, "gamelist.xml").as_posix()
         excluded = {gamelist_rel}
+        if not any(
+            entry.relative_path == gamelist_rel and not entry.is_directory
+            for entry in root_entries
+        ):
+            return excluded
         try:
             text = self._provider.read_text(
                 str(Path(self._source_root) / system / "gamelist.xml")
@@ -552,12 +583,15 @@ class CatalogService:
 
     def _discover_entries(
         self, system: str, spec: SystemLaunchSpec
-    ) -> tuple[list[RemoteEntry], set[str], set[str]]:
+    ) -> tuple[
+        list[RemoteEntry], set[str], set[str], dict[str, RemoteEntry]
+    ]:
         """Recursively find only entries Batocera can launch for *system*."""
         candidates: list[RemoteEntry] = []
         known_ineligible: set[str] = set()
         ordinary_directories: set[str] = set()
-        excluded = self._source_metadata_entries(system)
+        entry_metadata: dict[str, RemoteEntry] = {}
+        excluded = {PurePosixPath(system, "gamelist.xml").as_posix()}
         pending = [system]
         visited: set[str] = set()
 
@@ -568,10 +602,18 @@ class CatalogService:
                     f"Provider returned a recursive directory cycle at {relative_dir!r}"
                 )
             visited.add(relative_dir)
-            for raw_entry in self._provider.list_entries(
-                self._source_root, relative_dir
-            ):
-                entry = self._validated_entry(system, relative_dir, raw_entry)
+            entries = [
+                self._validated_entry(system, relative_dir, raw_entry)
+                for raw_entry in self._provider.list_entries(
+                    self._source_root, relative_dir
+                )
+            ]
+            for entry in entries:
+                entry_metadata[entry.relative_path] = entry
+            if relative_dir == system:
+                excluded = self._source_metadata_entries(system, entries)
+
+            for entry in entries:
                 path = entry.relative_path
                 if any(path == root or path.startswith(root + "/") for root in excluded):
                     known_ineligible.add(path)
@@ -585,11 +627,13 @@ class CatalogService:
                     continue
                 known_ineligible.add(path)
                 if entry.is_directory:
+                    if entry.name.casefold() in _IGNORED_SOURCE_DIRECTORY_NAMES:
+                        continue
                     ordinary_directories.add(path)
                     pending.append(path)
 
         candidates.sort(key=lambda entry: entry.relative_path.casefold())
-        return candidates, known_ineligible, ordinary_directories
+        return candidates, known_ineligible, ordinary_directories, entry_metadata
 
     @staticmethod
     def _validated_entry(
@@ -628,7 +672,10 @@ class CatalogService:
         )
 
     def _group_entries(
-        self, system: str, entries: list[RemoteEntry]
+        self,
+        system: str,
+        entries: list[RemoteEntry],
+        entry_metadata: Optional[dict[str, RemoteEntry]] = None,
     ) -> tuple[list[Game], set[str], list[str]]:
         """Convert already-eligible recursive candidates into logical games."""
         games: list[Game] = []
@@ -639,7 +686,9 @@ class CatalogService:
         for entry in entries:
             if entry.is_directory or Path(entry.name).suffix.lower() != _CUE_EXTENSION:
                 continue
-            game, cue_warnings = self._build_cue_game(system, entry.relative_path)
+            game, cue_warnings = self._build_cue_game(
+                system, entry.relative_path, entry_metadata
+            )
             warnings.extend(cue_warnings)
             if game is None:
                 continue
@@ -660,7 +709,10 @@ class CatalogService:
         return games, consumed_paths, warnings
 
     def _build_cue_game(
-        self, system: str, cue_relative_path: str
+        self,
+        system: str,
+        cue_relative_path: str,
+        entry_metadata: Optional[dict[str, RemoteEntry]] = None,
     ) -> tuple[Optional[Game], list[str]]:
         """Parse one ``.cue`` file into a brand-new logical Game (launch
         asset + every referenced track as a required companion asset).
@@ -670,7 +722,9 @@ class CatalogService:
         file rather than losing it entirely ("ROMCloud may fail; Batocera
         must not").
         """
-        assets, warnings = self._build_cue_assets(system, cue_relative_path)
+        assets, warnings = self._build_cue_assets(
+            system, cue_relative_path, entry_metadata
+        )
         if assets is None:
             return None, warnings
 
@@ -685,7 +739,10 @@ class CatalogService:
         return game, warnings
 
     def _build_cue_assets(
-        self, system: str, cue_relative_path: str
+        self,
+        system: str,
+        cue_relative_path: str,
+        entry_metadata: Optional[dict[str, RemoteEntry]] = None,
     ) -> tuple[Optional[list[GameAsset]], list[str]]:
         """Parse one ``.cue`` file into ``[primary, *companions]`` — the pure
         asset-list computation shared by fresh discovery (:meth:`_build_cue_game`)
@@ -693,9 +750,10 @@ class CatalogService:
         (:meth:`_reconcile_cue_assets`), so both always derive companions the
         same way instead of one path silently drifting from the other.
 
-        Always re-reads the cue and re-queries sizes from the *current*
-        source state — never trusts a caller-supplied/previously-catalogued
-        size, so a stale legacy record is never used to decide completeness.
+        Always re-reads the cue. During refresh, sizes come from the current
+        directory snapshot returned by the provider; resolve-time legacy
+        reconciliation has no snapshot and therefore re-queries the source.
+        Previously catalogued sizes are never used to decide completeness.
 
         Returns ``(None, warnings)`` if the cue itself cannot even be read.
         """
@@ -711,7 +769,9 @@ class CatalogService:
             )
             return None, warnings
 
-        cue_size = self._provider.get_size(source_path)
+        cue_size = self._current_entry_size(
+            cue_relative_path, source_path, entry_metadata
+        )
         result = resolve_cue_dependencies(cue_relative_path, cue_text)
 
         for w in result.warnings:
@@ -732,7 +792,10 @@ class CatalogService:
                 continue
             seen_paths.add(dep.relative_path)
 
-            size = self._provider.get_size(str(Path(self._source_root) / dep.relative_path))
+            dep_source_path = str(Path(self._source_root) / dep.relative_path)
+            size = self._current_entry_size(
+                dep.relative_path, dep_source_path, entry_metadata
+            )
             if size is None:
                 warnings.append(
                     f"[{system}] {cue_relative_path}: referenced asset missing: "
@@ -754,6 +817,23 @@ class CatalogService:
             is_primary=True,
         )
         return [primary, *companions], warnings
+
+    def _current_entry_size(
+        self,
+        relative_path: str,
+        source_path: str,
+        entry_metadata: Optional[dict[str, RemoteEntry]],
+    ) -> Optional[int]:
+        """Use this scan's listing metadata before issuing a provider stat."""
+        if entry_metadata is not None:
+            entry = entry_metadata.get(relative_path)
+            if (
+                entry is not None
+                and not entry.is_directory
+                and entry.size_bytes is not None
+            ):
+                return entry.size_bytes
+        return self._provider.get_size(source_path)
 
     def _prune_stale_entries(self, system: str, consumed_paths: set[str]) -> int:
         """Remove catalog/proxy entries that are now stale because their

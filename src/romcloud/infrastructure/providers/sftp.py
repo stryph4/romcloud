@@ -8,8 +8,10 @@ differs per configured instance/credentials/path — see
 
 No local mount/filesystem is involved (unlike SMB, which is a real CIFS
 kernel mount read through :class:`~romcloud.infrastructure.providers.local.LocalFilesystemProvider`).
-Every operation opens a short-lived, bounded SSH/SFTP session — no
-persistent background connection or reconnect daemon is maintained.
+Ordinary operations open a short-lived, bounded SSH/SFTP session. Catalog
+refresh reuses one session only for the duration of each system scan and
+then closes it; no persistent background connection or reconnect daemon is
+maintained.
 
 Host-key verification is always enforced. A caller must supply the
 fingerprint trusted for this target (obtained once via
@@ -23,14 +25,16 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import contextvars
 import hashlib
 import posixpath
 import socket
 import stat as stat_module
 import time
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional
 
 import paramiko
 
@@ -49,6 +53,9 @@ from romcloud.core.storage import (
     StorageAccessResult,
     StorageProvider,
 )
+from romcloud.infrastructure.logging import get_logger
+
+log = get_logger("providers.sftp")
 
 DEFAULT_CONNECT_TIMEOUT = 10.0
 """Bounds DNS/TCP connect, SSH banner exchange, and authentication."""
@@ -62,6 +69,55 @@ _PROBE_CONTENT = b"ROMCloud writable storage probe\n"
 _SFTP_CAPABILITIES = ProviderCapabilities(
     has_filesystem_semantics=False, can_resume_download=False
 )
+
+
+@dataclass(frozen=True)
+class SFTPCatalogScanMetrics:
+    """Password/path-safe remote-operation totals for one system scan."""
+
+    system: str
+    connections: int
+    directory_listings: int
+    stat_calls: int
+    recursive_directory_visits: int
+    file_opens: int
+    content_reads: int
+    entries_examined: int
+    elapsed_seconds: float
+
+
+@dataclass
+class _SFTPCatalogScanState:
+    system: str
+    client: paramiko.SSHClient
+    sftp: paramiko.SFTPClient
+    started_at: float
+    connections: int = 1
+    directory_listings: int = 0
+    stat_calls: int = 0
+    recursive_directory_visits: int = 0
+    file_opens: int = 0
+    content_reads: int = 0
+    entries_examined: int = 0
+    directory_cache: dict[str, tuple[paramiko.SFTPAttributes, ...]] = field(
+        default_factory=dict
+    )
+    attributes_by_path: dict[str, paramiko.SFTPAttributes] = field(
+        default_factory=dict
+    )
+
+    def finish(self) -> SFTPCatalogScanMetrics:
+        return SFTPCatalogScanMetrics(
+            system=self.system,
+            connections=self.connections,
+            directory_listings=self.directory_listings,
+            stat_calls=self.stat_calls,
+            recursive_directory_visits=self.recursive_directory_visits,
+            file_opens=self.file_opens,
+            content_reads=self.content_reads,
+            entries_examined=self.entries_examined,
+            elapsed_seconds=time.perf_counter() - self.started_at,
+        )
 
 
 def fingerprint_of(key: paramiko.PKey) -> str:
@@ -160,6 +216,10 @@ class SFTPProvider(StorageProvider):
         self._probe_writable = probe_writable
         self._connect_timeout = connect_timeout
         self._operation_timeout = operation_timeout
+        self._catalog_scan_state: contextvars.ContextVar[
+            Optional[_SFTPCatalogScanState]
+        ] = contextvars.ContextVar("romcloud_sftp_catalog_scan", default=None)
+        self._catalog_scan_metrics: dict[str, SFTPCatalogScanMetrics] = {}
 
     @property
     def provider_id(self) -> str:
@@ -168,6 +228,54 @@ class SFTPProvider(StorageProvider):
     @property
     def capabilities(self) -> ProviderCapabilities:
         return _SFTP_CAPABILITIES
+
+    @property
+    def catalog_scan_metrics(self) -> dict[str, SFTPCatalogScanMetrics]:
+        """Most recent completed metrics for each system in this provider.
+
+        Values contain only the canonical system ID and aggregate counts;
+        credentials and remote paths are never retained.
+        """
+        return dict(self._catalog_scan_metrics)
+
+    @contextlib.contextmanager
+    def catalog_system_scan(self, system: str) -> Iterator[None]:
+        """Reuse one bounded SFTP session and directory cache for a system."""
+        if self._catalog_scan_state.get() is not None:
+            # Catalog does not nest scans today, but treating a nested scope
+            # as part of its parent is safer than opening a competing channel.
+            yield
+            return
+
+        client, sftp = self._connect()
+        state = _SFTPCatalogScanState(
+            system=system,
+            client=client,
+            sftp=sftp,
+            started_at=time.perf_counter(),
+        )
+        token = self._catalog_scan_state.set(state)
+        try:
+            yield
+        finally:
+            self._catalog_scan_state.reset(token)
+            state.client.close()
+            metrics = state.finish()
+            self._catalog_scan_metrics[system] = metrics
+            log.info(
+                "SFTP catalog scan system=%s connections=%d listdir_attr=%d "
+                "stat=%d directory_visits=%d file_opens=%d content_reads=%d "
+                "entries_examined=%d elapsed_ms=%.1f",
+                metrics.system,
+                metrics.connections,
+                metrics.directory_listings,
+                metrics.stat_calls,
+                metrics.recursive_directory_visits,
+                metrics.file_opens,
+                metrics.content_reads,
+                metrics.entries_examined,
+                metrics.elapsed_seconds * 1000,
+            )
 
     # ── connection lifecycle ─────────────────────────────────────────────
 
@@ -243,7 +351,69 @@ class SFTPProvider(StorageProvider):
                 self._client.close()
 
     def _session(self) -> "SFTPProvider._Session":
+        state = self._catalog_scan_state.get()
+        if state is not None:
+            return SFTPProvider._BorrowedSession(state.sftp)
         return SFTPProvider._Session(self)
+
+    class _BorrowedSession:
+        """Expose the active catalog session without closing it per call."""
+
+        def __init__(self, sftp: paramiko.SFTPClient) -> None:
+            self._sftp = sftp
+
+        def __enter__(self) -> paramiko.SFTPClient:
+            return self._sftp
+
+        def __exit__(self, *exc_info: object) -> None:
+            return None
+
+    @staticmethod
+    def _cache_key(path: str) -> str:
+        return posixpath.normpath(str(path).replace("\\", "/"))
+
+    def _listdir_attr(
+        self, sftp: paramiko.SFTPClient, path: str
+    ) -> tuple[paramiko.SFTPAttributes, ...]:
+        state = self._catalog_scan_state.get()
+        key = self._cache_key(path)
+        if state is not None and key in state.directory_cache:
+            return state.directory_cache[key]
+
+        if state is not None:
+            state.directory_listings += 1
+            state.recursive_directory_visits += 1
+        entries = tuple(sftp.listdir_attr(path))
+        if state is not None:
+            state.entries_examined += len(entries)
+            state.directory_cache[key] = entries
+            for entry in entries:
+                state.attributes_by_path[
+                    self._cache_key(posixpath.join(key, entry.filename))
+                ] = entry
+        return entries
+
+    def _stat(
+        self, sftp: paramiko.SFTPClient, path: str
+    ) -> paramiko.SFTPAttributes:
+        state = self._catalog_scan_state.get()
+        key = self._cache_key(path)
+        if state is not None:
+            cached = state.attributes_by_path.get(key)
+            if cached is not None:
+                return cached
+            state.stat_calls += 1
+        return sftp.stat(path)
+
+    def _record_file_open(self) -> None:
+        state = self._catalog_scan_state.get()
+        if state is not None:
+            state.file_opens += 1
+
+    def _record_content_read(self) -> None:
+        state = self._catalog_scan_state.get()
+        if state is not None:
+            state.content_reads += 1
 
     # ── path safety ───────────────────────────────────────────────────────
 
@@ -270,7 +440,7 @@ class SFTPProvider(StorageProvider):
         """
         try:
             with self._session() as sftp:
-                sftp.stat(root)
+                self._stat(sftp, root)
             return True
         except ProviderNotReachableError:
             return False
@@ -354,7 +524,7 @@ class SFTPProvider(StorageProvider):
     def list_systems(self, rom_root: str) -> list[str]:
         with self._session() as sftp:
             try:
-                entries = sftp.listdir_attr(rom_root)
+                entries = self._listdir_attr(sftp, rom_root)
             except FileNotFoundError as exc:
                 raise ProviderNotReachableError(
                     f"ROM root not accessible: {rom_root}"
@@ -374,7 +544,7 @@ class SFTPProvider(StorageProvider):
         relative = PurePosixPath(str(system).replace("\\", "/"))
         with self._session() as sftp:
             try:
-                raw_entries = sftp.listdir_attr(system_path)
+                raw_entries = self._listdir_attr(sftp, system_path)
             except FileNotFoundError as exc:
                 raise ProviderError(f"System path not found: {system_path}") from exc
             except PermissionError as exc:
@@ -410,13 +580,32 @@ class SFTPProvider(StorageProvider):
 
     def _size_of(self, sftp: paramiko.SFTPClient, path: str) -> Optional[int]:
         try:
-            attr = sftp.stat(path)
+            attr = self._stat(sftp, path)
         except OSError:
             return None
         if attr.st_mode is not None and _is_dir(attr):
             total = 0
-            for entry in sftp.listdir_attr(path):
-                child_size = self._size_of(sftp, posixpath.join(path, entry.filename))
+            for entry in self._listdir_attr(sftp, path):
+                child_size = self._size_of_attr(
+                    sftp, posixpath.join(path, entry.filename), entry
+                )
+                total += child_size or 0
+            return total
+        return attr.st_size
+
+    def _size_of_attr(
+        self,
+        sftp: paramiko.SFTPClient,
+        path: str,
+        attr: paramiko.SFTPAttributes,
+    ) -> Optional[int]:
+        """Size an entry using metadata already returned by listdir_attr."""
+        if attr.st_mode is not None and _is_dir(attr):
+            total = 0
+            for child in self._listdir_attr(sftp, path):
+                child_size = self._size_of_attr(
+                    sftp, posixpath.join(path, child.filename), child
+                )
                 total += child_size or 0
             return total
         return attr.st_size
@@ -424,7 +613,9 @@ class SFTPProvider(StorageProvider):
     def read_text(self, path: str) -> str:
         try:
             with self._session() as sftp:
+                self._record_file_open()
                 with sftp.open(path, "r") as fh:
+                    self._record_content_read()
                     raw = fh.read()
         except FileNotFoundError as exc:
             raise ProviderError(f"Cannot read {path}: not found") from exc
@@ -458,7 +649,7 @@ class SFTPProvider(StorageProvider):
         entries: list[RemoteEntry] = []
         with self._session() as sftp:
             try:
-                sftp.stat(root)
+                self._stat(sftp, root)
             except OSError:
                 return []
             stack = [""]
@@ -468,7 +659,7 @@ class SFTPProvider(StorageProvider):
                     posixpath.join(root.rstrip("/"), relative_dir) if relative_dir else root
                 )
                 try:
-                    children = sftp.listdir_attr(current)
+                    children = self._listdir_attr(sftp, current)
                 except OSError:
                     continue
                 for child in children:
@@ -496,6 +687,7 @@ class SFTPProvider(StorageProvider):
     def open_binary(self, path: str):
         with self._session() as sftp:
             try:
+                self._record_file_open()
                 with sftp.open(path, "rb") as fh:
                     yield fh
             except FileNotFoundError as exc:
