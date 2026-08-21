@@ -363,6 +363,56 @@ class TestSetupBridge:
         assert captured == [request]
         assert json.loads(result.output)["path"] == "/Data"
 
+    def test_sftp_browse_action_surfaces_safe_provider_diagnostic(
+        self, tmp_path, monkeypatch
+    ):
+        password = "never-return-this-password"
+
+        class Provider:
+            def __init__(self, **_kwargs):
+                pass
+
+            def list_systems(self, _path):
+                raise OSError(f"listdir_attr failed for {password}")
+
+        monkeypatch.setattr(
+            "romcloud.infrastructure.providers.sftp.SFTPProvider", Provider
+        )
+        monkeypatch.setattr(
+            "romcloud.cli.commands.uidata._require_capability_if_configured",
+            lambda *args: None,
+        )
+        request = {
+            "progress": True,
+            "purpose": "source",
+            "source_type": "sftp",
+            "server": "nas.example",
+            "port": 2222,
+            "username": "rom-reader",
+            "password": password,
+            "sftp_host_key_fingerprint": "SHA256:trusted",
+            "sftp_browse_path": "/",
+        }
+
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--config",
+                str(tmp_path / "missing.toml"),
+                "uidata",
+                "setup-browse-sftp",
+            ],
+            input=json.dumps(request),
+        )
+
+        assert result.exit_code == 1
+        response = json.loads(result.stdout.splitlines()[-1])
+        assert "SFTP browser OSError: listdir_attr failed" in response["error"]
+        assert "password_present=True" in response["error"]
+        assert "trusted_fingerprint=SHA256:trusted" in response["error"]
+        assert "path=/" in response["error"]
+        assert password not in result.output
+
 
 class TestStatus:
     def test_emits_single_json_object(self, tmp_path):

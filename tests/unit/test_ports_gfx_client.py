@@ -10,7 +10,13 @@ from __future__ import annotations
 import subprocess
 from dataclasses import dataclass
 
-from ports_gfx.client import BackendResult, call_backend, start_backend_operation
+from ports_gfx.client import (
+    BackendResult,
+    call_backend,
+    operation_result,
+    start_backend_operation,
+)
+from ports_gfx.operation import OperationLine
 
 
 @dataclass
@@ -177,3 +183,24 @@ class TestTransportFailures:
 
         assert result.ok is False
         assert "unexpected response shape" in result.error
+
+    def test_background_failure_surfaces_non_progress_stderr(self):
+        class Runner:
+            error = "exited with code 2"
+            lines = [
+                OperationLine(
+                    "stderr",
+                    '@romcloud-progress {"status":"running"}',
+                ),
+                OperationLine(
+                    "stderr",
+                    "Error: No such command 'setup-browse-sftp'.",
+                ),
+            ]
+
+        result = operation_result(Runner())
+
+        assert result.ok is False
+        assert result.error == (
+            "exited with code 2: Error: No such command 'setup-browse-sftp'."
+        )

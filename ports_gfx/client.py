@@ -122,7 +122,17 @@ def operation_result(runner: OperationRunner) -> BackendResult:
     """Parse the final JSON response captured by a finished operation."""
     stdout_lines = [line.text for line in runner.lines if line.stream == "stdout"]
     if not stdout_lines:
-        return BackendResult(ok=False, error=runner.error or "no output from romcloud")
+        stderr_lines = [
+            line.text
+            for line in runner.lines
+            if line.stream == "stderr"
+            and not line.text.startswith("@romcloud-progress ")
+        ]
+        detail = stderr_lines[-1] if stderr_lines else ""
+        error = runner.error or "no output from romcloud"
+        if detail and detail not in error:
+            error = f"{error}: {detail}"
+        return BackendResult(ok=False, error=error)
     try:
         payload = json.loads(stdout_lines[-1])
     except ValueError:

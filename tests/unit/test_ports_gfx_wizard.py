@@ -382,6 +382,29 @@ def test_sftp_source_browser_lists_root_and_enters_case_sensitive_folder(monkeyp
     assert calls[-1][1]["purpose"] == "source"
 
 
+def test_sftp_browser_failure_surfaces_backend_diagnostic(monkeypatch):
+    wizard = WizardState()
+    wizard.step = WizardStep.SFTP_BROWSE
+    wizard.runner = _Runner()
+    monkeypatch.setattr(
+        "ports_gfx.wizard.operation_result",
+        lambda _runner: BackendResult(
+            False,
+            error=(
+                "SFTP browser ProviderAuthError: credentials rejected; "
+                "password_present=False; path=/"
+            ),
+        ),
+    )
+
+    wizard.poll()
+
+    assert "Could not open that SFTP folder" in wizard.error
+    assert "ProviderAuthError: credentials rejected" in wizard.error
+    assert "password_present=False" in wizard.error
+    assert wizard.technical_error in wizard.error
+
+
 def test_sftp_browser_parent_and_root_boundary_are_safe(monkeypatch):
     calls = []
     monkeypatch.setattr(

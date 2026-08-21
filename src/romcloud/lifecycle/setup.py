@@ -652,7 +652,20 @@ def browse_sftp_directory(
         probe_writable=False,
     )
     emit_progress(progress, "browse", "directory", "running", f"Opening {path}…")
-    directories = provider.list_systems(path)
+    try:
+        directories = provider.list_systems(path)
+    except Exception as exc:
+        detail = _redact(str(exc), connection["password"])
+        diagnostic = (
+            f"SFTP browser {type(exc).__name__}: {detail or '(no message)'}; "
+            f"provider=SFTPProvider; role={connection['purpose']}; "
+            f"host={connection['host']}; port={connection['port']}; "
+            f"username={connection['username']}; "
+            f"password_present={bool(connection['password'])}; "
+            f"trusted_fingerprint={connection['trusted_fingerprint'] or 'missing'}; "
+            f"path={path}"
+        )
+        raise ValueError(diagnostic) from None
     emit_progress(progress, "browse", "directory", "success", "Folder contents loaded")
     return {
         "path": path,

@@ -289,6 +289,47 @@ class TestSetupState:
 
 
 class TestSFTPDirectoryBrowsing:
+    def test_browser_failure_reports_safe_exact_invocation_context(
+        self, monkeypatch
+    ):
+        password = "do-not-leak-this"
+
+        class Provider:
+            def __init__(self, **_kwargs):
+                pass
+
+            def list_systems(self, _path):
+                raise RuntimeError(f"listing rejected while using {password}")
+
+        monkeypatch.setattr(
+            "romcloud.infrastructure.providers.sftp.SFTPProvider", Provider
+        )
+
+        with pytest.raises(ValueError) as raised:
+            graphical_setup.browse_sftp_directory(
+                {
+                    "purpose": "source",
+                    "server": "nas.example",
+                    "port": 2222,
+                    "username": "rom-reader",
+                    "password": password,
+                    "sftp_host_key_fingerprint": "SHA256:trusted",
+                    "sftp_browse_path": "/",
+                }
+            )
+
+        detail = str(raised.value)
+        assert "SFTP browser RuntimeError: listing rejected" in detail
+        assert "provider=SFTPProvider" in detail
+        assert "role=source" in detail
+        assert "host=nas.example" in detail
+        assert "port=2222" in detail
+        assert "username=rom-reader" in detail
+        assert "password_present=True" in detail
+        assert "trusted_fingerprint=SHA256:trusted" in detail
+        assert "path=/" in detail
+        assert password not in detail
+
     def test_trust_browse_select_and_validate_preserve_one_source_session(
         self, tmp_path, monkeypatch
     ):
