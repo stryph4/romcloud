@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
 from romcloud.core.models.game import Game, GameAsset
+from romcloud.core.storage import RemoteEntry
 from romcloud.services.transfer import TransferService
 from romcloud.core.cancellation import TransferCancellationToken
 from romcloud.core.exceptions import TransferCancelledError, TransferValidationError
@@ -15,14 +17,24 @@ from romcloud.core.exceptions import TransferCancelledError, TransferValidationE
 class _ChunkedProvider:
     """Deterministic fake using the shared provider progress contract."""
 
-    def __init__(self, provider_id: str = "local", chunk_size: int = 100) -> None:
+    def __init__(
+        self,
+        provider_id: str = "local",
+        chunk_size: int = 100,
+        fail_on_call: int | None = None,
+    ) -> None:
         self.provider_id = provider_id
         self.chunk_size = chunk_size
+        self.fail_on_call = fail_on_call
         self.calls = 0
+        self.sources: list[Path] = []
 
     def transfer_to(self, source_path, dest_path, on_progress=None):
         self.calls += 1
         source = Path(source_path)
+        self.sources.append(source)
+        if self.calls == self.fail_on_call:
+            raise OSError("simulated remote read failure")
         destination = Path(dest_path)
         if source.is_dir():
             files = sorted(path for path in source.rglob("*") if path.is_file())
@@ -49,6 +61,41 @@ class _ChunkedProvider:
                 done += len(chunk)
                 if on_progress:
                     on_progress(done, total)
+
+    @contextmanager
+    def transfer_session(self):
+        yield
+
+    def resolve_path(self, root, relative_path):
+        return str(Path(root).joinpath(*relative_path.replace("\\", "/").split("/")))
+
+    def list_entries(self, rom_root, system):
+        directory = Path(self.resolve_path(rom_root, system))
+        return [
+            RemoteEntry(
+                name=entry.name,
+                relative_path=(
+                    Path(system).joinpath(entry.name).as_posix()
+                ),
+                is_directory=entry.is_dir(),
+                size_bytes=(entry.stat().st_size if entry.is_file() else None),
+                is_symlink=entry.is_symlink(),
+            )
+            for entry in sorted(directory.iterdir())
+        ]
+
+    def walk(self, root):
+        directory = Path(root)
+        return [
+            RemoteEntry(
+                name=entry.name,
+                relative_path=entry.relative_to(directory).as_posix(),
+                is_directory=entry.is_dir(),
+                size_bytes=(entry.stat().st_size if entry.is_file() else None),
+                is_symlink=entry.is_symlink(),
+            )
+            for entry in sorted(directory.rglob("*"))
+        ]
 
     def get_size(self, path):
         source = Path(path)
@@ -79,19 +126,23 @@ def simple_game(tmp_path) -> tuple[Game, Path]:
 def dir_game(tmp_path) -> tuple[Game, Path]:
     """A directory-based game (PS3 style)."""
     source_root = tmp_path / "source"
-    game_dir = source_root / "ps3" / "BCES00000"
-    game_dir.mkdir(parents=True)
-    (game_dir / "EBOOT.BIN").write_bytes(b"eboot" * 50)
-    (game_dir / "data.pkg").write_bytes(b"data" * 200)
+    game_dir = source_root / "ps3" / "GAME"
+    usrdir = game_dir / "PS3_GAME" / "USRDIR"
+    (usrdir / "DATA" / "LEVELS").mkdir(parents=True)
+    (game_dir / "PS3_GAME" / "EMPTY").mkdir()
+    (usrdir / "EBOOT.BIN").write_bytes(b"eboot" * 50)
+    (game_dir / ".package-meta").write_bytes(b"meta")
+    (usrdir / "DATA" / "config.dat").write_bytes(b"config" * 20)
+    (usrdir / "DATA" / "LEVELS" / "level0.bin").write_bytes(b"data" * 200)
 
-    total = len(b"eboot" * 50) + len(b"data" * 200)
+    total = len(b"eboot" * 50) + len(b"config" * 20) + len(b"data" * 200) + 4
     asset = GameAsset(
-        filename="BCES00000",
-        relative_path="ps3/BCES00000",
+        filename="GAME",
+        relative_path="ps3/GAME",
         size_bytes=total,
         is_primary=True,
     )
-    game = Game.create("ps3", "BCES00000", "local", str(source_root), [asset])
+    game = Game.create("ps3", "GAME", "local", str(source_root), [asset])
     return game, source_root
 
 
@@ -133,11 +184,49 @@ class TestTransferService:
         with pytest.raises(TransferCancelledError):
             service.transfer(game, cancel_after_first_chunk, cancellation)
 
-        staging = cache_dir / ".partial" / "ps3" / "BCES00000"
-        final = cache_dir / "ps3" / "BCES00000"
+        staging = cache_dir / ".partial" / "ps3" / "GAME"
+        final = cache_dir / "ps3" / "GAME"
         assert staging.is_dir()
         assert service.staging_size(game) < game.total_size_bytes
         assert not final.exists()
+
+        completed = Path(service.transfer(game))
+        assert completed == final
+        assert (completed / "PS3_GAME" / "USRDIR" / "EBOOT.BIN").is_file()
+        assert (completed / "PS3_GAME" / "EMPTY").is_dir()
+        assert not staging.exists()
+
+    def test_remote_failure_mid_directory_preserves_staging_and_retries(
+        self, dir_game, cache_dir
+    ):
+        game, _ = dir_game
+        provider = _ChunkedProvider("sftp", fail_on_call=2)
+        service = TransferService(provider=provider, cache_root=str(cache_dir))
+
+        with pytest.raises(OSError, match="remote read failure"):
+            service.transfer(game)
+
+        staging = cache_dir / ".partial" / "ps3" / "GAME"
+        final = cache_dir / "ps3" / "GAME"
+        assert staging.is_dir()
+        assert any(path.is_file() for path in staging.rglob("*"))
+        assert not final.exists()
+
+        provider.fail_on_call = None
+        completed = Path(service.transfer(game))
+        assert completed == final
+        assert not staging.exists()
+        assert all(path.is_file() for path in provider.sources)
+        assert {
+            path.relative_to(completed).as_posix()
+            for path in completed.rglob("*")
+            if path.is_file()
+        } == {
+            ".package-meta",
+            "PS3_GAME/USRDIR/EBOOT.BIN",
+            "PS3_GAME/USRDIR/DATA/config.dat",
+            "PS3_GAME/USRDIR/DATA/LEVELS/level0.bin",
+        }
 
     def test_subsequent_transfer_reuses_safe_staging_path_and_completes(
         self, simple_game, cache_dir
@@ -176,7 +265,7 @@ class TestTransferService:
             provider=LocalFilesystemProvider(), cache_root=str(cache_dir)
         )
 
-        assert svc.estimate_size(game) == len(b"eboot" * 50) + len(b"data" * 200)
+        assert svc.estimate_size(game) == 1174
 
     def test_transfers_single_file(self, simple_game, cache_dir):
         game, source_root = simple_game
@@ -266,10 +355,24 @@ class TestTransferService:
 
         final = svc.transfer(game)
         game_dir = Path(final)
-        assert game_dir.name == "BCES00000"
+        assert game_dir.name == "GAME"
         assert game_dir.is_dir()
-        assert (game_dir / "EBOOT.BIN").exists()
-        assert (game_dir / "data.pkg").exists()
+        assert (game_dir / "PS3_GAME" / "USRDIR" / "EBOOT.BIN").read_bytes() == (
+            b"eboot" * 50
+        )
+        assert (
+            game_dir / "PS3_GAME" / "USRDIR" / "DATA" / "config.dat"
+        ).read_bytes() == b"config" * 20
+        assert (
+            game_dir
+            / "PS3_GAME"
+            / "USRDIR"
+            / "DATA"
+            / "LEVELS"
+            / "level0.bin"
+        ).read_bytes() == b"data" * 200
+        assert (game_dir / "PS3_GAME" / "EMPTY").is_dir()
+        assert (game_dir / ".package-meta").read_bytes() == b"meta"
 
     def test_cached_filename_matches_source_filename(self, simple_game, cache_dir):
         """The cached ROM filename must equal the original source filename.

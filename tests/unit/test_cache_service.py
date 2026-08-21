@@ -269,6 +269,12 @@ class TestCacheGameCancellation:
         assert not (cache_dir / "ps3" / "Example.ps3").exists()
         assert cache_service.is_cached(game.id) is False
 
+        launch_path = Path(cache_service.cache_game(game.id))
+        assert launch_path == cache_dir / "ps3" / "Example.ps3"
+        assert cache_repo.get(game.id).status is CacheStatus.COMPLETE
+        assert cache_service.is_cached(game.id) is True
+        assert not (cache_dir / ".partial" / "ps3" / "Example.ps3").exists()
+
     def test_real_transfer_failure_remains_distinct_from_cancellation(
         self, cache_service, cache_repo, game_with_file, monkeypatch
     ):

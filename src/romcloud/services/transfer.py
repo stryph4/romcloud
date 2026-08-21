@@ -5,11 +5,13 @@ Transfer lifecycle
 
 1. For each asset, stage it at
    ``{cache_root}/.partial/{system}/{asset path relative to system root}``.
-2. Transfer each asset from the provider into staging (resumable per-file).
-3. Validate that all staging files match expected sizes.
-4. Atomically promote each staged asset to its final cache path:
+2. Expand directory assets through the provider's recursive tree API and
+   create their complete staging layout.
+3. Transfer each required file into staging (resumable per-file).
+4. Validate exact directory membership and every known file size.
+5. Atomically promote each staged asset to its final cache path:
    ``{cache_root}/{system}/{asset path relative to system root}``.
-5. Return the final cache path of the game's primary asset.
+6. Return the final cache path of the game's primary asset.
 
 The final (and staging) layout mirrors the source's relative path under the
 system, so the original basename is always preserved and identical filenames
@@ -34,7 +36,8 @@ time.
 from __future__ import annotations
 
 import shutil
-from pathlib import Path
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from typing import Callable, Optional
 
 from romcloud.core.cache_paths import resolve_cache_path
@@ -45,10 +48,29 @@ from romcloud.core.exceptions import (
     TransferValidationError,
 )
 from romcloud.core.models.game import Game, GameAsset
-from romcloud.core.storage import StorageProvider
+from romcloud.core.storage import RemoteEntry, StorageProvider
 from romcloud.infrastructure.logging import get_logger
 
 log = get_logger("transfer")
+
+
+@dataclass(frozen=True)
+class _PlannedFile:
+    relative_path: str
+    package_relative_path: str
+    size_bytes: Optional[int]
+
+
+@dataclass(frozen=True)
+class _AssetPlan:
+    asset: GameAsset
+    is_directory: bool
+    directories: tuple[str, ...] = ()
+    files: tuple[_PlannedFile, ...] = ()
+
+    @property
+    def total_size_bytes(self) -> int:
+        return sum(file.size_bytes or 0 for file in self.files)
 
 
 class TransferService:
@@ -85,6 +107,16 @@ class TransferService:
         on_progress: Optional[Callable[[int, int], None]] = None,
         cancellation: Optional[TransferCancellationToken] = None,
     ) -> str:
+        """Transfer one logical game within the provider's bounded session."""
+        with self._provider.transfer_session():
+            return self._transfer_in_session(game, on_progress, cancellation)
+
+    def _transfer_in_session(
+        self,
+        game: Game,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+        cancellation: Optional[TransferCancellationToken] = None,
+    ) -> str:
         """Transfer all game assets and return the final cache path.
 
         The returned path is the primary asset's final location:
@@ -100,6 +132,7 @@ class TransferService:
 
         log.info("Starting transfer for %r (%s)", game.title, game.id)
 
+        plans: list[_AssetPlan] = []
         grand_total = game.total_size_bytes or 0
         cumulative_done = 0
 
@@ -107,12 +140,14 @@ class TransferService:
             _check_cancelled(cancellation)
             for asset in game.assets:
                 _check_cancelled(cancellation)
+                plan = self._plan_asset(game, asset, cancellation)
+                plans.append(plan)
+                if game.total_size_bytes is None:
+                    grand_total += plan.total_size_bytes
                 final = self._final_path(game.system, asset.relative_path)
-                final_size = _existing_size(final)
+                final_size = self._validated_size(final, plan)
 
-                if final_size is not None and (
-                    asset.size_bytes is None or final_size == asset.size_bytes
-                ):
+                if final_size is not None:
                     # Already fully cached (from a previous run, or another
                     # asset of this same game) — repair only what's missing.
                     cumulative_done += final_size
@@ -128,25 +163,32 @@ class TransferService:
                 # settings by filename (e.g. snes["Some Game.sfc"].*);
                 # renaming here would silently break any game-specific
                 # emulator/core overrides.
-                src = str(Path(self._asset_source_root(game)) / asset.relative_path)
                 dst = self._staging_path(game.system, asset.relative_path)
                 dst.parent.mkdir(parents=True, exist_ok=True)
 
-                base_done = cumulative_done
-
-                def _asset_progress(done: int, total: int, _base: int = base_done) -> None:
-                    _check_cancelled(cancellation)
-                    if on_progress:
-                        on_progress(_base + done, grand_total or (_base + total))
-                    _check_cancelled(cancellation)
-
-                log.debug("Transferring asset %s → %s", asset.relative_path, dst)
-                self._provider.transfer_to(src, str(dst), _asset_progress)
-                _check_cancelled(cancellation)
-                cumulative_done = base_done + (_existing_size(dst) or 0)
+                if plan.is_directory:
+                    cumulative_done = self._transfer_directory(
+                        game,
+                        plan,
+                        dst,
+                        cumulative_done,
+                        grand_total,
+                        on_progress,
+                        cancellation,
+                    )
+                else:
+                    cumulative_done = self._transfer_file(
+                        game,
+                        plan.files[0],
+                        dst,
+                        cumulative_done,
+                        grand_total,
+                        on_progress,
+                        cancellation,
+                    )
 
             _check_cancelled(cancellation)
-            self._validate(game)
+            self._validate(game, plans)
             _check_cancelled(cancellation)
 
             final = self._promote(game)
@@ -198,7 +240,9 @@ class TransferService:
         """Resolve one lazy asset size for deduplicated batch planning."""
         if asset.size_bytes is not None:
             return asset.size_bytes
-        source = str(Path(self._asset_source_root(game)) / asset.relative_path)
+        source = self._provider.resolve_path(
+            self._asset_source_root(game), asset.relative_path
+        )
         return self._provider.get_size(source) or 0
 
     def discard_staging(self, game: Game) -> None:
@@ -220,29 +264,227 @@ class TransferService:
     def _final_path(self, system: str, relative_path: str) -> Path:
         return resolve_cache_path(self._cache_root, system, relative_path)
 
-    def _validate(self, game: Game) -> None:
+    def _plan_asset(
+        self,
+        game: Game,
+        asset: GameAsset,
+        cancellation: Optional[TransferCancellationToken],
+    ) -> _AssetPlan:
+        """Snapshot every required source path for one logical asset."""
+        _check_cancelled(cancellation)
+        entry = self._source_entry(game, asset.relative_path)
+        if entry.is_symlink:
+            raise TransferError(
+                f"Refusing to transfer symlink asset: {asset.relative_path}"
+            )
+        if entry.is_directory:
+            return self._plan_directory(game, asset, cancellation)
+        return _AssetPlan(
+            asset=asset,
+            is_directory=False,
+            files=(
+                _PlannedFile(
+                    relative_path=asset.relative_path,
+                    package_relative_path="",
+                    size_bytes=(
+                        asset.size_bytes
+                        if asset.size_bytes is not None
+                        else entry.size_bytes
+                    ),
+                ),
+            ),
+        )
+
+    def _source_entry(self, game: Game, relative_path: str) -> RemoteEntry:
+        relative = PurePosixPath(str(relative_path).replace("\\", "/"))
+        if len(relative.parts) < 2:
+            raise TransferError(f"Invalid source asset path: {relative_path!r}")
+        parent = PurePosixPath(*relative.parts[:-1]).as_posix()
+        expected = relative.as_posix()
+        for entry in self._provider.list_entries(self._asset_source_root(game), parent):
+            if entry.relative_path.replace("\\", "/") == expected:
+                return entry
+        raise TransferError(f"Source does not exist: {relative_path}")
+
+    def _plan_directory(
+        self,
+        game: Game,
+        asset: GameAsset,
+        cancellation: Optional[TransferCancellationToken],
+    ) -> _AssetPlan:
+        root = PurePosixPath(asset.relative_path.replace("\\", "/"))
+        directories: list[str] = []
+        files: list[_PlannedFile] = []
+        source = self._provider.resolve_path(
+            self._asset_source_root(game), asset.relative_path
+        )
+
+        for entry in self._provider.walk(source):
+            _check_cancelled(cancellation)
+            package_path = PurePosixPath(entry.relative_path.replace("\\", "/"))
+            if (
+                package_path.is_absolute()
+                or not package_path.parts
+                or any(part in ("", ".", "..") for part in package_path.parts)
+                or entry.name != package_path.name
+            ):
+                raise TransferError(
+                    "Provider returned an invalid directory-package path: "
+                    f"{entry.relative_path!r}"
+                )
+            package_relative = package_path.as_posix()
+            relative = PurePosixPath(root, package_path).as_posix()
+            if entry.is_symlink:
+                raise TransferError(
+                    f"Refusing to transfer package symlink: {relative}"
+                )
+            if entry.is_directory:
+                directories.append(package_relative)
+            else:
+                files.append(
+                    _PlannedFile(
+                        relative_path=relative,
+                        package_relative_path=package_relative,
+                        size_bytes=entry.size_bytes,
+                    )
+                )
+
+        return _AssetPlan(
+            asset=asset,
+            is_directory=True,
+            directories=tuple(sorted(directories)),
+            files=tuple(sorted(files, key=lambda file: file.relative_path)),
+        )
+
+    def _transfer_directory(
+        self,
+        game: Game,
+        plan: _AssetPlan,
+        staging: Path,
+        cumulative_done: int,
+        grand_total: int,
+        on_progress: Optional[Callable[[int, int], None]],
+        cancellation: Optional[TransferCancellationToken],
+    ) -> int:
+        if staging.exists() and not staging.is_dir():
+            staging.unlink()
+        staging.mkdir(parents=True, exist_ok=True)
+        expected_dirs = set(plan.directories)
+        expected_files = {file.package_relative_path for file in plan.files}
+        for candidate in sorted(
+            staging.rglob("*"), key=lambda path: len(path.parts), reverse=True
+        ):
+            relative = candidate.relative_to(staging).as_posix()
+            if candidate.is_symlink():
+                candidate.unlink()
+            elif candidate.is_file() and relative not in expected_files:
+                candidate.unlink()
+            elif candidate.is_dir() and relative not in expected_dirs:
+                shutil.rmtree(candidate)
+        for relative in plan.directories:
+            (staging / Path(*PurePosixPath(relative).parts)).mkdir(
+                parents=True, exist_ok=True
+            )
+
+        for file in plan.files:
+            _check_cancelled(cancellation)
+            destination = staging / Path(
+                *PurePosixPath(file.package_relative_path).parts
+            )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            existing = _existing_size(destination)
+            if file.size_bytes is not None and existing == file.size_bytes:
+                cumulative_done += existing
+                if on_progress:
+                    on_progress(cumulative_done, grand_total or cumulative_done)
+                continue
+            cumulative_done = self._transfer_file(
+                game,
+                file,
+                destination,
+                cumulative_done,
+                grand_total,
+                on_progress,
+                cancellation,
+            )
+        return cumulative_done
+
+    def _transfer_file(
+        self,
+        game: Game,
+        file: _PlannedFile,
+        destination: Path,
+        cumulative_done: int,
+        grand_total: int,
+        on_progress: Optional[Callable[[int, int], None]],
+        cancellation: Optional[TransferCancellationToken],
+    ) -> int:
+        source = self._provider.resolve_path(
+            self._asset_source_root(game), file.relative_path
+        )
+        base_done = cumulative_done
+
+        def _file_progress(done: int, total: int) -> None:
+            _check_cancelled(cancellation)
+            if on_progress:
+                on_progress(base_done + done, grand_total or (base_done + total))
+            _check_cancelled(cancellation)
+
+        log.debug("Transferring asset %s to %s", file.relative_path, destination)
+        self._provider.transfer_to(source, str(destination), _file_progress)
+        _check_cancelled(cancellation)
+        return base_done + (_existing_size(destination) or 0)
+
+    def _validate(self, game: Game, plans: list[_AssetPlan]) -> None:
         """Check that every asset ended up complete — either already
         correct at its final path, or freshly staged with the expected size."""
-        for asset in game.assets:
+        for plan in plans:
+            asset = plan.asset
             final = self._final_path(game.system, asset.relative_path)
-            final_size = _existing_size(final)
-            if final_size is not None and (
-                asset.size_bytes is None or final_size == asset.size_bytes
-            ):
+            if self._validated_size(final, plan) is not None:
                 continue  # already promoted from a previous run
 
             staged = self._staging_path(game.system, asset.relative_path)
-            if not staged.exists():
+            if self._validated_size(staged, plan) is None:
                 raise TransferValidationError(
-                    f"Asset missing after transfer: {asset.filename}"
+                    f"Asset incomplete after transfer: {asset.filename}"
                 )
-            if asset.size_bytes is not None:
-                actual = _existing_size(staged)
-                if actual != asset.size_bytes:
-                    raise TransferValidationError(
-                        f"Size mismatch for {asset.filename}: "
-                        f"expected {asset.size_bytes}, got {actual}"
-                    )
+
+    @staticmethod
+    def _validated_size(path: Path, plan: _AssetPlan) -> Optional[int]:
+        if not plan.is_directory:
+            if not path.is_file() or path.is_symlink():
+                return None
+            actual = path.stat().st_size
+            expected = plan.files[0].size_bytes
+            return actual if expected is None or actual == expected else None
+
+        if not path.is_dir() or path.is_symlink():
+            return None
+        expected_dirs = set(plan.directories)
+        expected_files = {
+            file.package_relative_path: file.size_bytes for file in plan.files
+        }
+        actual_dirs: set[str] = set()
+        actual_files: dict[str, int] = {}
+        for candidate in path.rglob("*"):
+            if candidate.is_symlink():
+                return None
+            relative = candidate.relative_to(path).as_posix()
+            if candidate.is_dir():
+                actual_dirs.add(relative)
+            elif candidate.is_file():
+                actual_files[relative] = candidate.stat().st_size
+            else:
+                return None
+        if actual_dirs != expected_dirs or set(actual_files) != set(expected_files):
+            return None
+        if any(
+            expected is not None and actual_files[relative] != expected
+            for relative, expected in expected_files.items()
+        ):
+            return None
+        return sum(actual_files.values())
 
     def _promote(self, game: Game) -> str:
         """Move each freshly-staged asset to its final cache location.

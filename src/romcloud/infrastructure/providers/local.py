@@ -160,13 +160,23 @@ class LocalFilesystemProvider(StorageProvider):
     def walk(self, root: str) -> list[RemoteEntry]:
         base = Path(root)
         if not base.is_dir():
-            return []
+            raise ProviderError(f"Directory tree not found: {root}")
         entries: list[RemoteEntry] = []
         for current, directories, filenames in os.walk(base, followlinks=False):
             current_path = Path(current)
             directories[:] = sorted(
                 name for name in directories if not (current_path / name).is_symlink()
             )
+            for dirname in directories:
+                candidate = current_path / dirname
+                entries.append(
+                    RemoteEntry(
+                        name=dirname,
+                        relative_path=candidate.relative_to(base).as_posix(),
+                        is_directory=True,
+                        size_bytes=None,
+                    )
+                )
             for filename in sorted(filenames):
                 candidate = current_path / filename
                 if candidate.is_symlink() or not candidate.is_file():

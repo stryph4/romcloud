@@ -195,6 +195,11 @@ class ProviderTreeIndex:
         self._known_dirs: set[str] = set()
         for entry in entries:
             if entry.is_directory:
+                relative = entry.relative_path.strip("/")
+                parent, _, name = relative.rpartition("/")
+                if relative:
+                    self._known_dirs.add(relative)
+                    self._child_dirs.setdefault(parent, set()).add(name)
                 continue
             relative = entry.relative_path
             self._file_sizes[relative] = entry.size_bytes or 0

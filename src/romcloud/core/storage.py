@@ -5,6 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from typing import Callable, Iterator, Optional
 
 
@@ -179,16 +180,42 @@ class StorageProvider(ABC):
     ) -> None:
         """Copy *source_path* from this provider to local *dest_path*."""
 
+    def resolve_path(self, root: str, relative_path: str) -> str:
+        """Resolve a catalog-relative path in this provider's namespace.
+
+        Catalog paths always use POSIX separators, while the provider root is
+        opaque to callers. Filesystem-backed providers can use the default;
+        protocol providers should override it when their namespace differs.
+        """
+        relative = PurePosixPath(str(relative_path).replace("\\", "/"))
+        if (
+            relative.is_absolute()
+            or not relative.parts
+            or any(part in ("", ".", "..") for part in relative.parts)
+        ):
+            raise ValueError(f"Unsafe provider-relative path: {relative_path!r}")
+        return str(Path(root).joinpath(*relative.parts))
+
+    @contextmanager
+    def transfer_session(self) -> Iterator[None]:
+        """Bound one logical game's transfer operations.
+
+        Most providers need no lifecycle. Protocol providers may override
+        this scope to reuse a connection across tree enumeration and all
+        file downloads while still closing it on success, failure, or cancel.
+        """
+        yield
+
     def walk(self, root: str) -> list[RemoteEntry]:
-        """Recursively enumerate every file under *root*, relative to it.
+        """Recursively enumerate every entry under *root*, relative to it.
 
         Generic arbitrary-tree read surface for callers (SaveSync/Library
         Sync) that need to scan a dataset not shaped like the ROM
         catalog's one-level system/game layout ``list_entries`` assumes.
         ``relative_path`` on each returned entry is relative to *root*
-        itself, not to any provider-wide root. Directories are not
-        yielded. The default raises; providers that can be used as
-        remote-data must override it (see
+        itself, not to any provider-wide root. Directories, including empty
+        ones, are yielded so callers can reproduce an exact tree. The default
+        raises; providers that can be used as remote-data must override it (see
         :mod:`romcloud.infrastructure.providers.local` and
         :mod:`romcloud.infrastructure.providers.sftp`).
         """

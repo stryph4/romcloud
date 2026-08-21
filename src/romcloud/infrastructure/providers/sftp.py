@@ -219,6 +219,9 @@ class SFTPProvider(StorageProvider):
         self._catalog_scan_state: contextvars.ContextVar[
             Optional[_SFTPCatalogScanState]
         ] = contextvars.ContextVar("romcloud_sftp_catalog_scan", default=None)
+        self._transfer_session_state: contextvars.ContextVar[
+            Optional[tuple[paramiko.SSHClient, paramiko.SFTPClient]]
+        ] = contextvars.ContextVar("romcloud_sftp_transfer_session", default=None)
         self._catalog_scan_metrics: dict[str, SFTPCatalogScanMetrics] = {}
 
     @property
@@ -354,6 +357,9 @@ class SFTPProvider(StorageProvider):
         state = self._catalog_scan_state.get()
         if state is not None:
             return SFTPProvider._BorrowedSession(state.sftp)
+        transfer_state = self._transfer_session_state.get()
+        if transfer_state is not None:
+            return SFTPProvider._BorrowedSession(transfer_state[1])
         return SFTPProvider._Session(self)
 
     class _BorrowedSession:
@@ -367,6 +373,20 @@ class SFTPProvider(StorageProvider):
 
         def __exit__(self, *exc_info: object) -> None:
             return None
+
+    @contextlib.contextmanager
+    def transfer_session(self) -> Iterator[None]:
+        """Reuse one bounded SFTP connection for a logical game package."""
+        if self._transfer_session_state.get() is not None:
+            yield
+            return
+        client, sftp = self._connect()
+        token = self._transfer_session_state.set((client, sftp))
+        try:
+            yield
+        finally:
+            self._transfer_session_state.reset(token)
+            client.close()
 
     @staticmethod
     def _cache_key(path: str) -> str:
@@ -422,7 +442,8 @@ class SFTPProvider(StorageProvider):
         rel = PurePosixPath(str(relative).replace("\\", "/"))
         if rel.is_absolute() or any(part in ("", ".", "..") for part in rel.parts):
             raise ProviderError(f"Unsafe relative SFTP path: {relative!r}")
-        return posixpath.join(root.rstrip("/"), *rel.parts) if rel.parts else root
+        base = root.rstrip("/") or "/"
+        return posixpath.join(base, *rel.parts) if rel.parts else root
 
     # ── StorageProvider contract ──────────────────────────────────────────
 
@@ -645,13 +666,21 @@ class SFTPProvider(StorageProvider):
         except (paramiko.SSHException, OSError) as exc:
             raise TransferError(f"Copy failed {source_path} → {dest_path}: {exc}") from exc
 
+    def resolve_path(self, root: str, relative_path: str) -> str:
+        """Resolve a catalog path without applying local filesystem rules."""
+        return self._safe_join(root, relative_path)
+
     def walk(self, root: str) -> list[RemoteEntry]:
         entries: list[RemoteEntry] = []
         with self._session() as sftp:
             try:
                 self._stat(sftp, root)
-            except OSError:
-                return []
+            except PermissionError as exc:
+                raise ProviderPermissionError(
+                    f"Permission denied reading directory tree: {root}"
+                ) from exc
+            except OSError as exc:
+                raise ProviderError(f"Directory tree not found: {root}") from exc
             stack = [""]
             while stack:
                 relative_dir = stack.pop()
@@ -660,8 +689,12 @@ class SFTPProvider(StorageProvider):
                 )
                 try:
                     children = self._listdir_attr(sftp, current)
-                except OSError:
-                    continue
+                except PermissionError as exc:
+                    raise ProviderPermissionError(
+                        f"Permission denied listing: {current}"
+                    ) from exc
+                except OSError as exc:
+                    raise ProviderError(f"Cannot list {current}: {exc}") from exc
                 for child in children:
                     if _is_symlink(child):
                         continue
@@ -671,6 +704,14 @@ class SFTPProvider(StorageProvider):
                         else child.filename
                     )
                     if _is_dir(child):
+                        entries.append(
+                            RemoteEntry(
+                                name=child.filename,
+                                relative_path=child_relative,
+                                is_directory=True,
+                                size_bytes=None,
+                            )
+                        )
                         stack.append(child_relative)
                         continue
                     entries.append(

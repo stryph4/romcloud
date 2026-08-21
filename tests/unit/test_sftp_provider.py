@@ -25,6 +25,7 @@ from romcloud.core.exceptions import (
     ProviderNotReachableError,
     TransferCancelledError,
 )
+from romcloud.core.models.game import Game, GameAsset
 from romcloud.integrations.batocera.catalog import CatalogService
 from romcloud.integrations.batocera.system_registry import EffectiveSystemRegistry
 from romcloud.infrastructure.providers.sftp import (
@@ -32,6 +33,7 @@ from romcloud.infrastructure.providers.sftp import (
     fingerprint_of,
     probe_host_key,
 )
+from romcloud.services.transfer import TransferService
 
 # A client that disconnects right after a rejected auth/host-key handshake
 # leaves the server-side thread's blocking read to observe a reset socket —
@@ -302,6 +304,59 @@ class TestReadOperations:
         provider.transfer_to((root / "rom.bin").as_posix(), str(dest))
         assert dest.read_bytes() == b"payload-bytes"
 
+    def test_transfer_service_caches_nested_directory_package(
+        self, sftp_server, tmp_path, monkeypatch
+    ):
+        server, root = sftp_server
+        source_root = root / "roms"
+        package = source_root / "ps3" / "GAME"
+        usrdir = package / "PS3_GAME" / "USRDIR"
+        (usrdir / "DATA" / "LEVELS").mkdir(parents=True)
+        (package / "PS3_GAME" / "EMPTY").mkdir()
+        (usrdir / "EBOOT.BIN").write_bytes(b"eboot")
+        (package / ".package-meta").write_bytes(b"meta")
+        (usrdir / "DATA" / "config.dat").write_bytes(b"config")
+        (usrdir / "DATA" / "LEVELS" / "level0.bin").write_bytes(b"level")
+        game = Game.create(
+            "ps3",
+            "GAME",
+            "sftp",
+            source_root.as_posix(),
+            [GameAsset("GAME", "ps3/GAME", size_bytes=None, is_primary=True)],
+        )
+        cache_root = tmp_path / "cache"
+        provider = _provider(server)
+        original_connect = provider._connect
+        connection_count = 0
+
+        def counted_connect():
+            nonlocal connection_count
+            connection_count += 1
+            return original_connect()
+
+        monkeypatch.setattr(provider, "_connect", counted_connect)
+
+        final = Path(
+            TransferService(
+                provider=provider, cache_root=str(cache_root)
+            ).transfer(game)
+        )
+
+        assert final == cache_root / "ps3" / "GAME"
+        assert {
+            path.relative_to(final).as_posix(): path.read_bytes()
+            for path in final.rglob("*")
+            if path.is_file()
+        } == {
+            ".package-meta": b"meta",
+            "PS3_GAME/USRDIR/EBOOT.BIN": b"eboot",
+            "PS3_GAME/USRDIR/DATA/config.dat": b"config",
+            "PS3_GAME/USRDIR/DATA/LEVELS/level0.bin": b"level",
+        }
+        assert (final / "PS3_GAME" / "EMPTY").is_dir()
+        assert not (cache_root / ".partial" / "ps3" / "GAME").exists()
+        assert connection_count == 1
+
     def test_transfer_to_propagates_provider_neutral_cancellation(
         self, sftp_server, tmp_path
     ):
@@ -329,7 +384,9 @@ class TestReadOperations:
         (root / "top.txt").write_text("y", encoding="utf-8")
         provider = _provider(server)
         entries = {e.relative_path: e for e in provider.walk(root.as_posix())}
-        assert set(entries) == {"a/b/f.txt", "top.txt"}
+        assert set(entries) == {"a", "a/b", "a/b/f.txt", "top.txt"}
+        assert entries["a"].is_directory
+        assert entries["a/b"].is_directory
 
     def test_open_binary_streams_content(self, sftp_server):
         server, root = sftp_server
