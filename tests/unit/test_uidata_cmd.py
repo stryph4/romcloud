@@ -10,6 +10,7 @@ Every command must:
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 from click.testing import CliRunner
 
@@ -173,6 +174,34 @@ class TestSetupBridge:
         payload = json.loads(result.output)
         assert payload["ok"] is True
         assert payload["state"] == "fresh"
+        assert payload["update_channel"] == "stable"
+        assert payload["build_identity"].endswith("— Stable")
+
+    def test_setup_status_displays_develop_revision(self, tmp_path):
+        from romcloud.lifecycle.update import BuildInfo, write_build_info
+
+        config = replace(_build_config(tmp_path), update_channel="develop")
+        config_path = tmp_path / "home" / "config" / "romcloud.toml"
+        write_config(config, str(config_path))
+        write_build_info(
+            config_path.parent.parent,
+            BuildInfo(
+                version="0.9.29",
+                commit="a" * 40,
+                commit_short="abc1234",
+                build_date="x",
+                source="github:stryph4/romcloud@develop",
+                channel="develop",
+            ),
+        )
+
+        result = CliRunner().invoke(
+            cli, ["--config", str(config_path), "uidata", "setup-status"]
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["build_identity"] == "ROMCloud 0.9.29 — Develop • abc1234"
 
     def test_setup_status_surfaces_manager_boot_failure_distinctly(
         self, tmp_path, monkeypatch
@@ -647,7 +676,7 @@ class TestUpdateBridge:
         monkeypatch.setattr(
             update_module,
             "check_for_update",
-            lambda home, progress=None: update_module.CheckResult(
+            lambda home, channel, progress=None: update_module.CheckResult(
                 current=current,
                 latest_commit=latest,
                 update_available=True,
@@ -678,7 +707,7 @@ class TestUpdateBridge:
         monkeypatch.setattr(
             update_module,
             "perform_update",
-            lambda home, python, progress=None: update_module.UpdateResult(
+            lambda home, python, channel, progress=None: update_module.UpdateResult(
                 previous=None, new=new
             ),
         )

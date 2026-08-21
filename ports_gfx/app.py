@@ -1457,6 +1457,9 @@ def _run(  # noqa: ANN001
                     message_kind,
                     activity,
                     update_check,
+                    build_identity=str(
+                        setup_status.data.get("build_identity") or "ROMCloud"
+                    ),
                 )
             elif current_screen == "controller_test":
                 _render_controller_test(pygame, screen, fonts, layout, input_manager, controller_test)
@@ -1871,10 +1874,13 @@ def _render_menu(  # noqa: ANN001
     message_kind: str,
     activity: ActivityLog,
     update_check: UpdateCheckState,
+    build_identity: str = "ROMCloud",
 ) -> None:
     screen.fill(_BG_COLOR)
 
-    title_text = state.title if isinstance(state, NavigationState) else "ROMCloud"
+    title_text = state.title if isinstance(state, NavigationState) else build_identity
+    if isinstance(state, NavigationState) and state.title == "ROMCloud":
+        title_text = build_identity
     title = fonts["title"].render(title_text, True, _FG_COLOR)
     screen.blit(title, (layout.safe_area.x, layout.safe_area.y))
 

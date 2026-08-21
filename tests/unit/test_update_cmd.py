@@ -9,6 +9,7 @@ check_for_update/perform_update functions.
 from __future__ import annotations
 
 from click.testing import CliRunner
+from types import SimpleNamespace
 
 import romcloud.cli.commands.update as update_cmd_module
 from romcloud.cli.commands.update import update_cmd
@@ -16,8 +17,8 @@ from romcloud.core.exceptions import UpdateDownloadError, UpdateInstallError
 from romcloud.lifecycle.update import BuildInfo, CheckResult, CommitInfo, UpdateResult
 
 
-def _run(args):
-    return CliRunner().invoke(update_cmd, args)
+def _run(args, *, obj=None):
+    return CliRunner().invoke(update_cmd, args, obj=obj)
 
 
 class TestUpdateCheckMode:
@@ -29,7 +30,7 @@ class TestUpdateCheckMode:
         monkeypatch.setattr(
             update_cmd_module,
             "check_for_update",
-            lambda home, repo, branch: CheckResult(current=current, latest_commit=latest, update_available=True),
+            lambda home, repo, channel: CheckResult(current=current, latest_commit=latest, update_available=True),
         )
         result = _run(["--check"])
         assert result.exit_code == 0, result.output
@@ -45,7 +46,7 @@ class TestUpdateCheckMode:
         monkeypatch.setattr(
             update_cmd_module,
             "check_for_update",
-            lambda home, repo, branch: CheckResult(current=current, latest_commit=latest, update_available=False),
+            lambda home, repo, channel: CheckResult(current=current, latest_commit=latest, update_available=False),
         )
         result = _run(["--check"])
         assert result.exit_code == 0, result.output
@@ -56,14 +57,14 @@ class TestUpdateCheckMode:
         monkeypatch.setattr(
             update_cmd_module,
             "check_for_update",
-            lambda home, repo, branch: CheckResult(current=None, latest_commit=latest, update_available=True),
+            lambda home, repo, channel: CheckResult(current=None, latest_commit=latest, update_available=True),
         )
         result = _run(["--check"])
         assert result.exit_code == 0, result.output
         assert "unknown" in result.output.lower()
 
     def test_check_failure_exits_nonzero_with_clear_message(self, monkeypatch):
-        def _raise(home, repo, branch):
+        def _raise(home, repo, channel):
             raise UpdateDownloadError("network unreachable")
 
         monkeypatch.setattr(update_cmd_module, "check_for_update", _raise)
@@ -78,7 +79,7 @@ class TestUpdateCheckMode:
         monkeypatch.setattr(
             update_cmd_module,
             "check_for_update",
-            lambda home, repo, branch: CheckResult(current=None, latest_commit=latest, update_available=True),
+            lambda home, repo, channel: CheckResult(current=None, latest_commit=latest, update_available=True),
         )
         _run(["--check"])
         assert called == []
@@ -90,7 +91,7 @@ class TestUpdatePerform:
         monkeypatch.setattr(
             update_cmd_module,
             "perform_update",
-            lambda home, venv_python, repo, branch: UpdateResult(previous=None, new=new),
+            lambda home, venv_python, repo, channel: UpdateResult(previous=None, new=new),
         )
         result = _run([])
         assert result.exit_code == 0, result.output
@@ -98,7 +99,7 @@ class TestUpdatePerform:
         assert "c" * 12 in result.output
 
     def test_failure_exits_nonzero_with_clear_message(self, monkeypatch):
-        def _raise(home, venv_python, repo, branch):
+        def _raise(home, venv_python, repo, channel):
             raise UpdateInstallError("pip explosion")
 
         monkeypatch.setattr(update_cmd_module, "perform_update", _raise)
@@ -106,12 +107,12 @@ class TestUpdatePerform:
         assert result.exit_code != 0
         assert "pip explosion" in result.output
 
-    def test_default_repo_and_branch_used_when_not_overridden(self, monkeypatch):
+    def test_default_repo_and_stable_channel_used(self, monkeypatch):
         captured = {}
 
-        def fake_perform_update(home, venv_python, repo, branch):
+        def fake_perform_update(home, venv_python, repo, channel):
             captured["repo"] = repo
-            captured["branch"] = branch
+            captured["channel"] = channel.value
             return UpdateResult(
                 previous=None,
                 new=BuildInfo(version="1", commit="d" * 40, commit_short="d" * 12, build_date="x", source="s"),
@@ -121,4 +122,128 @@ class TestUpdatePerform:
         result = _run([])
         assert result.exit_code == 0, result.output
         assert captured["repo"] == update_cmd_module.DEFAULT_REPO
-        assert captured["branch"] == update_cmd_module.DEFAULT_BRANCH
+        assert captured["channel"] == "stable"
+
+    def test_successful_channel_switch_persists_after_update(self, monkeypatch):
+        calls = []
+        new = BuildInfo(
+            version="2", commit="e" * 40, commit_short="e" * 12,
+            build_date="x", source="s", channel="develop",
+        )
+        monkeypatch.setattr(
+            update_cmd_module,
+            "perform_update",
+            lambda *args, **kwargs: calls.append(("update", kwargs["channel"].value))
+            or UpdateResult(previous=None, new=new),
+        )
+        monkeypatch.setattr(
+            update_cmd_module,
+            "write_update_channel",
+            lambda channel, path: calls.append(("persist", channel.value)),
+        )
+
+        result = _run(["--channel", "develop"])
+
+        assert result.exit_code == 0, result.output
+        assert calls == [("update", "develop"), ("persist", "develop")]
+
+    def test_failed_channel_switch_does_not_persist(self, monkeypatch):
+        persisted = []
+        monkeypatch.setattr(
+            update_cmd_module,
+            "perform_update",
+            lambda *args, **kwargs: (_ for _ in ()).throw(UpdateInstallError("failed")),
+        )
+        monkeypatch.setattr(
+            update_cmd_module,
+            "write_update_channel",
+            lambda *args: persisted.append(args),
+        )
+
+        result = _run(["--channel", "develop"])
+
+        assert result.exit_code != 0
+        assert persisted == []
+
+    def test_invalid_channel_is_rejected_before_update(self, monkeypatch):
+        called = []
+        monkeypatch.setattr(
+            update_cmd_module, "perform_update", lambda *args, **kwargs: called.append(1)
+        )
+
+        result = _run(["--channel", "feature/foo"])
+
+        assert result.exit_code != 0
+        assert called == []
+
+    def test_normal_update_respects_persisted_develop_channel(self, monkeypatch, tmp_path):
+        config_path = tmp_path / "romcloud.toml"
+        config_path.write_text(
+            'update_channel = "develop"\n[source]\nprovider = "none"\n',
+            encoding="utf-8",
+        )
+        captured = []
+        monkeypatch.setattr(
+            update_cmd_module,
+            "load_config",
+            lambda *args, **kwargs: SimpleNamespace(update_channel="develop"),
+        )
+        monkeypatch.setattr(
+            update_cmd_module,
+            "capability_policy",
+            lambda config: SimpleNamespace(require=lambda *args: None),
+        )
+        new = BuildInfo("2", None, None, "x", "s", channel="develop")
+        monkeypatch.setattr(
+            update_cmd_module,
+            "perform_update",
+            lambda *args, **kwargs: captured.append(kwargs["channel"].value)
+            or UpdateResult(previous=None, new=new),
+        )
+        monkeypatch.setattr(
+            update_cmd_module,
+            "write_update_channel",
+            lambda *args: (_ for _ in ()).throw(AssertionError("must not rewrite")),
+        )
+
+        result = _run([], obj={"config_path": str(config_path)})
+
+        assert result.exit_code == 0, result.output
+        assert captured == ["develop"]
+
+    def test_develop_to_stable_switch_persists_after_success(self, monkeypatch, tmp_path):
+        config_path = tmp_path / "romcloud.toml"
+        config_path.write_text(
+            'update_channel = "develop"\n[source]\nprovider = "none"\n',
+            encoding="utf-8",
+        )
+        calls = []
+        monkeypatch.setattr(
+            update_cmd_module,
+            "load_config",
+            lambda *args, **kwargs: SimpleNamespace(update_channel="develop"),
+        )
+        monkeypatch.setattr(
+            update_cmd_module,
+            "capability_policy",
+            lambda config: SimpleNamespace(require=lambda *args: None),
+        )
+        new = BuildInfo("2", None, None, "x", "s", channel="stable")
+        monkeypatch.setattr(
+            update_cmd_module,
+            "perform_update",
+            lambda *args, **kwargs: calls.append(("update", kwargs["channel"].value))
+            or UpdateResult(previous=None, new=new),
+        )
+        monkeypatch.setattr(
+            update_cmd_module,
+            "write_update_channel",
+            lambda channel, path: calls.append(("persist", channel.value)),
+        )
+
+        result = _run(
+            ["--channel", "stable"], obj={"config_path": str(config_path)}
+        )
+
+        assert result.exit_code == 0, result.output
+        assert calls == [("update", "stable"), ("persist", "stable")]

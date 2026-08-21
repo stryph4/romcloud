@@ -496,6 +496,31 @@ def test_cli_cancellation_and_noninteractive_flags(tmp_path: Path, monkeypatch: 
     assert calls == ["uninstall", "purge"]
 
 
+def test_cli_repair_uses_persisted_channel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from romcloud.lifecycle import update as update_module
+
+    config, home, _local_roms, _cache = _config(tmp_path)
+    config = replace(config, update_channel="develop")
+    config_path = home / "config" / "romcloud.toml"
+    write_config(config, str(config_path))
+    captured = []
+    new = update_module.BuildInfo(
+        "1", "a" * 40, "a" * 12, "x", "github:test@develop", channel="develop"
+    )
+    monkeypatch.setattr(
+        update_module,
+        "perform_repair",
+        lambda *args, **kwargs: captured.append(kwargs["channel"])
+        or update_module.UpdateResult(previous=None, new=new),
+    )
+
+    result = CliRunner().invoke(cli, ["--config", str(config_path), "repair"])
+
+    assert result.exit_code == 0, result.output
+    assert captured == ["develop"]
+    assert "from develop" in result.output
+
+
 def test_cli_repeated_purge_is_safe_after_config_is_gone(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

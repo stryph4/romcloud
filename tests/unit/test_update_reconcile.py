@@ -67,9 +67,11 @@ def _make_update_archive(sha: str = _SHA, version: str = "9.9.9", ports_gfx_mark
     with zipfile.ZipFile(buf, "w") as zf:
         zf.writestr(f"{top}/pyproject.toml", f'[project]\nname = "romcloud"\nversion = "{version}"\n')
         zf.writestr(f"{top}/src/romcloud/__init__.py", f'__version__ = "{version}"\n')
-        zf.writestr(f"{top}/ports_gfx/__init__.py", "")
+        zf.writestr(f"{top}/src/romcloud/cli/main.py", "def cli():\n    pass\n")
+        zf.writestr(f"{top}/ports_gfx/__init__.py", "# package\n")
         zf.writestr(f"{top}/ports_gfx/client.py", f"# {ports_gfx_marker}\n")
         zf.writestr(f"{top}/ports_gfx/app.py", f"# {ports_gfx_marker}\n")
+        zf.writestr(f"{top}/_padding.bin", b"0" * 4096)
     return buf.getvalue()
 
 
@@ -98,8 +100,15 @@ def _make_runner(*, pip_returncode: int = 0, pip_stderr: str = "", reconcile_arg
     subcommand through the real CLI command in-process."""
 
     def runner(argv, **kwargs):
+        if len(argv) >= 4 and argv[1:3] == ["-m", "venv"]:
+            candidate = Path(argv[3])
+            (candidate / "bin").mkdir(parents=True, exist_ok=True)
+            (candidate / "bin" / "python").write_text("candidate")
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
         if "pip" in argv:
             return subprocess.CompletedProcess(argv, pip_returncode, stdout="", stderr=pip_stderr)
+        if argv[1:3] == ["-m", "romcloud.cli.main"] and "_reconcile-install" not in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
         assert argv[1:4] == ["-m", "romcloud.cli.main", "_reconcile-install"]
         args = reconcile_argv_override if reconcile_argv_override is not None else argv[4:]
         result = CliRunner().invoke(reconcile_install_cmd, args)
@@ -311,10 +320,11 @@ class TestReconciliationDuringUpdate:
         # required-artifact write failure) by pointing --romcloud-home at an
         # unwritable-looking location: a file where a directory is expected.
         (tmp_path / "not-a-directory").write_text("blocking file")
+        candidate_runner = _make_runner()
 
         def runner(argv, **kwargs):
-            if "pip" in argv:
-                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            if "_reconcile-install" not in argv:
+                return candidate_runner(argv, **kwargs)
             project_root = argv[argv.index("--project-root") + 1]
             args = [
                 "--romcloud-home", str(tmp_path / "not-a-directory" / "romcloud"),

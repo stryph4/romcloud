@@ -94,6 +94,16 @@ def _require_capability_if_configured(
     capability_policy(load_config(str(path))).require(capability, operation)
 
 
+def _configured_update_channel(ctx: click.Context) -> str:
+    """Return persisted channel, retaining stable behavior before config exists."""
+    from romcloud.core.update_channels import DEFAULT_UPDATE_CHANNEL
+
+    path = Path(ctx.obj["config_path"])
+    if not path.is_file():
+        return DEFAULT_UPDATE_CHANNEL.value
+    return _load_context_config(ctx).update_channel
+
+
 def _read_request() -> dict:
     raw = click.get_text_stream("stdin").read()
     if not raw:
@@ -144,6 +154,23 @@ def uidata_setup_status(ctx: click.Context) -> None:
     def build() -> dict:
         config_path = Path(ctx.obj["config_path"])
         payload = setup_state(config_path)
+        from romcloud import __version__
+        from romcloud.core.update_channels import DEFAULT_UPDATE_CHANNEL, channel_label
+        from romcloud.lifecycle.update import read_build_info
+
+        channel = str(payload.get("update_channel") or DEFAULT_UPDATE_CHANNEL.value)
+        build = read_build_info(config_path.parent.parent)
+        version = build.version if build is not None else __version__
+        revision = build.commit_short if build is not None else None
+        identity = f"ROMCloud {version} — {channel_label(channel)}"
+        if channel == "develop" and revision:
+            identity += f" • {revision[:12]}"
+        payload.update(
+            update_channel=channel,
+            build_version=version,
+            build_revision=revision,
+            build_identity=identity,
+        )
         payload.update(
             startup_activation.activation_status(
                 startup_activation.state_path(config_path.parent.parent)
@@ -673,12 +700,15 @@ def uidata_update_check(ctx: click.Context) -> None:
         from romcloud.core.capabilities import Capability
 
         _require_capability_if_configured(ctx, Capability.UPDATE_NETWORK, "Update check")
+        channel = _configured_update_channel(ctx)
         from romcloud.lifecycle.update import check_for_update
 
         progress = _progress_sink({"progress": True})
         home = Path(sys.prefix).parent
         try:
-            result = check_for_update(home, progress=progress)
+            result = check_for_update(
+                home, channel=channel, progress=progress
+            )
         except Exception as exc:
             emit_progress(
                 progress,
@@ -695,6 +725,7 @@ def uidata_update_check(ctx: click.Context) -> None:
             "current_version": current_version,
             "available_version": result.latest_version or result.latest_commit.short_sha,
             "available_commit": result.latest_commit.short_sha,
+            "channel": channel,
         }
 
     _run_action(ctx, build)
@@ -711,12 +742,18 @@ def uidata_update_install(ctx: click.Context) -> None:
         from romcloud.core.capabilities import Capability
 
         _require_capability_if_configured(ctx, Capability.UPDATE_NETWORK, "ROMCloud update")
+        channel = _configured_update_channel(ctx)
         from romcloud.lifecycle.update import perform_update
 
         progress = _progress_sink({"progress": True})
         home = Path(sys.prefix).parent
         try:
-            result = perform_update(home, Path(sys.executable), progress=progress)
+            result = perform_update(
+                home,
+                Path(sys.executable),
+                channel=channel,
+                progress=progress,
+            )
         except Exception as exc:
             emit_progress(
                 progress,
@@ -730,6 +767,7 @@ def uidata_update_install(ctx: click.Context) -> None:
         return {
             "version": result.new.version,
             "commit": result.new.commit_short,
+            "channel": result.new.channel,
             "restart_required": True,
         }
 

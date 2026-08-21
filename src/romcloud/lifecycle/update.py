@@ -104,6 +104,12 @@ from romcloud.core.exceptions import (
     UpdateInstallError,
 )
 from romcloud.core.progress import ProgressSink, emit_progress
+from romcloud.core.update_channels import (
+    DEFAULT_UPDATE_CHANNEL,
+    channel_label,
+    parse_channel,
+    resolve_channel,
+)
 from romcloud.lifecycle.install import DEFAULT_PORTS_DIR as _DEFAULT_PORTS_DIR
 from romcloud.infrastructure.logging import get_logger
 
@@ -148,7 +154,9 @@ def _hard_network_deadline(seconds: float):  # noqa: ANN202
 
 
 DEFAULT_REPO = "stryph4/romcloud"
-DEFAULT_BRANCH = "main"
+# Compatibility export for low-level URL tests. Public update operations use
+# the channel resolver and never accept a branch/ref from CLI input.
+DEFAULT_BRANCH = resolve_channel(DEFAULT_UPDATE_CHANNEL).ref
 
 _GITHUB_API_BASE = "https://api.github.com"
 _GITHUB_WEB_BASE = "https://github.com"
@@ -206,6 +214,14 @@ class BuildInfo:
     commit_short: Optional[str]
     build_date: str
     source: str
+    channel: str = DEFAULT_UPDATE_CHANNEL.value
+
+    @property
+    def display_identity(self) -> str:
+        identity = f"ROMCloud {self.version} — {channel_label(self.channel)}"
+        if self.channel == "develop" and self.commit_short:
+            identity += f" • {self.commit_short[:12]}"
+        return identity
 
 
 @dataclass(frozen=True)
@@ -496,12 +512,17 @@ def read_build_info(romcloud_home: Path) -> Optional[BuildInfo]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    try:
+        channel = parse_channel(data.get("channel")).value
+    except ValueError:
+        return None
     return BuildInfo(
         version=str(data.get("version", "unknown")),
         commit=data.get("commit"),
         commit_short=data.get("commit_short"),
         build_date=str(data.get("build_date", "")),
         source=str(data.get("source", "")),
+        channel=channel,
     )
 
 
@@ -514,6 +535,7 @@ def write_build_info(romcloud_home: Path, info: BuildInfo) -> Path:
         "commit_short": info.commit_short,
         "build_date": info.build_date,
         "source": info.source,
+        "channel": parse_channel(info.channel).value,
     }
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return path
@@ -543,7 +565,7 @@ def check_for_update(
     romcloud_home: Path,
     *,
     repo: str = DEFAULT_REPO,
-    branch: str = DEFAULT_BRANCH,
+    channel: object = DEFAULT_UPDATE_CHANNEL,
     opener: OpenerType = urllib.request.urlopen,
     progress: ProgressSink = None,
 ) -> CheckResult:
@@ -551,8 +573,9 @@ def check_for_update(
     emit_progress(
         progress, "update", "check_started", "running", "Checking for ROMCloud updates"
     )
+    source = resolve_channel(channel)
     current = read_build_info(romcloud_home)
-    latest = get_latest_commit(repo, branch, opener=opener)
+    latest = get_latest_commit(repo, source.ref, opener=opener)
     latest_version: str | None = None
     if current is None:
         update_available = True
@@ -695,7 +718,7 @@ def perform_update(
     venv_python: Path,
     *,
     repo: str = DEFAULT_REPO,
-    branch: str = DEFAULT_BRANCH,
+    channel: object = DEFAULT_UPDATE_CHANNEL,
     opener: OpenerType = urllib.request.urlopen,
     runner: RunnerType = subprocess.run,
     ports_dir: Optional[Path] = None,
@@ -722,6 +745,7 @@ def perform_update(
     The temporary download/extraction/candidate-venv directory is always
     removed, on success or failure.
     """
+    source = resolve_channel(channel)
     previous = read_build_info(romcloud_home)
     manager_was_running = False
     manager_data_path = romcloud_home / "data"
@@ -736,7 +760,7 @@ def perform_update(
     emit_progress(
         progress, "update", "resolve", "running", "Resolving the latest ROMCloud release"
     )
-    latest = get_latest_commit(repo, branch, opener=opener)
+    latest = get_latest_commit(repo, source.ref, opener=opener)
 
     tmp_root = _make_temp_dir(romcloud_home)
     try:
@@ -847,7 +871,8 @@ def perform_update(
             commit=latest.sha,
             commit_short=latest.short_sha,
             build_date=datetime.now(timezone.utc).isoformat(),
-            source=f"github:{repo}@{branch}",
+            source=f"github:{repo}@{source.ref}",
+            channel=source.channel.value,
         )
         write_build_info(romcloud_home, new_info)
         log.info("Updated ROMCloud to %s (%s)", new_info.version, new_info.commit_short)
@@ -866,3 +891,26 @@ def perform_update(
             from romcloud.web.lifecycle import start_manager
 
             start_manager(romcloud_home / "bin" / "romcloud", manager_data_path)
+
+
+def perform_repair(
+    romcloud_home: Path,
+    venv_python: Path,
+    *,
+    channel: object = DEFAULT_UPDATE_CHANNEL,
+    **kwargs,
+) -> UpdateResult:
+    """Restore the runtime from the latest immutable commit on *channel*.
+
+    Repair intentionally shares the updater's resolver, download pinning,
+    candidate validation, activation, and reconciliation path. This prevents
+    a develop backend from restoring stable support files (or the inverse).
+    User configuration, credentials, catalog, cache, games, and sync data are
+    preserved by the shared update transaction.
+    """
+    return perform_update(
+        romcloud_home,
+        venv_python,
+        channel=resolve_channel(channel).channel,
+        **kwargs,
+    )

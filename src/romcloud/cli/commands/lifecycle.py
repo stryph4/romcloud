@@ -48,20 +48,25 @@ def _project_root() -> Path:
 @click.option("--system-python", default=None, hidden=True)
 @click.pass_context
 def repair_cmd(ctx: click.Context, system_python: str | None) -> None:
-    """Restore ROMCloud runtime artifacts without deleting user data."""
+    """Restore ROMCloud from its configured channel without deleting user data."""
     romcloud_home, config = _paths(ctx)
     try:
-        report, lifecycle_report = manage.repair(
-            config=config,
-            romcloud_home=romcloud_home,
-            project_root=_project_root(),
+        from romcloud.lifecycle.update import perform_repair
+
+        result = perform_repair(
+            romcloud_home,
+            romcloud_home / "venv" / "bin" / "python",
+            channel=config.update_channel,
             system_python=system_python,
         )
     except Exception as exc:  # noqa: BLE001
         raise click.ClickException(str(exc)) from exc
-    click.echo(f"Repaired CLI wrapper: {report.core.cli_wrapper}")
-    click.echo(f"Repaired launch wrapper: {report.core.launch_wrapper}")
-    click.echo(f"Restored proxies: {lifecycle_report.proxies_restored}")
+    click.echo(
+        f"Repaired ROMCloud {result.new.version} ({result.new.commit_short}) "
+        f"from {result.new.channel}."
+    )
+    if result.reconcile_log:
+        click.echo(result.reconcile_log)
 
 
 @click.command("uninstall")

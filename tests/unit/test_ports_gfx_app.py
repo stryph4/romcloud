@@ -68,9 +68,11 @@ class TestMenuItems:
                 return SimpleNamespace(bottom=center[1] + 10)
 
         rendered: list[RenderedText] = []
+        strings: list[str] = []
 
         class Font:
             def render(self, *_args):  # noqa: ANN002
+                strings.append(str(_args[0]))
                 text = RenderedText()
                 rendered.append(text)
                 return text
@@ -93,6 +95,7 @@ class TestMenuItems:
             "info",
             ActivityLog(),
             UpdateCheckState(),
+            build_identity="ROMCloud 0.9.29 — Develop • abc1234",
         )
 
         center_x, center_y = layout.card_rects[0].center
@@ -101,6 +104,7 @@ class TestMenuItems:
             (center_x, center_y - (layout.fonts.hint + text_gap) // 2)
         ]
         assert rendered[2].centers[0][0] == center_x
+        assert strings[0] == "ROMCloud 0.9.29 — Develop • abc1234"
 
     def test_contains_expected_actions_in_order(self):
         from ports_gfx import app as app_module

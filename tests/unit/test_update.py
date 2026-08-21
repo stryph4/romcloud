@@ -433,6 +433,17 @@ class TestCheckForUpdate:
         assert result.update_available is True
         assert result.latest_commit.sha == _SHA
 
+    def test_develop_check_uses_develop_only(self, tmp_path):
+        calls: list[str] = []
+        opener = _make_opener(
+            {upd.commit_api_url(upd.DEFAULT_REPO, "develop"): _commit_json()},
+            calls=calls,
+        )
+
+        upd.check_for_update(tmp_path, channel="develop", opener=opener)
+
+        assert calls == [upd.commit_api_url(upd.DEFAULT_REPO, "develop")]
+
     def test_matching_commit_reports_up_to_date(self, tmp_path):
         upd.write_build_info(
             tmp_path,
@@ -515,6 +526,30 @@ class TestPerformUpdateSuccess:
 
         on_disk = upd.read_build_info(home)
         assert on_disk == result.new
+
+    def test_develop_resolves_and_downloads_one_pinned_revision(self, tmp_path):
+        home = tmp_path / "romcloud"
+        archive = _make_archive_bytes(sha=_SHA, version="2.0.0")
+        payloads = {
+            upd.commit_api_url(upd.DEFAULT_REPO, "develop"): _commit_json(sha=_SHA),
+            upd.archive_download_url(upd.DEFAULT_REPO, _SHA): archive,
+        }
+        calls: list[str] = []
+
+        result = upd.perform_update(
+            home,
+            home / "venv" / "bin" / "python",
+            channel="develop",
+            opener=_make_opener(payloads, calls),
+            runner=_fake_runner_success,
+        )
+
+        assert result.new.channel == "develop"
+        assert result.new.source.endswith("@develop")
+        assert calls == [
+            upd.commit_api_url(upd.DEFAULT_REPO, "develop"),
+            upd.archive_download_url(upd.DEFAULT_REPO, _SHA),
+        ]
 
     def test_temp_directory_cleaned_up_on_success(self, tmp_path):
         home = tmp_path / "romcloud"

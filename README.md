@@ -22,6 +22,12 @@ Run the following command:
 curl -fsSL https://romcloud.app/install | bash
 ```
 
+This installs the stable channel. Development/test machines can instead use:
+
+``` bash
+curl -fsSL https://romcloud.app/install | bash -s -- --channel develop
+```
+
 After installation, refresh EmulationStation's game list if needed and
 open **Ports → ROMCloud**. The graphical setup wizard handles normal
 configuration; typical users do not need to edit configuration files or
@@ -594,6 +600,20 @@ romcloud update --check
 romcloud update
 ```
 
+Ordinary updates stay on the machine's persisted channel. To switch an
+existing installation (the selection is saved only after a successful
+update), use:
+
+``` bash
+romcloud update --channel develop
+romcloud update --channel stable
+```
+
+Only `stable` and `develop` are accepted. Stable currently resolves to the
+`main` source line; develop resolves to `develop`. The resolver is centralized
+so stable can move to published release artifacts later without changing the
+commands or configuration format.
+
 Updates reconcile ROMCloud-owned runtime files and integrations while
 preserving configuration, credentials, catalog data, cache, logs,
 proxies, and synchronization data. A successful GUI-initiated update can
@@ -605,9 +625,9 @@ relaunch.
   -----------------------------------------------------------------------
   Command                             Behavior
   ----------------------------------- -----------------------------------
-  `romcloud repair`                   Reconciles ROMCloud-owned runtime
-                                      artifacts and integrations without
-                                      deleting user data
+  `romcloud repair`                   Downloads and reconciles ROMCloud-owned
+                                      runtime artifacts from the configured
+                                      channel without deleting user data
 
   `romcloud uninstall`                Removes runtime/integration
                                       components while preserving
@@ -663,8 +683,9 @@ romcloud library-sync ...           Metadata/media synchronization
 romcloud saves ...                  SaveSync operations
 romcloud mount ...                  SMB mount management
 romcloud es ...                     EmulationStation integration
-romcloud update [--check]           Update ROMCloud
-romcloud repair                     Reconcile installed artifacts
+romcloud update [--check] [--channel stable|develop]
+                                    Update ROMCloud on/switch to a channel
+romcloud repair                     Repair from the configured channel
 romcloud uninstall                  Remove runtime; preserve recoverable data
 romcloud purge                      Remove ROMCloud-owned local state
 ```
@@ -677,6 +698,8 @@ The graphical setup flow normally writes the configuration. A
 representative layout is:
 
 ``` toml
+update_channel = "stable"
+
 [source]
 provider = "local"
 rom_root = "/userdata/romcloud/source"

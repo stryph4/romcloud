@@ -31,6 +31,7 @@ else:
             ) from exc
 
 from romcloud.core.exceptions import ConfigurationError, ConfigurationNotFoundError
+from romcloud.core.update_channels import DEFAULT_UPDATE_CHANNEL, parse_channel
 from romcloud.infrastructure.atomic_file import atomic_write_text
 from romcloud.infrastructure.credentials import (
     migrate_legacy_smb_credentials,
@@ -258,6 +259,7 @@ class AppConfig:
     saves: SavesConfig = field(default_factory=SavesConfig)
     library_sync: LibrarySyncConfig = field(default_factory=LibrarySyncConfig)
     game_access_mode: str = SMART_CACHE_MODE
+    update_channel: str = DEFAULT_UPDATE_CHANNEL.value
 
     @property
     def game_management_enabled(self) -> bool:
@@ -386,6 +388,11 @@ def _replace_exact_toml_string(line: str, key: str, old: str, new: str) -> str:
 def _parse(
     data: dict, path: Path, *, resolve_paths: bool = True
 ) -> AppConfig:  # noqa: C901
+    try:
+        update_channel = parse_channel(data.get("update_channel")).value
+    except ValueError as exc:
+        raise ConfigurationError(f"{path}: {exc}") from exc
+
     src = data.get("source", {"provider": "none"})
     if not isinstance(src, dict):
         raise ConfigurationError(f"{path}: [source] must be a table when present.")
@@ -598,6 +605,7 @@ def _parse(
         saves=saves,
         library_sync=library_sync,
         game_access_mode=game_access_mode,
+        update_channel=update_channel,
     )
 
 
@@ -611,6 +619,10 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
     fully written.
     """
     path = Path(config_path) if config_path else default_config_path()
+    try:
+        update_channel = parse_channel(config.update_channel).value
+    except ValueError as exc:
+        raise ConfigurationError(f"{path}: {exc}") from exc
     if config.game_access_mode not in GAME_ACCESS_MODES:
         raise ConfigurationError(
             f"{path}: game_access_mode must be smart_cache or direct_nas."
@@ -640,6 +652,8 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
     lines = [
         "# ROMCloud configuration\n",
         "# Edit this file or run `romcloud configure` to change settings.\n",
+        "\n",
+        f'update_channel = "{update_channel}"\n',
         "\n",
         "[source]\n",
         f'provider = "{config.source.provider}"\n',
@@ -744,6 +758,47 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
     ]
 
     atomic_write_text(path, "".join(lines))
+    return path
+
+
+def write_update_channel(channel: object, config_path: Optional[str] = None) -> Path:
+    """Atomically patch only the top-level update channel in an existing config.
+
+    Comments, ordering, unknown settings, and all user/provider state remain
+    untouched.  A missing config is intentionally rejected: channel switching
+    is an operation on an existing installation, not a second state system.
+    """
+    path = Path(config_path) if config_path else default_config_path()
+    try:
+        value = parse_channel(channel).value
+    except ValueError as exc:
+        raise ConfigurationError(f"{path}: {exc}") from exc
+    if not path.is_file():
+        raise ConfigurationNotFoundError(f"No configuration found at {path}.")
+
+    raw = path.read_text(encoding="utf-8")
+    try:
+        data = tomllib.loads(raw)
+    except Exception as exc:
+        raise ConfigurationError(f"Failed to parse config {path}: {exc}") from exc
+    if "update_channel" in data:
+        pattern = re.compile(
+            r'^(\s*update_channel\s*=\s*)(?:"[^"\r\n]*"|\'[^\'\r\n]*\')(\s*(?:#.*)?)(\r?\n|$)',
+            re.MULTILINE,
+        )
+        rewritten, count = pattern.subn(
+            lambda match: f'{match.group(1)}"{value}"{match.group(2)}{match.group(3)}',
+            raw,
+            count=1,
+        )
+        if count != 1:
+            raise ConfigurationError(
+                f"{path}: update_channel must be a simple top-level string"
+            )
+    else:
+        prefix = f'update_channel = "{value}"\n\n'
+        rewritten = prefix + raw
+    atomic_write_text(path, rewritten, mode=path.stat().st_mode & 0o777)
     return path
 
 

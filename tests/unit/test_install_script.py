@@ -48,14 +48,14 @@ def test_default_runtime_paths_use_single_userdata_namespace() -> None:
 
 
 def _run_install(
-    env_overrides: dict[str, str], *, path: str | None = None
+    env_overrides: dict[str, str], *, path: str | None = None, args: tuple[str, ...] = ()
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     if path is not None:
         env["PATH"] = path
     env.update(env_overrides)
     return subprocess.run(
-        ["bash", str(INSTALL_SH)],
+        ["bash", str(INSTALL_SH), *args],
         env=env,
         capture_output=True,
         text=True,
@@ -342,6 +342,45 @@ def test_summary_shows_full_cli_path_clearly(installed: InstalledLayout) -> None
     assert romcloud_bin in output
     assert "was NOT added to PATH" in output
     assert "custom.sh" in output  # explains *why*, for a curious SSH user
+
+
+def test_default_install_persists_stable_channel(installed: InstalledLayout) -> None:
+    assert 'update_channel = "stable"' in (
+        installed.home / "config" / "romcloud.toml"
+    ).read_text(encoding="utf-8")
+    assert _read_version_info(installed.home)["channel"] == "stable"
+
+
+def test_develop_install_persists_channel_and_revision(tmp_path: Path) -> None:
+    home = tmp_path / "romcloud"
+    commit = "d" * 40
+    result = _run_install(
+        {
+            "ROMCLOUD_HOME": str(home),
+            "CACHE_ROOT": str(tmp_path / "cache"),
+            "LOCAL_ROMS": str(tmp_path / "roms"),
+            "ROMCLOUD_BUILD_COMMIT": commit,
+        },
+        args=("--channel", "develop"),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'update_channel = "develop"' in (
+        home / "config" / "romcloud.toml"
+    ).read_text(encoding="utf-8")
+    assert _read_version_info(home)["channel"] == "develop"
+    assert _read_version_info(home)["commit"] == commit
+
+
+def test_invalid_channel_fails_before_installation(tmp_path: Path) -> None:
+    home = tmp_path / "romcloud"
+    result = _run_install(
+        {"ROMCLOUD_HOME": str(home)}, args=("--channel", "feature/foo")
+    )
+
+    assert result.returncode != 0
+    assert "invalid channel" in result.stderr
+    assert not home.exists()
 
 
 # ── dependency checks ──────────────────────────────────────────────────────────

@@ -8,7 +8,7 @@
 #   - Overwrites the cache directory
 #
 # Usage:
-#   bash scripts/install.sh [--prefix PATH]
+#   bash scripts/install.sh [--prefix=PATH] [--channel stable|develop]
 #
 # Defaults to Batocera layout under /userdata.
 
@@ -30,24 +30,50 @@ BIN_DIR="${ROMCLOUD_HOME}/bin"
 CONFIG_DIR="${ROMCLOUD_HOME}/config"
 DATA_DIR="${ROMCLOUD_HOME}/data"
 LOGS_DIR="${ROMCLOUD_HOME}/logs"
+UPDATE_CHANNEL="${ROMCLOUD_UPDATE_CHANNEL:-stable}"
 
 # ── parse args ────────────────────────────────────────────────────────────────
-for arg in "$@"; do
-    case "$arg" in
+while [[ $# -gt 0 ]]; do
+    case "$1" in
         --prefix=*)
-            ROMCLOUD_HOME="${arg#*=}"
+            ROMCLOUD_HOME="${1#*=}"
             VENV_DIR="${ROMCLOUD_HOME}/venv"
             BIN_DIR="${ROMCLOUD_HOME}/bin"
             CONFIG_DIR="${ROMCLOUD_HOME}/config"
             DATA_DIR="${ROMCLOUD_HOME}/data"
             LOGS_DIR="${ROMCLOUD_HOME}/logs"
+            shift
+            ;;
+        --channel)
+            if [[ $# -lt 2 ]]; then
+                echo "ERROR: --channel requires stable or develop." >&2
+                exit 2
+            fi
+            UPDATE_CHANNEL="$2"
+            shift 2
+            ;;
+        --channel=*)
+            UPDATE_CHANNEL="${1#*=}"
+            shift
             ;;
         --help|-h)
-            echo "Usage: bash install.sh [--prefix=PATH]"
+            echo "Usage: bash install.sh [--prefix=PATH] [--channel stable|develop]"
             exit 0
+            ;;
+        *)
+            echo "ERROR: unknown argument: $1" >&2
+            exit 2
             ;;
     esac
 done
+
+case "${UPDATE_CHANNEL}" in
+    stable|develop) ;;
+    *)
+        echo "ERROR: invalid channel '${UPDATE_CHANNEL}'; expected stable or develop." >&2
+        exit 2
+        ;;
+esac
 
 echo "Installing ROMCloud to ${ROMCLOUD_HOME} ..."
 
@@ -104,7 +130,7 @@ echo "  Installed ROMCloud into ${VENV_DIR}."
 # metadata when this is a same-version reinstall/repair. If none of those
 # sources are available, the commit stays unknown.
 ROMCLOUD_BUILD_COMMIT="${ROMCLOUD_BUILD_COMMIT:-}"
-ROMCLOUD_HOME="${ROMCLOUD_HOME}" PROJECT_DIR="${PROJECT_DIR}" ROMCLOUD_BUILD_COMMIT="${ROMCLOUD_BUILD_COMMIT}" "${VENV_DIR}/bin/python" <<'PY'
+ROMCLOUD_HOME="${ROMCLOUD_HOME}" PROJECT_DIR="${PROJECT_DIR}" ROMCLOUD_BUILD_COMMIT="${ROMCLOUD_BUILD_COMMIT}" ROMCLOUD_UPDATE_CHANNEL="${UPDATE_CHANNEL}" "${VENV_DIR}/bin/python" <<'PY'
 import json
 import os
 import subprocess
@@ -116,6 +142,7 @@ import romcloud
 project_dir = Path(os.environ["PROJECT_DIR"])
 romcloud_home = Path(os.environ["ROMCLOUD_HOME"])
 explicit_commit = os.environ.get("ROMCLOUD_BUILD_COMMIT") or None
+channel = os.environ["ROMCLOUD_UPDATE_CHANNEL"]
 version = romcloud.__version__
 
 
@@ -186,6 +213,7 @@ payload = {
     "commit_short": commit[:12] if commit else None,
     "build_date": datetime.now(timezone.utc).isoformat(),
     "source": source,
+    "channel": channel,
 }
 
 path = romcloud_home / "version.json"
@@ -228,6 +256,8 @@ if [[ ! -f "${CONFIG_FILE}" ]]; then
 # ROMCloud configuration
 # Edit this file or run: romcloud configure
 
+update_channel = "${UPDATE_CHANNEL}"
+
 [source]
 provider = "local"
 rom_root = "/userdata/romcloud/source"
@@ -251,6 +281,12 @@ CONFIG
     echo "  Edit it or run: romcloud configure"
 else
     echo "  Config already exists at ${CONFIG_FILE} — not overwritten."
+    if [[ "${UPDATE_CHANNEL}" != "stable" ]] || \
+            grep -Eq '^[[:space:]]*update_channel[[:space:]]*=' "${CONFIG_FILE}"; then
+        ROMCLOUD_CONFIG_FILE="${CONFIG_FILE}" ROMCLOUD_UPDATE_CHANNEL="${UPDATE_CHANNEL}" \
+            "${VENV_DIR}/bin/python" -c \
+            'import os; from romcloud.infrastructure.config import write_update_channel; write_update_channel(os.environ["ROMCLOUD_UPDATE_CHANNEL"], os.environ["ROMCLOUD_CONFIG_FILE"])'
+    fi
 fi
 
 # ── summary ───────────────────────────────────────────────────────────────────
@@ -265,6 +301,7 @@ echo "ROMCloud installed successfully."
 echo ""
 echo "  CLI:       ${BIN_DIR}/romcloud"
 echo "  Config:    ${CONFIG_FILE}"
+echo "  Channel:   ${UPDATE_CHANNEL}"
 echo "  Cache:     ${CACHE_ROOT}"
 echo "  Catalog:   ${DATA_DIR}/catalog.db"
 echo ""

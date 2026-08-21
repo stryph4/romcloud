@@ -314,6 +314,7 @@ def setup_state(config_path: Path) -> dict[str, Any]:
             else "local"
         ),
         "game_access_mode": config.game_access_mode,
+        "update_channel": config.update_channel,
         "library_sync_enabled": config.library_sync.enabled,
         "selected_systems": (
             list(config.source.selected_systems)

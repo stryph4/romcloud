@@ -13,6 +13,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BOOTSTRAP = REPO_ROOT / "scripts" / "bootstrap.sh"
+SHA = "a" * 40
 
 
 def _archive(installer: str = "#!/usr/bin/env bash\nexit 0\n") -> bytes:
@@ -33,12 +34,19 @@ def _fake_commands(tmp_path: Path, archive_bytes: bytes) -> tuple[Path, Path]:
     fake_curl = fake_bin / "curl"
     fake_curl.write_text(
         "#!/usr/bin/env bash\n"
-        f"printf '%s\\n' \"$@\" > '{curl_log}'\n"
+        f"printf '%s\\n' \"$*\" >> '{curl_log}'\n"
+        "url=''\n"
+        "output=''\n"
         "while [[ $# -gt 0 ]]; do\n"
-        "  if [[ $1 == -o ]]; then cp \"$ROMCLOUD_TEST_ARCHIVE\" \"$2\"; exit 0; fi\n"
+        "  if [[ $1 == -o ]]; then output=$2; shift 2; continue; fi\n"
+        "  if [[ $1 == http* ]]; then url=$1; fi\n"
         "  shift\n"
         "done\n"
-        "exit 2\n"
+        "if [[ $url == https://api.github.com/* ]]; then\n"
+        f"  printf '{{\"sha\":\"{SHA}\"}}' > \"$output\"\n"
+        "else\n"
+        "  cp \"$ROMCLOUD_TEST_ARCHIVE\" \"$output\"\n"
+        "fi\n"
     )
     fake_curl.chmod(0o755)
     (tmp_path / "source.tar.gz").write_bytes(archive_bytes)
@@ -50,7 +58,7 @@ def _run(
     tmp_path: Path,
     archive_bytes: bytes,
     *,
-    ref: str = "main",
+    channel: str | None = None,
     extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     fake_bin, _ = _fake_commands(tmp_path, archive_bytes)
@@ -60,34 +68,44 @@ def _run(
         **os.environ,
         "PATH": f"{fake_bin}:/usr/bin:/bin",
         "ROMCLOUD_USERDATA": str(userdata),
-        "ROMCLOUD_REF": ref,
         "ROMCLOUD_TEST_ARCHIVE": str(tmp_path / "source.tar.gz"),
         "TMPDIR": str(tmp_path),
         **(extra_env or {}),
     }
-    return subprocess.run(["bash", str(BOOTSTRAP)], env=env, capture_output=True, text=True)
+    argv = ["bash", str(BOOTSTRAP)]
+    if channel is not None:
+        argv.extend(["--channel", channel])
+    return subprocess.run(argv, env=env, capture_output=True, text=True)
 
 
-def test_defaults_to_main_and_invokes_canonical_installer(tmp_path: Path) -> None:
+def test_defaults_to_stable_main_and_invokes_canonical_installer(tmp_path: Path) -> None:
     marker = tmp_path / "installed"
     result = _run(tmp_path, _archive(f"#!/usr/bin/env bash\ntouch '{marker}'\n"))
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert marker.exists()
-    assert "Downloading stryph4/romcloud@main" in result.stdout
-    assert "https://github.com/stryph4/romcloud/archive/main.tar.gz" in (tmp_path / "curl-args").read_text()
+    assert f"Downloading stryph4/romcloud stable@{SHA[:12]}" in result.stdout
+    calls = (tmp_path / "curl-args").read_text()
+    assert "/commits/main" in calls
+    assert f"https://github.com/stryph4/romcloud/archive/{SHA}.tar.gz" in calls
     assert not list(tmp_path.glob("romcloud-bootstrap.*"))
 
 
-@pytest.mark.parametrize("ref", ["v0.1.0", "feature/bootstrap", "a" * 40])
-def test_supports_branch_tag_and_commit_refs(tmp_path: Path, ref: str) -> None:
-    captured = tmp_path / "commit"
-    installer = f"#!/usr/bin/env bash\nprintf '%s' \"${{ROMCLOUD_BUILD_COMMIT:-}}\" > '{captured}'\n"
-    result = _run(tmp_path, _archive(installer), ref=ref)
+@pytest.mark.parametrize(
+    ("channel", "ref"), [("stable", "main"), ("develop", "develop")]
+)
+def test_supports_only_allowlisted_channels(tmp_path: Path, channel: str, ref: str) -> None:
+    captured = tmp_path / "installer-input"
+    installer = (
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n%s\\n%s' \"${{ROMCLOUD_BUILD_COMMIT:-}}\" "
+        f"\"${{ROMCLOUD_UPDATE_CHANNEL:-}}\" \"$*\" > '{captured}'\n"
+    )
+    result = _run(tmp_path, _archive(installer), channel=channel)
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert f"archive/{ref}.tar.gz" in (tmp_path / "curl-args").read_text()
-    assert captured.read_text() == (ref if len(ref) == 40 else "")
+    assert f"/commits/{ref}" in (tmp_path / "curl-args").read_text()
+    assert captured.read_text().splitlines() == [SHA, channel, f"--channel {channel}"]
 
 
 def test_propagates_installer_failure_and_cleans_up(tmp_path: Path) -> None:
@@ -98,11 +116,14 @@ def test_propagates_installer_failure_and_cleans_up(tmp_path: Path) -> None:
     assert not list(tmp_path.glob("romcloud-bootstrap.*"))
 
 
-def test_rejects_invalid_ref_before_download(tmp_path: Path) -> None:
-    result = _run(tmp_path, _archive(), ref="../main")
+@pytest.mark.parametrize(
+    "channel", ["main", "feature/foo", "../main", "https://evil", "$(id)", "main; id"]
+)
+def test_rejects_invalid_channel_before_download(tmp_path: Path, channel: str) -> None:
+    result = _run(tmp_path, _archive(), channel=channel)
 
     assert result.returncode != 0
-    assert "invalid ROMCLOUD_REF" in result.stderr
+    assert "invalid channel" in result.stderr
     assert not (tmp_path / "curl-args").exists()
 
 
