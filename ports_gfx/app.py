@@ -209,38 +209,44 @@ def operating_state_from_status(data: dict) -> dict[str, object]:
 def root_menu_items_for_state(state: dict[str, object]) -> tuple[MenuItem, ...]:
     capabilities = state.get("capabilities", {})
     capabilities = capabilities if isinstance(capabilities, dict) else {}
-    items = [MenuItem("Library", f"{CATEGORY_ACTION_PREFIX}Library")]
+    game_management_enabled = bool(state.get("game_management_enabled", True))
+    items = (
+        [MenuItem("Library", f"{CATEGORY_ACTION_PREFIX}Library")]
+        if game_management_enabled
+        else []
+    )
     active_mode = str(state.get("operating_mode", "cache"))
-    items.append(
-        MenuItem(
-            "Direct",
-            ACTIVE_MODE_ACTION if active_mode == "connected" else "library-connected",
-            "Active"
-            if active_mode == "connected"
-            else "Play games directly from the configured ROM source.",
-            active=active_mode == "connected",
+    if game_management_enabled:
+        items.append(
+            MenuItem(
+                "Direct",
+                ACTIVE_MODE_ACTION if active_mode == "connected" else "library-connected",
+                "Active"
+                if active_mode == "connected"
+                else "Play games directly from the configured ROM source.",
+                active=active_mode == "connected",
+            )
         )
-    )
-    items.append(
-        MenuItem(
-            "Cached Storage",
-            ACTIVE_MODE_ACTION if active_mode == "cache" else "library-cache",
-            "Active"
-            if active_mode == "cache"
-            else "Copy games into ROMCloud-managed local storage as needed, then play them locally.",
-            active=active_mode == "cache",
+        items.append(
+            MenuItem(
+                "Cached Storage",
+                ACTIVE_MODE_ACTION if active_mode == "cache" else "library-cache",
+                "Active"
+                if active_mode == "cache"
+                else "Copy games into ROMCloud-managed local storage as needed, then play them locally.",
+                active=active_mode == "cache",
+            )
         )
-    )
-    items.append(
-        MenuItem(
-            "Offline",
-            ACTIVE_MODE_ACTION if active_mode == "offline" else "library-offline",
-            "Active"
-            if active_mode == "offline"
-            else "Show and launch only games already available locally.",
-            active=active_mode == "offline",
+        items.append(
+            MenuItem(
+                "Offline",
+                ACTIVE_MODE_ACTION if active_mode == "offline" else "library-offline",
+                "Active"
+                if active_mode == "offline"
+                else "Show and launch only games already available locally.",
+                active=active_mode == "offline",
+            )
         )
-    )
     items.append(MenuItem("Storage", f"{CATEGORY_ACTION_PREFIX}Storage"))
     if capabilities.get("save_sync", True):
         items.append(MenuItem("SaveSync", SAVESYNC_ACTION))

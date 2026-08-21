@@ -111,6 +111,13 @@ class SaveSyncScreenState:
         )
 
     @property
+    def remote_writable(self) -> bool:
+        # Older backends reported one combined availability bit; preserve
+        # their writable interpretation while new backends send the explicit
+        # field needed for read-only Download behavior.
+        return bool(self.status.get("remote_writable", True))
+
+    @property
     def dashboard_items(self) -> tuple[str, ...]:
         conflicts = int(self.status.get("active_conflicts", 0))
         resolve = (f"Resolve Conflicts ({conflicts})",) if conflicts > 0 else ()
@@ -137,6 +144,12 @@ class SaveSyncScreenState:
             elif not self.remote_actions_available:
                 detail = f" {self.remote_detail}" if self.remote_detail else ""
                 self.error = f"Remote storage is unavailable.{detail}"
+            elif self.selected_index in (
+                _UPLOAD_INDEX,
+                _QUICK_SYNC_INDEX,
+                _FULL_SYNC_INDEX,
+            ) and not self.remote_writable:
+                self.error = "Remote storage is read-only; Download remains available."
             elif self.selected_index == _QUICK_SYNC_INDEX:
                 self.start_quick_sync()
             elif self.selected_index == _FULL_SYNC_INDEX:
@@ -332,6 +345,8 @@ class SaveSyncScreenState:
             self.status = {
                 **self.status,
                 "remote_configured": configured,
+                "remote_readable": bool(result.data.get("remote_readable", False)),
+                "remote_writable": bool(result.data.get("remote_writable", False)),
                 **availability_state,
             }
             available = bool(

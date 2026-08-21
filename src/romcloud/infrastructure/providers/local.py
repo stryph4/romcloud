@@ -27,6 +27,34 @@ from romcloud.core.storage import (
 _CHUNK = 1024 * 1024
 _PROBE_CONTENT = "ROMCloud writable storage probe\n"
 
+
+def _safe_remote_data_path(
+    root: str, relative_path: str, *, create_parents: bool = False
+) -> Path:
+    base = Path(root).resolve()
+    relative = PurePosixPath(str(relative_path).replace("\\", "/"))
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise ProviderError(f"Unsafe remote-data logical key: {relative_path!r}")
+    target = base.joinpath(*relative.parts)
+    try:
+        target.resolve(strict=False).relative_to(base)
+    except (OSError, ValueError) as exc:
+        raise ProviderError(f"Remote-data key escapes root: {relative_path!r}") from exc
+    cursor = base
+    for part in relative.parts[:-1]:
+        cursor /= part
+        if cursor.is_symlink():
+            raise ProviderError(f"Refusing remote-data symlink parent: {relative_path}")
+        if cursor.exists() and not cursor.is_dir():
+            raise ProviderError(f"Remote-data parent is not a directory: {relative_path}")
+        if create_parents:
+            cursor.mkdir(exist_ok=True)
+    return target
+
 # Re-exported for existing callers/tests importing from this module.
 __all__ = [
     "StorageAccessResult",
@@ -41,6 +69,7 @@ _LOCAL_CAPABILITIES = ProviderCapabilities(
     has_filesystem_semantics=True,
     can_resume_download=False,
     supports_durable_transactions=True,
+    supports_remote_data_writes=True,
 )
 
 
@@ -197,6 +226,96 @@ class LocalFilesystemProvider(StorageProvider):
             return Path(path).open("rb")
         except OSError as exc:
             raise ProviderError(f"Cannot read {path}: {exc}") from exc
+
+    def metadata(
+        self, root: str, relative_path: str, *, operation=None
+    ) -> Optional[RemoteEntry]:
+        if operation is not None:
+            operation.check()
+        path = _safe_remote_data_path(root, relative_path)
+        if not path.exists() and not path.is_symlink():
+            return None
+        stat = path.lstat()
+        is_symlink = path.is_symlink()
+        is_directory = path.is_dir() and not is_symlink
+        return RemoteEntry(
+            name=path.name,
+            relative_path=PurePosixPath(relative_path).as_posix(),
+            is_directory=is_directory,
+            size_bytes=None if is_directory or is_symlink else stat.st_size,
+            is_symlink=is_symlink,
+            object_id=str(path),
+            revision=f"{stat.st_ino}:{stat.st_size}:{stat.st_mtime_ns}",
+        )
+
+    def ensure_directory(
+        self, root: str, relative_path: str, *, operation=None
+    ) -> RemoteEntry:
+        if operation is not None:
+            operation.check()
+        path = _safe_remote_data_path(root, relative_path, create_parents=True)
+        if path.is_symlink():
+            raise ProviderError(f"Refusing remote-data symlink: {relative_path}")
+        path.mkdir(parents=True, exist_ok=True)
+        metadata = self.metadata(root, relative_path, operation=operation)
+        assert metadata is not None
+        return metadata
+
+    def upload_from_local(
+        self,
+        root: str,
+        relative_path: str,
+        source_path: str,
+        *,
+        expected_revision: Optional[str] = None,
+        create_only: bool = False,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+        operation=None,
+    ) -> RemoteEntry:
+        if operation is not None:
+            operation.check()
+        destination = _safe_remote_data_path(root, relative_path, create_parents=True)
+        current = self.metadata(root, relative_path, operation=operation)
+        if create_only and current is not None:
+            raise ProviderError(f"Remote-data object already exists: {relative_path}")
+        if expected_revision is not None and (
+            current is None or current.revision != expected_revision
+        ):
+            raise ProviderError(f"Remote-data object changed: {relative_path}")
+        source = Path(source_path)
+        if source.is_symlink() or not source.is_file():
+            raise ProviderError(f"Upload source is not a regular file: {source_path}")
+        temporary = destination.with_name(f".{destination.name}.upload-{uuid.uuid4().hex}")
+        try:
+            _copy_file(source, temporary, on_progress)
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+        if operation is not None:
+            operation.check()
+        metadata = self.metadata(root, relative_path, operation=operation)
+        assert metadata is not None
+        return metadata
+
+    def delete_object(
+        self,
+        root: str,
+        relative_path: str,
+        *,
+        expected_revision: Optional[str] = None,
+        operation=None,
+    ) -> None:
+        if operation is not None:
+            operation.check()
+        path = _safe_remote_data_path(root, relative_path)
+        current = self.metadata(root, relative_path, operation=operation)
+        if current is None:
+            return
+        if expected_revision is not None and current.revision != expected_revision:
+            raise ProviderError(f"Remote-data object changed: {relative_path}")
+        if current.is_symlink or current.is_directory:
+            raise ProviderError(f"Refusing to delete non-file object: {relative_path}")
+        path.unlink()
 
 
 class WritableMountedFilesystemProvider(LocalFilesystemProvider):

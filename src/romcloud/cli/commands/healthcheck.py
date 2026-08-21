@@ -23,7 +23,7 @@ def healthcheck_cmd(ctx: click.Context) -> None:
     """Verify source reachability, cache space, and config integrity."""
     container = get_container(ctx)
     config = container.config
-    source = source_display_summary(config)
+    source = source_display_summary(config) if config.source.enabled else None
 
     ok = True
 
@@ -41,12 +41,16 @@ def healthcheck_cmd(ctx: click.Context) -> None:
     click.echo("─" * 50)
 
     # Source reachability.
-    reachable = container.provider.is_reachable(config.source.rom_root)
-    check(
-        f"Source reachable ({source['source_type']})",
-        reachable,
-        source["source_description"] if not reachable else "",
-    )
+    if config.source.enabled:
+        assert source is not None
+        reachable = container.provider.is_reachable(config.source.rom_root)
+        check(
+            f"Source reachable ({source['source_type']})",
+            reachable,
+            source["source_description"] if not reachable else "",
+        )
+    else:
+        click.echo("  ℹ  Game management disabled — local Batocera games are untouched")
 
     # Local ROM directory.
     local_roms = Path(config.local_roms_path)
@@ -56,7 +60,7 @@ def healthcheck_cmd(ctx: click.Context) -> None:
         str(local_roms),
     )
 
-    if operating_mode(config) is not OperatingMode.CONNECTED:
+    if config.source.enabled and operating_mode(config) is not OperatingMode.CONNECTED:
         # Cache directory and reserve apply to cache-backed operating modes.
         cache_path = Path(config.cache.path)
         check("Cache path writable", _can_write(cache_path), str(cache_path))
@@ -79,11 +83,16 @@ def healthcheck_cmd(ctx: click.Context) -> None:
     # local roots must pass a real write probe, while SMB roots must be an
     # actual read-write mount and also pass that probe.
     if config.remote_data is not None:
-        remote_ok = container.saves.is_remote_reachable()
+        remote_access = container.saves.validate_remote_storage()
+        check(
+            "ROMCloud data location readable",
+            remote_access.readable,
+            "" if remote_access.readable else str(config.remote_data.root),
+        )
         check(
             "ROMCloud data location writable",
-            remote_ok,
-            "" if remote_ok else str(config.remote_data.root),
+            remote_access.writable,
+            "" if remote_access.writable else remote_access.detail,
         )
 
     # Independently configured SMB-backed source/remote-data mounts.

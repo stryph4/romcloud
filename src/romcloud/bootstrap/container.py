@@ -34,6 +34,7 @@ from romcloud.infrastructure.repositories.game import GameRepository
 from romcloud.infrastructure.repositories.proxy import ProxyRepository
 from romcloud.services.cache import CacheService
 from romcloud.services.saves import SaveSyncService
+from romcloud.infrastructure.remote_saves import build_remote_save_store
 from romcloud.services.library_sync import LibrarySyncService
 from romcloud.services.transfer import TransferService
 
@@ -149,6 +150,10 @@ class Container:
     @property
     def provider(self) -> StorageProvider:
         if self._provider is None:
+            if not self._config.source.enabled:
+                raise ConfigurationError(
+                    "ROMCloud game management is disabled; no ROM source provider is configured."
+                )
             provider_id = self._config.source.provider
             if provider_id == "local":
                 self._provider = LocalFilesystemProvider(
@@ -230,21 +235,18 @@ class Container:
                 remote_data=remote_data,
                 context="ROMCloud configuration",
             )
-            remote_base = _remote_data_base_path(remote_data)
-            if remote_data is None:
-                saves_provider = None
-            elif remote_data.provider == "smb":
-                if remote_data.smb is None:  # validated above; keeps type narrowing explicit
-                    raise ConfigurationError("SMB remote data requires an SMB target")
-                saves_provider = WritableMountedFilesystemProvider(
-                    expected_server=remote_data.smb.server,
-                    expected_share=remote_data.smb.share,
-                    probe_timeout=_NETWORK_STORAGE_PROBE_TIMEOUT,
-                )
-            elif remote_data.provider == "sftp":
-                saves_provider = self._build_writable_sftp_provider(remote_data.sftp)
-            else:
-                saves_provider = WritableLocalFilesystemProvider()
+            saves_provider = self._build_remote_data_provider()
+            connectivity_root = remote_data.root if remote_data is not None else None
+            dataset_root = (
+                saves_provider.remote_data_root(connectivity_root, "saves")
+                if saves_provider is not None and connectivity_root is not None
+                else None
+            )
+            remote_store = build_remote_save_store(
+                saves_provider,
+                connectivity_root=connectivity_root,
+                dataset_root=dataset_root,
+            )
             data_path = Path(self._config.data_path)
             legacy_rpcs3_root = None
             local_saves_path = Path(self._config.saves.local_path)
@@ -265,9 +267,11 @@ class Container:
                 )
             self._saves = SaveSyncService(
                 provider=saves_provider,
-                connectivity_root=str(remote_base) if remote_base is not None else None,
+                connectivity_root=(
+                    str(connectivity_root) if connectivity_root is not None else None
+                ),
                 local_root=self._config.saves.local_path,
-                remote_root=str(remote_base / "saves") if remote_base is not None else None,
+                remote_root=None,
                 state_path=Path(self._config.data_path) / "savesync-state.json",
                 xbox_enabled=self._config.saves.xbox_enabled,
                 rpcs3_installed_games_enabled=(
@@ -277,6 +281,7 @@ class Container:
                     str(legacy_rpcs3_root) if legacy_rpcs3_root is not None else None
                 ),
                 capability_policy=self._policy(),
+                remote_store=remote_store,
             )
         return self._saves
 
@@ -414,4 +419,25 @@ class Container:
             private_key_path=sftp_cfg.private_key_path or None,
             trusted_host_key_fingerprint=sftp_cfg.host_key_fingerprint or None,
             probe_writable=True,
+        )
+
+    def _build_remote_data_provider(self) -> Optional[StorageProvider]:
+        """Build the independently configured ROMCloud-owned data provider."""
+        remote_data = self._config.remote_data
+        if remote_data is None:
+            return None
+        if remote_data.provider == "smb":
+            if remote_data.smb is None:
+                raise ConfigurationError("SMB remote data requires an SMB target")
+            return WritableMountedFilesystemProvider(
+                expected_server=remote_data.smb.server,
+                expected_share=remote_data.smb.share,
+                probe_timeout=_NETWORK_STORAGE_PROBE_TIMEOUT,
+            )
+        if remote_data.provider == "sftp":
+            return self._build_writable_sftp_provider(remote_data.sftp)
+        if remote_data.provider == "local":
+            return WritableLocalFilesystemProvider()
+        raise ConfigurationError(
+            f"Unknown remote-data provider: {remote_data.provider!r}"
         )

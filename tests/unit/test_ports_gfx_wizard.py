@@ -271,6 +271,19 @@ def test_sftp_is_a_source_option_and_only_offers_cached_storage():
     assert wizard.options == ["Cached Storage"]
 
 
+def test_savesync_only_source_choice_skips_game_setup_steps():
+    wizard = WizardState()
+    wizard.step = WizardStep.SOURCE
+    wizard.selected_index = 3
+
+    wizard._confirm("romcloud", show_osk=False)
+
+    assert wizard.source_type == "none"
+    assert wizard.step == WizardStep.REMOTE_DATA
+    assert wizard._post_storage_step() == WizardStep.REVIEW
+    assert wizard.request_payload()["source_type"] == "none"
+
+
 def test_sftp_host_key_requires_explicit_fingerprint_trust(monkeypatch):
     started = []
     monkeypatch.setattr(

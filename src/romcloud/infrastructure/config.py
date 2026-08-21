@@ -10,6 +10,7 @@ Default installation path: ``/userdata/system/romcloud/config/romcloud.toml``
 from __future__ import annotations
 
 import os
+import json
 import re
 import sys
 from dataclasses import dataclass, field
@@ -151,6 +152,11 @@ class SourceConfig:
     system. An empty tuple explicitly selects no systems.
     """
 
+    @property
+    def enabled(self) -> bool:
+        """Whether ROMCloud manages games from a configured source."""
+        return self.provider != "none"
+
 
 @dataclass(frozen=True)
 class SMBConfig:
@@ -252,6 +258,10 @@ class AppConfig:
     saves: SavesConfig = field(default_factory=SavesConfig)
     library_sync: LibrarySyncConfig = field(default_factory=LibrarySyncConfig)
     game_access_mode: str = SMART_CACHE_MODE
+
+    @property
+    def game_management_enabled(self) -> bool:
+        return self.source.enabled
 
     @property
     def credentials_path(self) -> Path:
@@ -376,12 +386,13 @@ def _replace_exact_toml_string(line: str, key: str, old: str, new: str) -> str:
 def _parse(
     data: dict, path: Path, *, resolve_paths: bool = True
 ) -> AppConfig:  # noqa: C901
-    try:
-        src = data["source"]
-        provider = src["provider"]
-        rom_root = src["rom_root"]
-    except KeyError as exc:
-        raise ConfigurationError(f"Missing required config key: {exc}") from exc
+    src = data.get("source", {"provider": "none"})
+    if not isinstance(src, dict):
+        raise ConfigurationError(f"{path}: [source] must be a table when present.")
+    provider = str(src.get("provider", "none")).strip().lower()
+    rom_root = str(src.get("rom_root", "")).strip()
+    if provider != "none" and not rom_root:
+        raise ConfigurationError(f"{path}: source.rom_root is required for {provider}.")
 
     smb = None
     if "smb" in data:
@@ -407,9 +418,9 @@ def _parse(
                 f"{path}: source.provider = \"sftp\" but no [sftp] section is present."
             )
         rom_root = _validated_posix_absolute(rom_root, "source.rom_root", path)
-    elif provider not in ("local", "smb"):
+    elif provider not in ("none", "local", "smb"):
         raise ConfigurationError(
-            f"{path}: source.provider must be \"local\", \"smb\", or \"sftp\"."
+            f"{path}: source.provider must be \"none\", \"local\", \"smb\", or \"sftp\"."
         )
 
     if provider == "smb":
@@ -433,7 +444,7 @@ def _parse(
     selected_systems = (
         canonical_system_ids(src["selected_systems"], path)
         if "selected_systems" in src
-        else None
+        else (() if provider == "none" else None)
     )
     source = SourceConfig(
         provider=provider,
@@ -480,7 +491,7 @@ def _parse(
             remote_root = _validated_posix_absolute(
                 remote_root, "remote_data.root", path
             )
-        elif not remote_root or not Path(remote_root).is_absolute():
+        elif not remote_root or not is_absolute_config_path(remote_root):
             raise ConfigurationError(
                 f"{path}: remote_data.root must be an explicit absolute path."
             )
@@ -549,7 +560,7 @@ def _parse(
         raise ConfigurationError(
             f"{path}: game_access.mode must be \"smart_cache\" or \"direct_nas\"."
         )
-    if game_access_mode == DIRECT_NAS_MODE and paths_overlap(
+    if source.enabled and game_access_mode == DIRECT_NAS_MODE and paths_overlap(
         Path(source.rom_root),
         Path(local_roms_path),
         resolve_paths=resolve_paths,
@@ -557,7 +568,7 @@ def _parse(
         raise ConfigurationError(
             f"{path}: Connected Mode source.rom_root must not overlap local_roms.path."
         )
-    if game_access_mode == DIRECT_NAS_MODE and source.provider == "sftp":
+    if source.enabled and game_access_mode == DIRECT_NAS_MODE and source.provider == "sftp":
         raise ConfigurationError(
             f"{path}: Connected Mode (Direct) requires filesystem semantics that an "
             "SFTP source does not provide; use Cache Mode instead."
@@ -604,7 +615,7 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
         raise ConfigurationError(
             f"{path}: game_access_mode must be smart_cache or direct_nas."
         )
-    if config.game_access_mode == DIRECT_NAS_MODE and paths_overlap(
+    if config.source.enabled and config.game_access_mode == DIRECT_NAS_MODE and paths_overlap(
         Path(config.source.rom_root), Path(config.local_roms_path)
     ):
         raise ConfigurationError(
@@ -632,8 +643,9 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
         "\n",
         "[source]\n",
         f'provider = "{config.source.provider}"\n',
-        f'rom_root = "{config.source.rom_root}"\n',
     ]
+    if config.source.enabled:
+        lines.append(f"rom_root = {_toml_quote(config.source.rom_root)}\n")
     if config.source.selected_systems is not None:
         selected_systems = canonical_system_ids(
             config.source.selected_systems, path
@@ -647,7 +659,7 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
         f'mode = "{config.game_access_mode}"\n',
         "\n",
         "[cache]\n",
-        f'path = "{config.cache.path}"\n',
+        f"path = {_toml_quote(config.cache.path)}\n",
         f"max_size_gb = {config.cache.max_size_gb}\n",
         f"min_free_gb = {config.cache.min_free_gb}\n",
         "\n",
@@ -656,7 +668,7 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
     ]
 
     if config.logging.path:
-        lines.append(f'path = "{config.logging.path}"\n')
+        lines.append(f"path = {_toml_quote(config.logging.path)}\n")
 
     lines += [
         "\n",
@@ -668,10 +680,10 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
         "# Directory where Batocera stores local ROM directories.\n",
         "# Cache Mode creates proxies; Connected Mode creates verified system symlinks.\n",
         "# ROMCloud never modifies existing user ROMs or owns system directories.\n",
-        f'path = "{config.local_roms_path}"\n',
+        f"path = {_toml_quote(config.local_roms_path)}\n",
         "\n",
         "[data]\n",
-        f'path = "{config.data_path}"\n',
+        f"path = {_toml_quote(config.data_path)}\n",
     ]
 
     if config.smb:
@@ -695,7 +707,7 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
             "[remote_data]\n",
             "# General writable storage for synchronized ROMCloud data.\n",
             f'provider = "{config.remote_data.provider}"\n',
-            f'root = "{config.remote_data.root}"\n',
+            f"root = {_toml_quote(config.remote_data.root)}\n",
         ]
         if config.remote_data.smb is not None:
             lines += [
@@ -719,7 +731,7 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
         "\n",
         "[saves]\n",
         "# Shared save/state continuity — see `romcloud saves --help`.\n",
-        f'local_path = "{config.saves.local_path}"\n',
+        f"local_path = {_toml_quote(config.saves.local_path)}\n",
         f"auto_sync_enabled = {'true' if config.saves.auto_sync_enabled else 'false'}\n",
         f"xbox_enabled = {'true' if config.saves.xbox_enabled else 'false'}\n",
         "# Compatibility key: RPCS3 applications remain ineligible.\n",
@@ -737,6 +749,11 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
 
 def default_config_path() -> Path:
     return _DEFAULT_ROMCLOUD_HOME / "config" / "romcloud.toml"
+
+
+def _toml_quote(value: object) -> str:
+    """Render a TOML-compatible basic string with escaped backslashes."""
+    return json.dumps(str(value), ensure_ascii=False)
 
 
 def _sftp_toml_lines(sftp: "SFTPConfig") -> list[str]:
@@ -809,17 +826,19 @@ def validate_remote_data_boundary(
         # comparable to any of the local paths checked below.
         return
     remote_root = Path(remote_data.root)
-    if not remote_root.is_absolute():
+    if not is_absolute_config_path(remote_data.root):
         raise ConfigurationError(
             f"{context}: remote_data.root must be an explicit absolute path."
         )
-    for label, other in (
-        ("source.rom_root", Path(source.rom_root)),
+    compared_paths = [
         ("cache.path", Path(cache.path)),
         ("data.path", Path(data_path)),
         ("ROMCloud system home", _DEFAULT_ROMCLOUD_HOME),
         ("saves.local_path", Path(local_saves_path)),
-    ):
+    ]
+    if source.enabled:
+        compared_paths.insert(0, ("source.rom_root", Path(source.rom_root)))
+    for label, other in compared_paths:
         if paths_overlap(remote_root, other, resolve_paths=resolve_paths):
             raise ConfigurationError(
                 f"{context}: remote_data.root must not overlap {label}."
@@ -830,6 +849,11 @@ def _posix_paths_overlap(first: str, second: str) -> bool:
     a = PurePosixPath(first)
     b = PurePosixPath(second)
     return a == b or a in b.parents or b in a.parents
+
+
+def is_absolute_config_path(value: str) -> bool:
+    """Recognize Batocera POSIX paths even on a non-POSIX test host."""
+    return Path(value).is_absolute() or PurePosixPath(value).is_absolute()
 
 
 def paths_overlap(

@@ -840,6 +840,39 @@ class TestCacheValidation:
 
 
 class TestApply:
+    def test_savesync_only_setup_skips_all_game_management(self, tmp_path, monkeypatch):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        remote_root = tmp_path / "remote-data"
+        save_sync_calls = []
+        _patch_apply_dependencies(monkeypatch, save_sync_calls=save_sync_calls)
+        reconcile_calls = []
+        monkeypatch.setattr(
+            "romcloud.integrations.batocera.game_access.reconcile_game_access",
+            lambda *args, **kwargs: reconcile_calls.append((args, kwargs)),
+        )
+
+        result = graphical_setup.apply_setup(
+            config_path,
+            _payload(
+                source_type="none",
+                server="",
+                share="",
+                username="",
+                password="",
+                remote_data_type="local",
+                remote_data_root=str(remote_root),
+                cache_root="not-used",
+            ),
+        )
+        config = graphical_setup.load_config(str(config_path))
+
+        assert config.source.provider == "none"
+        assert config.source.rom_root == ""
+        assert result["system_count"] == 0
+        assert result["source_validation"] is None
+        assert save_sync_calls == ["full-sync"]
+        assert reconcile_calls == []
+
     def test_reconfigure_preserves_savesync_selection_settings(self, tmp_path):
         config_path = tmp_path / "config" / "romcloud.toml"
         existing = _config(config_path)

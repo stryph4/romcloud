@@ -189,6 +189,21 @@ class TestMenuItems:
             for item in menu_categories_for_state(offline_state)["Storage"]
         )
 
+    def test_savesync_only_profile_hides_game_management_modes(self):
+        items = root_menu_items_for_state(
+            {
+                "game_management_enabled": False,
+                "capabilities": {"save_sync": True, "update_network": True},
+            }
+        )
+
+        labels = [item.label for item in items]
+        assert "SaveSync" in labels
+        assert "Library" not in labels
+        assert "Direct" not in labels
+        assert "Cached Storage" not in labels
+        assert "Offline" not in labels
+
     def test_library_sync_action_is_visible_only_when_enabled(self):
         disabled = menu_categories_for_mode("smart_cache", False, False)["Library"]
         enabled = menu_categories_for_mode("smart_cache", False, True)["Library"]

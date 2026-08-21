@@ -77,9 +77,10 @@ import os
 @click.option(
     "--source-type",
     default=None,
-    type=click.Choice(["local", "smb", "sftp"], case_sensitive=False),
+    type=click.Choice(["none", "local", "smb", "sftp"], case_sensitive=False),
     help=(
-        "Where your ROMs live: 'local' (local disk or USB drive), "
+        "Where your ROMs live: 'none' (SaveSync only with local games), "
+        "'local' (local disk or USB drive), "
         "'smb' (a network SMB/CIFS share, mounted locally and read from there), or "
         "'sftp' (an SFTP account, read directly over SSH)."
     ),
@@ -142,14 +143,15 @@ def configure_cmd(
         click.echo("  local  Local disk or USB drive")
         click.echo("  smb    Network share (SMB/CIFS), e.g. a NAS")
         click.echo("  sftp   SFTP account, read directly over SSH")
+        click.echo("  none   SaveSync only; leave local Batocera games untouched")
         source_type = click.prompt(
             "Source type",
-            type=click.Choice(["local", "smb", "sftp"], case_sensitive=False),
+            type=click.Choice(["none", "local", "smb", "sftp"], case_sensitive=False),
             default="local",
         )
     source_type = (source_type or "local").lower()
 
-    if game_access_mode is None and not non_interactive:
+    if source_type != "none" and game_access_mode is None and not non_interactive:
         click.echo("\nWhich initial ROMCloud operating mode should be used?")
         click.echo("  smart_cache  Cached Storage; copy to local storage on first launch")
         if source_type != "sftp":
@@ -175,7 +177,7 @@ def configure_cmd(
         )
 
     # ── ROM root ──────────────────────────────────────────────────────────────
-    if rom_root is None and not non_interactive:
+    if source_type != "none" and rom_root is None and not non_interactive:
         if source_type == "smb":
             rom_root = click.prompt(
                 "Local mount point for the SMB share",
@@ -188,7 +190,9 @@ def configure_cmd(
             )
         else:
             rom_root = click.prompt("ROM root path", default="/mnt/rom-source/ROMs")
-    if rom_root is None:
+    if source_type == "none":
+        rom_root = ""
+    elif rom_root is None:
         rom_root = "/userdata/romcloud/source" if source_type == "smb" else "/userdata/roms"
 
     # ── SMB settings ──────────────────────────────────────────────────────────
@@ -401,16 +405,16 @@ def configure_cmd(
 
     if library_sync is None:
         library_sync = existing.library_sync.enabled if existing else False
-    if library_sync and remote_data is None:
+    if library_sync and (remote_data is None or source_type == "none"):
         raise click.ClickException(
-            "Library Sync requires writable ROMCloud data storage."
+            "Library Sync requires ROMCloud game management and writable remote data."
         )
     if library_sync:
         click.echo("\nLibrary Sync will read existing source/NAS gamelist.xml files to initialize metadata.")
         click.echo("ROMCloud will not modify those source files; it manages local Batocera metadata only.")
 
     # ── cache ─────────────────────────────────────────────────────────────────
-    if game_access_mode == SMART_CACHE_MODE and cache_root is None and not non_interactive:
+    if source_type != "none" and game_access_mode == SMART_CACHE_MODE and cache_root is None and not non_interactive:
         cache_root = click.prompt(
             "Cache directory",
             default="/userdata/romcloud/cache",
@@ -419,7 +423,7 @@ def configure_cmd(
 
     max_gb = existing.cache.max_size_gb if existing else 50.0
     min_free_gb = existing.cache.min_free_gb if existing else 5.0
-    if game_access_mode == SMART_CACHE_MODE and not non_interactive:
+    if source_type != "none" and game_access_mode == SMART_CACHE_MODE and not non_interactive:
         max_gb = click.prompt("Max cache size (GB)", default=50.0, type=float)
         min_free_gb = click.prompt("Min free disk space (GB)", default=5.0, type=float)
 
@@ -459,10 +463,12 @@ def configure_cmd(
     _default_home = config_path.parent.parent
     config = AppConfig(
         source=SourceConfig(
-            provider="local",
+            provider="none" if source_type == "none" else "local",
             rom_root=rom_root,
             selected_systems=(
-                existing.source.selected_systems if existing else None
+                ()
+                if source_type == "none"
+                else existing.source.selected_systems if existing else None
             ),
         ),
         cache=CacheConfig(path=cache_root, max_size_gb=max_gb, min_free_gb=min_free_gb),
@@ -487,7 +493,7 @@ def configure_cmd(
 
     # Reconfiguration switches only ROMCloud-owned access artifacts. A fresh
     # configuration has no catalog yet, so this is naturally a no-op.
-    if existing is not None:
+    if existing is not None and config.source.enabled:
         from romcloud.integrations.batocera.game_access import reconcile_game_access
 
         try:

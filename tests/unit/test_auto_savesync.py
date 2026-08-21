@@ -1208,19 +1208,20 @@ def test_unavailable_remote_preserves_durable_dirty_state(tmp_path: Path):
     assert (tmp_path / "remote" / "psx" / "Game.srm").read_bytes() == b"changed"
 
 
-def test_offline_preserves_dirty_without_accessing_provider(tmp_path: Path):
+def test_offline_game_mode_still_allows_independent_savesync(tmp_path: Path):
     provider = _Provider()
     offline = CapabilityPolicy("smart_cache", OperatingMode.OFFLINE)
     service = _service(tmp_path, provider, capability_policy=offline)
     path = tmp_path / "local" / "psx" / "Game.srm"
+    _write(path, b"base")
+    service.full_sync()
     _write(path, b"local")
     service.mark_local_dirty("psx/Game.srm")
 
     _coordinator(tmp_path, service).drain_pending()
 
-    assert provider.reachability_checks == 0
-    assert service.get_state().groups[0].dirty_path_hints == ("psx/Game.srm",)
-    assert not (tmp_path / "remote").exists()
+    assert provider.reachability_checks > 0
+    assert (tmp_path / "remote" / "psx" / "Game.srm").read_bytes() == b"local"
 
 
 def test_verified_unchanged_hint_clears_without_transaction(

@@ -257,6 +257,30 @@ class TestDashboardSelection:
         assert state.step == PREVIEWING
         assert state.direction == "upload"
 
+    def test_read_only_remote_allows_download_but_blocks_mutations(self):
+        upload = SaveSyncScreenState(
+            romcloud_bin="romcloud",
+            selected_index=2,
+            status={"remote_configured": True, "remote_writable": False},
+            remote_availability=REMOTE_AVAILABLE,
+        )
+        upload.confirm_dashboard_selection()
+        assert upload.step == DASHBOARD
+        assert "read-only" in upload.error
+
+        download = SaveSyncScreenState(
+            romcloud_bin="romcloud",
+            selected_index=3,
+            status={"remote_configured": True, "remote_writable": False},
+            remote_availability=REMOTE_AVAILABLE,
+        )
+        download.popen = _fake_popen_returning(
+            {"ok": True, "diff": {"direction": "download", "entries": []}}
+        )
+        download.confirm_dashboard_selection()
+        assert download.step == PREVIEWING
+        assert download.direction == "download"
+
     def test_upload_is_unavailable_without_configured_remote_data(self):
         state = SaveSyncScreenState(
             romcloud_bin="romcloud",

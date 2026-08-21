@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import posixpath
 import shutil
 import uuid
 from dataclasses import dataclass
@@ -25,6 +24,10 @@ from pathlib import Path
 from typing import Optional
 
 from romcloud.core.exceptions import SaveSyncError
+from romcloud.core.remote_data import (
+    LooseObjectRemoteDataProvider,
+    RemoteOperationContext,
+)
 from romcloud.core.models.savesync import SaveArtifact
 from romcloud.core.save_selection import SaveSelectionPolicy
 from romcloud.core.storage import StorageProvider
@@ -189,60 +192,87 @@ class ProviderTreeIndex:
     per-directory I/O — important for a network provider like SFTP.
     """
 
-    def __init__(self, entries) -> None:  # noqa: ANN001 - list[RemoteEntry]
-        self._file_sizes: dict[str, int] = {}
-        self._child_dirs: dict[str, set[str]] = {}
-        self._known_dirs: set[str] = set()
-        for entry in entries:
-            if entry.is_directory:
-                relative = entry.relative_path.strip("/")
-                parent, _, name = relative.rpartition("/")
-                if relative:
-                    self._known_dirs.add(relative)
-                    self._child_dirs.setdefault(parent, set()).add(name)
-                continue
-            relative = entry.relative_path
-            self._file_sizes[relative] = entry.size_bytes or 0
-            parent = ""
-            for part in relative.split("/")[:-1]:
-                child = f"{parent}/{part}" if parent else part
-                self._known_dirs.add(child)
-                self._child_dirs.setdefault(parent, set()).add(part)
-                parent = child
+    def __init__(
+        self,
+        provider: LooseObjectRemoteDataProvider,
+        root: object,
+        operation: RemoteOperationContext,
+    ) -> None:
+        self._provider = provider
+        self._root = root
+        self._operation = operation
+        self._children: dict[str, tuple] = {}
+
+    def children(self, relative: str) -> tuple:
+        normalized = relative.strip("/")
+        if normalized not in self._children:
+            self._operation.check()
+            entries = self._provider.list_children(
+                self._root, normalized, operation=self._operation
+            )
+            self._children[normalized] = tuple(
+                entry
+                for entry in entries
+                if not entry.is_symlink
+                and entry.name not in {"", ".", ".."}
+                and "/" not in entry.name
+                and "\\" not in entry.name
+            )
+        return self._children[normalized]
 
     def dir_exists(self, relative: str) -> bool:
-        return relative == "" or relative in self._known_dirs
+        normalized = relative.strip("/")
+        if not normalized:
+            return True
+        parent, _, name = normalized.rpartition("/")
+        return any(
+            entry.name == name and entry.is_directory
+            for entry in self.children(parent)
+        )
 
     def list_subdirs(self, relative: str) -> tuple[str, ...]:
-        return tuple(sorted(self._child_dirs.get(relative, ())))
+        return tuple(
+            sorted(entry.name for entry in self.children(relative) if entry.is_directory)
+        )
 
     def files_under(
         self, relative_root: str, *, recursive: bool
     ) -> list[tuple[str, int]]:
         """Return ``(relative_to_root, size)`` for every file under
         *relative_root*, one level deep unless *recursive*."""
-        prefix = f"{relative_root}/" if relative_root else ""
         results: list[tuple[str, int]] = []
-        for path, size in self._file_sizes.items():
-            if prefix:
-                if not path.startswith(prefix):
+        pending = [(relative_root.strip("/"), "")]
+        while pending:
+            directory, result_prefix = pending.pop()
+            for entry in self.children(directory):
+                relative = (
+                    f"{result_prefix}/{entry.name}" if result_prefix else entry.name
+                )
+                if entry.is_directory:
+                    if recursive:
+                        child = f"{directory}/{entry.name}" if directory else entry.name
+                        pending.append((child, relative))
                     continue
-                remainder = path[len(prefix) :]
-            else:
-                remainder = path
-            if not remainder or (not recursive and "/" in remainder):
-                continue
-            results.append((remainder, size))
-        return results
+                results.append((relative, entry.size_bytes or 0))
+        return sorted(results)
 
 
-def hash_provider_file(provider: StorageProvider, root: str, relative_path: str) -> str:
+def hash_provider_file(
+    provider: LooseObjectRemoteDataProvider,
+    root: object,
+    relative_path: str,
+    *,
+    operation: Optional[RemoteOperationContext] = None,
+) -> str:
     """sha256 hex digest of a provider-hosted file, streamed without
     materializing a local temporary copy."""
-    full_path = posixpath.join(root.rstrip("/"), relative_path) if relative_path else root
+    context = operation or RemoteOperationContext()
+    context.check()
+    full_path = provider.resolve_path(root, relative_path) if relative_path else root
     digest = hashlib.sha256()
     with provider.open_binary(full_path) as fh:
         while True:
+            context.check()
             chunk = fh.read(_CHUNK)
             if not chunk:
                 break
@@ -251,26 +281,27 @@ def hash_provider_file(provider: StorageProvider, root: str, relative_path: str)
 
 
 def scan_provider_tree_report(
-    provider: StorageProvider,
-    root: str,
+    provider: LooseObjectRemoteDataProvider,
+    root: object,
     policy: SaveSelectionPolicy,
     *,
     enabled_optional_systems: frozenset[str] = frozenset(),
     enabled_optional_groups: frozenset[str] = frozenset(),
+    operation: Optional[RemoteOperationContext] = None,
 ) -> ScanReport:
     """Provider-generic twin of :func:`scan_tree_report`.
 
     Used when the remote SaveSync dataset's provider has no real
-    filesystem semantics (e.g. SFTP): enumerates the whole tree with one
-    :meth:`~romcloud.core.storage.StorageProvider.walk` call, resolves the
-    same dynamic-segment layouts via
+    filesystem semantics (e.g. SFTP): enumerates only allowlisted layout
+    roots through immediate-child listings, resolves dynamic segments via
     :meth:`~romcloud.core.save_selection.SaveSelectionPolicy.resolve_watch_roots_from_listing`,
     and hashes eligible files by streaming them through
     :meth:`~romcloud.core.storage.StorageProvider.open_binary` — never via
     a raw local :class:`~pathlib.Path`. Eligibility rules are identical to
     the local scanner; only the I/O primitives differ.
     """
-    index = ProviderTreeIndex(provider.walk(root))
+    context = operation or RemoteOperationContext()
+    index = ProviderTreeIndex(provider, root, context)
     watch_roots = policy.resolve_watch_roots_from_listing(
         index.dir_exists,
         index.list_subdirs,
@@ -298,7 +329,11 @@ def scan_provider_tree_report(
                 f"{watch.relative_root}/{relative}" if watch.relative_root else relative
             )
             artifacts[canonical] = SaveArtifact(
-                canonical, size_bytes, hash_provider_file(provider, root, full_relative)
+                canonical,
+                size_bytes,
+                hash_provider_file(
+                    provider, root, full_relative, operation=context
+                ),
             )
     return ScanReport(artifacts)
 

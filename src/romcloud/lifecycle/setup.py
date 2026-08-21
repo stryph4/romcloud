@@ -24,6 +24,7 @@ from romcloud.infrastructure.config import (
     SMART_CACHE_MODE,
     DIRECT_NAS_MODE,
     canonical_system_ids,
+    is_absolute_config_path,
     paths_overlap,
     load_config,
     write_config,
@@ -140,8 +141,8 @@ class SetupRequest:
         return request
 
     def validate(self, *, require_share: bool = True, validate_cache: bool = True) -> None:
-        if self.source_type not in {"local", "smb", "sftp"}:
-            raise ValueError("ROM source type must be local, smb, or sftp.")
+        if self.source_type not in {"none", "local", "smb", "sftp"}:
+            raise ValueError("ROM source type must be none, local, smb, or sftp.")
         if self.game_access_mode not in {SMART_CACHE_MODE, DIRECT_NAS_MODE}:
             raise ValueError("Game access mode must be smart_cache or direct_nas.")
         if self.source_type == "smb":
@@ -183,8 +184,10 @@ class SetupRequest:
             raise ValueError("ROMCloud data storage type must be none, local, smb, or sftp.")
         if self.library_sync_enabled and self.remote_data_type == "none":
             raise ValueError("Library Sync requires writable ROMCloud data storage.")
+        if self.library_sync_enabled and self.source_type == "none":
+            raise ValueError("Library Sync requires ROMCloud game management.")
         if self.remote_data_type == "local":
-            if not self.remote_data_root or not Path(self.remote_data_root).is_absolute():
+            if not self.remote_data_root or not is_absolute_config_path(self.remote_data_root):
                 raise ValueError("Local ROMCloud data location must be an absolute path.")
         if self.remote_data_type == "smb":
             if not all((self.remote_server, self.remote_share, self.remote_username, self.remote_password)):
@@ -213,14 +216,20 @@ class SetupRequest:
         if validate_cache and self.min_free_gb < 0:
             raise ValueError("Minimum free space cannot be negative.")
 
-        rom_root = Path(self.rom_root)
+        rom_root = Path(self.rom_root) if self.source_type != "none" else None
         cache_root = Path(self.cache_root)
-        if not rom_root.is_absolute() or not cache_root.is_absolute():
+        if self.source_type != "none" and (
+            rom_root is None or not is_absolute_config_path(self.rom_root)
+        ):
+            raise ValueError("ROM path must be absolute.")
+        if validate_cache and not is_absolute_config_path(self.cache_root):
             raise ValueError("ROM and cache paths must be absolute.")
-        if validate_cache and (cache_root == rom_root or rom_root in cache_root.parents):
+        if validate_cache and rom_root is not None and (
+            cache_root == rom_root or rom_root in cache_root.parents
+        ):
             raise ValueError("Cache location cannot be inside the mounted ROM source.")
-        if self.game_access_mode == DIRECT_NAS_MODE and paths_overlap(
-            rom_root, Path("/userdata/roms")
+        if self.source_type != "none" and self.game_access_mode == DIRECT_NAS_MODE and paths_overlap(
+            rom_root, Path("/userdata/roms")  # type: ignore[arg-type]
         ):
             raise ValueError(
                 "Connected Mode ROM source must be separate from /userdata/roms."
@@ -231,7 +240,12 @@ class SetupRequest:
                 if self.remote_data_type == "local"
                 else Path(DEFAULT_REMOTE_DATA_ROOT)
             )
-            for label, other in (("ROM source", rom_root), ("cache", cache_root)):
+            compared = (
+                []
+                if self.source_type == "none"
+                else [("ROM source", rom_root), ("cache", cache_root)]
+            )
+            for label, other in compared:
                 if paths_overlap(remote_root, other):
                     raise ValueError(
                         f"ROMCloud data location cannot overlap the {label}."
@@ -285,11 +299,15 @@ def setup_state(config_path: Path) -> dict[str, Any]:
     from romcloud.infrastructure.capabilities import capability_policy
     from romcloud.infrastructure.library_view import offline_library_enabled
 
+    operating_state = capability_policy(config).serialize()
+    operating_state["game_management_enabled"] = config.source.enabled
     payload: dict[str, Any] = {
         "state": "partial" if issues else "configured",
         "issues": issues,
         "source_type": (
-            "smb"
+            "none"
+            if not config.source.enabled
+            else "smb"
             if config.smb is not None
             else "sftp"
             if config.source.provider == "sftp"
@@ -303,7 +321,7 @@ def setup_state(config_path: Path) -> dict[str, Any]:
             else None
         ),
         "offline_library_mode": offline_library_enabled(config),
-        "operating_state": capability_policy(config).serialize(),
+        "operating_state": operating_state,
         "rom_root": config.source.rom_root,
         "cache_root": config.cache.path,
         "max_size_gb": config.cache.max_size_gb,
@@ -337,18 +355,18 @@ def setup_state(config_path: Path) -> dict[str, Any]:
 
 def _structural_issues(config: AppConfig) -> list[str]:
     issues = []
-    if not Path(config.source.rom_root).is_absolute():
+    if config.source.enabled and not is_absolute_config_path(config.source.rom_root):
         issues.append("ROM source path must be absolute.")
-    if not Path(config.cache.path).is_absolute():
+    if config.source.enabled and not is_absolute_config_path(config.cache.path):
         issues.append("Cache path must be absolute.")
-    if config.cache.max_size_gb <= 0:
+    if config.source.enabled and config.cache.max_size_gb <= 0:
         issues.append("Maximum cache size must be greater than zero.")
-    if config.cache.min_free_gb < 0:
+    if config.source.enabled and config.cache.min_free_gb < 0:
         issues.append("Minimum free space cannot be negative.")
     if config.smb is not None and load_smb_password(config.credentials_path) is None:
         issues.append("SMB credentials are missing.")
     if config.remote_data is not None:
-        if not Path(config.remote_data.root).is_absolute():
+        if not is_absolute_config_path(config.remote_data.root):
             issues.append("ROMCloud data root must be absolute.")
         if (
             config.remote_data.provider == "smb"
@@ -701,11 +719,17 @@ def apply_setup(
     config_path: Path, payload: dict[str, Any], progress: ProgressSink = None
 ) -> dict[str, Any]:
     requested_mode = str(payload.get("game_access_mode", SMART_CACHE_MODE)).lower()
+    requested_source = str(payload.get("source_type", "smb")).strip().lower()
     request = SetupRequest.from_payload(
-        payload, validate_cache=requested_mode != DIRECT_NAS_MODE
+        payload,
+        validate_cache=(
+            requested_source != "none" and requested_mode != DIRECT_NAS_MODE
+        ),
     )
     validation_result = (
-        validate_share(payload, progress)
+        {"systems": [], "count": 0}
+        if request.source_type == "none"
+        else validate_share(payload, progress)
         if request.source_type == "smb"
         else validate_sftp_source(payload, progress)
         if request.source_type == "sftp"
@@ -791,12 +815,14 @@ def apply_setup(
                 )
 
         container = Container(config)
-        source_probe = container.provider.validate_access(config.source.rom_root)
-        if not source_probe.ok:
-            raise RuntimeError(
-                f"ROM library access validation failed: {source_probe.detail}"
-            )
-        emit_progress(progress, "configure", "read", "success", "ROM read access verified")
+        source_probe = None
+        if config.source.enabled:
+            source_probe = container.provider.validate_access(config.source.rom_root)
+            if not source_probe.ok:
+                raise RuntimeError(
+                    f"ROM library access validation failed: {source_probe.detail}"
+                )
+            emit_progress(progress, "configure", "read", "success", "ROM read access verified")
 
         remote_probe = None
         save_sync_state = None
@@ -814,16 +840,20 @@ def apply_setup(
                 emit_progress(progress, "configure", "read_back", "success", "Read-back verified")
                 emit_progress(progress, "configure", "cleanup", "success", "Test file removed")
             else:
-                emit_progress(
-                    progress, "configure", "write", "warning",
-                    "Shared data is read-only; upload and publishing features remain unavailable.",
+                raise RuntimeError(
+                    "Configured ROMCloud data location is not writable: "
+                    f"{remote_probe.detail}"
                 )
 
         step = "refresh catalog"
         emit_progress(progress, "configure", "catalog", "running", "Refreshing the game catalog…")
         _write_state(state_path, {"status": "applying", "step": step})
-        refresh_result = container.catalog.refresh(progress=progress)
-        if refresh_result.errors:
+        refresh_result = (
+            container.catalog.refresh(progress=progress)
+            if config.source.enabled
+            else None
+        )
+        if refresh_result is not None and refresh_result.errors:
             details = "; ".join(f"{system}: {message}" for system, message in refresh_result.errors)
             raise RuntimeError(details)
         emit_progress(progress, "configure", "catalog", "success", "Catalog refreshed")
@@ -841,7 +871,8 @@ def apply_setup(
         )
         # Optional metadata/media enrichment is a deliberate post-setup
         # Library action. Setup needs only catalog-owned launch entries.
-        reconcile_game_access(config, render_library_metadata=False)
+        if config.source.enabled:
+            reconcile_game_access(config, render_library_metadata=False)
         emit_progress(
             progress,
             "configure",
@@ -935,7 +966,9 @@ def apply_setup(
         "max_size_gb": request.max_size_gb,
         "remote_data_type": request.remote_data_type,
         "library_sync_enabled": request.library_sync_enabled,
-        "source_validation": source_probe.as_dict(),
+        "source_validation": (
+            source_probe.as_dict() if source_probe is not None else None
+        ),
         "remote_data_validation": (
             remote_probe.as_dict() if remote_probe is not None else None
         ),
@@ -994,14 +1027,24 @@ def _build_config(
         )
     return AppConfig(
         source=SourceConfig(
-            provider="sftp" if request.source_type == "sftp" else "local",
+            provider=(
+                "none"
+                if request.source_type == "none"
+                else "sftp"
+                if request.source_type == "sftp"
+                else "local"
+            ),
             rom_root=(
-                request.source_remote_path
+                ""
+                if request.source_type == "none"
+                else request.source_remote_path
                 if request.source_type == "sftp"
                 else request.rom_root
             ),
             selected_systems=(
-                request.selected_systems
+                ()
+                if request.source_type == "none"
+                else request.selected_systems
                 if selected_systems is None
                 else selected_systems
             ),

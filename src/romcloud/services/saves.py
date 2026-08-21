@@ -10,7 +10,6 @@ authoritative after preview and confirmation.
 from __future__ import annotations
 
 import contextlib
-import posixpath
 import shutil
 import tempfile
 import uuid
@@ -60,6 +59,7 @@ from romcloud.infrastructure import save_transaction
 from romcloud.infrastructure.logging import get_logger
 from romcloud.infrastructure import savesync_state as durable_state
 from romcloud.infrastructure import savesync_journal
+from romcloud.infrastructure.remote_saves import RemoteSaveStore, build_remote_save_store
 
 log = get_logger("saves")
 _RPCS3_CANONICAL_PREFIX = f"ps3/{RPCS3_DEV_HDD0_PREFIX}"
@@ -103,9 +103,9 @@ class SaveSyncService:
         self,
         *,
         provider: Optional[StorageProvider],
-        connectivity_root: Optional[str],
+        connectivity_root: Optional[object],
         local_root: str,
-        remote_root: Optional[str],
+        remote_root: Optional[object],
         state_path: Path,
         xbox_enabled: bool = False,
         rpcs3_installed_games_enabled: bool = False,
@@ -113,11 +113,24 @@ class SaveSyncService:
         legacy_rpcs3_root: Optional[str] = None,
         policy: SaveSelectionPolicy = DEFAULT_SAVE_SELECTION_POLICY,
         capability_policy: Optional[CapabilityPolicy] = None,
+        remote_store: Optional[RemoteSaveStore] = None,
     ) -> None:
         self._provider = provider
         self._connectivity_root = connectivity_root
         self._local_root = Path(local_root)
-        self._remote_root = Path(remote_root) if remote_root is not None else None
+        self._remote_store = remote_store or build_remote_save_store(
+            provider,
+            connectivity_root=connectivity_root,
+            dataset_root=remote_root,
+        )
+        # Compatibility for callers/tests that inspect the confirmed
+        # filesystem destination. Protocol/object roots are never exposed as
+        # local Paths through this attribute.
+        self._remote_root = (
+            self._remote_store.filesystem_transaction_root
+            if self._remote_store is not None
+            else None
+        )
         self._state_path = Path(state_path)
         self._xbox_enabled = xbox_enabled
         # Kept as accepted constructor arguments for configuration/API
@@ -138,22 +151,18 @@ class SaveSyncService:
     # ── connectivity and settings ────────────────────────────────────────
 
     def is_remote_reachable(self) -> bool:
-        return (
-            self._provider is not None
-            and self._connectivity_root is not None
-            and self._provider.is_reachable(self._connectivity_root)
-        )
+        return self._remote_store is not None and self._remote_store.is_readable()
 
     def validate_remote_storage(self) -> StorageAccessResult:
-        if self._provider is None or self._connectivity_root is None:
+        if self._remote_store is None:
             return StorageAccessResult(
                 False, False, detail="ROMCloud data storage is not configured"
             )
-        return self._provider.validate_access(self._connectivity_root)
+        return self._remote_store.validate_access()
 
     @property
     def is_remote_configured(self) -> bool:
-        return self._provider is not None and self._remote_root is not None
+        return self._remote_store is not None
 
     @property
     def xbox_enabled(self) -> bool:
@@ -417,7 +426,7 @@ class SaveSyncService:
             )
             source_path = self._local_path if direction == "upload" else self._remote_path
             destination_views = (
-                (_DestinationView(self._remote_root),)
+                (_DestinationView(self._remote_transaction_root()),)
                 if direction == "upload"
                 else self._local_views()
             )
@@ -608,7 +617,7 @@ class SaveSyncService:
         observation = SaveRemoteObservation(
             availability=(
                 SaveRemoteAvailability.AVAILABLE
-                if access.ok
+                if access.readable
                 else SaveRemoteAvailability.UNAVAILABLE
             ),
             checked_at=datetime.now(timezone.utc).isoformat(),
@@ -622,12 +631,15 @@ class SaveSyncService:
         return durable_state.state_file_lock(self._state_path)
 
     def _remote_has_filesystem_semantics(self) -> bool:
-        return self._provider is not None and self._provider.capabilities.has_filesystem_semantics
+        return (
+            self._remote_store is not None
+            and self._remote_store.capabilities.filesystem_transactions
+        )
 
     def _remote_supports_durable_transactions(self) -> bool:
         return (
-            self._provider is not None
-            and self._provider.capabilities.supports_durable_transactions
+            self._remote_store is not None
+            and self._remote_store.capabilities.filesystem_transactions
         )
 
     def _require_durable_remote(self, operation: str) -> None:
@@ -637,6 +649,17 @@ class SaveSyncService:
                 "ROMCloud's durable write-transaction requirements. Read-only SaveSync "
                 "behavior remains available."
             )
+        assert self._remote_store is not None
+        access = self._remote_store.validate_access()
+        if not access.readable:
+            raise SaveSyncConnectivityError(
+                f"{operation}: remote-data storage is not readable. {access.detail}".rstrip()
+            )
+        if not self._remote_store.is_writable(access):
+            detail = f" {access.detail}" if access.detail else ""
+            raise SaveSyncWriteUnavailableError(
+                f"{operation}: remote-data storage is readable but not writable.{detail}"
+            )
 
     def _require_filesystem_remote(self, operation: str) -> None:
         """Full/Quick Sync's remote change-journal uses a real local-style
@@ -645,7 +668,10 @@ class SaveSyncService:
         a protocol-only provider (e.g. SFTP) cannot provide. Ordinary
         reconcile/preview/commit do not depend on this and remain available.
         """
-        if not self._remote_has_filesystem_semantics():
+        if (
+            self._remote_store is None
+            or not self._remote_store.capabilities.filesystem_journal
+        ):
             raise SaveSyncWriteUnavailableError(
                 f"{operation}: the configured remote-data storage does not support "
                 "the filesystem semantics ROMCloud's change journal requires. Use "
@@ -738,22 +764,17 @@ class SaveSyncService:
         return save_tree.merge_scan_reports(primary, legacy)
 
     def _scan_remote(self) -> save_tree.ScanReport:
-        assert self._remote_root is not None
-        if not self._remote_has_filesystem_semantics():
-            assert self._provider is not None
-            return save_tree.scan_provider_tree_report(
-                self._provider,
-                self._remote_root.as_posix(),
-                self._policy,
-                enabled_optional_systems=self._enabled_optional_systems(),
-                enabled_optional_groups=self._enabled_optional_groups(),
-            )
-        return self._scan_primary(self._remote_root)
+        assert self._remote_store is not None
+        return self._remote_store.scan(
+            self._policy,
+            enabled_optional_systems=self._enabled_optional_systems(),
+            enabled_optional_groups=self._enabled_optional_groups(),
+        )
 
     def _scan_remote_layouts(
         self, layout_ids: frozenset[str]
     ) -> save_tree.ScanReport:
-        assert self._remote_root is not None
+        assert self._remote_store is not None
         layouts = tuple(
             layout
             for layout in self._policy.layouts
@@ -762,17 +783,7 @@ class SaveSyncService:
         if not layouts:
             return save_tree.ScanReport({})
         selected_policy = SaveSelectionPolicy(layouts=layouts)
-        if not self._remote_has_filesystem_semantics():
-            assert self._provider is not None
-            return save_tree.scan_provider_tree_report(
-                self._provider,
-                self._remote_root.as_posix(),
-                selected_policy,
-                enabled_optional_systems=self._enabled_optional_systems(),
-                enabled_optional_groups=self._enabled_optional_groups(),
-            )
-        return save_tree.scan_tree_report(
-            self._remote_root,
+        return self._remote_store.scan(
             selected_policy,
             enabled_optional_systems=self._enabled_optional_systems(),
             enabled_optional_groups=self._enabled_optional_groups(),
@@ -808,8 +819,8 @@ class SaveSyncService:
     def _remote_path(self, relative_path: str) -> Path:
         """A local, readable :class:`Path` containing *relative_path*'s
         remote content — used only as a copy *source*, never as a write
-        destination (remote writes always target ``self._remote_root``
-        itself through a :class:`_DestinationView`). When the remote
+        destination (remote writes use the remote store's commit strategy).
+        When the remote
         provider has real filesystem semantics this is the live mounted
         path, unchanged from before. Otherwise (e.g. SFTP) the content is
         fetched into this locked operation's scratch directory first, so
@@ -817,17 +828,12 @@ class SaveSyncService:
         (:mod:`romcloud.infrastructure.save_tree`/``save_transaction``)
         never has to open a non-local path directly.
         """
-        assert self._remote_root is not None
-        if self._remote_has_filesystem_semantics():
-            return self._remote_root / relative_path
-        assert self._provider is not None
+        assert self._remote_store is not None
         assert self._active_read_scratch is not None, (
             "Reading remote SaveSync content requires an active locked operation"
         )
         local_path = self._active_read_scratch.path() / f"{uuid.uuid4().hex}.tmp"
-        remote_full_path = posixpath.join(self._remote_root.as_posix(), relative_path)
-        self._provider.transfer_to(remote_full_path, str(local_path))
-        return local_path
+        return self._remote_store.materialize(relative_path, local_path)
 
     def _local_views(self) -> tuple[_DestinationView, ...]:
         views = [_DestinationView(self._local_root)]
@@ -842,14 +848,26 @@ class SaveSyncService:
 
     @property
     def _remote_journal_path(self) -> Optional[Path]:
-        if self._remote_root is None:
+        if self._remote_store is None:
             return None
-        return savesync_journal.default_journal_path(self._remote_root)
+        return self._remote_store.filesystem_journal_path
+
+    def _remote_transaction_root(self) -> Path:
+        if self._remote_store is None:
+            raise SaveSyncWriteUnavailableError("Remote-data storage is not configured")
+        root = self._remote_store.filesystem_transaction_root
+        if root is None:
+            raise SaveSyncWriteUnavailableError(
+                "The configured remote-data provider has no filesystem commit strategy"
+            )
+        return root
 
     def _all_destination_roots(self) -> tuple[Path, ...]:
         roots = [view.root for view in self._local_views()]
-        if self._remote_root is not None:
-            roots.append(self._remote_root)
+        if self._remote_store is not None:
+            remote_root = self._remote_store.filesystem_transaction_root
+            if remote_root is not None:
+                roots.append(remote_root)
         return tuple(roots)
 
     def _recover(self) -> None:
@@ -866,8 +884,8 @@ class SaveSyncService:
         # targeted selected-content staging instead.
         for view in self._local_views():
             save_tree.recover_interrupted_commit(view.root)
-        if self._remote_root is not None:
-            save_tree.recover_interrupted_commit(self._remote_root)
+        if self._remote_store is not None:
+            self._remote_store.recover_filesystem_dataset()
 
     # ── authoritative force-operation preview ────────────────────────────
 
@@ -914,6 +932,7 @@ class SaveSyncService:
         """Run authoritative reconciliation and establish Quick Sync baseline."""
         self._require_remote()
         self._require_filesystem_remote("Full Sync")
+        self._require_durable_remote("Full Sync")
         self._load_remote_journal(reset_on_error=True)
         report = self.reconcile(progress=progress)
         journal = self._load_remote_journal(reset_on_error=True)
@@ -942,6 +961,7 @@ class SaveSyncService:
         self._capabilities.require(Capability.SAVE_SYNC, "Quick SaveSync")
         self._require_remote()
         self._require_filesystem_remote("Quick SaveSync")
+        self._require_durable_remote("Quick SaveSync")
         if not self.is_remote_reachable():
             raise SaveSyncConnectivityError(
                 f"Remote save location is not reachable: {self._connectivity_root}"
@@ -1370,8 +1390,9 @@ class SaveSyncService:
                     # uploads (pure download/no-op) must remain available
                     # regardless of the remote's durable-transaction support.
                     self._require_durable_remote("Save/state reconciliation upload")
-                    assert self._remote_root is not None
-                    remote_views = (_DestinationView(self._remote_root),)
+                    remote_views = (
+                        _DestinationView(self._remote_transaction_root()),
+                    )
                     destination_views.extend(remote_views)
                     selected_views.extend(
                         self._selected_transaction_views(
@@ -1686,12 +1707,13 @@ class SaveSyncService:
         self._capabilities.require(Capability.SAVE_SYNC, "Upload All Saves")
         self._require_durable_remote("Upload All Saves")
         self._require_remote()
-        assert self._remote_root is not None
         return self._commit_force(
             diff,
             source_scan=self._scan_local,
             source_path=self._local_path,
-            destination_views=(_DestinationView(self._remote_root),),
+            destination_views=(
+                _DestinationView(self._remote_transaction_root()),
+            ),
             progress=progress,
         )
 

@@ -452,7 +452,12 @@ class WizardState:
                 else "Start Setup"
             ]
         if self.step == WizardStep.SOURCE:
-            return ["SMB network share", "Local / external directory", "SFTP server"]
+            return [
+                "SMB network share",
+                "Local / external directory",
+                "SFTP server",
+                "SaveSync only (local games)",
+            ]
         if self.step in (WizardStep.SFTP_TRUST, WizardStep.REMOTE_SFTP_TRUST):
             return ["Trust this host key"]
         if self.step == WizardStep.SHARE:
@@ -819,7 +824,7 @@ class WizardState:
             elif self.selected_index == 1:
                 self.source_type = "local"
                 self._start_local_browse("source", self.rom_root if self.mode != "fresh" else "/userdata", romcloud_bin)
-            else:
+            elif self.selected_index == 2:
                 self.source_type = "sftp"
                 self.server = ""
                 self.port = 22
@@ -827,6 +832,12 @@ class WizardState:
                 self.password = ""
                 self.source_remote_path = "/"
                 self.enter_text_step(WizardStep.SERVER, show_osk=show_osk)
+            else:
+                self.source_type = "none"
+                self.selected_systems.clear()
+                self.library_sync_enabled = False
+                self.step = WizardStep.REMOTE_DATA
+                self.selected_index = 0
         elif self.step == WizardStep.SFTP_TRUST:
             self._start_sftp_browse("source", "/", romcloud_bin)
         elif self.step == WizardStep.REMOTE_SFTP_TRUST:
@@ -885,6 +896,9 @@ class WizardState:
                 self.remote_data_type = "none"
                 self.library_sync_enabled = False
                 self.step = (
+                    WizardStep.REVIEW
+                    if self.source_type == "none"
+                    else
                     WizardStep.CACHE
                     if self.game_access_mode == "smart_cache"
                     else WizardStep.REVIEW
@@ -1006,7 +1020,11 @@ class WizardState:
                 else WizardStep.SHARE
             ),
             WizardStep.GAME_ACCESS: WizardStep.SYSTEMS,
-            WizardStep.REMOTE_DATA: WizardStep.GAME_ACCESS,
+            WizardStep.REMOTE_DATA: (
+                WizardStep.SOURCE
+                if self.source_type == "none"
+                else WizardStep.GAME_ACCESS
+            ),
             WizardStep.REMOTE_AUTH: WizardStep.REMOTE_DATA,
             WizardStep.REMOTE_DISCOVER: (
                 WizardStep.REMOTE_AUTH
@@ -1469,7 +1487,11 @@ class WizardState:
         self._start_current_browser_operation(romcloud_bin)
 
     def _post_storage_step(self) -> WizardStep:
-        return WizardStep.LIBRARY_SYNC
+        return (
+            WizardStep.REVIEW
+            if self.source_type == "none"
+            else WizardStep.LIBRARY_SYNC
+        )
 
 
 def _normalize_sftp_path(path: str) -> str:

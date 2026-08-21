@@ -35,7 +35,6 @@ def test_offline_policy_has_narrow_explicit_capabilities(offline_policy) -> None
         Capability.GAME_DOWNLOAD,
         Capability.CATALOG_REFRESH,
         Capability.LIBRARY_SYNC,
-        Capability.SAVE_SYNC,
         Capability.UPDATE_NETWORK,
         Capability.REMOTE_VALIDATION,
     ):
@@ -47,13 +46,14 @@ def test_offline_policy_has_narrow_explicit_capabilities(offline_policy) -> None
         Capability.LOCAL_SETTINGS,
         Capability.LOCAL_DIAGNOSTICS,
         Capability.CONNECTION_RECOVERY,
+        Capability.SAVE_SYNC,
     ):
         assert offline_policy.allows(capability)
 
     serialized = offline_policy.serialize()
     assert serialized["presentation_intent"] == "offline"
-    assert serialized["capabilities"]["save_sync"] is False
-    assert "Offline" in serialized["blocked_reasons"]["save_sync"]
+    assert serialized["capabilities"]["save_sync"] is True
+    assert "save_sync" not in serialized["blocked_reasons"]
 
 
 def test_configured_strategy_does_not_override_authoritative_offline_state() -> None:
@@ -131,7 +131,7 @@ def test_cached_game_and_local_cache_management_work_but_cache_miss_is_blocked(
         offline_cache.cache_game(game_with_file.id)
 
 
-def test_savesync_guard_precedes_connectivity_and_preserves_local_saves(
+def test_savesync_is_independent_from_offline_game_mode(
     tmp_path: Path, offline_policy
 ) -> None:
     local = tmp_path / "saves"
@@ -140,7 +140,9 @@ def test_savesync_guard_precedes_connectivity_and_preserves_local_saves(
     remote.mkdir(parents=True)
     save = local / "game.sav"
     save.write_bytes(b"local-save")
-    provider = Mock()
+    from romcloud.infrastructure.providers.local import LocalFilesystemProvider
+
+    provider = LocalFilesystemProvider()
     service = SaveSyncService(
         provider=provider,
         connectivity_root=str(remote.parent),
@@ -150,21 +152,7 @@ def test_savesync_guard_precedes_connectivity_and_preserves_local_saves(
         capability_policy=offline_policy,
     )
 
-    with pytest.raises(CapabilityUnavailableError, match="Offline"):
-        service.preview_upload()
-    provider.is_reachable.assert_not_called()
-    assert save.read_bytes() == b"local-save"
-
-    provider.is_reachable.return_value = True
-    online = SaveSyncService(
-        provider=provider,
-        connectivity_root=str(remote.parent),
-        local_root=str(local),
-        remote_root=str(remote),
-        state_path=tmp_path / "state.json",
-        capability_policy=CapabilityPolicy("smart_cache", PresentationIntent.CACHE),
-    )
-    assert online.preview_upload().direction == "upload"
+    assert service.preview_upload().direction == "upload"
     assert save.read_bytes() == b"local-save"
 
 

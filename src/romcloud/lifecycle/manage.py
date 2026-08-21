@@ -317,7 +317,9 @@ def purge(
     romcloud_home: Path,
     ports_dir: Optional[Path] = None,
 ) -> LifecycleReport:
-    protected = (Path(config.local_roms_path), Path(config.source.rom_root))
+    protected = (Path(config.local_roms_path),)
+    if config.source.enabled:
+        protected = (*protected, Path(config.source.rom_root))
     if config.remote_data is not None:
         protected = (*protected, Path(config.remote_data.root))
     external_roots = {Path(config.cache.path), Path(config.data_path)}

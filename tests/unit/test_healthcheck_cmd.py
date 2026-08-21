@@ -41,6 +41,29 @@ def _invoke(config):
 
 
 class TestMountDiagnosticLine:
+    def test_standalone_savesync_skips_rom_source_and_cache_checks(self, tmp_path):
+        local_roms = tmp_path / "local-roms"
+        local_roms.mkdir()
+        data = tmp_path / "data"
+        data.mkdir()
+        remote = tmp_path / "remote"
+        remote.mkdir()
+        config = AppConfig(
+            source=SourceConfig(provider="none", rom_root="", selected_systems=()),
+            cache=CacheConfig(path="unused-cache"),
+            local_roms_path=str(local_roms),
+            data_path=str(data),
+            remote_data=RemoteDataConfig(provider="local", root=str(remote)),
+        )
+
+        result = _invoke(config)
+
+        assert result.exit_code == 0, result.output
+        assert "Game management disabled" in result.output
+        assert "Source reachable" not in result.output
+        assert "Cache path writable" not in result.output
+        assert "ROMCloud data location writable" in result.output
+
     def test_absent_when_no_smb_configured(self, tmp_path):
         result = _invoke(_build_config(tmp_path, smb=None))
         assert "SMB locations mounted" not in result.output

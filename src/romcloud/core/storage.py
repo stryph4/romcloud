@@ -22,6 +22,14 @@ class RemoteEntry:
     is_directory: bool
     size_bytes: Optional[int]
     is_symlink: bool = False
+    object_id: Optional[str] = None
+    """Stable provider identity when the backend exposes one."""
+
+    revision: Optional[str] = None
+    """Provider revision/ETag suitable for optimistic concurrency checks."""
+
+    checksum: Optional[str] = None
+    """Provider-verified content checksum, when trustworthy and available."""
 
 
 @dataclass(frozen=True)
@@ -47,6 +55,9 @@ class ProviderCapabilities:
     """True when an interrupted download can continue from its last
     written byte instead of restarting from zero."""
 
+    can_resume_upload: bool = False
+    """True when an interrupted upload can resume instead of restarting."""
+
     supports_durable_transactions: bool = False
     """True when writes through this provider go through a real local (or
     locally-mounted) filesystem, so ROMCloud's atomic-rename + fsync
@@ -62,6 +73,16 @@ class ProviderCapabilities:
     Write-dependent SaveSync/Library Sync operations must gate on this
     capability of the *destination* provider instance, never on provider
     identity; read-only consumption of such a target remains available."""
+
+    supports_remote_data_writes: bool = False
+    """Implements logical upload/delete/folder operations. Runtime account
+    writability must still be established by an explicit access probe."""
+
+    supports_conditional_revisions: bool = False
+    """Can reject a mutation when the provider revision changed."""
+
+    supports_object_generations: bool = False
+    """Can publish immutable generations behind provider-owned metadata."""
 
 
 _DEFAULT_CAPABILITIES = ProviderCapabilities()
@@ -85,6 +106,22 @@ class StorageAccessResult:
     write_verified: Optional[bool] = None
     cleanup_verified: Optional[bool] = None
     detail: str = ""
+
+    @property
+    def reachable(self) -> bool:
+        return self.connected
+
+    @property
+    def readable(self) -> bool:
+        return self.connected and self.read_verified
+
+    @property
+    def writable(self) -> bool:
+        return (
+            self.readable
+            and self.write_verified is True
+            and self.cleanup_verified is not False
+        )
 
     @property
     def ok(self) -> bool:
@@ -220,6 +257,94 @@ class StorageProvider(ABC):
         :mod:`romcloud.infrastructure.providers.sftp`).
         """
         raise NotImplementedError(f"{self.provider_id} does not support tree walking")
+
+    def list_children(
+        self,
+        root: str,
+        relative_directory: str = "",
+        *,
+        operation=None,
+    ) -> list[RemoteEntry]:
+        """List one logical directory below *root* without recursive traversal.
+
+        This is the remote-data counterpart to catalog listing.  The default
+        deliberately reuses the existing catalog primitives so current local,
+        mounted-SMB, and SFTP providers gain the narrow operation without a
+        parallel provider hierarchy.  Object providers may override it and
+        resolve *root* and logical keys to opaque IDs internally.
+        """
+        if operation is not None:
+            operation.check()
+        relative = str(relative_directory).replace("\\", "/").strip("/")
+        if not relative:
+            return [
+                RemoteEntry(name=name, relative_path=name, is_directory=True, size_bytes=None)
+                for name in self.list_systems(root)
+            ]
+        return self.list_entries(root, relative)
+
+    def download_to_local(
+        self,
+        root: str,
+        relative_path: str,
+        destination: str,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+        *,
+        operation=None,
+    ) -> None:
+        """Materialize one logical provider object at a local path."""
+        if operation is not None:
+            operation.check()
+        self.transfer_to(
+            self.resolve_path(root, relative_path),
+            destination,
+            on_progress=on_progress,
+        )
+        if operation is not None:
+            operation.check()
+
+    def remote_data_root(self, root: str, namespace: str) -> str:
+        """Return an opaque handle for one ROMCloud-owned logical dataset.
+
+        Filesystem/SFTP providers use their normal logical-path resolver.
+        Object providers may instead resolve or return a stable folder/object
+        identifier. Callers must never interpret the result as a local path.
+        """
+        return self.resolve_path(root, namespace)
+
+    def metadata(
+        self, root: str, relative_path: str, *, operation=None
+    ) -> Optional[RemoteEntry]:
+        """Return metadata for one logical remote-data object, or ``None``."""
+        raise NotImplementedError(f"{self.provider_id} does not support object metadata")
+
+    def ensure_directory(
+        self, root: str, relative_path: str, *, operation=None
+    ) -> RemoteEntry:
+        raise NotImplementedError(f"{self.provider_id} does not support logical folders")
+
+    def upload_from_local(
+        self,
+        root: str,
+        relative_path: str,
+        source_path: str,
+        *,
+        expected_revision: Optional[str] = None,
+        create_only: bool = False,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+        operation=None,
+    ) -> RemoteEntry:
+        raise NotImplementedError(f"{self.provider_id} does not support uploads")
+
+    def delete_object(
+        self,
+        root: str,
+        relative_path: str,
+        *,
+        expected_revision: Optional[str] = None,
+        operation=None,
+    ) -> None:
+        raise NotImplementedError(f"{self.provider_id} does not support deletes")
 
     def open_binary(self, path: str):
         """Context manager yielding a readable binary stream for *path*.

@@ -43,7 +43,6 @@ _OFFLINE_BLOCKED = frozenset(
         Capability.GAME_DOWNLOAD,
         Capability.CATALOG_REFRESH,
         Capability.LIBRARY_SYNC,
-        Capability.SAVE_SYNC,
         Capability.UPDATE_NETWORK,
         Capability.REMOTE_VALIDATION,
     }

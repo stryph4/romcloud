@@ -331,16 +331,28 @@ def uidata_status(ctx: click.Context) -> None:
     def build() -> dict:
         _load_context_config(ctx)
         container = get_container(ctx)
-        games = container.catalog.list_games()
+        games = (
+            container.catalog.list_games()
+            if container.config.source.enabled
+            else []
+        )
+        operating_state = capability_policy(container.config).serialize()
+        operating_state["game_management_enabled"] = (
+            container.config.source.enabled
+        )
         payload = {
             "games_total": len(games),
             "game_access_mode": container.config.game_access_mode,
             "library_sync_enabled": container.config.library_sync.enabled,
-            "operating_state": capability_policy(container.config).serialize(),
+            "operating_state": operating_state,
         }
         from romcloud.infrastructure.library_view import offline_library_enabled
 
-        summary = container.cache.status_summary()
+        summary = (
+            container.cache.status_summary()
+            if container.config.source.enabled
+            else {"complete": 0, "pinned": 0}
+        )
         payload.update(
             cached=summary["complete"],
             pinned=summary["pinned"],
@@ -997,10 +1009,12 @@ def uidata_savesync_availability(ctx: click.Context) -> None:
         state = saves.record_remote_observation(access)
         return {
             "remote_configured": saves.is_remote_configured,
-            "remote_available": access.ok,
+            "remote_available": access.readable,
+            "remote_readable": access.readable,
+            "remote_writable": access.writable,
             # Keep the old boolean spelling in this provider-neutral endpoint
             # for internal callers migrating from the combined status call.
-            "remote_reachable": access.ok,
+            "remote_reachable": access.reachable,
             "access": access.as_dict(),
             "detail": access.detail,
             "sync_status": state.effective_status.value,

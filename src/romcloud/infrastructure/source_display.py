@@ -20,6 +20,13 @@ def source_display_summary(config: AppConfig) -> dict[str, str]:
     ``source_type`` first and only treat ``source_internal_provider`` as a
     diagnostic hint if it wants to show one at all.
     """
+    if not config.source.enabled:
+        return {
+            "source_type": "None (local games only)",
+            "source_mount_point": "",
+            "source_internal_provider": "none",
+            "source_description": "ROMCloud game management is disabled",
+        }
     summary = {
         "source_type": "SMB" if config.smb is not None else "Local filesystem",
         "source_mount_point": config.source.rom_root,
