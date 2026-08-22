@@ -12,6 +12,8 @@ env/
 *.db-wal
 .env
 *.log
+runtime/google-oauth-client.json
+data/google-drive/
 .pytest_cache/
 htmlcov/
 .coverage

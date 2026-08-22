@@ -53,7 +53,8 @@ from romcloud.core.save_selection import (
     XBOX_SYSTEM,
     SaveSelectionPolicy,
 )
-from romcloud.core.storage import StorageAccessResult, StorageProvider
+from romcloud.core.storage import StorageAccessResult
+from romcloud.core.remote_data import RemoteDataProvider
 from romcloud.infrastructure import save_tree
 from romcloud.infrastructure import save_transaction
 from romcloud.infrastructure.logging import get_logger
@@ -102,7 +103,7 @@ class SaveSyncService:
     def __init__(
         self,
         *,
-        provider: Optional[StorageProvider],
+        provider: Optional[RemoteDataProvider],
         connectivity_root: Optional[object],
         local_root: str,
         remote_root: Optional[object],

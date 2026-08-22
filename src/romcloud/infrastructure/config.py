@@ -201,8 +201,10 @@ class RemoteDataConfig:
     (normally ``/userdata/romcloud/remote``), while ``smb`` identifies the
     independently selected network target. For SFTP it is the remote POSIX
     path on the independently configured ``sftp`` target — there is no
-    mount step. Independent of :class:`SourceConfig`: a user may freely mix
-    e.g. an SFTP ROM source with SMB remote-data or vice versa.
+    mount step. For Google Drive it is an opaque logical account slot, never
+    a local path or Drive file ID. Independent of :class:`SourceConfig`: a
+    user may freely mix e.g. an SFTP ROM source with SMB remote-data or vice
+    versa.
     """
 
     provider: str
@@ -486,18 +488,28 @@ def _parse(
     remote_raw = data.get("remote_data")
     if remote_raw is not None:
         provider_id = str(remote_raw.get("provider", "local")).lower()
-        if provider_id not in {"local", "smb", "sftp"}:
+        if provider_id not in {"local", "smb", "sftp", "google_drive"}:
             raise ConfigurationError(
-                f"{path}: remote_data.provider must be \"local\", \"smb\", or \"sftp\"."
+                f"{path}: remote_data.provider must be \"local\", \"smb\", "
+                "\"sftp\", or \"google_drive\"."
             )
         default_root = (
-            str(_DEFAULT_REMOTE_DATA_ROOT) if provider_id == "smb" else ""
+            str(_DEFAULT_REMOTE_DATA_ROOT)
+            if provider_id == "smb"
+            else "romcloud-savesync"
+            if provider_id == "google_drive"
+            else ""
         )
         remote_root = str(remote_raw.get("root", default_root)).strip()
         if provider_id == "sftp":
             remote_root = _validated_posix_absolute(
                 remote_root, "remote_data.root", path
             )
+        elif provider_id == "google_drive":
+            if remote_root != "romcloud-savesync":
+                raise ConfigurationError(
+                    f"{path}: Google Drive root must use ROMCloud's logical account slot."
+                )
         elif not remote_root or not is_absolute_config_path(remote_root):
             raise ConfigurationError(
                 f"{path}: remote_data.root must be an explicit absolute path."
@@ -558,6 +570,14 @@ def _parse(
     if library_sync.enabled and remote_data is None:
         raise ConfigurationError(
             f"{path}: Library Sync requires configured writable [remote_data]."
+        )
+    if (
+        library_sync.enabled
+        and remote_data is not None
+        and remote_data.provider == "google_drive"
+    ):
+        raise ConfigurationError(
+            f"{path}: Google Drive Library Sync is not implemented."
         )
 
     game_access_mode = str(
@@ -636,6 +656,14 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
     if config.library_sync.enabled and config.remote_data is None:
         raise ConfigurationError(
             f"{path}: Library Sync requires configured writable [remote_data]."
+        )
+    if (
+        config.library_sync.enabled
+        and config.remote_data is not None
+        and config.remote_data.provider == "google_drive"
+    ):
+        raise ConfigurationError(
+            f"{path}: Google Drive Library Sync is not implemented."
         )
     validate_remote_data_boundary(
         source=config.source,
@@ -876,9 +904,9 @@ def validate_remote_data_boundary(
             f"{context}: remote_data.sftp must not reuse or overlap the ROM source "
             "SFTP target; select a separate remote path."
         )
-    if remote_data.provider == "sftp":
-        # A path on a different host's filesystem entirely — never
-        # comparable to any of the local paths checked below.
+    if remote_data.provider in {"sftp", "google_drive"}:
+        # SFTP is a different host's path and Google Drive is an opaque
+        # account slot. Neither is comparable to the local paths below.
         return
     remote_root = Path(remote_data.root)
     if not is_absolute_config_path(remote_data.root):

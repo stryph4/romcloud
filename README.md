@@ -222,6 +222,13 @@ unrelated content.
   Local/external ROMCloud **Supported**           Explicit writable
   data                                            directory
 
+  Google Drive SaveSync   **Foundation only**     Account authorization,
+                                                  owned app-folder setup,
+                                                  and write/read/delete
+                                                  readiness checks; save
+                                                  package sync is not yet
+                                                  implemented
+
   SFTP                    **Not implemented**     No current SFTP
                                                   provider/setup flow
 
@@ -544,6 +551,39 @@ romcloud saves download-all
 The SaveSync dashboard renders local/configured state immediately. Writable
 `[remote_data]` availability is checked separately with a bounded background
 probe, so Back and application Exit stay responsive when storage is missing.
+
+### Google Drive foundation
+
+Google Drive can be selected as ROMCloud data storage during setup. On a
+controller-only device, ROMCloud displays Google's verification address and a
+short user code so authorization can be completed in a browser on another
+device. ROMCloud requests only the `drive.file` scope. Refresh credentials and
+the remembered ID of ROMCloud's app-owned folder are stored outside
+`romcloud.toml` under the configured data directory with restrictive file
+permissions.
+
+This is a provider foundation, not complete Google Drive SaveSync. Setup can
+authorize the account, create or recover the marked `ROMCloud SaveSync` folder,
+and verify create/read-back/delete access. Save preview and transfer operations
+fail explicitly until the package manifest, generation, conflict, and atomic
+promotion protocol is implemented. Google Drive is not available for Library
+Sync in this phase.
+
+Project owners must enable the Google Drive API and create an OAuth client of
+type **TVs and Limited Input devices** in Google Cloud. Supply its deployment
+metadata at `runtime/google-oauth-client.json` beneath the ROMCloud install root:
+
+``` json
+{
+  "client_id": "deployed-client-id",
+  "client_secret": "deployed-client-secret"
+}
+```
+
+The same values can instead be supplied as
+`ROMCLOUD_GOOGLE_OAUTH_CLIENT_ID` and
+`ROMCLOUD_GOOGLE_OAUTH_CLIENT_SECRET`. Never commit either deployment metadata
+or the generated token files.
 
 SaveSync does not currently hook emulator launch/exit. Game lifecycle
 synchronization requires a proven way to wait for the real emulator

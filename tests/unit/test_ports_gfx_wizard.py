@@ -253,6 +253,7 @@ def test_detected_systems_lead_to_explicit_game_access_and_remote_data_choices()
         "SMB network location",
         "Local / external directory",
         "SFTP server",
+        "Google Drive",
         "Skip (sync features unavailable)",
     ]
 
@@ -590,7 +591,7 @@ def test_system_multi_select_persists_canonical_ids_in_request():
 def test_skipping_remote_data_makes_choice_explicit():
     wizard = WizardState()
     wizard.step = WizardStep.REMOTE_DATA
-    wizard.selected_index = 3
+    wizard.selected_index = wizard.options.index("Skip (sync features unavailable)")
 
     wizard._confirm("romcloud")  # noqa: SLF001 - pure navigation test
 
@@ -619,7 +620,7 @@ def test_direct_mode_skips_cache_settings_and_explains_source_requirement():
     wizard.step = WizardStep.GAME_ACCESS
     wizard.selected_index = 1
     wizard._confirm("romcloud")  # noqa: SLF001
-    wizard.selected_index = 3
+    wizard.selected_index = wizard.options.index("Skip (sync features unavailable)")
     wizard._confirm("romcloud")  # noqa: SLF001
 
     assert wizard.game_access_mode == "direct_nas"

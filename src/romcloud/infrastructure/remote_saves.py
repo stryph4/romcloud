@@ -218,6 +218,9 @@ def build_remote_save_store(
 ) -> Optional[RemoteSaveStore]:
     if provider is None or connectivity_root is None or dataset_root is None:
         return None
+    provider_factory = getattr(provider, "build_remote_save_store", None)
+    if callable(provider_factory):
+        return provider_factory(connectivity_root, dataset_root)
     if provider.capabilities.has_filesystem_semantics:
         if not isinstance(dataset_root, (str, Path)):
             raise TypeError("Filesystem remote-data roots must be path-like")

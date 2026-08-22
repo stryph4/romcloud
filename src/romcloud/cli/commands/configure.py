@@ -61,8 +61,10 @@ import os
 @click.option(
     "--remote-data-type",
     default=None,
-    type=click.Choice(["none", "local", "smb"], case_sensitive=False),
-    help="Writable ROMCloud data storage for SaveSync: none, local, or SMB.",
+    type=click.Choice(
+        ["none", "local", "smb", "google_drive"], case_sensitive=False
+    ),
+    help="Writable SaveSync storage: none, local, SMB, or Google Drive.",
 )
 @click.option(
     "--remote-data-root",
@@ -315,7 +317,9 @@ def configure_cmd(
         if use_remote:
             remote_data_type = click.prompt(
                 "ROMCloud data storage type",
-                type=click.Choice(["local", "smb"], case_sensitive=False),
+                type=click.Choice(
+                    ["local", "smb", "google_drive"], case_sensitive=False
+                ),
                 default=remote_data.provider if remote_data is not None else "smb",
             )
         else:
@@ -361,6 +365,39 @@ def configure_cmd(
                     f"ROMCloud data directory must not overlap the {label}: {other}"
                 )
         remote_data = RemoteDataConfig(provider="local", root=str(root_path))
+    elif remote_data_type == "google_drive":
+        from romcloud.lifecycle.google_drive_setup import (
+            begin_google_drive_auth,
+            complete_google_drive_auth,
+            google_drive_auth_status,
+        )
+
+        if non_interactive:
+            status = google_drive_auth_status(config_path)
+            if not status.get("ready"):
+                raise click.ClickException(
+                    "Google Drive is not authenticated and writable; run interactive "
+                    "configuration first."
+                )
+        else:
+            authorization = begin_google_drive_auth(config_path)
+            click.echo("\nAuthorize ROMCloud on another device:")
+            click.echo(f"  Open: {authorization['verification_url']}")
+            click.echo(f"  Code: {authorization['user_code']}")
+            while True:
+                if not click.confirm("Authorization completed?", default=True):
+                    raise click.ClickException("Google Drive authorization cancelled.")
+                result = complete_google_drive_auth(config_path)
+                if result.get("authenticated"):
+                    if not result.get("ready"):
+                        raise click.ClickException(
+                            str(result.get("detail") or "Google Drive is not writable.")
+                        )
+                    break
+                click.echo("Authorization is still pending; finish it and retry.")
+        remote_data = RemoteDataConfig(
+            provider="google_drive", root="romcloud-savesync"
+        )
     else:
         if non_interactive:
             if remote_data is None or remote_data.provider != "smb":
@@ -409,6 +446,8 @@ def configure_cmd(
         raise click.ClickException(
             "Library Sync requires ROMCloud game management and writable remote data."
         )
+    if library_sync and remote_data is not None and remote_data.provider == "google_drive":
+        raise click.ClickException("Google Drive Library Sync is not implemented.")
     if library_sync:
         click.echo("\nLibrary Sync will read existing source/NAS gamelist.xml files to initialize metadata.")
         click.echo("ROMCloud will not modify those source files; it manages local Batocera metadata only.")

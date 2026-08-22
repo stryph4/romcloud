@@ -48,6 +48,26 @@ class ProviderPermissionError(ProviderError):
     operation was denied (e.g. a read-only account/path)."""
 
 
+class ProviderAuthRequiredError(ProviderAuthError):
+    """No usable provider authorization is stored; interactive auth is needed."""
+
+
+class ProviderObjectNotFoundError(ProviderError):
+    """A provider-owned object does not exist or is not accessible."""
+
+
+class ProviderQuotaError(ProviderError):
+    """The provider account or application quota prevents the operation."""
+
+
+class ProviderRateLimitError(ProviderError):
+    """The provider rejected a bounded operation because of rate limiting."""
+
+
+class ProviderConflictError(ProviderError):
+    """A provider object/revision changed or already exists."""
+
+
 class ProviderHostKeyUnknownError(ProviderError):
     """No trusted host key is on file yet for this server.
 

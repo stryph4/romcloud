@@ -44,6 +44,11 @@ from romcloud.lifecycle.setup import (
     validate_sftp_source,
     validate_share,
 )
+from romcloud.lifecycle.google_drive_setup import (
+    begin_google_drive_auth,
+    complete_google_drive_auth,
+    google_drive_auth_status,
+)
 from romcloud.core.progress import ProgressEvent, emit_progress, redact_text
 from romcloud.infrastructure.config import load_config
 from romcloud.infrastructure.capabilities import capability_policy
@@ -257,6 +262,36 @@ def uidata_setup_validate(ctx: click.Context) -> None:
         return action(request, progress)
 
     _run_request_action(ctx, validate)
+
+
+@uidata_group.command("setup-google-drive-auth-start")
+@click.pass_context
+def uidata_setup_google_drive_auth_start(ctx: click.Context) -> None:
+    """Begin console-friendly Google device authorization."""
+    _run_action(
+        ctx,
+        lambda: begin_google_drive_auth(Path(ctx.obj["config_path"])),
+    )
+
+
+@uidata_group.command("setup-google-drive-auth-complete")
+@click.pass_context
+def uidata_setup_google_drive_auth_complete(ctx: click.Context) -> None:
+    """Poll once and validate Google Drive after user consent."""
+    _run_action(
+        ctx,
+        lambda: complete_google_drive_auth(Path(ctx.obj["config_path"])),
+    )
+
+
+@uidata_group.command("google-drive-auth-status")
+@click.pass_context
+def uidata_google_drive_auth_status(ctx: click.Context) -> None:
+    """Return credential/readiness state without exposing token material."""
+    _run_action(
+        ctx,
+        lambda: google_drive_auth_status(Path(ctx.obj["config_path"])),
+    )
 
 
 @uidata_group.command("setup-sftp-host-key")

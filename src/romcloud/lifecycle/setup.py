@@ -180,12 +180,19 @@ class SetupRequest:
             raise ValueError("Setup values cannot contain quotes or line breaks.")
         if self.source_type == "smb" and not 1 <= self.port <= 65535:
             raise ValueError("SMB port must be between 1 and 65535.")
-        if self.remote_data_type not in {"none", "local", "smb", "sftp"}:
-            raise ValueError("ROMCloud data storage type must be none, local, smb, or sftp.")
+        if self.remote_data_type not in {
+            "none", "local", "smb", "sftp", "google_drive"
+        }:
+            raise ValueError(
+                "ROMCloud data storage type must be none, local, smb, sftp, "
+                "or google_drive."
+            )
         if self.library_sync_enabled and self.remote_data_type == "none":
             raise ValueError("Library Sync requires writable ROMCloud data storage.")
         if self.library_sync_enabled and self.source_type == "none":
             raise ValueError("Library Sync requires ROMCloud game management.")
+        if self.library_sync_enabled and self.remote_data_type == "google_drive":
+            raise ValueError("Google Drive Library Sync is not implemented.")
         if self.remote_data_type == "local":
             if not self.remote_data_root or not is_absolute_config_path(self.remote_data_root):
                 raise ValueError("Local ROMCloud data location must be an absolute path.")
@@ -234,7 +241,7 @@ class SetupRequest:
             raise ValueError(
                 "Connected Mode ROM source must be separate from /userdata/roms."
             )
-        if self.remote_data_type != "none":
+        if self.remote_data_type not in {"none", "google_drive"}:
             remote_root = (
                 Path(self.remote_data_root)
                 if self.remote_data_type == "local"
@@ -367,7 +374,10 @@ def _structural_issues(config: AppConfig) -> list[str]:
     if config.smb is not None and load_smb_password(config.credentials_path) is None:
         issues.append("SMB credentials are missing.")
     if config.remote_data is not None:
-        if not is_absolute_config_path(config.remote_data.root):
+        if (
+            config.remote_data.provider != "google_drive"
+            and not is_absolute_config_path(config.remote_data.root)
+        ):
             issues.append("ROMCloud data root must be absolute.")
         if (
             config.remote_data.provider == "smb"
@@ -1025,6 +1035,11 @@ def _build_config(
                 port=request.remote_port,
                 host_key_fingerprint=request.remote_sftp_host_key_fingerprint,
             ),
+        )
+    elif request.remote_data_type == "google_drive":
+        remote_data = RemoteDataConfig(
+            provider="google_drive",
+            root="romcloud-savesync",
         )
     return AppConfig(
         source=SourceConfig(

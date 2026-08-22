@@ -35,6 +35,7 @@ class WizardStep(Enum):
     SYSTEMS = "systems"
     GAME_ACCESS = "game_access"
     REMOTE_DATA = "remote_data"
+    REMOTE_GOOGLE_AUTH = "remote_google_auth"
     REMOTE_LOCAL = "remote_local"
     REMOTE_AUTH = "remote_auth"
     REMOTE_SERVER = "remote_server"
@@ -182,6 +183,10 @@ STEP_CONTEXT: dict[WizardStep, WizardStepContext] = {
         "Choose where ROMCloud should store shared data such as synchronized saves.",
         "This location must be writable and separate from the read-only ROM share.",
     ),
+    WizardStep.REMOTE_GOOGLE_AUTH: WizardStepContext(
+        "Open the shown Google URL on a phone or computer and enter the code.",
+        "ROMCloud requests access only to Drive files created or opened by ROMCloud.",
+    ),
     WizardStep.REMOTE_LOCAL: WizardStepContext(
         "Enter a writable local or external folder for shared ROMCloud data.",
         "Next, choose whether to enable shared library metadata.",
@@ -258,6 +263,7 @@ STEP_CONTEXT: dict[WizardStep, WizardStepContext] = {
 
 
 _RUNNING_MESSAGES = {
+    WizardStep.REMOTE_GOOGLE_AUTH: "Connecting Google Drive...",
     WizardStep.LOCAL_BROWSE: "Opening the selected folder…",
     WizardStep.DISCOVER: "Connecting to your ROM library…",
     WizardStep.SOURCE_BROWSE: "Opening the ROM share…",
@@ -272,6 +278,7 @@ _RUNNING_MESSAGES = {
 
 
 _FAILURE_MESSAGES = {
+    WizardStep.REMOTE_GOOGLE_AUTH: "Google Drive authentication did not complete. Retry or review details.",
     WizardStep.LOCAL_BROWSE: "Could not open that folder. Check that it is available, then retry.",
     WizardStep.DISCOVER: "Could not connect. Check the ROM server and account, then retry.",
     WizardStep.SOURCE_BROWSE: "Could not open the ROM share. Check access, then retry.",
@@ -329,6 +336,10 @@ class WizardState:
         self.remote_sftp_browse_path = "/"
         self.remote_sftp_browse_entries: list[dict[str, Any]] = []
         self.remote_shares: list[dict[str, str]] = []
+        self.google_verification_url = ""
+        self.google_user_code = ""
+        self.google_authenticated = False
+        self._google_auth_phase = ""
         self.browser_path = ""
         self.browser_entries: list[dict[str, Any]] = []
         self.local_browse_purpose = ""
@@ -383,6 +394,7 @@ class WizardState:
             WizardStep.SYSTEMS: "Detected Systems",
             WizardStep.GAME_ACCESS: "Choose Game Access",
             WizardStep.REMOTE_DATA: "ROMCloud Data Storage",
+            WizardStep.REMOTE_GOOGLE_AUTH: "Connect Google Drive",
             WizardStep.REMOTE_LOCAL: "Local Data Directory",
             WizardStep.REMOTE_AUTH: "Data SMB Credentials",
             WizardStep.REMOTE_SERVER: "Data SFTP Server" if self.remote_data_type == "sftp" else "Data SMB Server",
@@ -467,8 +479,16 @@ class WizardState:
                 "SMB network location",
                 "Local / external directory",
                 "SFTP server",
+                "Google Drive",
                 "Skip (sync features unavailable)",
             ]
+        if self.step == WizardStep.REMOTE_GOOGLE_AUTH and self.runner is None:
+            if self.google_user_code:
+                return [
+                    "I've authorized this device",
+                    "Restart authentication",
+                ]
+            return ["Start Google Drive authentication"]
         if self.step == WizardStep.GAME_ACCESS:
             return ["Cached Storage"] if self.source_type == "sftp" else ["Cached Storage", "Direct"]
         if self.step == WizardStep.LIBRARY_SYNC:
@@ -892,6 +912,18 @@ class WizardState:
                 self.remote_data_root = "/"
                 self.remote_reuse_source_credentials = False
                 self.enter_text_step(WizardStep.REMOTE_SERVER, show_osk=show_osk)
+            elif self.selected_index == 3:
+                self.remote_data_type = "google_drive"
+                self.library_sync_enabled = False
+                self.google_verification_url = ""
+                self.google_user_code = ""
+                self.google_authenticated = False
+                self._google_auth_phase = "begin"
+                self._start_operation(
+                    WizardStep.REMOTE_GOOGLE_AUTH,
+                    "setup-google-drive-auth-start",
+                    romcloud_bin,
+                )
             else:
                 self.remote_data_type = "none"
                 self.library_sync_enabled = False
@@ -934,6 +966,21 @@ class WizardState:
             self._start_operation(
                 WizardStep.REMOTE_VALIDATE, "setup-validate", romcloud_bin
             )
+        elif self.step == WizardStep.REMOTE_GOOGLE_AUTH:
+            if self.selected_index == 1 or not self.google_user_code:
+                self._google_auth_phase = "begin"
+                self._start_operation(
+                    WizardStep.REMOTE_GOOGLE_AUTH,
+                    "setup-google-drive-auth-start",
+                    romcloud_bin,
+                )
+            else:
+                self._google_auth_phase = "complete"
+                self._start_operation(
+                    WizardStep.REMOTE_GOOGLE_AUTH,
+                    "setup-google-drive-auth-complete",
+                    romcloud_bin,
+                )
         elif self.step == WizardStep.LIBRARY_SYNC:
             self.library_sync_enabled = self.selected_index == 0
             self.step = (
@@ -1025,6 +1072,7 @@ class WizardState:
                 if self.source_type == "none"
                 else WizardStep.GAME_ACCESS
             ),
+            WizardStep.REMOTE_GOOGLE_AUTH: WizardStep.REMOTE_DATA,
             WizardStep.REMOTE_AUTH: WizardStep.REMOTE_DATA,
             WizardStep.REMOTE_DISCOVER: (
                 WizardStep.REMOTE_AUTH
@@ -1047,13 +1095,18 @@ class WizardState:
             ),
             WizardStep.LIBRARY_SYNC: WizardStep.REMOTE_DATA,
             WizardStep.CACHE: (
-                WizardStep.LIBRARY_SYNC
+                WizardStep.REMOTE_GOOGLE_AUTH
+                if self.remote_data_type == "google_drive"
+                else WizardStep.LIBRARY_SYNC
                 if self.remote_data_type != "none"
                 else WizardStep.REMOTE_DATA
             ),
             WizardStep.REVIEW: (
                 WizardStep.CACHE
                 if self.game_access_mode == "smart_cache"
+                and self.source_type != "none"
+                else WizardStep.REMOTE_GOOGLE_AUTH
+                if self.remote_data_type == "google_drive"
                 else WizardStep.LIBRARY_SYNC
                 if self.remote_data_type != "none"
                 else WizardStep.REMOTE_DATA
@@ -1208,6 +1261,36 @@ class WizardState:
                 return drained
             self.selected_index = 0
             self.notice = "Verify the fingerprint, then choose Trust this host key."
+        elif self.step == WizardStep.REMOTE_GOOGLE_AUTH:
+            if self._google_auth_phase == "begin":
+                self.google_verification_url = str(
+                    result.data.get("verification_url", "")
+                )
+                self.google_user_code = str(result.data.get("user_code", ""))
+                if not self.google_verification_url or not self.google_user_code:
+                    self.error = "Google did not return an authorization code."
+                    return drained
+                self.notice = (
+                    f"Open {self.google_verification_url} and enter "
+                    f"{self.google_user_code}."
+                )
+                self.selected_index = 0
+            elif not bool(result.data.get("authenticated", False)):
+                self.notice = (
+                    "Authorization is still pending. Complete it on your other "
+                    "device, then try again."
+                )
+                self.selected_index = 0
+            elif not bool(result.data.get("ready", False)):
+                self.error = str(
+                    result.data.get("detail", "Google Drive is not writable.")
+                )
+            else:
+                self.google_authenticated = True
+                self.remote_validation = dict(result.data.get("validation", {}))
+                self.step = self._post_storage_step()
+                self.selected_index = 0
+                self.notice = "Google Drive is authenticated and writable."
         elif self.step == WizardStep.REMOTE_VALIDATE:
             self.remote_validation = dict(result.data.get("validation", {}))
             self.step = self._post_storage_step()
@@ -1490,6 +1573,11 @@ class WizardState:
         return (
             WizardStep.REVIEW
             if self.source_type == "none"
+            else WizardStep.CACHE
+            if self.remote_data_type == "google_drive"
+            and self.game_access_mode == "smart_cache"
+            else WizardStep.REVIEW
+            if self.remote_data_type == "google_drive"
             else WizardStep.LIBRARY_SYNC
         )
 

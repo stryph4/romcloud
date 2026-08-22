@@ -20,6 +20,7 @@ from romcloud.core.capabilities import CapabilityPolicy, OperatingMode
 from romcloud.core.exceptions import ConfigurationError
 from romcloud.core.models.cache import CachePolicy
 from romcloud.core.storage import StorageProvider
+from romcloud.core.remote_data import RemoteDataProvider
 from romcloud.infrastructure.config import AppConfig, validate_remote_data_boundary
 from romcloud.infrastructure.capabilities import capability_policy
 from romcloud.infrastructure.database import Database
@@ -48,7 +49,7 @@ def _remote_data_base_path(remote_data) -> object:  # noqa: ANN001
     :class:`~pathlib.Path` objects, unchanged."""
     if remote_data is None:
         return None
-    if remote_data.provider == "sftp":
+    if remote_data.provider in {"sftp", "google_drive"}:
         return PurePosixPath(remote_data.root)
     return Path(remote_data.root)
 
@@ -60,7 +61,7 @@ def _remote_data_base_path(remote_data) -> "Path | PurePosixPath | None":  # noq
     :class:`~pathlib.Path` objects, unchanged."""
     if remote_data is None:
         return None
-    if remote_data.provider == "sftp":
+    if remote_data.provider in {"sftp", "google_drive"}:
         return PurePosixPath(remote_data.root)
     return Path(remote_data.root)
 
@@ -314,6 +315,10 @@ class Container:
                 )
             elif remote_data.provider == "sftp":
                 provider = self._build_writable_sftp_provider(remote_data.sftp)
+            elif remote_data.provider == "google_drive":
+                # Library Sync over Drive is intentionally not implemented.
+                provider = None
+                remote_base = None
             else:
                 provider = WritableLocalFilesystemProvider()
             self._library_sync = LibrarySyncService(
@@ -421,7 +426,7 @@ class Container:
             probe_writable=True,
         )
 
-    def _build_remote_data_provider(self) -> Optional[StorageProvider]:
+    def _build_remote_data_provider(self) -> Optional[RemoteDataProvider]:
         """Build the independently configured ROMCloud-owned data provider."""
         remote_data = self._config.remote_data
         if remote_data is None:
@@ -438,6 +443,15 @@ class Container:
             return self._build_writable_sftp_provider(remote_data.sftp)
         if remote_data.provider == "local":
             return WritableLocalFilesystemProvider()
+        if remote_data.provider == "google_drive":
+            from romcloud.infrastructure.providers.google_drive import (
+                build_google_drive_provider,
+            )
+
+            return build_google_drive_provider(
+                Path(self._config.data_path).parent,
+                Path(self._config.data_path),
+            )
         raise ConfigurationError(
             f"Unknown remote-data provider: {remote_data.provider!r}"
         )
