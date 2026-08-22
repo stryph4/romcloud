@@ -53,14 +53,13 @@ def reconcile_install_cmd(
     click.echo(f"  Wrote launch wrapper: {report.core.launch_wrapper}")
     if report.google_oauth.configured:
         click.echo(
-            "  Deployed Google Drive OAuth metadata: "
+            "  Google Drive OAuth metadata ready: "
             f"{report.google_oauth.target_path} ({report.google_oauth.source})"
         )
     else:
-        click.echo(
-            "  Google Drive unavailable: this source build does not advertise "
-            "Google Drive OAuth metadata."
-        )
+        click.echo(f"  {report.google_oauth.unavailable_reason}")
+    if report.google_oauth.warning:
+        click.echo(f"warning: {report.google_oauth.warning}", err=True)
 
     ports = report.ports_ui
     if ports.installed:

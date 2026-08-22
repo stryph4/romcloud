@@ -67,7 +67,7 @@ class TestReconcileInstallCmd:
         assert result.exit_code == 0, result.output
         assert "Wrote CLI wrapper" in result.output
         assert "Wrote launch wrapper" in result.output
-        assert "Deployed Google Drive OAuth metadata" in result.output
+        assert "Google Drive OAuth metadata ready" in result.output
         assert (romcloud_home / "bin" / "romcloud").exists()
         assert (
             romcloud_home / "runtime" / "google-oauth-client.json"
@@ -103,6 +103,33 @@ class TestReconcileInstallCmd:
         assert result.exit_code == 0, result.output
         assert "Wrote graphical Ports wrapper" in result.output
         assert "Installed Batocera Port entry" in result.output
+
+    def test_optional_google_metadata_failure_warns_without_failing_install(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("ROMCLOUD_GOOGLE_OAUTH_CLIENT_ID", "incomplete-client")
+        monkeypatch.delenv("ROMCLOUD_GOOGLE_OAUTH_CLIENT_SECRET", raising=False)
+        home = tmp_path / "romcloud"
+        project = tmp_path / "project"
+        project.mkdir()
+
+        result = _run(
+            [
+                "--romcloud-home",
+                str(home),
+                "--project-root",
+                str(project),
+                "--ports-dir",
+                str(tmp_path / "ports"),
+                "--system-python",
+                "",
+            ]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "warning: Google Drive is unavailable" in result.output
+        assert "Other ROMCloud features are unaffected" in result.output
+        assert (home / "bin" / "romcloud").exists()
 
     def test_pygame_missing_reports_skip_message(self, tmp_path: Path, monkeypatch) -> None:
         from romcloud.integrations.batocera import mount_service, es_config

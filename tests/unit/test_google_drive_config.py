@@ -7,6 +7,7 @@ import pytest
 from ports_gfx.client import BackendResult
 from ports_gfx.wizard import WizardState, WizardStep
 
+from romcloud.core.exceptions import ConfigurationError
 from romcloud.infrastructure.config import (
     AppConfig,
     CacheConfig,
@@ -18,6 +19,7 @@ from romcloud.infrastructure.config import (
 from romcloud.infrastructure.google_auth import GoogleOAuthToken, GoogleTokenStore
 from romcloud.lifecycle.setup import SetupRequest, _build_config, setup_state
 from romcloud.lifecycle.google_drive_setup import google_drive_build_status
+from romcloud.lifecycle.install import reconcile_google_oauth_metadata
 
 
 def config(tmp_path: Path) -> AppConfig:
@@ -144,7 +146,7 @@ def test_missing_build_metadata_is_reported_and_not_started(
 
     wizard._confirm("romcloud", show_osk=False)
 
-    assert "not configured in this build" in wizard.options[3]
+    assert "unavailable" in wizard.options[3]
     assert wizard.error == "Google Drive is not configured in this ROMCloud build."
 
 
@@ -168,3 +170,38 @@ def test_auth_backend_build_error_is_shown_directly(monkeypatch) -> None:
     wizard.poll()
 
     assert wizard.error == "Google Drive is not configured in this ROMCloud build."
+
+
+def test_wizard_shows_specific_optional_deployment_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "romcloud"
+    config_path = home / "config" / "romcloud.toml"
+    project = tmp_path / "project"
+    locator = project / "runtime" / "google-oauth-client.url"
+    locator.parent.mkdir(parents=True)
+    locator.write_text("https://deploy.example/google.json", encoding="utf-8")
+    deployment = reconcile_google_oauth_metadata(
+        romcloud_home=home,
+        project_root=project,
+        environment={},
+        fetcher=lambda _url: (_ for _ in ()).throw(
+            ConfigurationError("metadata could not be downloaded")
+        ),
+    )
+    state = setup_state(config_path)
+    wizard = WizardState(BackendResult(True, state))
+    wizard.step = WizardStep.REMOTE_DATA
+    wizard.selected_index = 3
+    monkeypatch.setattr(
+        wizard,
+        "_start_operation",
+        lambda *_args: pytest.fail("disabled provider must not start"),
+    )
+
+    wizard._confirm("romcloud", show_osk=False)
+
+    assert deployment.warning == state["google_drive_warning"]
+    assert state["google_drive_available"] is False
+    assert "could not be retrieved" in state["google_drive_unavailable_reason"]
+    assert wizard.error == state["google_drive_unavailable_reason"]

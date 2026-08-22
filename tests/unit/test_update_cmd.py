@@ -107,6 +107,31 @@ class TestUpdatePerform:
         assert result.exit_code != 0
         assert "pip explosion" in result.output
 
+    def test_success_surfaces_optional_provider_warning(self, monkeypatch):
+        new = BuildInfo(
+            version="2.0.0",
+            commit="c" * 40,
+            commit_short="c" * 12,
+            build_date="x",
+            source="s",
+        )
+        warning = "Google Drive is unavailable; other features are unaffected."
+        monkeypatch.setattr(
+            update_cmd_module,
+            "perform_update",
+            lambda *args, **kwargs: UpdateResult(
+                previous=None,
+                new=new,
+                reconcile_log=f"warning: {warning}",
+                warnings=(warning,),
+            ),
+        )
+
+        result = _run([])
+
+        assert result.exit_code == 0
+        assert warning in result.output
+
     def test_default_repo_and_stable_channel_used(self, monkeypatch):
         captured = {}
 

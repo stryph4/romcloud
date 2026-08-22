@@ -513,7 +513,11 @@ def test_cli_repair_uses_persisted_channel(tmp_path: Path, monkeypatch: pytest.M
         update_module,
         "perform_repair",
         lambda *args, **kwargs: captured.append(kwargs["channel"])
-        or update_module.UpdateResult(previous=None, new=new),
+        or update_module.UpdateResult(
+            previous=None,
+            new=new,
+            reconcile_log="warning: Google Drive configuration could not be retrieved.",
+        ),
     )
 
     result = CliRunner().invoke(cli, ["--config", str(config_path), "repair"])
@@ -521,6 +525,7 @@ def test_cli_repair_uses_persisted_channel(tmp_path: Path, monkeypatch: pytest.M
     assert result.exit_code == 0, result.output
     assert captured == ["develop"]
     assert "from develop" in result.output
+    assert "Google Drive configuration could not be retrieved" in result.output
 
 
 def test_cli_repeated_purge_is_safe_after_config_is_gone(

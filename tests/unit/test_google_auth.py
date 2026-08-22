@@ -16,10 +16,12 @@ from romcloud.core.exceptions import (
     TransferCancelledError,
 )
 from romcloud.core.remote_data import RemoteOperationContext
+from romcloud.infrastructure import credential_crypto
 from romcloud.infrastructure.google_auth import (
     DEVICE_CODE_ENDPOINT,
     TOKEN_ENDPOINT,
     AuthorizationPending,
+    DeviceAuthorization,
     GoogleOAuthClientConfig,
     GoogleOAuthDeviceFlow,
     GoogleOAuthToken,
@@ -66,12 +68,113 @@ def test_no_token_requires_interactive_auth(tmp_path: Path) -> None:
 def test_valid_token_never_calls_network(tmp_path: Path) -> None:
     transport = FakeTransport()
     oauth = flow(tmp_path, transport)
-    oauth.token_store.save(valid_token())
+    stored = GoogleOAuthToken(
+        "distinctive-access-secret-12345",
+        "distinctive-refresh-secret-67890",
+        2000.0,
+    )
+    oauth.token_store.save(stored)
 
-    assert oauth.usable_token().access_token == "access"
+    assert oauth.usable_token() == stored
     assert transport.calls == []
+    raw = oauth.token_store.path.read_text(encoding="utf-8")
+    assert json.loads(raw)["version"] == 2
+    assert "distinctive-access-secret-12345" not in raw
+    assert "distinctive-refresh-secret-67890" not in raw
     if os.name == "posix":
         assert stat.S_IMODE(oauth.token_store.path.stat().st_mode) & 0o077 == 0
+
+
+def test_plaintext_phase1_token_is_migrated_one_way_on_load(tmp_path: Path) -> None:
+    path = tmp_path / "token.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "access_token": "legacy-access-secret",
+                "refresh_token": "legacy-refresh-secret",
+                "expires_at": 2000.0,
+                "scope": "https://www.googleapis.com/auth/drive.file",
+                "token_type": "Bearer",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    token = GoogleTokenStore(path).load()
+
+    assert token is not None
+    assert token.refresh_token == "legacy-refresh-secret"
+    migrated = path.read_text(encoding="utf-8")
+    assert json.loads(migrated)["version"] == 2
+    assert "legacy-access-secret" not in migrated
+    assert "legacy-refresh-secret" not in migrated
+
+
+def test_failed_plaintext_migration_leaves_original_file_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "token.json"
+    original = json.dumps(
+        {
+            "version": 1,
+            "access_token": "never-log-access",
+            "refresh_token": "never-log-refresh",
+            "expires_at": 2000.0,
+        }
+    ).encode()
+    path.write_bytes(original)
+    monkeypatch.setattr(
+        credential_crypto,
+        "encrypt_password",
+        lambda _value: (_ for _ in ()).throw(
+            credential_crypto.CredentialCryptoUnavailableError("unavailable")
+        ),
+    )
+
+    with pytest.raises(ProviderAuthError, match="stored securely") as captured:
+        GoogleTokenStore(path).load()
+
+    assert path.read_bytes() == original
+    assert "never-log" not in str(captured.value)
+
+
+def test_token_and_device_code_repr_are_secret_safe() -> None:
+    token = valid_token()
+    authorization = DeviceAuthorization(
+        device_code="device-secret",
+        user_code="ABCD-EFGH",
+        verification_url="https://google.com/device",
+        expires_at=2000.0,
+        interval=5.0,
+    )
+
+    assert "access" not in repr(token)
+    assert "refresh" not in repr(token)
+    assert "device-secret" not in repr(authorization)
+
+
+def test_corrupt_encrypted_token_error_has_no_decrypted_context(tmp_path: Path) -> None:
+    store = GoogleTokenStore(tmp_path / "token.json")
+    store.save(
+        GoogleOAuthToken(
+            "never-log-access-token",
+            "never-log-refresh-token",
+            2000.0,
+        )
+    )
+    payload = json.loads(store.path.read_text(encoding="utf-8"))
+    ciphertext = payload["encrypted_token"]["ciphertext"]
+    payload["encrypted_token"]["ciphertext"] = (
+        ("A" if ciphertext[0] != "A" else "B") + ciphertext[1:]
+    )
+    store.path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ProviderAuthError, match="could not be unlocked") as captured:
+        store.load()
+
+    assert "never-log" not in str(captured.value)
+    assert captured.value.__cause__ is None
 
 
 def test_device_flow_uses_drive_file_scope_and_persists_tokens(tmp_path: Path) -> None:

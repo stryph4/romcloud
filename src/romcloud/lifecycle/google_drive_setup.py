@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from romcloud.core.remote_data import RemoteOperationContext
 from romcloud.infrastructure.config import load_config
 from romcloud.infrastructure.google_auth import (
     AuthorizationPending,
+    GOOGLE_OAUTH_STATUS_RELATIVE_PATH,
     GoogleOAuthClientConfig,
     GoogleOAuthDeviceFlow,
     GoogleTokenStore,
@@ -25,16 +27,37 @@ AUTH_OPERATION_TIMEOUT = 15.0
 
 def google_drive_build_status(config_path: Path) -> dict[str, object]:
     home = Path(config_path).parent.parent
+    deployment_status: dict[str, object] = {}
+    try:
+        raw_status = json.loads(
+            (home / GOOGLE_OAUTH_STATUS_RELATIVE_PATH).read_text(encoding="utf-8")
+        )
+        if isinstance(raw_status, dict) and raw_status.get("version") == 1:
+            deployment_status = raw_status
+    except (OSError, ValueError, TypeError):
+        pass
     try:
         GoogleOAuthClientConfig.load(home)
     except ConfigurationError as exc:
+        recorded_reason = deployment_status.get("unavailable_reason")
+        reason = (
+            str(recorded_reason)
+            if deployment_status.get("available") is False and recorded_reason
+            else str(exc)
+        )
         return {
             "google_drive_available": False,
-            "google_drive_unavailable_reason": str(exc),
+            "google_drive_unavailable_reason": reason,
+            "google_drive_warning": str(deployment_status.get("warning", "")),
         }
     return {
         "google_drive_available": True,
         "google_drive_unavailable_reason": "",
+        "google_drive_warning": (
+            str(deployment_status.get("warning", ""))
+            if deployment_status.get("available") is True
+            else ""
+        ),
     }
 
 

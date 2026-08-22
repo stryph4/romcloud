@@ -14,7 +14,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Protocol
 
@@ -25,6 +25,7 @@ from romcloud.core.exceptions import (
     ProviderNotReachableError,
 )
 from romcloud.core.remote_data import RemoteOperationContext
+from romcloud.infrastructure import credential_crypto
 from romcloud.infrastructure.atomic_file import atomic_write_text
 
 GOOGLE_DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
@@ -32,6 +33,9 @@ DEVICE_CODE_ENDPOINT = "https://oauth2.googleapis.com/device/code"
 TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 DEFAULT_HTTP_TIMEOUT = 10.0
 GOOGLE_OAUTH_CLIENT_RELATIVE_PATH = Path("runtime/google-oauth-client.json")
+GOOGLE_OAUTH_STATUS_RELATIVE_PATH = Path("runtime/google-oauth-status.json")
+GOOGLE_OAUTH_METADATA_SCHEMA_VERSION = 1
+GOOGLE_OAUTH_CLIENT_TYPE = "tv_and_limited_input_device"
 GOOGLE_OAUTH_NOT_CONFIGURED = (
     "Google Drive is not configured in this ROMCloud build."
 )
@@ -132,9 +136,37 @@ class GoogleOAuthClientConfig:
         return config
 
     @classmethod
-    def from_mapping(cls, payload: object) -> "GoogleOAuthClientConfig":
+    def from_mapping(
+        cls,
+        payload: object,
+        *,
+        require_deployment_schema: bool = False,
+    ) -> "GoogleOAuthClientConfig":
         if not isinstance(payload, Mapping):
             raise ConfigurationError("Google OAuth client metadata must be an object")
+        legacy_keys = {"client_id", "client_secret"}
+        deployment_keys = {
+            "schema_version",
+            "client_type",
+            "client_id",
+            "client_secret",
+        }
+        keys = set(payload)
+        if require_deployment_schema and keys != deployment_keys:
+            raise ConfigurationError(
+                "Google OAuth deployment metadata does not match the expected schema"
+            )
+        if keys not in (legacy_keys, deployment_keys):
+            raise ConfigurationError(
+                "Google OAuth client metadata does not match the expected schema"
+            )
+        if keys == deployment_keys and (
+            payload.get("schema_version") != GOOGLE_OAUTH_METADATA_SCHEMA_VERSION
+            or payload.get("client_type") != GOOGLE_OAUTH_CLIENT_TYPE
+        ):
+            raise ConfigurationError(
+                "Google OAuth client metadata is not for TVs and limited-input devices"
+            )
         client_id = payload.get("client_id")
         client_secret = payload.get("client_secret")
         if not isinstance(client_id, str) or not isinstance(client_secret, str):
@@ -158,7 +190,12 @@ class GoogleOAuthClientConfig:
 
     def serialized(self) -> str:
         return json.dumps(
-            {"client_id": self.client_id, "client_secret": self.client_secret},
+            {
+                "schema_version": GOOGLE_OAUTH_METADATA_SCHEMA_VERSION,
+                "client_type": GOOGLE_OAUTH_CLIENT_TYPE,
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+            },
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -166,8 +203,8 @@ class GoogleOAuthClientConfig:
 
 @dataclass(frozen=True)
 class GoogleOAuthToken:
-    access_token: str
-    refresh_token: str
+    access_token: str = field(repr=False)
+    refresh_token: str = field(repr=False)
     expires_at: float
     scope: str = GOOGLE_DRIVE_FILE_SCOPE
     token_type: str = "Bearer"
@@ -178,7 +215,12 @@ class GoogleOAuthToken:
 
 
 class GoogleTokenStore:
-    """Atomic mode-0600 storage for device-local OAuth credentials."""
+    """Encrypted, atomic mode-0600 storage for device-local OAuth tokens.
+
+    Version-1 Phase 1 files contained plaintext JSON. A valid legacy file is
+    migrated in place on first load only after the established ROMCloud
+    credential envelope has been created and verified in memory.
+    """
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
@@ -188,8 +230,75 @@ class GoogleTokenStore:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return None
-        except (OSError, ValueError, TypeError) as exc:
-            raise ProviderAuthError("Stored Google authorization is invalid") from exc
+        except (OSError, ValueError, TypeError):
+            raise ProviderAuthError("Stored Google authorization is invalid") from None
+        if not isinstance(payload, dict):
+            raise ProviderAuthError("Stored Google authorization is invalid")
+
+        version = payload.get("version")
+        if version == 2:
+            token = self._load_encrypted(payload)
+        elif version in (None, 1):
+            token = self._token_from_payload(payload)
+            # Safe one-way migration: save validates its encrypted envelope
+            # before atomically replacing the still-usable plaintext file.
+            self.save(token)
+        else:
+            raise ProviderAuthError("Stored Google authorization is invalid")
+        try:
+            self.path.chmod(0o600)
+        except OSError:
+            pass
+        return token
+
+    def save(self, token: GoogleOAuthToken) -> None:
+        token_payload = {
+            "version": 1,
+            "access_token": token.access_token,
+            "refresh_token": token.refresh_token,
+            "expires_at": token.expires_at,
+            "scope": token.scope,
+            "token_type": token.token_type,
+        }
+        plaintext = json.dumps(
+            token_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        try:
+            envelope = credential_crypto.encrypt_password(plaintext)
+            # Verify against the same envelope before replacing any existing
+            # token file. Neither plaintext nor ciphertext is ever logged.
+            if credential_crypto.decrypt_password(envelope) != plaintext:
+                raise credential_crypto.CredentialDecryptionError(
+                    "Google token envelope verification failed"
+                )
+        except (
+            credential_crypto.CredentialCryptoUnavailableError,
+            credential_crypto.CredentialDecryptionError,
+        ) as exc:
+            raise ProviderAuthError(
+                "Google authorization could not be stored securely"
+            ) from exc
+        payload = {
+            "version": 2,
+            "encrypted_token": envelope.to_toml_dict(),
+        }
+        atomic_write_text(
+            self.path,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            mode=0o600,
+        )
+
+    @staticmethod
+    def _token_from_payload(payload: object) -> GoogleOAuthToken:
+        if not isinstance(payload, Mapping):
+            raise ProviderAuthError("Stored Google authorization is invalid")
+        keys = set(payload)
+        required = {"access_token", "refresh_token", "expires_at"}
+        allowed = required | {"version", "scope", "token_type"}
+        if not required.issubset(keys) or not keys.issubset(allowed):
+            raise ProviderAuthError("Stored Google authorization is incomplete")
         try:
             token = GoogleOAuthToken(
                 access_token=str(payload["access_token"]),
@@ -198,30 +307,29 @@ class GoogleTokenStore:
                 scope=str(payload.get("scope", GOOGLE_DRIVE_FILE_SCOPE)),
                 token_type=str(payload.get("token_type", "Bearer")),
             )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ProviderAuthError("Stored Google authorization is incomplete") from exc
+        except (KeyError, TypeError, ValueError):
+            raise ProviderAuthError("Stored Google authorization is incomplete") from None
         if not token.access_token or not token.refresh_token or not token.has_required_scope:
             raise ProviderAuthError("Stored Google authorization is unusable")
-        try:
-            self.path.chmod(0o600)
-        except OSError:
-            pass
         return token
 
-    def save(self, token: GoogleOAuthToken) -> None:
-        payload = {
-            "version": 1,
-            "access_token": token.access_token,
-            "refresh_token": token.refresh_token,
-            "expires_at": token.expires_at,
-            "scope": token.scope,
-            "token_type": token.token_type,
-        }
-        atomic_write_text(
-            self.path,
-            json.dumps(payload, sort_keys=True, separators=(",", ":")),
-            mode=0o600,
-        )
+    def _load_encrypted(self, payload: Mapping[str, object]) -> GoogleOAuthToken:
+        if set(payload) != {"version", "encrypted_token"}:
+            raise ProviderAuthError("Stored Google authorization is invalid")
+        envelope_payload = payload.get("encrypted_token")
+        if not isinstance(envelope_payload, dict):
+            raise ProviderAuthError("Stored Google authorization is incomplete")
+        try:
+            envelope = credential_crypto.CredentialEnvelope.from_toml_dict(
+                envelope_payload
+            )
+            plaintext = credential_crypto.decrypt_password(envelope)
+            token_payload = json.loads(plaintext)
+        except Exception:  # noqa: BLE001 - suppress all decrypted-value context
+            raise ProviderAuthError(
+                "Stored Google authorization could not be unlocked"
+            ) from None
+        return self._token_from_payload(token_payload)
 
     def clear(self) -> None:
         self.path.unlink(missing_ok=True)
@@ -229,7 +337,7 @@ class GoogleTokenStore:
 
 @dataclass(frozen=True)
 class DeviceAuthorization:
-    device_code: str
+    device_code: str = field(repr=False)
     user_code: str
     verification_url: str
     expires_at: float

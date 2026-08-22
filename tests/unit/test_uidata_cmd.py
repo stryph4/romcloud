@@ -708,7 +708,9 @@ class TestUpdateBridge:
             update_module,
             "perform_update",
             lambda home, python, channel, progress=None: update_module.UpdateResult(
-                previous=None, new=new
+                previous=None,
+                new=new,
+                warnings=("Google Drive is temporarily unavailable.",),
             ),
         )
 
@@ -721,6 +723,7 @@ class TestUpdateBridge:
         payload = json.loads(result.stdout.strip())
         assert payload["version"] == "1.1.0"
         assert payload["restart_required"] is True
+        assert payload["warnings"] == ["Google Drive is temporarily unavailable."]
 
 
 class TestHealthcheck:

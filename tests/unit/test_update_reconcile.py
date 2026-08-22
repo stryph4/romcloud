@@ -15,6 +15,7 @@ import io
 import json
 import stat
 import subprocess
+import urllib.error
 import zipfile
 from pathlib import Path
 
@@ -65,7 +66,12 @@ def _make_update_archive(
     sha: str = _SHA,
     version: str = "9.9.9",
     ports_gfx_marker: str = "fresh",
-    oauth_payload: bytes | None = b'{"client_id":"update-client","client_secret":"update-secret"}',
+    oauth_payload: bytes | None = (
+        b'{"schema_version":1,"client_type":"tv_and_limited_input_device",'
+        b'"client_id":"update-client","client_secret":"update-secret"}'
+    ),
+    oauth_locator: bool = False,
+    oauth_required: bool = False,
 ) -> bytes:
     top = f"romcloud-{sha}"
     buf = io.BytesIO()
@@ -80,6 +86,16 @@ def _make_update_archive(
             zf.writestr(
                 f"{top}/runtime/google-oauth-client.json",
                 oauth_payload,
+            )
+        elif oauth_locator:
+            zf.writestr(
+                f"{top}/runtime/google-oauth-client.url",
+                "https://deploy.example/google.json\n",
+            )
+        if oauth_required:
+            zf.writestr(
+                f"{top}/runtime/google-oauth-client.required",
+                "required\n",
             )
         zf.writestr(f"{top}/_padding.bin", b"0" * 4096)
     return buf.getvalue()
@@ -181,6 +197,8 @@ class TestReconciliationDuringUpdate:
             )
         )
         assert payload == {
+            "schema_version": 1,
+            "client_type": "tv_and_limited_input_device",
             "client_id": "update-client",
             "client_secret": "update-secret",
         }
@@ -207,18 +225,72 @@ class TestReconciliationDuringUpdate:
             == "update-client"
         )
 
-    def test_malformed_oauth_release_metadata_fails_update(self, tmp_path: Path) -> None:
+    def test_malformed_oauth_release_metadata_warns_but_update_succeeds(
+        self, tmp_path: Path
+    ) -> None:
         home = _old_install_layout(tmp_path)
         previous = upd.read_build_info(home)
         opener = _make_opener(
             _full_payloads(oauth_payload=b"not-json")
         )
 
+        result = upd.perform_update(
+            home,
+            home / "venv" / "bin" / "python",
+            opener=opener,
+            runner=_make_runner(),
+            ports_dir=tmp_path / "ports",
+            system_python=None,
+        )
+
+        assert result.previous == previous
+        assert upd.read_build_info(home) == result.new
+        assert any("malformed" in warning for warning in result.warnings)
+        assert not (home / "runtime" / "google-oauth-client.json").exists()
+
+    def test_unreachable_oauth_endpoint_warns_but_update_succeeds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from romcloud.lifecycle import install as installer
+
+        home = _old_install_layout(tmp_path)
+        opener = _make_opener(
+            _full_payloads(oauth_payload=None, oauth_locator=True)
+        )
+
+        def unavailable(*_args, **_kwargs):
+            raise urllib.error.URLError("temporary outage")
+
+        monkeypatch.setattr(installer.urllib.request, "urlopen", unavailable)
+        result = upd.perform_update(
+            home,
+            home / "venv" / "bin" / "python",
+            opener=opener,
+            runner=_make_runner(),
+            ports_dir=tmp_path / "ports",
+            system_python=None,
+        )
+
+        assert upd.read_build_info(home) == result.new
+        assert any("could not be retrieved" in warning for warning in result.warnings)
+        assert "warning:" in result.reconcile_log
+
+    def test_explicitly_required_malformed_metadata_rolls_back_update(
+        self, tmp_path: Path
+    ) -> None:
+        home = _old_install_layout(tmp_path)
+        previous = upd.read_build_info(home)
+
         with pytest.raises(UpdateInstallError, match="reconcile"):
             upd.perform_update(
                 home,
                 home / "venv" / "bin" / "python",
-                opener=opener,
+                opener=_make_opener(
+                    _full_payloads(
+                        oauth_payload=b"not-json",
+                        oauth_required=True,
+                    )
+                ),
                 runner=_make_runner(),
                 ports_dir=tmp_path / "ports",
                 system_python=None,

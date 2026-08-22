@@ -234,15 +234,25 @@ class CheckResult:
 
 @dataclass(frozen=True)
 class UpdateResult:
+    """Installed build plus captured reconciliation output and warnings."""
+
     previous: Optional[BuildInfo]
     new: BuildInfo
     reconcile_log: str = ""
-    """Captured stdout/stderr from reconciling installer-managed runtime
-    artifacts (wrappers, graphical Ports UI, previously-enabled Batocera
-    integrations) — see :func:`perform_update`."""
+    warnings: tuple[str, ...] = ()
 
 
 # ── GitHub API / download ────────────────────────────────────────────────────
+
+
+def _reconciliation_warnings(output: str) -> tuple[str, ...]:
+    """Extract credential-free warnings emitted by the candidate reconciler."""
+    return tuple(
+        line.partition(":")[2].strip()
+        for line in output.splitlines()
+        if line.casefold().startswith("warning:")
+        and line.partition(":")[2].strip()
+    )
 
 
 def commit_api_url(repo: str, branch: str) -> str:
@@ -876,15 +886,28 @@ def perform_update(
         )
         write_build_info(romcloud_home, new_info)
         log.info("Updated ROMCloud to %s (%s)", new_info.version, new_info.commit_short)
+        reconciliation_warnings = _reconciliation_warnings(reconcile_log)
+        completion_message = f"ROMCloud {new_info.version} installed successfully"
+        if reconciliation_warnings:
+            completion_message += "; optional features need attention"
         emit_progress(
             progress,
             "update",
             "completed",
             "success",
-            f"ROMCloud {new_info.version} installed successfully",
-            metadata={"version": new_info.version, "restart_required": True},
+            completion_message,
+            metadata={
+                "version": new_info.version,
+                "restart_required": True,
+                "warnings": list(reconciliation_warnings),
+            },
         )
-        return UpdateResult(previous=previous, new=new_info, reconcile_log=reconcile_log.strip())
+        return UpdateResult(
+            previous=previous,
+            new=new_info,
+            reconcile_log=reconcile_log.strip(),
+            warnings=reconciliation_warnings,
+        )
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
         if manager_was_running:

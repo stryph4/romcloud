@@ -804,6 +804,7 @@ def uidata_update_install(ctx: click.Context) -> None:
             "commit": result.new.commit_short,
             "channel": result.new.channel,
             "restart_required": True,
+            "warnings": list(result.warnings),
         }
 
     _run_action(ctx, build)

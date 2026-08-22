@@ -125,6 +125,8 @@ def test_deploys_google_oauth_release_metadata(installed: InstalledLayout) -> No
     payload = json.loads(path.read_text(encoding="utf-8"))
 
     assert payload == {
+        "schema_version": 1,
+        "client_type": "tv_and_limited_input_device",
         "client_id": "installer-test-client",
         "client_secret": "installer-test-secret",
     }

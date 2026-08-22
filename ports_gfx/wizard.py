@@ -348,6 +348,7 @@ class WizardState:
                 "Google Drive is not configured in this ROMCloud build.",
             )
         )
+        self.google_drive_warning = str(data.get("google_drive_warning", ""))
         self._google_auth_phase = ""
         self.browser_path = ""
         self.browser_entries: list[dict[str, Any]] = []
@@ -491,7 +492,7 @@ class WizardState:
                 (
                     "Google Drive"
                     if self.google_drive_available
-                    else "Google Drive (not configured in this build)"
+                    else "Google Drive (unavailable)"
                 ),
                 "Skip (sync features unavailable)",
             ]

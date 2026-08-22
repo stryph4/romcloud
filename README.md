@@ -557,10 +557,13 @@ probe, so Back and application Exit stay responsive when storage is missing.
 Google Drive can be selected as ROMCloud data storage during setup. On a
 controller-only device, ROMCloud displays Google's verification address and a
 short user code so authorization can be completed in a browser on another
-device. ROMCloud requests only the `drive.file` scope. Refresh credentials and
-the remembered ID of ROMCloud's app-owned folder are stored outside
-`romcloud.toml` under the configured data directory with restrictive file
-permissions.
+device. ROMCloud requests only the `drive.file` scope and never collects a
+Google password. Access and refresh tokens are stored outside `romcloud.toml`
+under the configured data directory in ROMCloud's versioned AES-256-GCM
+credential envelope, with mode `0600` as an additional layer. Existing Phase 1
+plaintext token JSON is migrated atomically on first successful read. Tokens
+never pass through `romcloud.app`; only Google's OAuth and Drive endpoints
+receive them. The remembered ID of ROMCloud's app-owned folder is not a token.
 
 This is a provider foundation, not complete Google Drive SaveSync. Setup can
 authorize the account, create or recover the marked `ROMCloud SaveSync` folder,
@@ -577,6 +580,8 @@ endpoint whose response is:
 
 ``` json
 {
+  "schema_version": 1,
+  "client_type": "tv_and_limited_input_device",
   "client_id": "deployed-client-id",
   "client_secret": "deployed-client-secret"
 }
@@ -584,10 +589,15 @@ endpoint whose response is:
 
 Install, update, and repair use the shared runtime reconciler to download and
 validate that response, then atomically deploy it with mode `0600` to
-`/userdata/system/romcloud/runtime/google-oauth-client.json`. A malformed or
-unreachable response fails reconciliation rather than advertising a broken
-Google Drive option. The endpoint must be populated by the release environment
-from its protected `ROMCLOUD_GOOGLE_OAUTH_CLIENT_ID` and
+`/userdata/system/romcloud/runtime/google-oauth-client.json`. The schema is
+exact and explicitly attests that the client was created for **TVs and Limited
+Input devices**. A missing, unreachable, or malformed optional response does
+not fail ROMCloud install/update/repair: Google Drive is disabled with a clear
+warning, while a valid previously installed copy is preserved. A release that
+deliberately requires Google Drive can add
+`runtime/google-oauth-client.required` to retain fail-closed reconciliation.
+The endpoint must be populated by the release environment from its protected
+`ROMCLOUD_GOOGLE_OAUTH_CLIENT_ID` and
 `ROMCLOUD_GOOGLE_OAUTH_CLIENT_SECRET` values.
 
 For local/repackaged builds, the same environment variables can be present when
@@ -597,6 +607,14 @@ the external release inputs or an already-valid installed copy exists, the
 build reports Google Drive as unavailable. User access/refresh tokens remain
 separate under the configured data directory and are never part of this release
 metadata flow.
+
+The client ID identifies a distributed/public OAuth application and is not a
+user credential or a secret ROMCloud can conceal on installed devices. User
+OAuth tokens are a separate trust boundary. The current metadata artifact is
+authenticated by HTTPS to the ROMCloud-operated endpoint; unlike the updater's
+GitHub source archive, it is not bound to the selected Git commit and currently
+has no ROMCloud signature. Exact schema validation prevents accidental format
+or client-type mistakes but is not a substitute for origin authenticity.
 
 SaveSync does not currently hook emulator launch/exit. Game lifecycle
 synchronization requires a proven way to wait for the real emulator
