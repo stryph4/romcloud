@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -23,6 +24,23 @@ from romcloud.infrastructure.providers.google_drive import (
 )
 
 AUTH_OPERATION_TIMEOUT = 15.0
+GOOGLE_DRIVE_EXPERIMENTAL_ENV = "ROMCLOUD_EXPERIMENTAL_GOOGLE_DRIVE"
+
+
+def google_drive_experimental_enabled() -> bool:
+    """Whether developer-only Google Drive setup should be exposed.
+
+    Google Drive is parked for the beta because ROMCloud will not distribute
+    the limited-input OAuth client secret or require an operated token broker.
+    Existing configured providers remain loadable; this flag controls only
+    explicit setup exposure.
+    """
+    return os.environ.get(GOOGLE_DRIVE_EXPERIMENTAL_ENV, "").strip().casefold() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def google_drive_build_status(config_path: Path) -> dict[str, object]:

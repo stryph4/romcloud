@@ -339,8 +339,11 @@ class WizardState:
         self.google_verification_url = ""
         self.google_user_code = ""
         self.google_authenticated = False
+        self.google_drive_experimental = bool(
+            data.get("google_drive_experimental", False)
+        )
         self.google_drive_available = bool(
-            data.get("google_drive_available", True)
+            data.get("google_drive_available", False)
         )
         self.google_drive_unavailable_reason = str(
             data.get(
@@ -485,17 +488,19 @@ class WizardState:
         if self.step == WizardStep.SHARE:
             return [share["name"] for share in self.shares]
         if self.step == WizardStep.REMOTE_DATA:
-            return [
+            options = [
                 "SMB network location",
                 "Local / external directory",
                 "SFTP server",
-                (
+            ]
+            if self.google_drive_experimental:
+                options.append(
                     "Google Drive"
                     if self.google_drive_available
                     else "Google Drive (unavailable)"
-                ),
-                "Skip (sync features unavailable)",
-            ]
+                )
+            options.append("Skip (sync features unavailable)")
+            return options
         if self.step == WizardStep.REMOTE_GOOGLE_AUTH and self.runner is None:
             if self.google_user_code:
                 return [
@@ -926,7 +931,7 @@ class WizardState:
                 self.remote_data_root = "/"
                 self.remote_reuse_source_credentials = False
                 self.enter_text_step(WizardStep.REMOTE_SERVER, show_osk=show_osk)
-            elif self.selected_index == 3:
+            elif self.selected_index == 3 and self.google_drive_experimental:
                 if not self.google_drive_available:
                     self.error = (
                         self.google_drive_unavailable_reason

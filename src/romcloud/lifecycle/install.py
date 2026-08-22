@@ -3,8 +3,8 @@
 Both the bootstrap installer (``scripts/install.sh``) and the self-updater
 (:func:`romcloud.lifecycle.update.perform_update`) need to write the
 exact same set of managed runtime artifacts: the ``romcloud``/``romcloud-run``
-wrappers, externally supplied Google OAuth deployment metadata, the optional
-graphical Ports UI payload (including its
+wrappers, preservation of previously installed experimental Google OAuth
+metadata, the optional graphical Ports UI payload (including its
 EmulationStation Ports ``gamelist.xml`` entry/icon), the ROMCloud-owned
 Batocera boot service, and — only if previously enabled — the
 EmulationStation override. The small Batocera lifecycle hook used by Auto
@@ -15,10 +15,9 @@ the same source revision.
 
 Failure semantics ("ROMCloud may fail; Batocera must not")
 -----------------------------------------------------------
-- The ``romcloud``/``romcloud-run`` wrappers are **required**. Google OAuth
-  deployment metadata is optional unless the release contains an explicit
-  ``runtime/google-oauth-client.required`` marker. Optional metadata failures
-  produce warnings and never roll back otherwise-valid ROMCloud updates.
+- The ``romcloud``/``romcloud-run`` wrappers are **required**. Parked Google
+  Drive metadata is preserved in place but is never downloaded or deployed by
+  normal install/update/repair.
 - Everything else — the graphical Ports UI (and its gamelist.xml entry),
   the boot service script, and the EmulationStation override — is
   best-effort. A missing/incompatible system Python or a never-installed ES
@@ -29,36 +28,21 @@ Failure semantics ("ROMCloud may fail; Batocera must not")
 
 from __future__ import annotations
 
-import json
-import os
 import shutil
 import subprocess
-import urllib.error
-import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping, Optional
+from typing import Mapping, Optional
 
-from romcloud.core.exceptions import ConfigurationError
 from romcloud.infrastructure.atomic_file import atomic_write_text
 from romcloud.infrastructure.google_auth import (
     GOOGLE_OAUTH_CLIENT_RELATIVE_PATH,
-    GOOGLE_OAUTH_STATUS_RELATIVE_PATH,
-    GoogleOAuthClientConfig,
 )
 from romcloud.infrastructure.logging import get_logger
 
 log = get_logger("installer")
 
 DEFAULT_PORTS_DIR = Path("/userdata/roms/ports")
-GOOGLE_OAUTH_LOCATOR_RELATIVE_PATH = Path("runtime/google-oauth-client.url")
-GOOGLE_OAUTH_REQUIRED_RELATIVE_PATH = Path("runtime/google-oauth-client.required")
-_MAX_GOOGLE_OAUTH_METADATA_BYTES = 16 * 1024
-GOOGLE_OAUTH_RETRY_GUIDANCE = (
-    "Other ROMCloud features are unaffected. Retry later or run Repair after "
-    "the issue is resolved."
-)
 
 
 @dataclass(frozen=True)
@@ -70,242 +54,35 @@ class GoogleOAuthDeploymentResult:
     unavailable_reason: str = ""
 
 
-def _download_google_oauth_metadata(url: str) -> bytes:
-    parsed = urllib.parse.urlsplit(url)
-    if (
-        parsed.scheme != "https"
-        or not parsed.hostname
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.fragment
-    ):
-        raise ConfigurationError(
-            "Google Drive deployment metadata locator must be a plain HTTPS URL"
-        )
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "romcloud-installer"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=15.0) as response:
-            final_url = str(getattr(response, "geturl", lambda: url)())
-            final = urllib.parse.urlsplit(final_url)
-            if (
-                final.scheme != "https"
-                or not final.hostname
-                or final.username is not None
-                or final.password is not None
-                or final.fragment
-            ):
-                raise ConfigurationError(
-                    "Google Drive deployment metadata redirected outside HTTPS"
-                )
-            payload = response.read(_MAX_GOOGLE_OAUTH_METADATA_BYTES + 1)
-    except ConfigurationError:
-        raise
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise ConfigurationError(
-            "Google Drive deployment metadata could not be downloaded"
-        ) from exc
-    if not payload or len(payload) > _MAX_GOOGLE_OAUTH_METADATA_BYTES:
-        raise ConfigurationError(
-            "Google Drive deployment metadata download is empty or too large"
-        )
-    return payload
-
-
-def _parse_google_oauth_metadata(
-    payload: bytes | str,
-    *,
-    require_deployment_schema: bool = False,
-) -> GoogleOAuthClientConfig:
-    try:
-        raw = payload.decode("utf-8") if isinstance(payload, bytes) else payload
-        parsed = json.loads(raw)
-        return GoogleOAuthClientConfig.from_mapping(
-            parsed,
-            require_deployment_schema=require_deployment_schema,
-        )
-    except (UnicodeError, ValueError, TypeError, ConfigurationError) as exc:
-        raise ConfigurationError(
-            "Google Drive deployment metadata is malformed"
-        ) from exc
-
-
-def _write_google_oauth_status(
-    romcloud_home: Path,
-    *,
-    available: bool,
-    warning: str = "",
-    unavailable_reason: str = "",
-) -> None:
-    """Best-effort, credential-free state for setup/wizard availability UX."""
-    path = romcloud_home / GOOGLE_OAUTH_STATUS_RELATIVE_PATH
-    payload = {
-        "version": 1,
-        "available": available,
-        "warning": warning,
-        "unavailable_reason": unavailable_reason,
-    }
-    try:
-        atomic_write_text(
-            path,
-            json.dumps(payload, sort_keys=True, separators=(",", ":")),
-            mode=0o600,
-        )
-    except OSError:
-        log.warning("Could not persist Google Drive deployment availability")
-
-
-def _optional_google_oauth_failure(
-    *,
-    romcloud_home: Path,
-    target_path: Path,
-    existing: Optional[GoogleOAuthClientConfig],
-    reason: str,
-) -> GoogleOAuthDeploymentResult:
-    if existing is not None:
-        warning = (
-            "Google Drive configuration could not be refreshed, so ROMCloud kept "
-            f"the previously installed configuration. {GOOGLE_OAUTH_RETRY_GUIDANCE}"
-        )
-        _write_google_oauth_status(
-            romcloud_home,
-            available=True,
-            warning=warning,
-        )
-        return GoogleOAuthDeploymentResult(
-            True,
-            target_path,
-            "existing_runtime",
-            warning=warning,
-        )
-
-    unavailable_reason = f"Google Drive is unavailable because {reason}."
-    warning = f"{unavailable_reason} {GOOGLE_OAUTH_RETRY_GUIDANCE}"
-    _write_google_oauth_status(
-        romcloud_home,
-        available=False,
-        warning=warning,
-        unavailable_reason=unavailable_reason,
-    )
-    return GoogleOAuthDeploymentResult(
-        False,
-        target_path,
-        "unavailable",
-        warning=warning,
-        unavailable_reason=unavailable_reason,
-    )
-
-
 def reconcile_google_oauth_metadata(
     *,
     romcloud_home: Path,
     project_root: Path,
     environment: Optional[Mapping[str, str]] = None,
-    fetcher: Callable[[str], bytes] = _download_google_oauth_metadata,
 ) -> GoogleOAuthDeploymentResult:
-    """Install or validate build-owned Google OAuth client metadata.
+    """Preserve existing experimental metadata without deploying new secrets.
 
-    Production source trees advertise Google Drive with the committed,
-    non-secret ``runtime/google-oauth-client.url`` locator. Optional retrieval
-    failures disable Google Drive without failing ROMCloud. A valid installed
-    copy remains usable and can never be overwritten by malformed new input.
-    Releases may opt into fail-closed behavior with the explicit ``.required``
-    marker. User OAuth tokens are deliberately outside this path and never
-    copied.
+    Google Drive is dormant for the beta. Normal install/update/repair performs
+    no metadata retrieval and ignores release/environment candidates. Any
+    previously installed copy remains opaque and in place so experimental users
+    are not broken. User OAuth tokens are deliberately outside this path and are
+    never copied or removed.
     """
     romcloud_home = Path(romcloud_home)
-    project_root = Path(project_root)
+    # Kept in the signature for install/update/repair call compatibility. The
+    # parked beta path deliberately consumes neither source artifacts nor build
+    # environment secrets.
+    del project_root, environment
     target_path = romcloud_home / GOOGLE_OAUTH_CLIENT_RELATIVE_PATH
-    source_path = project_root / GOOGLE_OAUTH_CLIENT_RELATIVE_PATH
-    locator_path = project_root / GOOGLE_OAUTH_LOCATOR_RELATIVE_PATH
-    required_path = project_root / GOOGLE_OAUTH_REQUIRED_RELATIVE_PATH
-    current_environment = os.environ if environment is None else environment
-    client_id = str(
-        current_environment.get("ROMCLOUD_GOOGLE_OAUTH_CLIENT_ID", "")
-    ).strip()
-    client_secret = str(
-        current_environment.get("ROMCLOUD_GOOGLE_OAUTH_CLIENT_SECRET", "")
-    ).strip()
-
-    existing: Optional[GoogleOAuthClientConfig] = None
     if target_path.is_file():
-        try:
-            existing = _parse_google_oauth_metadata(target_path.read_bytes())
-        except (OSError, ConfigurationError):
-            # An invalid installed copy is never used as fallback and is not
-            # allowed to obscure a valid refresh candidate.
-            existing = None
-
-    config: Optional[GoogleOAuthClientConfig] = None
-    source = "unavailable"
-    failure: Optional[ConfigurationError] = None
-    failure_reason = "its configuration could not be retrieved"
-    try:
-        if client_id or client_secret:
-            config = GoogleOAuthClientConfig.from_mapping(
-                {"client_id": client_id, "client_secret": client_secret}
-            )
-            source = "build_environment"
-        elif source_path.is_file():
-            config = _parse_google_oauth_metadata(
-                source_path.read_bytes(),
-                require_deployment_schema=True,
-            )
-            source = "release_payload"
-        elif locator_path.is_file():
-            locator = locator_path.read_text(encoding="utf-8").strip()
-            if (
-                not locator
-                or len(locator) > 4096
-                or any(ch in locator for ch in "\r\n")
-            ):
-                raise ConfigurationError(
-                    "Google Drive deployment metadata locator is malformed"
-                )
-            config = _parse_google_oauth_metadata(
-                fetcher(locator),
-                require_deployment_schema=True,
-            )
-            source = "deployment_url"
-        elif existing is not None:
-            config = existing
-            source = "existing_runtime"
-    except Exception as exc:  # noqa: BLE001 - optional provider must not fail ROMCloud
-        failure = (
-            exc
-            if isinstance(exc, ConfigurationError)
-            else ConfigurationError(
-                "Google Drive deployment metadata could not be retrieved"
-            )
-        )
-        if "malformed" in str(failure).casefold() or "schema" in str(failure).casefold():
-            failure_reason = "the retrieved configuration was malformed"
-
-    if failure is not None:
-        if required_path.is_file():
-            raise failure
-        return _optional_google_oauth_failure(
-            romcloud_home=romcloud_home,
-            target_path=target_path,
-            existing=existing,
-            reason=failure_reason,
-        )
-
-    if config is None:
+        # Treat this as opaque legacy state: beta reconciliation neither reads
+        # the client secret nor validates, rewrites, logs, or deletes the file.
         return GoogleOAuthDeploymentResult(
-            False,
+            True,
             target_path,
-            source,
-            unavailable_reason=(
-                "Google Drive is not configured in this ROMCloud build."
-            ),
+            "existing_runtime",
         )
-
-    atomic_write_text(target_path, config.serialized(), mode=0o600)
-    _write_google_oauth_status(romcloud_home, available=True)
-    return GoogleOAuthDeploymentResult(True, target_path, source)
+    return GoogleOAuthDeploymentResult(False, target_path, "dormant")
 
 
 # ── low-level file writing ────────────────────────────────────────────────────
@@ -644,7 +421,6 @@ def reconcile_install(
     ports_dir: Optional[Path] = None,
     system_python: Optional[str] = None,
     environment: Optional[Mapping[str, str]] = None,
-    google_oauth_fetcher: Callable[[str], bytes] = _download_google_oauth_metadata,
 ) -> ReconcileReport:
     """Reconcile every ROMCloud-managed runtime artifact under
     *romcloud_home* against *project_root* (the current source tree — the
@@ -653,9 +429,8 @@ def reconcile_install(
 
     Idempotent: safe to call repeatedly with no observable difference after
     the first successful call. Raises if required core wrappers cannot be
-    written or explicitly-required Google OAuth deployment metadata cannot be
-    safely installed. Optional Google metadata failures and every other
-    optional artifact are reconciled best-effort.
+    written. Parked Google metadata is preservation-only; every optional
+    artifact is reconciled best-effort.
     """
     romcloud_home = Path(romcloud_home)
     project_root = Path(project_root)
@@ -677,7 +452,6 @@ def reconcile_install(
         romcloud_home=romcloud_home,
         project_root=project_root,
         environment=environment,
-        fetcher=google_oauth_fetcher,
     )
 
     ports_ui = install_ports_ui(

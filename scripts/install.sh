@@ -224,8 +224,7 @@ tmp_path.replace(path)
 PY
 
 # ── reconcile managed runtime artifacts ───────────────────────────────────────
-# Writes/refreshes the `romcloud`/`romcloud-run` wrappers, validates/deploys
-# externally supplied Google OAuth release metadata, and refreshes the optional
+# Writes/refreshes the `romcloud`/`romcloud-run` wrappers and the optional
 # graphical Ports UI (`ports_gfx`, `romcloud-ports`, the Batocera Port entry
 # script), and — only if already present from a prior install — the
 # Batocera mount service script and ROMCloud's EmulationStation override.

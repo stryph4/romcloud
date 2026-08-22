@@ -253,7 +253,6 @@ def test_detected_systems_lead_to_explicit_game_access_and_remote_data_choices()
         "SMB network location",
         "Local / external directory",
         "SFTP server",
-        "Google Drive",
         "Skip (sync features unavailable)",
     ]
 

@@ -53,10 +53,10 @@ def reconcile_install_cmd(
     click.echo(f"  Wrote launch wrapper: {report.core.launch_wrapper}")
     if report.google_oauth.configured:
         click.echo(
-            "  Google Drive OAuth metadata ready: "
+            "  Experimental Google Drive OAuth metadata preserved: "
             f"{report.google_oauth.target_path} ({report.google_oauth.source})"
         )
-    else:
+    elif report.google_oauth.unavailable_reason:
         click.echo(f"  {report.google_oauth.unavailable_reason}")
     if report.google_oauth.warning:
         click.echo(f"warning: {report.google_oauth.warning}", err=True)

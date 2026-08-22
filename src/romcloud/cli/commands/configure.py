@@ -62,9 +62,9 @@ import os
     "--remote-data-type",
     default=None,
     type=click.Choice(
-        ["none", "local", "smb", "google_drive"], case_sensitive=False
+        ["none", "local", "smb"], case_sensitive=False
     ),
-    help="Writable SaveSync storage: none, local, SMB, or Google Drive.",
+    help="Writable SaveSync storage: none, local, or SMB.",
 )
 @click.option(
     "--remote-data-root",
