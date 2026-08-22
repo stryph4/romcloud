@@ -133,8 +133,9 @@ def test_uninstall_removes_active_artifacts_and_preserves_recoverable_state(
     foreign_proxy = local_roms / "nes" / "Foreign.romcloud"
     foreign_proxy.write_text("{}")
     (cache / "cached.nes").write_bytes(b"cache")
-    for name in ("bin", "venv", "ports-gfx", "run"):
+    for name in ("bin", "venv", "ports-gfx", "run", "runtime"):
         (home / name).mkdir(parents=True, exist_ok=True)
+    (home / "runtime" / "google-oauth-client.json").write_text("release metadata")
     (home / "version.json").write_text("{}")
     ports_dir = tmp_path / "ports"
     (ports_dir / "images").mkdir(parents=True)
@@ -167,6 +168,7 @@ def test_uninstall_removes_active_artifacts_and_preserves_recoverable_state(
     assert (home / "data" / "catalog.db").exists()
     assert (cache / "cached.nes").exists()
     assert not (home / "bin").exists()
+    assert not (home / "runtime").exists()
     assert not (ports_dir / "ROMCloud.sh").exists()
     assert not (ports_dir / "images" / "ROMCloud.png").exists()
     assert "Other.sh" in (ports_dir / "gamelist.xml").read_text()

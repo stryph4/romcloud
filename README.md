@@ -570,8 +570,10 @@ promotion protocol is implemented. Google Drive is not available for Library
 Sync in this phase.
 
 Project owners must enable the Google Drive API and create an OAuth client of
-type **TVs and Limited Input devices** in Google Cloud. Supply its deployment
-metadata at `runtime/google-oauth-client.json` beneath the ROMCloud install root:
+type **TVs and Limited Input devices** in Google Cloud. Production deployment
+keeps the client metadata outside Git: the committed
+`runtime/google-oauth-client.url` points at a ROMCloud-operated HTTPS release
+endpoint whose response is:
 
 ``` json
 {
@@ -580,10 +582,21 @@ metadata at `runtime/google-oauth-client.json` beneath the ROMCloud install root
 }
 ```
 
-The same values can instead be supplied as
-`ROMCLOUD_GOOGLE_OAUTH_CLIENT_ID` and
-`ROMCLOUD_GOOGLE_OAUTH_CLIENT_SECRET`. Never commit either deployment metadata
-or the generated token files.
+Install, update, and repair use the shared runtime reconciler to download and
+validate that response, then atomically deploy it with mode `0600` to
+`/userdata/system/romcloud/runtime/google-oauth-client.json`. A malformed or
+unreachable response fails reconciliation rather than advertising a broken
+Google Drive option. The endpoint must be populated by the release environment
+from its protected `ROMCLOUD_GOOGLE_OAUTH_CLIENT_ID` and
+`ROMCLOUD_GOOGLE_OAUTH_CLIENT_SECRET` values.
+
+For local/repackaged builds, the same environment variables can be present when
+the installer runs, or a generated `runtime/google-oauth-client.json` can be
+staged into the release source tree. The JSON remains ignored by Git. If none of
+the external release inputs or an already-valid installed copy exists, the
+build reports Google Drive as unavailable. User access/refresh tokens remain
+separate under the configured data directory and are never part of this release
+metadata flow.
 
 SaveSync does not currently hook emulator launch/exit. Game lifecycle
 synchronization requires a proven way to wait for the real emulator

@@ -51,6 +51,11 @@ def _run_install(
     env_overrides: dict[str, str], *, path: str | None = None, args: tuple[str, ...] = ()
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
+    # Production obtains these from the externally hosted release metadata.
+    # Shell-installer tests supply protected build inputs directly so they
+    # remain offline while exercising the same shared reconciler.
+    env.setdefault("ROMCLOUD_GOOGLE_OAUTH_CLIENT_ID", "installer-test-client")
+    env.setdefault("ROMCLOUD_GOOGLE_OAUTH_CLIENT_SECRET", "installer-test-secret")
     if path is not None:
         env["PATH"] = path
     env.update(env_overrides)
@@ -113,6 +118,19 @@ def _installed_version(home: Path) -> str:
 
 def test_creates_persistent_venv(installed: InstalledLayout) -> None:
     assert installed.venv_python.exists()
+
+
+def test_deploys_google_oauth_release_metadata(installed: InstalledLayout) -> None:
+    path = installed.home / "runtime" / "google-oauth-client.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert payload == {
+        "client_id": "installer-test-client",
+        "client_secret": "installer-test-secret",
+    }
+    assert not (installed.home / "data" / "google-drive" / "token.json").exists()
+    if os.name == "posix":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 def test_romcloud_importable_inside_venv(installed: InstalledLayout) -> None:

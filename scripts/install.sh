@@ -224,7 +224,8 @@ tmp_path.replace(path)
 PY
 
 # ── reconcile managed runtime artifacts ───────────────────────────────────────
-# Writes/refreshes the `romcloud`/`romcloud-run` wrappers and the optional
+# Writes/refreshes the `romcloud`/`romcloud-run` wrappers, validates/deploys
+# externally supplied Google OAuth release metadata, and refreshes the optional
 # graphical Ports UI (`ports_gfx`, `romcloud-ports`, the Batocera Port entry
 # script), and — only if already present from a prior install — the
 # Batocera mount service script and ROMCloud's EmulationStation override.
@@ -241,7 +242,7 @@ if ! "${VENV_DIR}/bin/python" -m romcloud.cli.main _reconcile-install \
         --project-root "${PROJECT_DIR}" \
         --ports-dir "${ROMCLOUD_PORTS_DIR}" \
         --system-python "${ROMCLOUD_SYSTEM_PYTHON:-}"; then
-    echo "ERROR: failed to write ROMCloud runtime artifacts (wrappers)" >&2
+    echo "ERROR: failed to reconcile required ROMCloud runtime artifacts" >&2
     exit 1
 fi
 

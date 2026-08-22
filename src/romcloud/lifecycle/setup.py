@@ -276,23 +276,33 @@ def _number(value: Any, label: str) -> float:
 
 
 def setup_state(config_path: Path) -> dict[str, Any]:
+    from romcloud.lifecycle.google_drive_setup import google_drive_build_status
+
+    google_drive_status = google_drive_build_status(config_path)
     state_path = config_path.parent / SETUP_STATE_FILENAME
     saved_state = _read_state(state_path)
     if not config_path.exists():
         if saved_state.get("status") in ("applying", "failed"):
             failed_step = str(saved_state.get("failed_step") or saved_state.get("step") or "setup")
             return {
+                **google_drive_status,
                 "state": "partial",
                 "issues": [f"Setup did not finish at: {failed_step}."],
                 "source_type": None,
                 "failed_step": failed_step,
             }
-        return {"state": "fresh", "issues": [], "source_type": None}
+        return {
+            **google_drive_status,
+            "state": "fresh",
+            "issues": [],
+            "source_type": None,
+        }
 
     try:
         config = load_config(str(config_path))
     except Exception as exc:  # noqa: BLE001 - malformed config is a repairable state
         return {
+            **google_drive_status,
             "state": "partial",
             "issues": [f"Configuration could not be loaded: {exc}"],
             "source_type": None,
@@ -309,6 +319,7 @@ def setup_state(config_path: Path) -> dict[str, Any]:
     operating_state = capability_policy(config).serialize()
     operating_state["game_management_enabled"] = config.source.enabled
     payload: dict[str, Any] = {
+        **google_drive_status,
         "state": "partial" if issues else "configured",
         "issues": issues,
         "source_type": (

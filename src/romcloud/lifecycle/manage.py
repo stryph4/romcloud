@@ -282,7 +282,7 @@ def uninstall(
     mount_worker.cleanup_runtime_state(romcloud_home)
     _remove_credential_files(config)
 
-    for name in ("bin", "venv", "ports-gfx"):
+    for name in ("bin", "venv", "ports-gfx", "runtime"):
         shutil.rmtree(romcloud_home / name, ignore_errors=True)
     (romcloud_home / "version.json").unlink(missing_ok=True)
     run_dir = romcloud_home / "run"

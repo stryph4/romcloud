@@ -43,6 +43,8 @@ class TestReconcileInstallCmd:
 
         monkeypatch.setattr(mount_service, "SERVICE_SCRIPT_PATH", tmp_path / "services" / "romcloud_mount")
         monkeypatch.setattr(es_config, "ROMCLOUD_OVERRIDE_PATH", tmp_path / "es_systems_romcloud.cfg")
+        monkeypatch.setenv("ROMCLOUD_GOOGLE_OAUTH_CLIENT_ID", "cli-client")
+        monkeypatch.setenv("ROMCLOUD_GOOGLE_OAUTH_CLIENT_SECRET", "cli-secret")
 
         romcloud_home = tmp_path / "romcloud"
         project_root = tmp_path / "project"
@@ -65,7 +67,11 @@ class TestReconcileInstallCmd:
         assert result.exit_code == 0, result.output
         assert "Wrote CLI wrapper" in result.output
         assert "Wrote launch wrapper" in result.output
+        assert "Deployed Google Drive OAuth metadata" in result.output
         assert (romcloud_home / "bin" / "romcloud").exists()
+        assert (
+            romcloud_home / "runtime" / "google-oauth-client.json"
+        ).is_file()
 
     def test_ports_ui_installed_message(self, tmp_path: Path, monkeypatch) -> None:
         from romcloud.integrations.batocera import mount_service, es_config

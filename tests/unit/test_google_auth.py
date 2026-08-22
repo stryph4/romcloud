@@ -9,6 +9,7 @@ import pytest
 
 from romcloud.core.cancellation import TransferCancellationToken
 from romcloud.core.exceptions import (
+    ConfigurationError,
     ProviderAuthError,
     ProviderAuthRequiredError,
     ProviderNotReachableError,
@@ -201,3 +202,23 @@ def test_client_metadata_is_external_to_romcloud_config(tmp_path: Path) -> None:
     loaded = GoogleOAuthClientConfig.load(tmp_path)
 
     assert loaded == GoogleOAuthClientConfig("id", "secret")
+
+
+def test_missing_client_metadata_has_clear_build_error(tmp_path: Path) -> None:
+    with pytest.raises(
+        ConfigurationError,
+        match="Google Drive is not configured in this ROMCloud build",
+    ):
+        GoogleOAuthClientConfig.load(tmp_path)
+
+
+def test_malformed_client_metadata_has_clear_build_error(tmp_path: Path) -> None:
+    path = tmp_path / "runtime" / "google-oauth-client.json"
+    path.parent.mkdir()
+    path.write_text("not-json", encoding="utf-8")
+
+    with pytest.raises(
+        ConfigurationError,
+        match="not configured in this ROMCloud build.*malformed",
+    ):
+        GoogleOAuthClientConfig.load(tmp_path)

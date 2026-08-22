@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+from romcloud.core.exceptions import ConfigurationError
 from romcloud.core.remote_data import RemoteOperationContext
 from romcloud.infrastructure.config import load_config
 from romcloud.infrastructure.google_auth import (
@@ -20,6 +21,21 @@ from romcloud.infrastructure.providers.google_drive import (
 )
 
 AUTH_OPERATION_TIMEOUT = 15.0
+
+
+def google_drive_build_status(config_path: Path) -> dict[str, object]:
+    home = Path(config_path).parent.parent
+    try:
+        GoogleOAuthClientConfig.load(home)
+    except ConfigurationError as exc:
+        return {
+            "google_drive_available": False,
+            "google_drive_unavailable_reason": str(exc),
+        }
+    return {
+        "google_drive_available": True,
+        "google_drive_unavailable_reason": "",
+    }
 
 
 def begin_google_drive_auth(config_path: Path) -> dict[str, object]:

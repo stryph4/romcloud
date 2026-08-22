@@ -61,7 +61,12 @@ def _commit_json(sha: str) -> bytes:
     ).encode()
 
 
-def _make_update_archive(sha: str = _SHA, version: str = "9.9.9", ports_gfx_marker: str = "fresh") -> bytes:
+def _make_update_archive(
+    sha: str = _SHA,
+    version: str = "9.9.9",
+    ports_gfx_marker: str = "fresh",
+    oauth_payload: bytes | None = b'{"client_id":"update-client","client_secret":"update-secret"}',
+) -> bytes:
     top = f"romcloud-{sha}"
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
@@ -71,6 +76,11 @@ def _make_update_archive(sha: str = _SHA, version: str = "9.9.9", ports_gfx_mark
         zf.writestr(f"{top}/ports_gfx/__init__.py", "# package\n")
         zf.writestr(f"{top}/ports_gfx/client.py", f"# {ports_gfx_marker}\n")
         zf.writestr(f"{top}/ports_gfx/app.py", f"# {ports_gfx_marker}\n")
+        if oauth_payload is not None:
+            zf.writestr(
+                f"{top}/runtime/google-oauth-client.json",
+                oauth_payload,
+            )
         zf.writestr(f"{top}/_padding.bin", b"0" * 4096)
     return buf.getvalue()
 
@@ -153,6 +163,69 @@ def _old_install_layout(tmp_path: Path) -> Path:
 
 
 class TestReconciliationDuringUpdate:
+    def test_update_deploys_google_oauth_metadata(self, tmp_path: Path) -> None:
+        home = _old_install_layout(tmp_path)
+
+        upd.perform_update(
+            home,
+            home / "venv" / "bin" / "python",
+            opener=_make_opener(_full_payloads()),
+            runner=_make_runner(),
+            ports_dir=tmp_path / "ports",
+            system_python=None,
+        )
+
+        payload = json.loads(
+            (home / "runtime" / "google-oauth-client.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert payload == {
+            "client_id": "update-client",
+            "client_secret": "update-secret",
+        }
+        assert not (home / "data" / "google-drive" / "token.json").exists()
+
+    def test_repair_deploys_google_oauth_metadata(self, tmp_path: Path) -> None:
+        home = _old_install_layout(tmp_path)
+
+        upd.perform_repair(
+            home,
+            home / "venv" / "bin" / "python",
+            opener=_make_opener(_full_payloads()),
+            runner=_make_runner(),
+            ports_dir=tmp_path / "ports",
+            system_python=None,
+        )
+
+        assert (
+            json.loads(
+                (home / "runtime" / "google-oauth-client.json").read_text(
+                    encoding="utf-8"
+                )
+            )["client_id"]
+            == "update-client"
+        )
+
+    def test_malformed_oauth_release_metadata_fails_update(self, tmp_path: Path) -> None:
+        home = _old_install_layout(tmp_path)
+        previous = upd.read_build_info(home)
+        opener = _make_opener(
+            _full_payloads(oauth_payload=b"not-json")
+        )
+
+        with pytest.raises(UpdateInstallError, match="reconcile"):
+            upd.perform_update(
+                home,
+                home / "venv" / "bin" / "python",
+                opener=opener,
+                runner=_make_runner(),
+                ports_dir=tmp_path / "ports",
+                system_python=None,
+            )
+
+        assert upd.read_build_info(home) == previous
+
     def test_old_install_with_no_ports_ui_creates_it(self, tmp_path: Path) -> None:
         home = _old_install_layout(tmp_path)
         fake_python = _write_fake_system_python(tmp_path / "fake-python-pygame", has_pygame=True)

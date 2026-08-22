@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+from ports_gfx.client import BackendResult
 from ports_gfx.wizard import WizardState, WizardStep
 
 from romcloud.infrastructure.config import (
@@ -13,7 +16,8 @@ from romcloud.infrastructure.config import (
     write_config,
 )
 from romcloud.infrastructure.google_auth import GoogleOAuthToken, GoogleTokenStore
-from romcloud.lifecycle.setup import SetupRequest, _build_config
+from romcloud.lifecycle.setup import SetupRequest, _build_config, setup_state
+from romcloud.lifecycle.google_drive_setup import google_drive_build_status
 
 
 def config(tmp_path: Path) -> AppConfig:
@@ -119,3 +123,48 @@ def test_wizard_auth_code_is_user_facing() -> None:
 
     assert "ABCD-EFGH" in wizard.notice
     assert wizard.options[0] == "I've authorized this device"
+
+
+def test_missing_build_metadata_is_reported_and_not_started(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.delenv("ROMCLOUD_GOOGLE_OAUTH_CLIENT_ID", raising=False)
+    monkeypatch.delenv("ROMCLOUD_GOOGLE_OAUTH_CLIENT_SECRET", raising=False)
+    config_path = tmp_path / "config" / "romcloud.toml"
+    build_status = google_drive_build_status(config_path)
+    assert setup_state(config_path)["google_drive_available"] is False
+    wizard = WizardState(BackendResult(True, build_status))
+    wizard.step = WizardStep.REMOTE_DATA
+    wizard.selected_index = 3
+    monkeypatch.setattr(
+        wizard,
+        "_start_operation",
+        lambda *_args: pytest.fail("unconfigured Google Drive must not start"),
+    )
+
+    wizard._confirm("romcloud", show_osk=False)
+
+    assert "not configured in this build" in wizard.options[3]
+    assert wizard.error == "Google Drive is not configured in this ROMCloud build."
+
+
+def test_auth_backend_build_error_is_shown_directly(monkeypatch) -> None:
+    wizard = WizardState()
+    wizard.step = WizardStep.REMOTE_GOOGLE_AUTH
+    wizard.runner = type(
+        "FinishedRunner",
+        (),
+        {"is_finished": True, "poll": lambda self: [], "cancel": lambda self: None},
+    )()
+    monkeypatch.setattr(
+        "ports_gfx.wizard.operation_result",
+        lambda _runner: BackendResult(
+            False,
+            {},
+            "Google Drive is not configured in this ROMCloud build.",
+        ),
+    )
+
+    wizard.poll()
+
+    assert wizard.error == "Google Drive is not configured in this ROMCloud build."

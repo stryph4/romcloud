@@ -31,6 +31,10 @@ GOOGLE_DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
 DEVICE_CODE_ENDPOINT = "https://oauth2.googleapis.com/device/code"
 TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 DEFAULT_HTTP_TIMEOUT = 10.0
+GOOGLE_OAUTH_CLIENT_RELATIVE_PATH = Path("runtime/google-oauth-client.json")
+GOOGLE_OAUTH_NOT_CONFIGURED = (
+    "Google Drive is not configured in this ROMCloud build."
+)
 
 
 @dataclass(frozen=True)
@@ -101,29 +105,63 @@ class GoogleOAuthClientConfig:
         client_secret = os.environ.get(
             "ROMCLOUD_GOOGLE_OAUTH_CLIENT_SECRET", ""
         ).strip()
-        if not client_id or not client_secret:
-            path = romcloud_home / "runtime" / "google-oauth-client.json"
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except FileNotFoundError as exc:
-                raise ConfigurationError(
-                    "Google Drive needs project OAuth client metadata at "
-                    f"{path}; register a Google OAuth client of type "
-                    "'TVs and Limited Input devices'."
-                ) from exc
-            except (OSError, ValueError, TypeError) as exc:
-                raise ConfigurationError(
-                    "Google OAuth client metadata is unreadable or invalid"
-                ) from exc
-            if not isinstance(payload, dict):
-                raise ConfigurationError("Google OAuth client metadata must be an object")
-            client_id = str(payload.get("client_id", "")).strip()
-            client_secret = str(payload.get("client_secret", "")).strip()
-        if not client_id or not client_secret:
+        if client_id or client_secret:
+            return cls.from_mapping(
+                {"client_id": client_id, "client_secret": client_secret}
+            )
+
+        path = Path(romcloud_home) / GOOGLE_OAUTH_CLIENT_RELATIVE_PATH
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise ConfigurationError(GOOGLE_OAUTH_NOT_CONFIGURED) from exc
+        except (OSError, ValueError, TypeError) as exc:
             raise ConfigurationError(
-                "Google OAuth client metadata requires client_id and client_secret"
+                f"{GOOGLE_OAUTH_NOT_CONFIGURED} OAuth client metadata is malformed."
+            ) from exc
+        try:
+            config = cls.from_mapping(payload)
+        except ConfigurationError as exc:
+            raise ConfigurationError(
+                f"{GOOGLE_OAUTH_NOT_CONFIGURED} OAuth client metadata is malformed."
+            ) from exc
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+        return config
+
+    @classmethod
+    def from_mapping(cls, payload: object) -> "GoogleOAuthClientConfig":
+        if not isinstance(payload, Mapping):
+            raise ConfigurationError("Google OAuth client metadata must be an object")
+        client_id = payload.get("client_id")
+        client_secret = payload.get("client_secret")
+        if not isinstance(client_id, str) or not isinstance(client_secret, str):
+            raise ConfigurationError(
+                "Google OAuth client metadata requires string client_id and client_secret"
+            )
+        client_id = client_id.strip()
+        client_secret = client_secret.strip()
+        if (
+            not client_id
+            or not client_secret
+            or len(client_id) > 4096
+            or len(client_secret) > 4096
+            or any(char in client_id for char in "\r\n")
+            or any(char in client_secret for char in "\r\n")
+        ):
+            raise ConfigurationError(
+                "Google OAuth client metadata requires valid client_id and client_secret"
             )
         return cls(client_id=client_id, client_secret=client_secret)
+
+    def serialized(self) -> str:
+        return json.dumps(
+            {"client_id": self.client_id, "client_secret": self.client_secret},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
 
 @dataclass(frozen=True)

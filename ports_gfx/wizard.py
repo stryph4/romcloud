@@ -339,6 +339,15 @@ class WizardState:
         self.google_verification_url = ""
         self.google_user_code = ""
         self.google_authenticated = False
+        self.google_drive_available = bool(
+            data.get("google_drive_available", True)
+        )
+        self.google_drive_unavailable_reason = str(
+            data.get(
+                "google_drive_unavailable_reason",
+                "Google Drive is not configured in this ROMCloud build.",
+            )
+        )
         self._google_auth_phase = ""
         self.browser_path = ""
         self.browser_entries: list[dict[str, Any]] = []
@@ -479,7 +488,11 @@ class WizardState:
                 "SMB network location",
                 "Local / external directory",
                 "SFTP server",
-                "Google Drive",
+                (
+                    "Google Drive"
+                    if self.google_drive_available
+                    else "Google Drive (not configured in this build)"
+                ),
                 "Skip (sync features unavailable)",
             ]
         if self.step == WizardStep.REMOTE_GOOGLE_AUTH and self.runner is None:
@@ -913,6 +926,12 @@ class WizardState:
                 self.remote_reuse_source_credentials = False
                 self.enter_text_step(WizardStep.REMOTE_SERVER, show_osk=show_osk)
             elif self.selected_index == 3:
+                if not self.google_drive_available:
+                    self.error = (
+                        self.google_drive_unavailable_reason
+                        or "Google Drive is not configured in this ROMCloud build."
+                    )
+                    return
                 self.remote_data_type = "google_drive"
                 self.library_sync_enabled = False
                 self.google_verification_url = ""
@@ -1159,9 +1178,13 @@ class WizardState:
         self.runner = None
         if not result.ok:
             self.technical_error = result.error
-            self.error = _FAILURE_MESSAGES.get(
-                self.step,
-                "ROMCloud could not complete this step. Review details and retry.",
+            self.error = (
+                result.error
+                if self.step == WizardStep.REMOTE_GOOGLE_AUTH and result.error
+                else _FAILURE_MESSAGES.get(
+                    self.step,
+                    "ROMCloud could not complete this step. Review details and retry.",
+                )
             )
             if self.step in (
                 WizardStep.SFTP_BROWSE,
