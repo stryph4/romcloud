@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
+from romcloud.core.save_containers import ContainerBaseline
+
 
 @dataclass(frozen=True)
 class SaveArtifact:
@@ -442,6 +444,8 @@ class SaveSyncState:
     """Per-group verified observations and advisory dirty hints."""
     conflicts: tuple[SaveConflictRecord, ...] = ()
     """Conflict records remain here after acknowledgement and until resolution."""
+    container_baselines: tuple[ContainerBaseline, ...] = ()
+    """Allocation-independent logical baselines for supported containers."""
     remote_observation: SaveRemoteObservation = SaveRemoteObservation()
     active_operation: Optional[SaveSyncActiveOperation] = None
     last_error: Optional[SaveSyncLastError] = None

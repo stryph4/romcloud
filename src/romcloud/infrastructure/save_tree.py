@@ -173,6 +173,7 @@ def _scan_watch_roots(
                 system,
                 policy_relative,
                 enabled_optional_groups=enabled_optional_groups,
+                trusted_layout_id=watch.layout_id,
             )
             if not decision.included or not policy.is_canonical_path_supported(canonical):
                 continue
@@ -233,6 +234,14 @@ class ProviderTreeIndex:
     def list_subdirs(self, relative: str) -> tuple[str, ...]:
         return tuple(
             sorted(entry.name for entry in self.children(relative) if entry.is_directory)
+        )
+
+    def file_exists(self, relative: str) -> bool:
+        normalized = relative.strip("/")
+        parent, _, name = normalized.rpartition("/")
+        return any(
+            entry.name == name and not entry.is_directory
+            for entry in self.children(parent)
         )
 
     def files_under(
@@ -305,6 +314,7 @@ def scan_provider_tree_report(
     watch_roots = policy.resolve_watch_roots_from_listing(
         index.dir_exists,
         index.list_subdirs,
+        index.file_exists,
         enabled_optional_systems=enabled_optional_systems,
     )
     artifacts: dict[str, SaveArtifact] = {}
@@ -320,6 +330,7 @@ def scan_provider_tree_report(
                 system,
                 policy_relative,
                 enabled_optional_groups=enabled_optional_groups,
+                trusted_layout_id=watch.layout_id,
             )
             if not decision.included or not policy.is_canonical_path_supported(canonical):
                 continue

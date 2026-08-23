@@ -4,8 +4,9 @@ The state file is local ROMCloud metadata, not an authority for save content.
 Dirty-path hints and cached observations are useful to a future watcher, but all
 sync decisions must still verify the allowlisted filesystem content itself.
 
-Schema v3 preserves the v2 upload/download/common-manifest fields while adding
-orthogonal per-group, conflict, availability, operation, and error metadata.
+Schema v4 preserves the v3 physical/group state while adding versioned logical
+container baselines. V3 in turn preserves the v2 upload/download/common-manifest
+fields while adding orthogonal group, conflict, and operation metadata.
 Corrupt or newer state is rejected without replacing the original file or
 silently generating a new device identity.
 """
@@ -24,6 +25,11 @@ from pathlib import Path, PurePosixPath
 from typing import Callable, Iterator, Optional
 
 from romcloud.core.exceptions import SaveSyncError
+from romcloud.core.save_containers import (
+    ContainerBaseline,
+    LogicalDomainState,
+    LogicalEntryState,
+)
 from romcloud.core.models.savesync import (
     SaveArtifact,
     SaveConflictRecord,
@@ -39,8 +45,9 @@ from romcloud.core.models.savesync import (
     SaveSyncRecord,
     SaveSyncState,
 )
-CURRENT_STATE_VERSION = 3
-_MIGRATABLE_VERSIONS = frozenset({1, 2})
+CURRENT_STATE_VERSION = 4
+_MIGRATABLE_VERSIONS = frozenset({1, 2, 3})
+_GROUP_STATE_VERSIONS = frozenset({3, 4})
 
 
 def new_state(*, device_id: Optional[str] = None) -> SaveSyncState:
@@ -53,7 +60,7 @@ def new_state(*, device_id: Optional[str] = None) -> SaveSyncState:
 
 
 def state_to_dict(state: SaveSyncState) -> dict[str, object]:
-    """Serialize and structurally validate one schema-v3 state document."""
+    """Serialize and structurally validate one schema-v4 state document."""
 
     _validate_state(state)
     return {
@@ -65,6 +72,10 @@ def state_to_dict(state: SaveSyncState) -> dict[str, object]:
         "last_reconcile": _report_to_dict(state.last_reconcile),
         "groups": [_group_to_dict(group) for group in state.groups],
         "conflicts": [_conflict_to_dict(conflict) for conflict in state.conflicts],
+        "container_baselines": [
+            _container_baseline_to_dict(baseline)
+            for baseline in state.container_baselines
+        ],
         "remote_observation": _remote_to_dict(state.remote_observation),
         "active_operation": _operation_to_dict(state.active_operation),
         "last_error": _error_to_dict(state.last_error),
@@ -75,7 +86,7 @@ def state_to_dict(state: SaveSyncState) -> dict[str, object]:
 
 
 def state_from_dict(payload: object) -> SaveSyncState:
-    """Decode v1-v3 state, migrating known legacy documents in memory.
+    """Decode v1-v4 state, migrating known legacy documents in memory.
 
     Missing version metadata is recognized only as the historical v1 shape.
     Explicit unknown or future versions fail closed.
@@ -101,27 +112,32 @@ def state_from_dict(payload: object) -> SaveSyncState:
         last_reconcile=_report_from_dict(data.get("last_reconcile")),
         groups=(
             _groups_from_list(data.get("groups", []))
-            if version == CURRENT_STATE_VERSION
+            if version in _GROUP_STATE_VERSIONS
             else ()
         ),
         conflicts=(
             _conflicts_from_list(data.get("conflicts", []))
+            if version in _GROUP_STATE_VERSIONS
+            else ()
+        ),
+        container_baselines=(
+            _container_baselines_from_list(data.get("container_baselines", []))
             if version == CURRENT_STATE_VERSION
             else ()
         ),
         remote_observation=(
             _remote_from_dict(data.get("remote_observation", {}))
-            if version == CURRENT_STATE_VERSION
+            if version in _GROUP_STATE_VERSIONS
             else SaveRemoteObservation()
         ),
         active_operation=(
             _operation_from_dict(data.get("active_operation"))
-            if version == CURRENT_STATE_VERSION
+            if version in _GROUP_STATE_VERSIONS
             else None
         ),
         last_error=(
             _error_from_dict(data.get("last_error"))
-            if version == CURRENT_STATE_VERSION
+            if version in _GROUP_STATE_VERSIONS
             else None
         ),
         last_completed_operation_id=(
@@ -129,7 +145,7 @@ def state_from_dict(payload: object) -> SaveSyncState:
                 data.get("last_completed_operation_id"),
                 "last_completed_operation_id",
             )
-            if version == CURRENT_STATE_VERSION
+            if version in _GROUP_STATE_VERSIONS
             else None
         ),
         quick_sync_cursor_generation=(
@@ -137,20 +153,20 @@ def state_from_dict(payload: object) -> SaveSyncState:
                 data.get("quick_sync_cursor_generation"),
                 "quick_sync_cursor_generation",
             )
-            if version == CURRENT_STATE_VERSION
+            if version in _GROUP_STATE_VERSIONS
             else None
         ),
         quick_sync_ready=(
             bool(data.get("quick_sync_ready", False))
-            if version == CURRENT_STATE_VERSION
+            if version in _GROUP_STATE_VERSIONS
             else False
         ),
     )
     if version == 1 and not state.shared_manifest:
         # V1 recorded only force-operation receipts. A successful force made
         # both selected sides identical, so its newest manifest is the one
-        # safe migration baseline. Persist it during the v3 rewrite; an empty
-        # v3 shared_manifest can then unambiguously mean "verified empty".
+        # safe migration baseline. Persist it during the v4 rewrite; an empty
+        # shared_manifest can then unambiguously mean "verified empty".
         records = tuple(
             record
             for record in (state.last_upload, state.last_download)
@@ -191,7 +207,7 @@ def read_state(path: Path) -> SaveSyncState:
 
 
 def write_state(path: Path, state: SaveSyncState) -> None:
-    """Durably and atomically write v3 state without acquiring the lock.
+    """Durably and atomically write v4 state without acquiring the lock.
 
     The complete temporary document is flushed and fsynced before replacement.
     On filesystems that support it, the containing directory is fsynced after
@@ -222,7 +238,7 @@ def state_file_lock(path: Path) -> Iterator[None]:
 
 
 def load_state(path: Path) -> SaveSyncState:
-    """Load/create state and durably rewrite recognized legacy schemas as v3."""
+    """Load/create state and durably rewrite recognized legacy schemas as v4."""
 
     state_path = Path(path)
     with state_file_lock(state_path):
@@ -637,6 +653,15 @@ def _validate_state(state: SaveSyncState) -> None:
                     "requires conflict group state"
                 )
 
+    container_ids: set[str] = set()
+    for baseline in state.container_baselines:
+        _validate_container_baseline(baseline)
+        if baseline.container_id in container_ids:
+            raise SaveSyncError(
+                f"Duplicate SaveSync container baseline: {baseline.container_id}"
+            )
+        container_ids.add(baseline.container_id)
+
     _validate_remote(state.remote_observation)
     if state.active_operation is not None:
         _validate_operation(state.active_operation)
@@ -685,6 +710,57 @@ def _validate_group(group: SaveGroupState) -> None:
         raise SaveSyncError(f"Duplicate dirty path hint for group {group.group_id}")
     if group.verified_at is not None:
         _nonempty_text(group.verified_at, "verified_at")
+
+
+def _validate_container_baseline(baseline: ContainerBaseline) -> None:
+    if not isinstance(baseline, ContainerBaseline):
+        raise SaveSyncError("container_baselines must contain ContainerBaseline values")
+    _canonical_path(baseline.container_id, "container_baseline.container_id")
+    _nonempty_text(baseline.adapter_id, "container_baseline.adapter_id")
+    if (
+        isinstance(baseline.schema_version, bool)
+        or not isinstance(baseline.schema_version, int)
+        or baseline.schema_version <= 0
+    ):
+        raise SaveSyncError("container_baseline.schema_version must be positive")
+    _nonempty_text(baseline.format_variant, "container_baseline.format_variant")
+    domain_ids: set[str] = set()
+    entry_ids: set[str] = set()
+    for domain in baseline.domains:
+        if not isinstance(domain, LogicalDomainState):
+            raise SaveSyncError("container baseline domains are invalid")
+        domain_id = _nonempty_text(domain.merge_domain_id, "merge_domain_id")
+        if domain_id in domain_ids:
+            raise SaveSyncError(f"Duplicate logical merge domain: {domain_id}")
+        domain_ids.add(domain_id)
+        local_ids: set[str] = set()
+        for entry in domain.entries:
+            if not isinstance(entry, LogicalEntryState):
+                raise SaveSyncError("logical domain entries are invalid")
+            identity = _nonempty_text(entry.identity, "logical entry identity")
+            if identity in local_ids or identity in entry_ids:
+                raise SaveSyncError(f"Duplicate logical entry identity: {identity}")
+            local_ids.add(identity)
+            entry_ids.add(identity)
+            if (
+                isinstance(entry.size_bytes, bool)
+                or not isinstance(entry.size_bytes, int)
+                or entry.size_bytes < 0
+            ):
+                raise SaveSyncError(f"Invalid logical entry size: {identity}")
+            digest = entry.canonical_hash
+            if not isinstance(digest, str) or len(digest) != 64 or any(
+                char not in "0123456789abcdefABCDEF" for char in digest
+            ):
+                raise SaveSyncError(f"Invalid logical entry hash: {identity}")
+    tombstones = set(baseline.tombstones)
+    if len(tombstones) != len(baseline.tombstones):
+        raise SaveSyncError("Duplicate logical domain tombstone")
+    for domain_id in tombstones:
+        _nonempty_text(domain_id, "logical domain tombstone")
+    overlap = domain_ids.intersection(tombstones)
+    if overlap:
+        raise SaveSyncError("A logical domain cannot be present and tombstoned")
 
 
 def _validate_conflict(conflict: SaveConflictRecord) -> None:
@@ -1023,6 +1099,104 @@ def _conflicts_from_list(payload: object) -> tuple[SaveConflictRecord, ...]:
         for index, item in enumerate(_list(payload, "conflicts"))
     )
     return tuple(sorted(conflicts, key=lambda item: item.conflict_id))
+
+
+def _container_baseline_to_dict(
+    baseline: ContainerBaseline,
+) -> dict[str, object]:
+    return {
+        "container_id": baseline.container_id,
+        "adapter_id": baseline.adapter_id,
+        "schema_version": baseline.schema_version,
+        "format_variant": baseline.format_variant,
+        "domains": [
+            {
+                "merge_domain_id": domain.merge_domain_id,
+                "entries": [
+                    {
+                        "identity": entry.identity,
+                        "canonical_hash": entry.canonical_hash,
+                        "size_bytes": entry.size_bytes,
+                    }
+                    for entry in domain.entries
+                ],
+            }
+            for domain in baseline.domains
+        ],
+        "tombstones": list(baseline.tombstones),
+    }
+
+
+def _container_baseline_from_dict(
+    payload: object, label: str
+) -> ContainerBaseline:
+    data = _mapping(payload, label)
+    domains: list[LogicalDomainState] = []
+    for domain_index, domain_payload in enumerate(
+        _list(data.get("domains", []), f"{label}.domains")
+    ):
+        domain_data = _mapping(domain_payload, f"{label}.domains[{domain_index}]")
+        entries: list[LogicalEntryState] = []
+        for entry_index, entry_payload in enumerate(
+            _list(
+                domain_data.get("entries", []),
+                f"{label}.domains[{domain_index}].entries",
+            )
+        ):
+            entry_data = _mapping(
+                entry_payload,
+                f"{label}.domains[{domain_index}].entries[{entry_index}]",
+            )
+            size = entry_data.get("size_bytes")
+            if isinstance(size, bool) or not isinstance(size, int):
+                raise SaveSyncError("logical entry size_bytes must be an integer")
+            entries.append(
+                LogicalEntryState(
+                    identity=_nonempty_text(
+                        entry_data.get("identity"), "logical entry identity"
+                    ),
+                    canonical_hash=_nonempty_text(
+                        entry_data.get("canonical_hash"), "logical entry hash"
+                    ),
+                    size_bytes=size,
+                )
+            )
+        domains.append(
+            LogicalDomainState(
+                merge_domain_id=_nonempty_text(
+                    domain_data.get("merge_domain_id"), "merge_domain_id"
+                ),
+                entries=tuple(sorted(entries, key=lambda item: item.identity)),
+            )
+        )
+    schema_version = data.get("schema_version")
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+        raise SaveSyncError(f"{label}.schema_version must be an integer")
+    baseline = ContainerBaseline(
+        container_id=_canonical_path(data.get("container_id"), f"{label}.container_id"),
+        adapter_id=_nonempty_text(data.get("adapter_id"), f"{label}.adapter_id"),
+        schema_version=schema_version,
+        format_variant=_nonempty_text(
+            data.get("format_variant"), f"{label}.format_variant"
+        ),
+        domains=tuple(sorted(domains, key=lambda item: item.merge_domain_id)),
+        tombstones=tuple(
+            sorted(
+                _nonempty_text(item, f"{label}.tombstones")
+                for item in _list(data.get("tombstones", []), f"{label}.tombstones")
+            )
+        ),
+    )
+    _validate_container_baseline(baseline)
+    return baseline
+
+
+def _container_baselines_from_list(payload: object) -> tuple[ContainerBaseline, ...]:
+    baselines = tuple(
+        _container_baseline_from_dict(item, f"container_baselines[{index}]")
+        for index, item in enumerate(_list(payload, "container_baselines"))
+    )
+    return tuple(sorted(baselines, key=lambda item: item.container_id))
 
 
 def _record_to_dict(record: Optional[SaveSyncRecord]) -> Optional[dict[str, object]]:

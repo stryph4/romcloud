@@ -93,6 +93,10 @@ class SaveLayout:
     lifecycle_cores: tuple[str, ...] = ()
     lifecycle_enabled: bool = True
     description: str = ""
+    container_adapter_id: str = ""
+    container_policy_id: str = ""
+    container_kind: str = ""
+    root_markers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -103,6 +107,10 @@ class SaveGroupDescriptor:
     layout_id: str
     system: str
     shared: bool
+    container_id: str = ""
+    container_adapter_id: str = ""
+    container_policy_id: str = ""
+    container_kind: str = ""
 
 
 @dataclass(frozen=True)
@@ -140,6 +148,13 @@ _TOKEN_VALIDATORS = {
     "{sony_title_id}": re.compile(r"[A-Za-z]{4}[0-9]{5}").fullmatch,
     "{dolphin_gc_region}": frozenset({"EUR", "USA", "JAP", "JPN"}).__contains__,
     "{dolphin_gc_card}": frozenset({"Card A", "Card B"}).__contains__,
+    # Used only by marker-gated container layouts. The marker check happens
+    # before the directory becomes an approved traversal root.
+    "{host_directory}": lambda value: bool(value)
+    and value not in {".", ".."}
+    and "/" not in value
+    and "\\" not in value
+    and "\x00" not in value,
     # Dolphin's game, downloadable-channel, and game-with-channel title
     # namespaces. System channels, DLC, hidden channels, and other NAND
     # namespaces are deliberately not traversable SaveSync roots.
@@ -203,6 +218,10 @@ def _layout(
     lifecycle_cores: tuple[str, ...] = (),
     lifecycle_enabled: bool = True,
     description: str = "",
+    container_adapter_id: str = "",
+    container_policy_id: str = "",
+    container_kind: str = "",
+    root_markers: tuple[str, ...] = (),
 ) -> SaveLayout:
     return SaveLayout(
         layout_id=layout_id,
@@ -220,6 +239,10 @@ def _layout(
         lifecycle_cores=lifecycle_cores,
         lifecycle_enabled=lifecycle_enabled,
         description=description,
+        container_adapter_id=container_adapter_id,
+        container_policy_id=container_policy_id,
+        container_kind=container_kind,
+        root_markers=root_markers,
     )
 
 
@@ -269,6 +292,9 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
         lifecycle_systems=("psx",),
         lifecycle_emulators=("duckstation",),
         lifecycle_cores=("duckstation",),
+        container_adapter_id="ps1-raw-memory-card",
+        container_policy_id="ps1-commercial-namespace",
+        container_kind="file",
     ),
     _layout(
         "duckstation-root-sav",
@@ -282,6 +308,9 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
     _layout(
         "pcsx2-legacy-memory-cards", "pcsx2", files=("Mcd*.ps2",),
         shared=True, group_by="layout", lifecycle_systems=("ps2", "pcsx2"),
+        container_adapter_id="pcsx2-monolithic-file-card",
+        container_policy_id="opaque-only",
+        container_kind="file",
     ),
     _layout(
         "pcsx2-legacy-states", "pcsx2", root="sstates", recursive=True,
@@ -290,6 +319,24 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
     _layout(
         "pcsx2-memory-cards", "ps2", root="pcsx2", files=("Mcd*.ps2",),
         shared=True, group_by="layout", lifecycle_systems=("ps2", "pcsx2"),
+        description="Opaque monolithic PCSX2 .ps2 memory-card images",
+        container_adapter_id="pcsx2-monolithic-file-card",
+        container_policy_id="opaque-only",
+        container_kind="file",
+    ),
+    _layout(
+        "pcsx2-folder-memory-cards",
+        "ps2",
+        root="pcsx2/{host_directory}",
+        recursive=True,
+        shared=True,
+        group_by="root",
+        lifecycle_systems=("ps2", "pcsx2"),
+        container_adapter_id="pcsx2-folder-memory-card",
+        container_policy_id="pcsx2-folder-single-entry",
+        container_kind="directory",
+        root_markers=("_pcsx2_superblock",),
+        description="Marker-verified PCSX2 Folder Memory Card",
     ),
     _layout(
         "pcsx2-states", "ps2", root="pcsx2/sstates", recursive=True,
@@ -633,6 +680,7 @@ class SaveSelectionPolicy:
         relative_path: str,
         *,
         enabled_optional_groups: frozenset[str] = frozenset(),
+        trusted_layout_id: str = "",
     ) -> SaveSelectionDecision:
         # Keep exact legacy optional-group behavior for external custom policies.
         if self._legacy_rules is not None:
@@ -659,7 +707,9 @@ class SaveSelectionPolicy:
             return SaveSelectionDecision(False, excluded_reason="not selected by policy")
 
         if any(
-            layout.system == system and _match_layout(layout, relative_path) is not None
+            layout.system == system
+            and (not layout.root_markers or layout.layout_id == trusted_layout_id)
+            and _match_layout(layout, relative_path) is not None
             for layout in self._layouts
         ):
             return SaveSelectionDecision(True)
@@ -700,7 +750,17 @@ class SaveSelectionPolicy:
             part in {".", ".."} for part in PurePosixPath(canonical_path).parts
         ):
             return None
-        for layout in self._layouts:
+        # Prefer a fully literal registered root over a marker-gated dynamic
+        # root when both shapes could describe the same path (for example
+        # PCSX2's literal ``sstates`` tree versus a folder-card name).
+        layouts = sorted(
+            self._layouts,
+            key=lambda value: sum(
+                segment in _TOKEN_VALIDATORS
+                for segment in _segments(value.root_pattern)
+            ),
+        )
+        for layout in layouts:
             if layout.system != system:
                 continue
             matched = _match_layout(layout, relative)
@@ -713,6 +773,16 @@ class SaveSelectionPolicy:
                 layout_id=layout.layout_id,
                 system=system,
                 shared=layout.shared,
+                container_id=(
+                    canonical_path
+                    if layout.container_kind == "file"
+                    else "/".join((system, *root))
+                    if layout.container_kind == "directory"
+                    else ""
+                ),
+                container_adapter_id=layout.container_adapter_id,
+                container_policy_id=layout.container_policy_id,
+                container_kind=layout.container_kind,
             )
         return None
 
@@ -775,6 +845,12 @@ class SaveSelectionPolicy:
                     break
 
             for physical, canonical in candidates:
+                if layout.root_markers and any(
+                    (physical / marker).is_symlink()
+                    or not (physical / marker).is_file()
+                    for marker in layout.root_markers
+                ):
+                    continue
                 resolved.append(
                     SaveWatchRoot(
                         layout.layout_id,
@@ -789,6 +865,7 @@ class SaveSelectionPolicy:
         self,
         dir_exists: Callable[[str], bool],
         list_subdirs: Callable[[str], tuple[str, ...]],
+        file_exists: Optional[Callable[[str], bool]] = None,
         *,
         enabled_optional_systems: frozenset[str] = frozenset(),
         canonical_prefix: str = "",
@@ -843,6 +920,16 @@ class SaveSelectionPolicy:
                     break
 
             for relative, canonical in candidates:
+                if layout.root_markers and (
+                    file_exists is None
+                    or any(
+                        not file_exists(
+                            f"{relative}/{marker}" if relative else marker
+                        )
+                        for marker in layout.root_markers
+                    )
+                ):
+                    continue
                 resolved.append(
                     ProviderSaveWatchRoot(
                         layout.layout_id,

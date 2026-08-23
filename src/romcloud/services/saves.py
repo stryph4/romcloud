@@ -10,6 +10,8 @@ authoritative after preview and confirmation.
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import os
 import shutil
 import tempfile
 import uuid
@@ -19,6 +21,19 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from romcloud.core.capabilities import Capability, CapabilityPolicy
+from romcloud.core.save_containers import (
+    ContainerBaseline,
+    ContainerSnapshot,
+    EntryReplacement,
+    DomainAction,
+    OpaqueContainerError,
+    OpaqueReason,
+    RebuildPlan,
+    SaveContainerAdapter,
+    baseline_from_snapshot,
+    plan_container_reconcile,
+    target_snapshot,
+)
 from romcloud.core.exceptions import (
     SaveSyncConnectivityError,
     SaveSyncError,
@@ -51,6 +66,7 @@ from romcloud.core.save_selection import (
     RPCS3_DEV_HDD0_PREFIX,
     XBOX_HDD_RELATIVE_PATH,
     XBOX_SYSTEM,
+    SaveGroupDescriptor,
     SaveSelectionPolicy,
 )
 from romcloud.core.storage import StorageAccessResult
@@ -61,10 +77,15 @@ from romcloud.infrastructure.logging import get_logger
 from romcloud.infrastructure import savesync_state as durable_state
 from romcloud.infrastructure import savesync_journal
 from romcloud.infrastructure.remote_saves import RemoteSaveStore, build_remote_save_store
+from romcloud.infrastructure.save_container_registry import (
+    DEFAULT_SAVE_CONTAINER_REGISTRY,
+    SaveContainerRegistry,
+)
 
 log = get_logger("saves")
 _RPCS3_CANONICAL_PREFIX = f"ps3/{RPCS3_DEV_HDD0_PREFIX}"
 _QUICK_SYNC_HISTORY_REQUIRED = 1
+_CONTAINER_MERGE_ENV = "ROMCLOUD_EXPERIMENTAL_CONTAINER_SAVESYNC"
 
 
 class _ScratchDir:
@@ -108,6 +129,38 @@ class _LocalMaterializationStatus:
     missing: int
 
 
+@dataclass
+class _ContainerWork:
+    handled_paths: set[str]
+    desired_local: dict[str, SaveArtifact]
+    desired_remote: dict[str, SaveArtifact]
+    local_sources: dict[str, Path]
+    remote_sources: dict[str, Path]
+    baselines: dict[str, ContainerBaseline]
+    expected_local: dict[str, tuple[SaveContainerAdapter, Path, ContainerSnapshot]]
+    expected_remote: dict[str, tuple[SaveContainerAdapter, Path, ContainerSnapshot]]
+    descriptors: dict[str, SaveGroupDescriptor]
+    conflicted_container_ids: set[str]
+    conflict_paths: list[str]
+    preview_entries: list[SaveReconcileEntry]
+    invalidated_container_ids: set[str]
+    uploaded: int = 0
+    downloaded: int = 0
+    upload_bytes: int = 0
+    download_bytes: int = 0
+    unchanged: int = 0
+    scratch: Optional[Path] = None
+
+    @classmethod
+    def empty(cls) -> "_ContainerWork":
+        return cls(set(), {}, {}, {}, {}, {}, {}, {}, {}, set(), [], [], set())
+
+    def cleanup(self) -> None:
+        if self.scratch is not None:
+            shutil.rmtree(self.scratch, ignore_errors=True)
+            self.scratch = None
+
+
 class SaveSyncService:
     """Synchronize explicitly selected save/state content without live partial trees."""
 
@@ -126,6 +179,8 @@ class SaveSyncService:
         policy: SaveSelectionPolicy = DEFAULT_SAVE_SELECTION_POLICY,
         capability_policy: Optional[CapabilityPolicy] = None,
         remote_store: Optional[RemoteSaveStore] = None,
+        container_merge_enabled: Optional[bool] = None,
+        container_registry: SaveContainerRegistry = DEFAULT_SAVE_CONTAINER_REGISTRY,
     ) -> None:
         self._provider = provider
         self._connectivity_root = connectivity_root
@@ -159,6 +214,13 @@ class SaveSyncService:
         self._policy = policy
         self._capabilities = capability_policy or CapabilityPolicy("smart_cache")
         self._active_read_scratch: Optional[_ScratchDir] = None
+        self._container_merge_enabled = (
+            container_merge_enabled
+            if container_merge_enabled is not None
+            else os.environ.get(_CONTAINER_MERGE_ENV, "").strip().casefold()
+            in {"1", "true", "yes", "on"}
+        )
+        self._container_registry = container_registry
 
     # ── connectivity and settings ────────────────────────────────────────
 
@@ -1315,19 +1377,61 @@ class SaveSyncService:
             local_report = self._scan_automatic_local()
             remote_report = self._scan_automatic_remote()
             state = self._get_state_unlocked()
-            return _reconcile_plan(
-                local_report,
-                remote_report,
-                self._automatic_baseline(state),
-                policy=self._policy,
-                scope="all_eligible",
-                repair_local_group_ids=frozenset(
-                    status.group_id
-                    for status in self._local_materialization_gaps(
-                        state, excluded_layout_ids=frozenset()
-                    )
-                ),
+            baseline = self._automatic_baseline(state)
+            repair_local_group_ids = frozenset(
+                status.group_id
+                for status in self._local_materialization_gaps(
+                    state, excluded_layout_ids=frozenset()
+                )
             )
+            container_work = self._prepare_container_reconciliation(
+                local=dict(local_report.artifacts),
+                remote=dict(remote_report.artifacts),
+                state=state,
+                upload_only=False,
+                stage_candidates=False,
+                repair_local_group_ids=repair_local_group_ids,
+            )
+            try:
+                if container_work.handled_paths:
+                    local_report = replace(
+                        local_report,
+                        artifacts={
+                            path: artifact
+                            for path, artifact in local_report.artifacts.items()
+                            if path not in container_work.handled_paths
+                        },
+                    )
+                    remote_report = replace(
+                        remote_report,
+                        artifacts={
+                            path: artifact
+                            for path, artifact in remote_report.artifacts.items()
+                            if path not in container_work.handled_paths
+                        },
+                    )
+                    baseline = {
+                        path: artifact
+                        for path, artifact in baseline.items()
+                        if path not in container_work.handled_paths
+                    }
+                physical = _reconcile_plan(
+                    local_report,
+                    remote_report,
+                    baseline,
+                    policy=self._policy,
+                    scope="all_eligible",
+                    repair_local_group_ids=repair_local_group_ids,
+                )
+                return SaveReconcilePlan(
+                    entries=tuple((*physical.entries, *container_work.preview_entries)),
+                    excluded_files=physical.excluded_files,
+                    excluded_bytes=physical.excluded_bytes,
+                    optional_groups=physical.optional_groups,
+                    scope=physical.scope,
+                )
+            finally:
+                container_work.cleanup()
 
     def reconcile(self, *, progress: ProgressSink = None) -> SaveReconcileReport:
         """Apply all non-conflicting changes and preserve both conflict versions."""
@@ -1358,6 +1462,400 @@ class SaveSyncService:
             upload_only=True,
             is_group_active=is_group_active,
         )
+
+    @staticmethod
+    def _container_paths(
+        manifest: dict[str, SaveArtifact], container_id: str, kind: str
+    ) -> set[str]:
+        if kind == "file":
+            return {container_id} if container_id in manifest else set()
+        prefix = f"{container_id}/"
+        return {path for path in manifest if path.startswith(prefix)}
+
+    def _remote_container_path(self, container_id: str, kind: str) -> Optional[Path]:
+        if kind == "directory":
+            if self._remote_root is None:
+                return None
+            return self._remote_root / container_id
+        return self._remote_path(container_id)
+
+    @staticmethod
+    def _snapshot_content(snapshot: ContainerSnapshot) -> tuple:
+        return tuple(
+            (
+                entry.identity,
+                entry.merge_domain_id,
+                entry.canonical_hash,
+                entry.size_bytes,
+            )
+            for entry in snapshot.entries
+        )
+
+    @staticmethod
+    def _candidate_manifest(
+        candidate: Path, *, container_id: str, kind: str
+    ) -> tuple[dict[str, SaveArtifact], dict[str, Path]]:
+        if kind == "file":
+            artifact = SaveArtifact(
+                container_id,
+                candidate.stat().st_size,
+                save_tree.hash_file(candidate),
+            )
+            return {container_id: artifact}, {container_id: candidate}
+        artifacts: dict[str, SaveArtifact] = {}
+        sources: dict[str, Path] = {}
+        for current, directories, filenames in os.walk(candidate, followlinks=False):
+            current_path = Path(current)
+            if current_path.is_symlink():
+                raise SaveSyncVerificationError(
+                    "Container candidate contains a substituted directory"
+                )
+            directories[:] = sorted(
+                name
+                for name in directories
+                if not (current_path / name).is_symlink()
+            )
+            for filename in sorted(filenames):
+                path = current_path / filename
+                if path.is_symlink() or not path.is_file():
+                    raise SaveSyncVerificationError(
+                        "Container candidate contains a substituted path"
+                    )
+                relative = path.relative_to(candidate).as_posix()
+                canonical = f"{container_id}/{relative}"
+                artifacts[canonical] = SaveArtifact(
+                    canonical, path.stat().st_size, save_tree.hash_file(path)
+                )
+                sources[canonical] = path
+        return artifacts, sources
+
+    @staticmethod
+    def _replace_container_manifest(
+        manifest: dict[str, SaveArtifact],
+        *,
+        container_id: str,
+        kind: str,
+        replacement: dict[str, SaveArtifact],
+    ) -> dict[str, SaveArtifact]:
+        paths = SaveSyncService._container_paths(manifest, container_id, kind)
+        result = {path: value for path, value in manifest.items() if path not in paths}
+        result.update(replacement)
+        return result
+
+    def _stage_container_target(
+        self,
+        work: _ContainerWork,
+        *,
+        adapter: SaveContainerAdapter,
+        destination_path: Path,
+        destination_snapshot: ContainerSnapshot,
+        target: ContainerSnapshot,
+        local_path: Path,
+        local_snapshot: ContainerSnapshot,
+        remote_path: Path,
+        remote_snapshot: ContainerSnapshot,
+        kind: str,
+        side: str,
+    ) -> None:
+        if self._snapshot_content(destination_snapshot) == self._snapshot_content(target):
+            expected = (adapter, destination_path, target)
+            if side == "local":
+                work.expected_local[target.container_id] = expected
+            else:
+                work.expected_remote[target.container_id] = expected
+            return
+        if work.scratch is None:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            work.scratch = Path(
+                tempfile.mkdtemp(
+                    prefix=".romcloud-container-stage-",
+                    dir=str(self._state_path.parent),
+                )
+            )
+        stage_root = work.scratch / uuid.uuid4().hex
+        stage_root.mkdir()
+        candidate = stage_root / ("candidate.card" if kind == "file" else "candidate")
+        current = destination_snapshot.entry_map()
+        replacements: list[EntryReplacement] = []
+        for entry in target.entries:
+            current_entry = current.get(entry.identity)
+            if current_entry is not None and (
+                current_entry.canonical_hash == entry.canonical_hash
+                and current_entry.merge_domain_id == entry.merge_domain_id
+            ):
+                continue
+            if any(
+                value.identity == entry.identity
+                and value.canonical_hash == entry.canonical_hash
+                and value.merge_domain_id == entry.merge_domain_id
+                for value in local_snapshot.entries
+            ):
+                source_path, source_snapshot = local_path, local_snapshot
+            elif any(
+                value.identity == entry.identity
+                and value.canonical_hash == entry.canonical_hash
+                and value.merge_domain_id == entry.merge_domain_id
+                for value in remote_snapshot.entries
+            ):
+                source_path, source_snapshot = remote_path, remote_snapshot
+            else:
+                raise SaveSyncVerificationError(
+                    "No verified logical source exists for a container entry"
+                )
+            replacements.append(
+                EntryReplacement(
+                    entry,
+                    adapter.extract_entry(source_path, source_snapshot, entry.identity),
+                )
+            )
+        removals = tuple(
+            identity for identity in current if identity not in target.entry_map()
+        )
+        adapter.rebuild(
+            destination_path,
+            RebuildPlan(
+                expected=target,
+                replacements=tuple(replacements),
+                removals=tuple(sorted(removals)),
+            ),
+            candidate,
+        )
+        candidate_manifest, candidate_sources = self._candidate_manifest(
+            candidate, container_id=target.container_id, kind=kind
+        )
+        if side == "local":
+            work.desired_local = self._replace_container_manifest(
+                work.desired_local,
+                container_id=target.container_id,
+                kind=kind,
+                replacement=candidate_manifest,
+            )
+            work.local_sources.update(candidate_sources)
+            work.expected_local[target.container_id] = (adapter, destination_path, target)
+        else:
+            work.desired_remote = self._replace_container_manifest(
+                work.desired_remote,
+                container_id=target.container_id,
+                kind=kind,
+                replacement=candidate_manifest,
+            )
+            work.remote_sources.update(candidate_sources)
+            work.expected_remote[target.container_id] = (adapter, destination_path, target)
+
+    def _prepare_container_reconciliation(
+        self,
+        *,
+        local: dict[str, SaveArtifact],
+        remote: dict[str, SaveArtifact],
+        state: SaveSyncState,
+        upload_only: bool,
+        stage_candidates: bool = True,
+        repair_local_group_ids: frozenset[str] = frozenset(),
+    ) -> _ContainerWork:
+        work = _ContainerWork.empty()
+        work.desired_local = dict(local)
+        work.desired_remote = dict(remote)
+        if not self._container_merge_enabled or upload_only:
+            return work
+        baselines = {
+            baseline.container_id: baseline for baseline in state.container_baselines
+        }
+        descriptors: dict[str, SaveGroupDescriptor] = {}
+        for path in sorted(set(local).union(remote)):
+            descriptor = self._policy.group_for_path(path)
+            if (
+                descriptor is not None
+                and descriptor.container_id
+                and descriptor.container_adapter_id
+            ):
+                descriptors.setdefault(descriptor.container_id, descriptor)
+
+        for container_id, descriptor in descriptors.items():
+            if descriptor.group_id in repair_local_group_ids:
+                # Preserve the 0.9.32 materialization rule: a durable clean
+                # physical generation missing from the emulator-visible tree
+                # is repaired by the existing physical transaction path.
+                continue
+            adapter = self._container_registry.get(descriptor.container_adapter_id)
+            if adapter is None:
+                continue
+            local_paths = self._container_paths(local, container_id, descriptor.container_kind)
+            remote_paths = self._container_paths(remote, container_id, descriptor.container_kind)
+            if not local_paths or not remote_paths:
+                continue
+            local_path = self._local_root / container_id
+            remote_path = self._remote_container_path(
+                container_id, descriptor.container_kind
+            )
+            if remote_path is None:
+                continue
+            checkpoint = (
+                set(work.handled_paths),
+                dict(work.desired_local),
+                dict(work.desired_remote),
+                dict(work.local_sources),
+                dict(work.remote_sources),
+                dict(work.baselines),
+                dict(work.expected_local),
+                dict(work.expected_remote),
+                dict(work.descriptors),
+                set(work.conflicted_container_ids),
+                list(work.conflict_paths),
+                list(work.preview_entries),
+                set(work.invalidated_container_ids),
+                work.uploaded,
+                work.downloaded,
+                work.upload_bytes,
+                work.download_bytes,
+                work.unchanged,
+            )
+            try:
+                local_snapshot = adapter.snapshot(local_path, container_id=container_id)
+                remote_snapshot = adapter.snapshot(remote_path, container_id=container_id)
+                logical_plan = plan_container_reconcile(
+                    local_snapshot,
+                    remote_snapshot,
+                    baselines.get(container_id),
+                )
+                local_target = target_snapshot(
+                    logical_plan, local_snapshot, remote_snapshot, side="local"
+                )
+                remote_target = target_snapshot(
+                    logical_plan, local_snapshot, remote_snapshot, side="remote"
+                )
+                work.handled_paths.update(local_paths)
+                work.handled_paths.update(remote_paths)
+                work.baselines[container_id] = logical_plan.next_baseline
+                work.descriptors[container_id] = descriptor
+                if logical_plan.conflicts:
+                    work.conflicted_container_ids.add(container_id)
+                    for conflict in logical_plan.conflicts:
+                        fingerprint = hashlib.sha256(
+                            conflict.merge_domain_id.encode("utf-8")
+                        ).hexdigest()[:16]
+                        work.conflict_paths.append(
+                            f"{container_id}/logical-conflict-{fingerprint}"
+                        )
+                for decision in logical_plan.decisions:
+                    domain_fingerprint = hashlib.sha256(
+                        decision.merge_domain_id.encode("utf-8")
+                    ).hexdigest()[:16]
+                    logical_path = (
+                        f"{container_id}/logical-domain-{domain_fingerprint}"
+                    )
+
+                    def logical_artifact(domain):
+                        if domain is None:
+                            return None
+                        digest = hashlib.sha256()
+                        for entry in domain.entries:
+                            digest.update(entry.identity.encode("utf-8"))
+                            digest.update(entry.canonical_hash.encode("ascii"))
+                            digest.update(entry.size_bytes.to_bytes(8, "little"))
+                        return SaveArtifact(
+                            logical_path,
+                            sum(entry.size_bytes for entry in domain.entries),
+                            digest.hexdigest(),
+                        )
+
+                    action = {
+                        DomainAction.USE_LOCAL: SaveReconcileAction.UPLOAD,
+                        DomainAction.USE_REMOTE: SaveReconcileAction.DOWNLOAD,
+                        DomainAction.CONFLICT: SaveReconcileAction.CONFLICT,
+                        DomainAction.CONVERGED: SaveReconcileAction.UNCHANGED,
+                    }[decision.action]
+                    work.preview_entries.append(
+                        SaveReconcileEntry(
+                            relative_path=logical_path,
+                            action=action,
+                            local=logical_artifact(decision.local),
+                            remote=logical_artifact(decision.remote),
+                            baseline=logical_artifact(decision.baseline),
+                        )
+                    )
+                    if decision.action is DomainAction.USE_LOCAL:
+                        work.uploaded += 1
+                        if decision.local is not None:
+                            work.upload_bytes += sum(
+                                entry.size_bytes for entry in decision.local.entries
+                            )
+                    elif decision.action is DomainAction.USE_REMOTE:
+                        work.downloaded += 1
+                        if decision.remote is not None:
+                            work.download_bytes += sum(
+                                entry.size_bytes for entry in decision.remote.entries
+                            )
+                    elif decision.action is DomainAction.CONVERGED:
+                        work.unchanged += 1
+                if not stage_candidates:
+                    continue
+                self._stage_container_target(
+                    work,
+                    adapter=adapter,
+                    destination_path=local_path,
+                    destination_snapshot=local_snapshot,
+                    target=local_target,
+                    local_path=local_path,
+                    local_snapshot=local_snapshot,
+                    remote_path=remote_path,
+                    remote_snapshot=remote_snapshot,
+                    kind=descriptor.container_kind,
+                    side="local",
+                )
+                self._stage_container_target(
+                    work,
+                    adapter=adapter,
+                    destination_path=remote_path,
+                    destination_snapshot=remote_snapshot,
+                    target=remote_target,
+                    local_path=local_path,
+                    local_snapshot=local_snapshot,
+                    remote_path=remote_path,
+                    remote_snapshot=remote_snapshot,
+                    kind=descriptor.container_kind,
+                    side="remote",
+                )
+            except OpaqueContainerError as exc:
+                (
+                    work.handled_paths,
+                    work.desired_local,
+                    work.desired_remote,
+                    work.local_sources,
+                    work.remote_sources,
+                    work.baselines,
+                    work.expected_local,
+                    work.expected_remote,
+                    work.descriptors,
+                    work.conflicted_container_ids,
+                    work.conflict_paths,
+                    work.preview_entries,
+                    work.invalidated_container_ids,
+                    work.uploaded,
+                    work.downloaded,
+                    work.upload_bytes,
+                    work.download_bytes,
+                    work.unchanged,
+                ) = checkpoint
+                if exc.reason is OpaqueReason.ADAPTER_VERSION_MISMATCH:
+                    work.invalidated_container_ids.add(container_id)
+                fingerprint = hashlib.sha256(container_id.encode("utf-8")).hexdigest()[:12]
+                log.info(
+                    "SaveSync container fallback: adapter=%s container=%s reason=%s",
+                    descriptor.container_adapter_id,
+                    fingerprint,
+                    exc.reason.value,
+                )
+                continue
+        return work
+
+    def _verify_container_targets(self, work: _ContainerWork) -> None:
+        for values in (work.expected_local, work.expected_remote):
+            for adapter, path, expected in values.values():
+                actual = adapter.snapshot(path, container_id=expected.container_id)
+                if self._snapshot_content(actual) != self._snapshot_content(expected):
+                    raise SaveSyncVerificationError(
+                        "Promoted container does not match its expected logical snapshot"
+                    )
 
     def _reconcile(
         self,
@@ -1462,6 +1960,38 @@ class SaveSyncService:
                         and descriptor.layout_id in selected_layout_ids
                     )
                 }
+            original_local = dict(local_report.artifacts)
+            original_remote = dict(remote_report.artifacts)
+            physical_baseline = dict(baseline)
+            container_work = self._prepare_container_reconciliation(
+                local=original_local,
+                remote=original_remote,
+                state=state,
+                upload_only=upload_only,
+                repair_local_group_ids=repair_local_group_ids,
+            )
+            if container_work.handled_paths:
+                local_report = replace(
+                    local_report,
+                    artifacts={
+                        path: artifact
+                        for path, artifact in local_report.artifacts.items()
+                        if path not in container_work.handled_paths
+                    },
+                )
+                remote_report = replace(
+                    remote_report,
+                    artifacts={
+                        path: artifact
+                        for path, artifact in remote_report.artifacts.items()
+                        if path not in container_work.handled_paths
+                    },
+                )
+                baseline = {
+                    path: artifact
+                    for path, artifact in baseline.items()
+                    if path not in container_work.handled_paths
+                }
             plan = _reconcile_plan(
                 local_report,
                 remote_report,
@@ -1488,10 +2018,10 @@ class SaveSyncService:
                 ),
                 metadata=plan.to_dict(),
             )
-            local = local_report.artifacts
-            remote = remote_report.artifacts
-            desired_local = dict(local)
-            desired_remote = dict(remote)
+            local = original_local
+            remote = original_remote
+            desired_local = dict(container_work.desired_local)
+            desired_remote = dict(container_work.desired_remote)
             for entry in plan.entries:
                 if entry.action is SaveReconcileAction.UPLOAD:
                     _assign(desired_remote, entry.relative_path, entry.local)
@@ -1502,7 +2032,9 @@ class SaveSyncService:
             destination_views: list[_DestinationView] = []
             selected_views: list[save_transaction.SelectedView] = []
             try:
-                if plan.uploads:
+                remote_changed = desired_remote != remote
+                local_changed = desired_local != local
+                if remote_changed:
                     # Only this branch writes to remote-data; a plan with no
                     # uploads (pure download/no-op) must remain available
                     # regardless of the remote's durable-transaction support.
@@ -1516,12 +2048,14 @@ class SaveSyncService:
                             remote_views,
                             current=remote,
                             desired=desired_remote,
-                            source_for=lambda path, artifact: self._choose_source(
-                                path, artifact, local, remote
+                            source_for=lambda path, artifact: (
+                                container_work.remote_sources[path]
+                                if path in container_work.remote_sources
+                                else self._choose_source(path, artifact, local, remote)
                             ),
                         )
                     )
-                if plan.downloads and not upload_only:
+                if local_changed and not upload_only:
                     local_views = self._local_views()
                     destination_views.extend(local_views)
                     selected_views.extend(
@@ -1529,8 +2063,10 @@ class SaveSyncService:
                             local_views,
                             current=local,
                             desired=desired_local,
-                            source_for=lambda path, artifact: self._choose_source(
-                                path, artifact, local, remote
+                            source_for=lambda path, artifact: (
+                                container_work.local_sources[path]
+                                if path in container_work.local_sources
+                                else self._choose_source(path, artifact, local, remote)
                             ),
                         )
                     )
@@ -1576,6 +2112,7 @@ class SaveSyncService:
                     self._apply_selected_transaction(
                         transaction, tuple(destination_views)
                     )
+                self._verify_container_targets(container_work)
                 if verification_layout_ids is None:
                     final_local_report = self._scan_automatic_local()
                     final_remote_report = self._scan_automatic_remote()
@@ -1613,19 +2150,29 @@ class SaveSyncService:
                 transaction = locals().get("transaction")
                 if transaction is not None:
                     transaction.rollback()
+                container_work.cleanup()
                 raise
 
             timestamp = datetime.now(timezone.utc).isoformat()
             report = SaveReconcileReport(
                 revision=uuid.uuid4().hex,
                 timestamp=timestamp,
-                uploaded=len(plan.uploads),
-                downloaded=0 if upload_only else len(plan.downloads),
-                conflicts=len(plan.conflicts),
-                unchanged=len(plan.unchanged),
-                upload_bytes=plan.upload_bytes,
-                download_bytes=0 if upload_only else plan.download_bytes,
-                conflict_paths=tuple(entry.relative_path for entry in plan.conflicts),
+                uploaded=len(plan.uploads) + container_work.uploaded,
+                downloaded=(
+                    0 if upload_only else len(plan.downloads) + container_work.downloaded
+                ),
+                conflicts=len(plan.conflicts) + len(container_work.conflict_paths),
+                unchanged=len(plan.unchanged) + container_work.unchanged,
+                upload_bytes=plan.upload_bytes + container_work.upload_bytes,
+                download_bytes=(
+                    0
+                    if upload_only
+                    else plan.download_bytes + container_work.download_bytes
+                ),
+                conflict_paths=tuple(
+                    [entry.relative_path for entry in plan.conflicts]
+                    + container_work.conflict_paths
+                ),
                 scope=plan.scope,
             )
             selected_baseline = (
@@ -1633,6 +2180,17 @@ class SaveSyncService:
                 if upload_only
                 else _reconciled_baseline(plan, existing=baseline)
             )
+            for container_id, descriptor in container_work.descriptors.items():
+                paths = self._container_paths(
+                    desired_local, container_id, descriptor.container_kind
+                )
+                if container_id in container_work.conflicted_container_ids:
+                    for path in paths:
+                        if path in physical_baseline:
+                            selected_baseline[path] = physical_baseline[path]
+                    continue
+                for path in paths:
+                    selected_baseline[path] = desired_local[path]
             final_local_values = tuple(
                 desired_local[path] for path in sorted(desired_local)
             )
@@ -1652,6 +2210,63 @@ class SaveSyncService:
                     observed_at=timestamp,
                 )
             }
+            container_conflicted_group_ids = {
+                descriptor.group_id
+                for container_id, descriptor in container_work.descriptors.items()
+                if container_id in container_work.conflicted_container_ids
+            }
+            container_conflicted_group_ids.update(
+                descriptor.group_id
+                for entry in plan.conflicts
+                for descriptor in [self._policy.group_for_path(entry.relative_path)]
+                if descriptor is not None
+            )
+            for container_id, descriptor in container_work.descriptors.items():
+                group_id = descriptor.group_id
+                local_artifacts = tuple(
+                    desired_local[path]
+                    for path in sorted(desired_local)
+                    if (
+                        (value := self._policy.group_for_path(path)) is not None
+                        and value.group_id == group_id
+                    )
+                )
+                remote_artifacts = tuple(
+                    desired_remote[path]
+                    for path in sorted(desired_remote)
+                    if (
+                        (value := self._policy.group_for_path(path)) is not None
+                        and value.group_id == group_id
+                    )
+                )
+                local_snapshot = SaveGroupSnapshot(
+                    group_id, descriptor.layout_id, local_artifacts, timestamp
+                )
+                remote_snapshot = SaveGroupSnapshot(
+                    group_id, descriptor.layout_id, remote_artifacts, timestamp
+                )
+                previous_group = next(
+                    (group for group in state.groups if group.group_id == group_id),
+                    None,
+                )
+                conflicted = group_id in container_conflicted_group_ids
+                refreshed_groups[group_id] = SaveGroupState(
+                    group_id=group_id,
+                    layout_id=descriptor.layout_id,
+                    condition=(
+                        SaveGroupCondition.CONFLICT
+                        if conflicted
+                        else SaveGroupCondition.CLEAN
+                    ),
+                    baseline=(
+                        previous_group.baseline
+                        if conflicted and previous_group is not None
+                        else local_snapshot
+                    ),
+                    local_observed=local_snapshot,
+                    remote_observed=remote_snapshot,
+                    verified_at=timestamp,
+                )
             affected_layouts = {}
             for entry in plan.entries:
                 descriptor = self._policy.group_for_path(entry.relative_path)
@@ -1660,6 +2275,8 @@ class SaveSyncService:
                         "Reconciliation plan contains an unsupported path: "
                         f"{entry.relative_path}"
                     )
+                affected_layouts[descriptor.group_id] = descriptor.layout_id
+            for descriptor in container_work.descriptors.values():
                 affected_layouts[descriptor.group_id] = descriptor.layout_id
             # A watcher can mark a supported group dirty before any baseline
             # or file exists. A verified empty reconciliation clears only a
@@ -1736,6 +2353,20 @@ class SaveSyncService:
                 active_operation=None,
                 last_error=None,
                 last_completed_operation_id=operation_id,
+                container_baselines=tuple(
+                    sorted(
+                        {
+                            **{
+                                item.container_id: item
+                                for item in state.container_baselines
+                                if item.container_id
+                                not in container_work.invalidated_container_ids
+                            },
+                            **container_work.baselines,
+                        }.values(),
+                        key=lambda item: item.container_id,
+                    )
+                ),
             )
             conflicted_group_ids = {
                 group.group_id
@@ -1777,8 +2408,9 @@ class SaveSyncService:
             except BaseException:
                 if transaction is not None:
                     transaction.rollback()
+                container_work.cleanup()
                 raise
-            if plan.uploads:
+            if desired_remote != remote:
                 mutations = self._journal_mutations_for_remote_transition(
                     before=remote,
                     after=desired_remote,
@@ -1804,6 +2436,7 @@ class SaveSyncService:
                         operation_id,
                         exc_info=True,
                     )
+            container_work.cleanup()
             emit_progress(
                 progress,
                 "savesync",
@@ -2260,6 +2893,11 @@ class SaveSyncService:
             else conflict
             for conflict in state.conflicts
         )
+        container_baselines = self._container_baselines_after_force(
+            state,
+            record.manifest,
+            affected_paths=frozenset(set(local).union(remote)),
+        )
         _write_state(
             self._state_path,
             replace(
@@ -2271,11 +2909,49 @@ class SaveSyncService:
                 shared_manifest=shared_values,
                 groups=groups,
                 conflicts=conflicts,
+                container_baselines=container_baselines,
                 active_operation=None,
                 last_error=None,
                 last_completed_operation_id=operation_id,
             ),
         )
+
+    def _container_baselines_after_force(
+        self,
+        state: SaveSyncState,
+        manifest: tuple[SaveArtifact, ...],
+        *,
+        affected_paths: frozenset[str],
+    ) -> tuple[ContainerBaseline, ...]:
+        if not self._container_merge_enabled:
+            return state.container_baselines
+        by_id = {item.container_id: item for item in state.container_baselines}
+        descriptors = {}
+        manifest_map = {artifact.relative_path: artifact for artifact in manifest}
+        for path in sorted(set(affected_paths).union(manifest_map)):
+            descriptor = self._policy.group_for_path(path)
+            if descriptor is not None and descriptor.container_id:
+                descriptors.setdefault(descriptor.container_id, descriptor)
+        for container_id, descriptor in descriptors.items():
+            if not self._container_paths(
+                manifest_map, container_id, descriptor.container_kind
+            ):
+                by_id.pop(container_id, None)
+                continue
+            adapter = self._container_registry.get(descriptor.container_adapter_id)
+            if adapter is None:
+                by_id.pop(container_id, None)
+                continue
+            try:
+                snapshot = adapter.snapshot(
+                    self._local_root / container_id,
+                    container_id=container_id,
+                )
+            except OpaqueContainerError:
+                by_id.pop(container_id, None)
+                continue
+            by_id[container_id] = baseline_from_snapshot(snapshot)
+        return tuple(by_id[key] for key in sorted(by_id))
 
     def _append_remote_journal(
         self,
