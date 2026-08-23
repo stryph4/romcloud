@@ -873,6 +873,35 @@ def test_game_exit_detects_first_save_and_uploads_only_that_registry_group(tmp_p
     assert all(not group.dirty_path_hints for group in service.get_state().groups)
 
 
+def test_gba_game_stop_uploads_and_periodic_quick_sync_repairs_materialization(
+    tmp_path: Path,
+):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    local = tmp_path / "local" / "gba" / "Game.srm"
+    remote = tmp_path / "remote" / "gba" / "Game.srm"
+    service.full_sync()
+    coordinator.game_start(
+        system="gba", emulator="libretro", core="mgba", rom="Game.gba"
+    )
+    _write(local, b"gba-progress")
+
+    coordinator.game_stop(
+        system="gba", emulator="libretro", core="mgba", rom="Game.gba"
+    )
+
+    assert local.read_bytes() == b"gba-progress"
+    assert remote.read_bytes() == b"gba-progress"
+
+    local.unlink()
+    coordinator.menu_tick(force=True)
+
+    assert local.read_bytes() == b"gba-progress"
+    assert remote.read_bytes() == b"gba-progress"
+    assert service.quick_sync().status == "unchanged"
+
+
 def test_game_exit_remote_dirty_downloads_through_quick_sync(tmp_path: Path):
     provider = _Provider()
     service = _service(tmp_path, provider)

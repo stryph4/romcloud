@@ -452,7 +452,7 @@ class TestPreviewAccuracy:
         assert len(diff.added) == 1
         assert diff.added[0].relative_path == "psx/Game.srm"
 
-    def test_download_preview_rehashes_live_remote_when_roots_are_symlinks(
+    def test_symlinked_roots_rehash_preview_but_remain_commit_ineligible(
         self, tmp_path, provider
     ):
         real_local = tmp_path / "real-local-saves"
@@ -467,12 +467,13 @@ class TestPreviewAccuracy:
         except (AttributeError, NotImplementedError, OSError):
             pytest.skip("symlink creation is unavailable on this platform")
 
-        svc = SaveSyncService(
+        state_path = tmp_path / "data" / "savesync-state.json"
+        real_service = SaveSyncService(
             provider=provider,
             connectivity_root=str(tmp_path / "remote-data"),
-            local_root=str(local_root),
-            remote_root=str(remote_root),
-            state_path=tmp_path / "data" / "savesync-state.json",
+            local_root=str(real_local),
+            remote_root=str(real_remote),
+            state_path=state_path,
             xbox_enabled=False,
         )
 
@@ -480,7 +481,16 @@ class TestPreviewAccuracy:
         local_file = real_local / relative
         remote_file = real_remote / relative
         _write(local_file, b"local-A")
-        svc.commit_upload(svc.preview_upload())
+        real_service.commit_upload(real_service.preview_upload())
+
+        svc = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "remote-data"),
+            local_root=str(local_root),
+            remote_root=str(remote_root),
+            state_path=state_path,
+            xbox_enabled=False,
+        )
 
         stale_hash = svc.get_state().groups[0].remote_observed.artifacts[0].content_hash
         remote_file.write_bytes(b"remote-B")
@@ -491,11 +501,11 @@ class TestPreviewAccuracy:
         assert preview.conflicts == ()
         assert preview.unchanged == ()
 
-        svc.commit_download(preview)
+        with pytest.raises(SaveSyncError, match="symlinked ancestor"):
+            svc.commit_download(preview)
 
-        assert local_file.read_bytes() == b"remote-B"
-        refreshed_hash = svc.get_state().groups[0].remote_observed.artifacts[0].content_hash
-        assert refreshed_hash != stale_hash
+        assert local_file.read_bytes() == b"local-A"
+        assert svc.get_state().groups[0].remote_observed.artifacts[0].content_hash == stale_hash
 
 
 class TestExclusions:
@@ -1416,6 +1426,204 @@ class TestQuickSyncAndJournal:
 
         assert result.status == "unchanged"
         assert calls == {"local": 0, "remote": 0}
+
+    def test_missing_clean_gba_generation_is_materialized_without_download_all(
+        self, tmp_path: Path, service: SaveSyncService, caplog
+    ):
+        local = tmp_path / "local-saves" / "gba" / "Game.srm"
+        remote = tmp_path / "remote-saves" / "gba" / "Game.srm"
+        _write(local, b"gba-progress")
+        service.full_sync()
+        assert remote.read_bytes() == b"gba-progress"
+
+        local.unlink()
+
+        with caplog.at_level("INFO"):
+            repaired = service.quick_sync()
+        unchanged = service.quick_sync()
+
+        assert repaired.status == "reconciled"
+        assert repaired.report is not None
+        assert repaired.report.downloaded == 1
+        assert repaired.report.uploaded == 0
+        assert local.read_bytes() == b"gba-progress"
+        assert remote.read_bytes() == b"gba-progress"
+        assert unchanged.status == "unchanged"
+        assert unchanged.reason == "journal-current-local-materialized"
+        assert "logical_save_id=retroarch-root-gba/game" in caplog.text
+        assert "reconciliation_decision=download" in caplog.text
+        assert "missing_physical_destinations=1" in caplog.text
+        assert "selected_transaction_path_count=1" in caplog.text
+        assert "promoted_path_count=1" in caplog.text
+        assert "verified_path_count=1" in caplog.text
+
+    def test_quick_sync_and_download_all_materialize_the_same_gba_destination(
+        self, tmp_path: Path, service: SaveSyncService
+    ):
+        local = tmp_path / "local-saves" / "gba" / "Game.srm"
+        _write(local, b"gba-progress")
+        service.full_sync()
+
+        local.unlink()
+        service.commit_download(service.preview_download())
+        assert local.read_bytes() == b"gba-progress"
+
+        local.unlink()
+        repaired = service.quick_sync()
+
+        assert repaired.status == "reconciled"
+        assert local.read_bytes() == b"gba-progress"
+
+    @pytest.mark.parametrize(
+        ("files", "missing"),
+        (
+            (
+                {
+                    "ppsspp/PSP/SAVEDATA/ULUS12345/DATA.BIN": b"nested-data",
+                    "ppsspp/PSP/SAVEDATA/ULUS12345/PARAM.SFO": b"nested-metadata",
+                },
+                ("ppsspp/PSP/SAVEDATA/ULUS12345/DATA.BIN",),
+            ),
+            (
+                {
+                    "n64/Game.srm": b"save-ram",
+                    "n64/Game.1.sav": b"controller-pak",
+                },
+                ("n64/Game.1.sav",),
+            ),
+            (
+                {
+                    "duckstation/memcards/Card-1.mcd": b"card-one",
+                    "duckstation/memcards/Card-2.mcd": b"card-two",
+                },
+                ("duckstation/memcards/Card-2.mcd",),
+            ),
+        ),
+        ids=("nested-directory", "multi-file-group", "shared-layout"),
+    )
+    def test_missing_generation_contract_repairs_only_missing_physical_paths(
+        self,
+        tmp_path: Path,
+        service: SaveSyncService,
+        monkeypatch,
+        files: dict[str, bytes],
+        missing: tuple[str, ...],
+    ):
+        unrelated = "gba/Unrelated.srm"
+        expected = {**files, unrelated: b"unrelated"}
+        for relative, content in expected.items():
+            _write(tmp_path / "local-saves" / relative, content)
+        service.full_sync()
+        for relative in missing:
+            (tmp_path / "local-saves" / relative).unlink()
+
+        captured: list[save_transaction.TransactionMetrics] = []
+        real_prepare = save_transaction.prepare_transaction
+
+        def track_prepare(*args, **kwargs):
+            transaction = real_prepare(*args, **kwargs)
+            captured.append(transaction.metrics)
+            return transaction
+
+        monkeypatch.setattr(save_transaction, "prepare_transaction", track_prepare)
+
+        repaired = service.quick_sync()
+        unchanged = service.quick_sync()
+
+        assert repaired.status == "reconciled"
+        assert repaired.report is not None
+        assert repaired.report.uploaded == 0
+        assert repaired.report.conflicts == 0
+        assert unchanged.status == "unchanged"
+        for relative, content in expected.items():
+            assert (tmp_path / "local-saves" / relative).read_bytes() == content
+            assert (tmp_path / "remote-saves" / relative).read_bytes() == content
+        assert len(captured) == 1
+        assert captured[0].changed_files == len(missing)
+        assert captured[0].staged_files == len(missing)
+        assert captured[0].backed_up_files == 0
+
+    def test_new_local_gba_save_upload_stays_materialized_and_second_sync_is_noop(
+        self, tmp_path: Path, service: SaveSyncService
+    ):
+        service.full_sync()
+        local = tmp_path / "local-saves" / "gba" / "Game.srm"
+        remote = tmp_path / "remote-saves" / "gba" / "Game.srm"
+        _write(local, b"new-local-generation")
+        service.mark_local_dirty("gba/Game.srm")
+
+        uploaded = service.quick_sync()
+        unchanged = service.quick_sync()
+
+        assert uploaded.status == "reconciled"
+        assert uploaded.report is not None
+        assert uploaded.report.uploaded == 1
+        assert local.read_bytes() == b"new-local-generation"
+        assert remote.read_bytes() == b"new-local-generation"
+        assert unchanged.status == "unchanged"
+
+    def test_remote_only_nested_generation_quick_sync_materializes_exact_layout(
+        self, tmp_path: Path, service: SaveSyncService
+    ):
+        service.full_sync()
+        relative = "ppsspp/PSP/SAVEDATA/ULUS12345/DATA.BIN"
+        remote = tmp_path / "remote-saves" / relative
+        local = tmp_path / "local-saves" / relative
+        _write(remote, b"remote-generation")
+        descriptor = service.selection_policy.group_for_path(relative)
+        assert descriptor is not None
+        savesync_journal.append_mutations(
+            savesync_journal.default_journal_path(tmp_path / "remote-saves"),
+            device_id="peer",
+            revision="remote-nested",
+            timestamp="2026-08-22T00:00:00+00:00",
+            mutations=[
+                {
+                    "system": descriptor.system,
+                    "layout_id": descriptor.layout_id,
+                    "group_id": descriptor.group_id,
+                    "object_id": relative,
+                    "operation": "create",
+                }
+            ],
+        )
+
+        downloaded = service.quick_sync()
+        unchanged = service.quick_sync()
+
+        assert downloaded.status == "reconciled"
+        assert downloaded.report is not None
+        assert downloaded.report.downloaded == 1
+        assert local.read_bytes() == b"remote-generation"
+        assert unchanged.status == "unchanged"
+
+    def test_missing_legacy_rpcs3_generation_restores_external_physical_view(
+        self, tmp_path: Path, provider: _FakeProvider
+    ):
+        local_root = tmp_path / "local-saves"
+        legacy_root = tmp_path / "configs" / "rpcs3" / "dev_hdd0"
+        local_root.mkdir()
+        relative_physical = Path("home/00000001/savedata/BLUS12345/SAVE.DAT")
+        local = legacy_root / relative_physical
+        _write(local, b"rpcs3-progress")
+        service = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "remote-data"),
+            local_root=str(local_root),
+            remote_root=str(tmp_path / "remote-saves"),
+            state_path=tmp_path / "data" / "savesync-state.json",
+            legacy_rpcs3_root=str(legacy_root),
+        )
+        service.full_sync()
+        local.unlink()
+
+        repaired = service.quick_sync()
+
+        canonical = Path("ps3/rpcs3/dev_hdd0") / relative_physical
+        assert repaired.status == "reconciled"
+        assert local.read_bytes() == b"rpcs3-progress"
+        assert not (local_root / canonical).exists()
+        assert (tmp_path / "remote-saves" / canonical).read_bytes() == b"rpcs3-progress"
 
     def test_unchanged_generation_with_local_dirty_group_uploads_targeted_layout(
         self, tmp_path: Path, service: SaveSyncService, monkeypatch
