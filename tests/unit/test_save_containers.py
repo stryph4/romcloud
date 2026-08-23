@@ -512,12 +512,11 @@ def _container_service(
         local_root=str(local),
         remote_root=str(tmp_path / "remote"),
         state_path=tmp_path / "data/state.json",
-        container_merge_enabled=True,
         **({"container_registry": container_registry} if container_registry else {}),
     )
 
 
-def test_service_merges_disjoint_ps1_domains_through_existing_transaction(
+def test_service_automatically_merges_disjoint_ps1_domains_through_existing_transaction(
     tmp_path: Path,
 ) -> None:
     service = _container_service(tmp_path)
@@ -693,7 +692,7 @@ def test_adapter_schema_change_invalidates_logical_baseline_and_falls_back_opaqu
     assert service.get_state().container_baselines == ()
 
 
-def test_service_keeps_ps2_file_cards_opaque_when_container_gate_is_enabled(
+def test_service_keeps_ps2_file_cards_opaque_with_automatic_container_merging(
     tmp_path: Path,
 ) -> None:
     service = _container_service(tmp_path)
@@ -713,7 +712,7 @@ def test_service_keeps_ps2_file_cards_opaque_when_container_gate_is_enabled(
     assert service.get_state().container_baselines == ()
 
 
-def test_service_merges_ps2_folder_card_with_complete_versioned_grouping(
+def test_service_automatically_merges_ps2_folder_card_with_complete_versioned_grouping(
     tmp_path: Path,
 ) -> None:
     grouping = ExplicitPs2FolderGroupingPolicy(

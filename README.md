@@ -606,15 +606,14 @@ token.
 `xbox_hdd.qcow2` virtual disk. Support is disabled by default because
 synchronizing it means transferring the whole opaque file.
 
-**Experimental memory-card merging:** development hardware can enable
-`ROMCLOUD_EXPERIMENTAL_CONTAINER_SAVESYNC=1` to reconcile independent saves
+**Memory-card merging:** SaveSync automatically reconciles independent saves
 inside structurally valid 128 KiB raw PS1 cards and marker-verified PCSX2
 Folder Memory Cards. PS1 files are grouped conservatively by their documented
 commercial game namespace. A PCSX2 folder with multiple structural entries is
 kept opaque unless a complete versioned grouping supplied from trustworthy
-PCSX2-maintained data is available. Monolithic PCSX2 `.ps2` cards always retain
-the existing opaque whole-card behavior. The feature is disabled by default
-pending Batocera/DuckStation/PCSX2 hardware qualification.
+PCSX2-maintained data is available. Invalid, unsupported, or ambiguous cards
+retain opaque whole-card behavior, as do monolithic PCSX2 `.ps2` cards.
+Batocera/DuckStation/PCSX2 hardware qualification remains pending.
 
 **RPCS3 installed games:** installed titles, patches, firmware, caches,
 configuration, and logs are never SaveSync content. Only the explicitly

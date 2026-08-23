@@ -26,8 +26,8 @@ last column before it can be called fully validated.
 | Switch | legacy Yuzu-compatible install | `/userdata/saves/yuzu/0000000000000000/<account32>/<title16>/**` | Existing, confirmed | UT, exact account/title levels | One account + title directory | UT, generic | UT to legacy primary tree when no mapped fork is active | UT for Switch/Yuzu | Filesystem title domain | Yes on retained installations | Keys, firmware/system NAND, cache, shaders, logs and config excluded |
 | Switch | Ryujinx / other forks | No current generator found in audited Batocera tree | Unsupported | No | None | No | No | No | None | Re-audit if Batocera adds one | No guessed paths |
 | PS1 | RetroArch cores | `/userdata/saves/psx/*.{srm,state*}` | Existing, confirmed | UT | Per title stem | UT, generic | UT to same root | UT, system lifecycle | Filesystem files | Yes | Emulator load not exercised here |
-| PS1 | DuckStation | `/userdata/saves/duckstation/memcards/**` and root `*.sav` | Existing, confirmed | UT | Opaque card by default; experimental commercial-game domains inside valid 128 KiB raw cards | UT | UT | UT for DuckStation | Experimental `ps1-raw-memory-card`; opaque fallback | Yes, especially card adapter | Resume files excluded; adapter stays opt-in |
-| PS2 | PCSX2 | `/userdata/saves/ps2/pcsx2/Mcd*.ps2`, folder cards, `sstates/**`; legacy `pcsx2` roots retained | Existing, confirmed | UT | Monolithic cards/states deliberately broad; marker-verified folder card can use one structural entry | UT | UT | UT for PS2/PCSX2 | Monolithic `.ps2` opaque; experimental folder adapter with opaque fallback | Yes | Multi-entry folder cards remain opaque |
+| PS1 | DuckStation | `/userdata/saves/duckstation/memcards/**` and root `*.sav` | Existing, confirmed | UT | Commercial-game domains inside supported valid 128 KiB raw cards; opaque fallback | UT | UT | UT for DuckStation | Automatic `ps1-raw-memory-card`; opaque fallback | Yes, especially card adapter | Resume files excluded; invalid, unsupported, or ambiguous cards stay opaque |
+| PS2 | PCSX2 | `/userdata/saves/ps2/pcsx2/Mcd*.ps2`, folder cards, `sstates/**`; legacy `pcsx2` roots retained | Existing, confirmed | UT | Monolithic cards/states deliberately broad; marker-verified folder card can use one structural entry | UT | UT | UT for PS2/PCSX2 | Monolithic `.ps2` opaque; automatic folder adapter with opaque fallback | Yes | Multi-entry folder cards remain opaque unless complete grouping is proven |
 | PSP | PPSSPP | `/userdata/saves/ppsspp/PSP/SAVEDATA/<title>/**`; `PPSSPP_STATE/**` | Existing, confirmed | UT | Savedata first descendant; state stem | UT, nested repair regression | UT | UT for PSP/PPSSPP | Filesystem directory | Yes | Other PSP data excluded |
 | PS3 | RPCS3 | Canonical `ps3/rpcs3/dev_hdd0/home/<user>/savedata/<title>/**`; Batocera config-tree compatibility mapping retained; trophies, VMC and title savestates separately allowlisted | Existing, confirmed | UT | Savedata/trophy per title; savestate per title; VMC broad | UT, mapped-root regression | UT to configured physical tree | Registry-scoped; hardware check required | VMC remains opaque layout | Yes | Installed games, patches, firmware, caches, logs, and config excluded |
 | Master System | RetroArch cores | `/userdata/saves/mastersystem/*.{srm,state*}` | Existing, confirmed | UT | Per title stem | UT | UT | UT | Filesystem files | Yes | Emulator load not exercised here |
@@ -51,8 +51,8 @@ last column before it can be called fully validated.
 ## Shared and opaque review
 
 - DuckStation raw cards and PCSX2 Folder Memory Cards are the only currently
-  implemented logical-container decompositions, both experimental and with
-  opaque fallback.
+  implemented logical-container decompositions. Supported layouts use them
+  automatically, with opaque fallback for unsafe or unproven layouts.
 - RPCS3 trophies are safely grouped by their first title descendant. Dolphin
   raw cards, Flycast VMUs, and Ymir backup RAM are safely split only at the
   physical card/image boundary; none is decomposed internally.

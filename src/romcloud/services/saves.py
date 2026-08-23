@@ -85,7 +85,6 @@ from romcloud.infrastructure.save_container_registry import (
 log = get_logger("saves")
 _RPCS3_CANONICAL_PREFIX = f"ps3/{RPCS3_DEV_HDD0_PREFIX}"
 _QUICK_SYNC_HISTORY_REQUIRED = 1
-_CONTAINER_MERGE_ENV = "ROMCLOUD_EXPERIMENTAL_CONTAINER_SAVESYNC"
 
 
 class _ScratchDir:
@@ -181,7 +180,6 @@ class SaveSyncService:
         policy: SaveSelectionPolicy = DEFAULT_SAVE_SELECTION_POLICY,
         capability_policy: Optional[CapabilityPolicy] = None,
         remote_store: Optional[RemoteSaveStore] = None,
-        container_merge_enabled: Optional[bool] = None,
         container_registry: SaveContainerRegistry = DEFAULT_SAVE_CONTAINER_REGISTRY,
     ) -> None:
         self._provider = provider
@@ -233,12 +231,6 @@ class SaveSyncService:
         self._policy = policy
         self._capabilities = capability_policy or CapabilityPolicy("smart_cache")
         self._active_read_scratch: Optional[_ScratchDir] = None
-        self._container_merge_enabled = (
-            container_merge_enabled
-            if container_merge_enabled is not None
-            else os.environ.get(_CONTAINER_MERGE_ENV, "").strip().casefold()
-            in {"1", "true", "yes", "on"}
-        )
         self._container_registry = container_registry
 
     # ── connectivity and settings ────────────────────────────────────────
@@ -1768,7 +1760,7 @@ class SaveSyncService:
         work = _ContainerWork.empty()
         work.desired_local = dict(local)
         work.desired_remote = dict(remote)
-        if not self._container_merge_enabled or upload_only:
+        if upload_only:
             return work
         baselines = {
             baseline.container_id: baseline for baseline in state.container_baselines
@@ -3031,8 +3023,6 @@ class SaveSyncService:
         *,
         affected_paths: frozenset[str],
     ) -> tuple[ContainerBaseline, ...]:
-        if not self._container_merge_enabled:
-            return state.container_baselines
         by_id = {item.container_id: item for item in state.container_baselines}
         descriptors = {}
         manifest_map = {artifact.relative_path: artifact for artifact in manifest}
