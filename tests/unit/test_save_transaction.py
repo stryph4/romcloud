@@ -107,6 +107,218 @@ def test_operation_snapshot_survives_until_receipt_finalize(tmp_path: Path) -> N
     assert not journal.exists()
 
 
+def test_one_changed_save_has_constant_backup_scope_in_large_tree(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "saves"
+    source = tmp_path / "source"
+    changed_path = "psx/Changed.srm"
+    current_content: dict[str, bytes] = {changed_path: b"before"}
+    for index in range(64):
+        current_content[f"psx/Stable-{index:03d}.srm"] = b"s" * 512
+    for relative, content in current_content.items():
+        _write(root / relative, content)
+    for index in range(128):
+        _write(root / f"unrelated/User-{index:03d}.bin", b"u" * 1024)
+    before_files = sum(path.is_file() for path in root.rglob("*"))
+    before_bytes = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
+
+    current = _manifest(current_content)
+    desired = dict(current)
+    desired[changed_path] = _artifact(changed_path, b"after")
+    _write(source / changed_path, b"after")
+    transaction = save_transaction.prepare_transaction(
+        tmp_path / "transaction.json",
+        (
+            save_transaction.SelectedView(
+                root,
+                current,
+                desired,
+                lambda relative, _artifact: source / relative,
+            ),
+        ),
+        operation_id=_OPERATION_ID,
+    )
+
+    assert before_files == 193
+    assert before_bytes == 163846
+    assert transaction.metrics.to_dict() == {
+        "changed_files": 1,
+        "staged_files": 1,
+        "staged_bytes": 5,
+        "backed_up_files": 1,
+        "backed_up_bytes": 6,
+        "duplicated_files": 2,
+        "duplicated_bytes": 11,
+        "destination_views": 1,
+        "backup_retention_limit_per_view": 1,
+    }
+    assert [
+        path.relative_to(transaction.views[0].stage).as_posix()
+        for path in transaction.views[0].stage.rglob("*")
+        if path.is_file()
+    ] == [changed_path]
+    assert [
+        path.relative_to(transaction.views[0].previous_candidate).as_posix()
+        for path in transaction.views[0].previous_candidate.rglob("*")
+        if path.is_file()
+    ] == [changed_path]
+
+    _apply(transaction)
+    transaction.finalize()
+
+    assert (root / changed_path).read_bytes() == b"after"
+    assert (root / "unrelated/User-127.bin").read_bytes() == b"u" * 1024
+    assert sum(path.is_file() for path in root.rglob("*")) == before_files
+    previous = tmp_path / "saves.savesync-previous"
+    assert [
+        path.relative_to(previous).as_posix()
+        for path in previous.rglob("*")
+        if path.is_file()
+    ] == [changed_path]
+    assert not (tmp_path / "saves.previous").exists()
+
+
+def test_multiple_save_sets_are_counted_without_unchanged_siblings(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "saves"
+    source = tmp_path / "source"
+    current_content = {
+        "psx/Alpha.srm": b"alpha-before",
+        "psx/Stable.srm": b"stable",
+        "switch/title/slot/save.dat": b"switch-before",
+    }
+    desired_content = {
+        "psx/Alpha.srm": b"alpha-after",
+        "psx/Stable.srm": b"stable",
+        "switch/title/slot/save.dat": b"switch-after",
+    }
+    for relative, content in current_content.items():
+        _write(root / relative, content)
+    for relative, content in desired_content.items():
+        _write(source / relative, content)
+
+    transaction = save_transaction.prepare_transaction(
+        tmp_path / "transaction.json",
+        (
+            save_transaction.SelectedView(
+                root,
+                _manifest(current_content),
+                _manifest(desired_content),
+                lambda relative, _artifact: source / relative,
+            ),
+        ),
+        operation_id=_OPERATION_ID,
+    )
+
+    assert transaction.metrics.changed_files == 2
+    assert transaction.metrics.backed_up_files == 2
+    assert transaction.metrics.staged_files == 2
+    assert "psx/Stable.srm" not in transaction.views[0].current
+    assert "psx/Stable.srm" not in transaction.views[0].desired
+
+    _apply(transaction)
+    transaction.finalize()
+
+    assert (root / "psx/Alpha.srm").read_bytes() == b"alpha-after"
+    assert (root / "switch/title/slot/save.dat").read_bytes() == b"switch-after"
+    assert (root / "psx/Stable.srm").read_bytes() == b"stable"
+
+
+def test_storage_scope_does_not_narrow_conservative_verification(
+    tmp_path: Path,
+) -> None:
+    transaction, journal, root, _, _ = _prepare(
+        tmp_path,
+        current_content={"changed.srm": b"before", "shared.srm": b"stable"},
+        desired_content={"changed.srm": b"after", "shared.srm": b"stable"},
+    )
+    assert transaction.metrics.backed_up_files == 1
+    (root / "shared.srm").write_bytes(b"emulator-write")
+
+    with pytest.raises(SaveSyncVerificationError):
+        _apply(transaction)
+
+    assert (root / "changed.srm").read_bytes() == b"before"
+    assert (root / "shared.srm").read_bytes() == b"emulator-write"
+    assert not journal.exists()
+    assert not transaction.views[0].stage.exists()
+    assert not transaction.views[0].previous_candidate.exists()
+
+
+def test_completed_backup_retention_is_one_generation_per_view(tmp_path: Path) -> None:
+    transaction, _, root, _, _ = _prepare(
+        tmp_path,
+        current_content={"game.srm": b"v1"},
+        desired_content={"game.srm": b"v2"},
+    )
+    _apply(transaction)
+    transaction.finalize()
+
+    source = tmp_path / "source-v3"
+    _write(source / "game.srm", b"v3")
+    second = save_transaction.prepare_transaction(
+        tmp_path / "transaction.json",
+        (
+            save_transaction.SelectedView(
+                root,
+                _manifest({"game.srm": b"v2"}),
+                _manifest({"game.srm": b"v3"}),
+                lambda relative, _artifact: source / relative,
+            ),
+        ),
+        operation_id="fedcba9876543210fedcba9876543210",
+    )
+    _apply(second)
+    second.finalize()
+
+    retained = list(tmp_path.glob("saves.savesync-previous*"))
+    assert retained == [tmp_path / "saves.savesync-previous"]
+    assert (retained[0] / "game.srm").read_bytes() == b"v2"
+
+
+def test_cancellation_during_preparation_cleans_owned_data_only(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "saves"
+    source = tmp_path / "source"
+    current_content = {"a.srm": b"a-old", "b.srm": b"b-old"}
+    desired_content = {"a.srm": b"a-new", "b.srm": b"b-new"}
+    for relative, content in current_content.items():
+        _write(root / relative, content)
+    for relative, content in desired_content.items():
+        _write(source / relative, content)
+    unrelated = root / "foreign/keep.bin"
+    _write(unrelated, b"keep")
+
+    def cancel_on_second(relative: str, _artifact: SaveArtifact) -> Path:
+        if relative == "b.srm":
+            raise KeyboardInterrupt()
+        return source / relative
+
+    with pytest.raises(KeyboardInterrupt):
+        save_transaction.prepare_transaction(
+            tmp_path / "transaction.json",
+            (
+                save_transaction.SelectedView(
+                    root,
+                    _manifest(current_content),
+                    _manifest(desired_content),
+                    cancel_on_second,
+                ),
+            ),
+            operation_id=_OPERATION_ID,
+        )
+
+    assert (root / "a.srm").read_bytes() == b"a-old"
+    assert (root / "b.srm").read_bytes() == b"b-old"
+    assert unrelated.read_bytes() == b"keep"
+    assert not (tmp_path / "transaction.json").exists()
+    assert list(tmp_path.glob(".saves.savesync-stage-*")) == []
+    assert list(tmp_path.glob(".saves.savesync-previous-*")) == []
+
+
 def test_interruption_without_receipt_rolls_back_idempotently(tmp_path: Path) -> None:
     transaction, journal, root, _, _ = _prepare(
         tmp_path,

@@ -97,6 +97,17 @@ class _DestinationView:
     canonical_prefix: str = ""
 
 
+@dataclass(frozen=True)
+class _LocalMaterializationStatus:
+    """Physical presence of one durable logical save generation."""
+
+    group_id: str
+    layout_id: str
+    expected: int
+    existing: int
+    missing: int
+
+
 class SaveSyncService:
     """Synchronize explicitly selected save/state content without live partial trees."""
 
@@ -809,13 +820,82 @@ class SaveSyncService:
         }
 
     def _local_path(self, relative_path: str) -> Path:
-        if self._uses_legacy_rpcs3() and relative_path.startswith(
-            f"{_RPCS3_CANONICAL_PREFIX}/"
-        ):
-            assert self._legacy_rpcs3_root is not None
-            suffix = relative_path.removeprefix(f"{_RPCS3_CANONICAL_PREFIX}/")
-            return self._legacy_rpcs3_root / suffix
-        return self._local_root / relative_path
+        """Resolve a canonical save path through the local destination views.
+
+        Discovery, selected transactions, post-write verification, and direct
+        source lookups all use the same view/prefix mapping.  This is especially
+        important for Batocera releases whose RPCS3 tree is outside the primary
+        ``/userdata/saves`` root.
+        """
+        destinations: list[Path] = []
+        for view in self._local_views():
+            if not self._belongs_to_view(view, relative_path):
+                continue
+            physical = self._path_for_view(view, relative_path)
+            if physical is not None:
+                destinations.append(view.root / physical)
+        if len(destinations) != 1:
+            raise SaveSyncVerificationError(
+                "Canonical SaveSync path does not resolve to exactly one local "
+                f"destination: {relative_path}"
+            )
+        return destinations[0]
+
+    def _local_materialization_gaps(
+        self,
+        state: SaveSyncState,
+        *,
+        excluded_layout_ids: frozenset[str],
+    ) -> tuple[_LocalMaterializationStatus, ...]:
+        """Find clean durable generations with absent emulator-visible files.
+
+        This deliberately performs bounded path-existence checks rather than a
+        whole save-tree scan.  A gap only nominates the owning group for normal
+        authoritative reconciliation; both sides are still freshly scanned and
+        hashed before any winner or transaction is selected.
+        """
+        gaps: list[_LocalMaterializationStatus] = []
+        for group in state.groups:
+            if (
+                group.condition is not SaveGroupCondition.CLEAN
+                or group.layout_id in excluded_layout_ids
+                or not self._layout_enabled(group.layout_id)
+            ):
+                continue
+            snapshot = group.local_observed or group.baseline
+            if snapshot is None or not snapshot.artifacts:
+                continue
+            if any(
+                (descriptor := self._policy.group_for_path(artifact.relative_path))
+                is None
+                or descriptor.group_id != group.group_id
+                or descriptor.layout_id != group.layout_id
+                for artifact in snapshot.artifacts
+            ):
+                # Old policy state is not authority to touch a path that the
+                # current positive registry no longer maps to this exact group.
+                continue
+            existing = 0
+            for artifact in snapshot.artifacts:
+                destination = self._local_path(artifact.relative_path)
+                try:
+                    present = not destination.is_symlink() and destination.is_file()
+                except OSError:
+                    present = False
+                existing += int(present)
+            expected = len(snapshot.artifacts)
+            if existing == expected:
+                continue
+            gaps.append(
+                _LocalMaterializationStatus(
+                    group_id=group.group_id,
+                    layout_id=group.layout_id,
+                    expected=expected,
+                    existing=existing,
+                    missing=expected - existing,
+                )
+            )
+        return tuple(gaps)
 
     def _remote_path(self, relative_path: str) -> Path:
         """A local, readable :class:`Path` containing *relative_path*'s
@@ -976,6 +1056,27 @@ class SaveSyncService:
             group_layouts = {
                 group.group_id: group.layout_id for group in state.groups
             }
+            materialization_gaps = self._local_materialization_gaps(
+                state,
+                excluded_layout_ids=excluded_layouts,
+            )
+            materialization_groups = frozenset(
+                status.group_id for status in materialization_gaps
+            )
+            for status in materialization_gaps:
+                log.warning(
+                    "SaveSync local materialization gap: logical_save_id=%s "
+                    "layout=%s reconciliation_decision=inspect "
+                    "expected_physical_destinations=%d "
+                    "existing_physical_destinations=%d "
+                    "missing_physical_destinations=%d "
+                    "reason=missing-emulator-visible-data",
+                    status.group_id,
+                    status.layout_id,
+                    status.expected,
+                    status.existing,
+                    status.missing,
+                )
             pending_groups = frozenset(
                 group.group_id
                 for group in state.groups
@@ -989,7 +1090,7 @@ class SaveSyncService:
                     }
                     or bool(group.dirty_path_hints)
                 )
-            )
+            ).union(materialization_groups)
             if not state.quick_sync_ready or cursor is None:
                 return SaveQuickSyncResult(
                     status="requires-full-sync",
@@ -1015,6 +1116,7 @@ class SaveSyncService:
                     remote_generation=remote_generation,
                     cursor_before=cursor,
                     cursor_after=cursor,
+                    reason="journal-current-local-materialized",
                 )
             history = list(journal["history"])
             if generation_unchanged:
@@ -1101,6 +1203,7 @@ class SaveSyncService:
                 cursor_after=remote_generation,
                 processed_entries=len(unseen),
                 processed_groups=(),
+                reason="journal-no-eligible-changes",
             )
 
         report = self._reconcile(
@@ -1218,6 +1321,12 @@ class SaveSyncService:
                 self._automatic_baseline(state),
                 policy=self._policy,
                 scope="all_eligible",
+                repair_local_group_ids=frozenset(
+                    status.group_id
+                    for status in self._local_materialization_gaps(
+                        state, excluded_layout_ids=frozenset()
+                    )
+                ),
             )
 
     def reconcile(self, *, progress: ProgressSink = None) -> SaveReconcileReport:
@@ -1295,6 +1404,12 @@ class SaveSyncService:
             )
             self._recover()
             state = self._get_state_unlocked()
+            repair_local_group_ids = frozenset(
+                status.group_id
+                for status in self._local_materialization_gaps(
+                    state, excluded_layout_ids=frozenset()
+                )
+            )
             verification_layout_ids: Optional[frozenset[str]] = None
             if selected_layout_ids is not None:
                 local_report = self._scan_local_layouts(selected_layout_ids)
@@ -1359,6 +1474,7 @@ class SaveSyncService:
                     if selected_layout_ids is not None
                     else "all_eligible"
                 ),
+                repair_local_group_ids=repair_local_group_ids,
             )
             emit_progress(
                 progress,
@@ -1990,7 +2106,8 @@ class SaveSyncService:
     ) -> None:
         by_root = {view.root.absolute(): view for view in views}
         selected_paths = {
-            view.root.absolute(): frozenset(view.current) | frozenset(view.desired)
+            view.root.absolute(): frozenset(view.verification_current)
+            | frozenset(view.verification_desired)
             for view in transaction.views
         }
 
@@ -2015,6 +2132,16 @@ class SaveSyncService:
             transaction,
             verify_current=verify,
             verify_desired=verify,
+        )
+        log.info(
+            "SaveSync local/remote apply verified: operation_id=%s "
+            "selected_transaction_path_count=%d staged_path_count=%d "
+            "promoted_path_count=%d verified_path_count=%d",
+            transaction.operation_id,
+            transaction.metrics.changed_files,
+            transaction.metrics.staged_files,
+            transaction.metrics.changed_files,
+            sum(len(view.verification_desired) for view in transaction.views),
         )
 
     def _choose_source(
@@ -2269,6 +2396,35 @@ def _same_manifest(
     return left == right
 
 
+def _is_incomplete_local_materialization(
+    local: tuple[SaveArtifact, ...],
+    remote: tuple[SaveArtifact, ...],
+    baseline: tuple[SaveArtifact, ...],
+) -> bool:
+    """Return whether local is only missing files from a known generation.
+
+    Missing physical paths are not a new local content generation when the
+    remote still holds the last shared generation.  This is intentionally
+    narrower than treating every deletion as repairable: any added or modified
+    local artifact, remote change, or absent remote side keeps the ordinary
+    three-way/conflict semantics.
+    """
+    if (
+        not remote
+        or not baseline
+        or len(local) >= len(baseline)
+        or not _same_manifest(remote, baseline)
+    ):
+        return False
+    baseline_by_path = {
+        artifact.relative_path: artifact for artifact in baseline
+    }
+    return all(
+        _same_artifact(baseline_by_path.get(artifact.relative_path), artifact)
+        for artifact in local
+    )
+
+
 def _group_conflict_ids(
     local: dict[str, SaveArtifact],
     remote: dict[str, SaveArtifact],
@@ -2426,6 +2582,7 @@ def _reconcile_plan(
     *,
     policy: SaveSelectionPolicy,
     scope: str = "all_eligible",
+    repair_local_group_ids: frozenset[str] = frozenset(),
 ) -> SaveReconcilePlan:
     local = local_report.artifacts
     remote = remote_report.artifacts
@@ -2441,6 +2598,39 @@ def _reconcile_plan(
         baseline_group = _group_manifest(baseline, group_paths)
         if _same_manifest(local_group, remote_group):
             group_action = SaveReconcileAction.UNCHANGED
+        elif (
+            group_id in repair_local_group_ids
+            and _is_incomplete_local_materialization(
+                local_group, remote_group, baseline_group
+            )
+        ):
+            # A durable logical generation is not locally applied while any of
+            # its required physical files are absent.  Download All has always
+            # repaired this by making the remote manifest authoritative; normal
+            # reconciliation now makes the same safe decision for a pure gap.
+            group_action = SaveReconcileAction.DOWNLOAD
+            descriptor = policy.group_for_path(
+                remote_group[0].relative_path
+            )
+            log.warning(
+                "SaveSync reconciliation repair: logical_save_id=%s layout=%s "
+                "reconciliation_decision=download "
+                "expected_physical_destinations=%d "
+                "existing_physical_destinations=%d "
+                "missing_physical_destinations=%d "
+                "selected_transaction_path_count=%d "
+                "reason=incomplete-local-materialization",
+                group_id,
+                descriptor.layout_id if descriptor is not None else "unknown",
+                len(remote_group),
+                len(local_group),
+                len(baseline_group) - len(local_group),
+                sum(
+                    1
+                    for artifact in remote_group
+                    if artifact not in local_group
+                ),
+            )
         elif _same_manifest(remote_group, baseline_group):
             group_action = SaveReconcileAction.UPLOAD
         elif _same_manifest(local_group, baseline_group):

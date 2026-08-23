@@ -402,11 +402,13 @@ def recover_interrupted_commit(target_dir: Path) -> None:
     """Recover or clean transaction artifacts left by an interrupted commit.
 
     If the live target exists, it is authoritative: abandoned staging and
-    old backup directories are removed. If the target is absent and exactly
-    one backup exists, interruption happened after the old dataset was moved
-    aside, so that complete dataset is atomically restored before staging is
-    discarded. Multiple backups are ambiguous and are left untouched for
-    manual inspection rather than guessing which save dataset is correct.
+    every legacy whole-tree backup are removed. Current SaveSync versions do
+    not use these paths for rollback and retain only selected-content history.
+    If the target is absent and exactly one backup exists, interruption
+    happened after the old dataset was moved aside, so that complete dataset
+    is atomically restored before staging is discarded. Multiple backups are
+    ambiguous and are left untouched for manual inspection rather than
+    guessing which save dataset is correct.
     """
     parent = target_dir.parent
     if not parent.is_dir():
@@ -415,12 +417,15 @@ def recover_interrupted_commit(target_dir: Path) -> None:
     staging_dirs = sorted(parent.glob(f".{target_dir.name}.staging-*"))
     stable_previous = target_dir.with_name(f"{target_dir.name}.previous")
     legacy_backups = sorted(parent.glob(f"{target_dir.name}.previous-*"))
-    backup_dirs = ([stable_previous] if stable_previous.exists() else []) + legacy_backups
+    backup_dirs = (
+        [stable_previous]
+        if stable_previous.exists() or stable_previous.is_symlink()
+        else []
+    ) + legacy_backups
 
     if target_dir.exists():
-        for path in (*staging_dirs, *legacy_backups):
-            shutil.rmtree(path, ignore_errors=True)
-        # Keep the stable previous generation as deliberate rollback history.
+        for path in (*staging_dirs, *backup_dirs):
+            _remove_legacy_transaction_tree(path)
         return
 
     if len(backup_dirs) > 1:
@@ -429,10 +434,30 @@ def recover_interrupted_commit(target_dir: Path) -> None:
             f"found {len(backup_dirs)} previous datasets"
         )
     if backup_dirs:
+        _validate_legacy_transaction_tree(backup_dirs[0])
         os.rename(backup_dirs[0], target_dir)
 
     for path in staging_dirs:
-        shutil.rmtree(path, ignore_errors=True)
+        _remove_legacy_transaction_tree(path)
+
+
+def _validate_legacy_transaction_tree(path: Path) -> None:
+    if path.is_symlink():
+        raise SaveSyncError(
+            f"SaveSync refuses a symlinked legacy transaction path: {path}"
+        )
+    if not path.is_dir():
+        raise SaveSyncError(
+            f"SaveSync legacy transaction path is not a directory: {path}"
+        )
+
+
+def _remove_legacy_transaction_tree(path: Path) -> None:
+    """Remove only an exact legacy path already derived by the caller."""
+    if not path.exists() and not path.is_symlink():
+        return
+    _validate_legacy_transaction_tree(path)
+    shutil.rmtree(path)
 
 
 def promote_staging(new_dir: Path, target_dir: Path) -> DirectoryPromotion:
