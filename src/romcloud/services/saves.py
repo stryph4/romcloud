@@ -1990,7 +1990,8 @@ class SaveSyncService:
     ) -> None:
         by_root = {view.root.absolute(): view for view in views}
         selected_paths = {
-            view.root.absolute(): frozenset(view.current) | frozenset(view.desired)
+            view.root.absolute(): frozenset(view.verification_current)
+            | frozenset(view.verification_desired)
             for view in transaction.views
         }
 

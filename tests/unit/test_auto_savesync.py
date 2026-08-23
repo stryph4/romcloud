@@ -1050,6 +1050,51 @@ def test_game_exit_unchanged_uses_no_transaction(tmp_path: Path, monkeypatch):
     assert local.read_bytes() == b"base"
 
 
+def test_game_exit_changed_save_backs_up_only_that_save(
+    tmp_path: Path, monkeypatch
+):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    changed = tmp_path / "local" / "psx" / "Changed.srm"
+    stable = tmp_path / "local" / "psx" / "Stable.srm"
+    _write(changed, b"before")
+    _write(stable, b"stable")
+    for index in range(64):
+        _write(tmp_path / "local" / "foreign" / f"User-{index:03d}.bin", b"user")
+    service.full_sync()
+    coordinator.game_start(
+        system="psx", emulator="libretro", core="pcsx", rom="Changed.chd"
+    )
+    changed.write_bytes(b"after")
+    captured: list[save_transaction.TransactionMetrics] = []
+    real_prepare = save_transaction.prepare_transaction
+
+    def track_prepare(*args, **kwargs):
+        transaction = real_prepare(*args, **kwargs)
+        captured.append(transaction.metrics)
+        return transaction
+
+    monkeypatch.setattr(save_transaction, "prepare_transaction", track_prepare)
+
+    coordinator.game_stop(
+        system="psx", emulator="libretro", core="pcsx", rom="Changed.chd"
+    )
+
+    assert (tmp_path / "remote" / "psx" / "Changed.srm").read_bytes() == b"after"
+    assert (tmp_path / "remote" / "psx" / "Stable.srm").read_bytes() == b"stable"
+    assert len(captured) == 1
+    assert captured[0].backed_up_files == 1
+    assert captured[0].backed_up_bytes == len(b"before")
+    previous = tmp_path / "remote.savesync-previous"
+    assert [
+        path.relative_to(previous).as_posix()
+        for path in previous.rglob("*")
+        if path.is_file()
+    ] == ["psx/Changed.srm"]
+    assert (tmp_path / "local" / "foreign" / "User-063.bin").read_bytes() == b"user"
+
+
 def test_game_exit_retries_after_duckstation_save_changes_during_staging(
     tmp_path: Path, monkeypatch, caplog
 ):

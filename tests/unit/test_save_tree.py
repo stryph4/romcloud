@@ -550,7 +550,7 @@ class TestRecoverInterruptedCommit:
         assert (target / "known-good.srm").read_bytes() == b"known-good"
         assert not previous.exists()
 
-    def test_stable_previous_generation_is_retained_when_live_tree_exists(
+    def test_stable_previous_generation_is_cleaned_when_live_tree_exists(
         self, tmp_path: Path
     ):
         target = tmp_path / "remote-saves"
@@ -563,4 +563,25 @@ class TestRecoverInterruptedCommit:
         save_tree.recover_interrupted_commit(target)
 
         assert (target / "live.srm").read_bytes() == b"live"
-        assert (previous / "known-good.srm").read_bytes() == b"known-good"
+        assert not previous.exists()
+
+    def test_legacy_cleanup_refuses_symlink_and_preserves_target(
+        self, tmp_path: Path
+    ):
+        target = tmp_path / "saves"
+        target.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        marker = outside / "keep.srm"
+        marker.write_bytes(b"keep")
+        previous = tmp_path / "saves.previous"
+        try:
+            previous.symlink_to(outside, target_is_directory=True)
+        except OSError:
+            pytest.skip("directory symlinks are unavailable on this host")
+
+        with pytest.raises(SaveSyncError, match="symlinked legacy"):
+            save_tree.recover_interrupted_commit(target)
+
+        assert marker.read_bytes() == b"keep"
+        assert previous.is_symlink()

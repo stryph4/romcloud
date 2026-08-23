@@ -26,11 +26,15 @@ from typing import Callable, Iterable, Optional
 
 from romcloud.core.exceptions import SaveSyncError, SaveSyncVerificationError
 from romcloud.core.models.savesync import SaveArtifact
+from romcloud.infrastructure.logging import get_logger
 from romcloud.infrastructure.save_tree import hash_file, materialize
 
 
 _OPERATION_ID = re.compile(r"[0-9a-fA-F]{32}\Z")
 _SHA256 = re.compile(r"[0-9a-fA-F]{64}\Z")
+_BACKUP_RETENTION_LIMIT_PER_VIEW = 1
+
+log = get_logger("save_transaction")
 
 
 @dataclass(frozen=True)
@@ -54,8 +58,13 @@ class PreparedView:
     stage: Path
     previous: Path
     previous_candidate: Path
+    # Only changed paths are journaled/materialized in current/desired.
     current: dict[str, SaveArtifact]
     desired: dict[str, SaveArtifact]
+    # The live operation retains the caller's full conservative verification
+    # scope. Recovery after a restart safely falls back to the journaled delta.
+    verification_current: dict[str, SaveArtifact]
+    verification_desired: dict[str, SaveArtifact]
 
 
 @dataclass(frozen=True)
@@ -64,11 +73,54 @@ class _RestoreAction:
     original: Optional[SaveArtifact]
 
 
+@dataclass(frozen=True)
+class TransactionMetrics:
+    """Physical storage scope for one prepared SaveSync transaction.
+
+    Counts are summed across destination views. ``staged_*`` is the new
+    content materialized before promotion; ``backed_up_*`` is the old content
+    copied for rollback. SaveSync keeps at most one completed rollback
+    generation per destination view.
+    """
+
+    changed_files: int
+    staged_files: int
+    staged_bytes: int
+    backed_up_files: int
+    backed_up_bytes: int
+    destination_views: int
+    backup_retention_limit_per_view: int = _BACKUP_RETENTION_LIMIT_PER_VIEW
+
+    @property
+    def duplicated_files(self) -> int:
+        return self.staged_files + self.backed_up_files
+
+    @property
+    def duplicated_bytes(self) -> int:
+        return self.staged_bytes + self.backed_up_bytes
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "changed_files": self.changed_files,
+            "staged_files": self.staged_files,
+            "staged_bytes": self.staged_bytes,
+            "backed_up_files": self.backed_up_files,
+            "backed_up_bytes": self.backed_up_bytes,
+            "duplicated_files": self.duplicated_files,
+            "duplicated_bytes": self.duplicated_bytes,
+            "destination_views": self.destination_views,
+            "backup_retention_limit_per_view": (
+                self.backup_retention_limit_per_view
+            ),
+        }
+
+
 @dataclass
 class SelectedTransaction:
     operation_id: str
     journal_path: Path
     views: tuple[PreparedView, ...]
+    metrics: TransactionMetrics
     _finished: bool = False
     _live_touched: bool = False
 
@@ -79,6 +131,12 @@ class SelectedTransaction:
         if not self._live_touched:
             self._cleanup(remove_journal=True)
             self._finished = True
+            log.info(
+                "SaveSync transaction abandoned before promotion: "
+                "operation_id=%s cleanup=complete metrics=%s",
+                self.operation_id,
+                self.metrics.to_dict(),
+            )
             return
         # Preflight every view before restoring the first byte. A third live
         # version or corrupt rollback snapshot must preserve the whole observed
@@ -103,6 +161,12 @@ class SelectedTransaction:
         if not errors:
             self._cleanup(remove_journal=True)
             self._finished = True
+            log.info(
+                "SaveSync transaction rolled back: operation_id=%s "
+                "cleanup=complete metrics=%s",
+                self.operation_id,
+                self.metrics.to_dict(),
+            )
             return
         raise SaveSyncError(
             "SaveSync could not completely roll back its interrupted transaction; "
@@ -122,6 +186,11 @@ class SelectedTransaction:
             _install_previous(view)
         self._cleanup(remove_journal=True)
         self._finished = True
+        log.info(
+            "SaveSync transaction finalized: operation_id=%s metrics=%s",
+            self.operation_id,
+            self.metrics.to_dict(),
+        )
 
     def _cleanup(self, *, remove_journal: bool) -> None:
         for view in self.views:
@@ -155,6 +224,7 @@ def prepare_transaction(
             f"An unresolved SaveSync transaction journal already exists: {journal}"
         )
     prepared: list[PreparedView] = []
+    prepared_sources: list[SelectedView] = []
     created_owned: list[Path] = []
     journal_created = False
     try:
@@ -165,6 +235,23 @@ def prepare_transaction(
             seen_roots.append(root)
             _validate_manifest(raw_view.current)
             _validate_manifest(raw_view.desired)
+            changed = _changed_paths(raw_view.current, raw_view.desired)
+            if not changed:
+                continue
+            # Broad operations may scan a whole layout or every eligible save,
+            # but rollback only needs the physical paths this transaction can
+            # modify. Cropping here is the final invariant that prevents a
+            # one-save operation from materializing a tree-sized generation.
+            current = {
+                relative: raw_view.current[relative]
+                for relative in changed
+                if relative in raw_view.current
+            }
+            desired = {
+                relative: raw_view.desired[relative]
+                for relative in changed
+                if relative in raw_view.desired
+            }
             stage = root.parent / f".{root.name}.savesync-stage-{op_id}"
             previous_candidate = (
                 root.parent / f".{root.name}.savesync-previous-{op_id}"
@@ -181,15 +268,21 @@ def prepare_transaction(
                     stage=stage,
                     previous=previous,
                     previous_candidate=previous_candidate,
-                    current=dict(raw_view.current),
-                    desired=dict(raw_view.desired),
+                    current=current,
+                    desired=desired,
+                    verification_current=dict(raw_view.current),
+                    verification_desired=dict(raw_view.desired),
                 )
             )
+            prepared_sources.append(raw_view)
 
-        transaction = SelectedTransaction(op_id, journal, tuple(prepared))
+        if not prepared:
+            raise SaveSyncError("SaveSync transaction contains no changed paths")
+        metrics = _transaction_metrics(prepared)
+        transaction = SelectedTransaction(op_id, journal, tuple(prepared), metrics)
         _create_journal(transaction, phase="preparing")
         journal_created = True
-        for raw_view, view in zip(raw_views, prepared):
+        for raw_view, view in zip(prepared_sources, prepared):
             for owned in (view.stage, view.previous_candidate):
                 owned.mkdir(parents=True)
                 created_owned.append(owned)
@@ -205,6 +298,11 @@ def prepare_transaction(
             _fsync_tree(view.stage)
             _fsync_tree(view.previous_candidate)
         _write_journal(transaction, phase="prepared")
+        log.info(
+            "SaveSync transaction prepared: operation_id=%s metrics=%s",
+            transaction.operation_id,
+            transaction.metrics.to_dict(),
+        )
         return transaction
     except BaseException as exc:
         cleanup_errors: list[str] = []
@@ -221,6 +319,11 @@ def prepare_transaction(
                 "be cleaned; the recovery journal was preserved: "
                 + "; ".join(cleanup_errors)
             ) from exc
+        log.info(
+            "SaveSync transaction preparation aborted: operation_id=%s "
+            "cleanup=complete",
+            op_id,
+        )
         raise
 
 
@@ -236,11 +339,11 @@ def apply_transaction(
         # A final full positive scan closes the preview/stage window.  It also
         # detects newly-created eligible paths, not merely edits to known files.
         for view in transaction.views:
-            verify_current(view.root, view.current)
+            verify_current(view.root, view.verification_current)
         for view in transaction.views:
             _apply_view(view, transaction)
         for view in transaction.views:
-            verify_desired(view.root, view.desired)
+            verify_desired(view.root, view.verification_desired)
         for view in transaction.views:
             _fsync_changed_live_paths(view)
         _write_journal(transaction, phase="promoted")
@@ -516,6 +619,36 @@ def _same_artifact(
     if left is None or right is None:
         return left is right
     return left.size_bytes == right.size_bytes and left.content_hash == right.content_hash
+
+
+def _changed_paths(
+    current: dict[str, SaveArtifact], desired: dict[str, SaveArtifact]
+) -> frozenset[str]:
+    return frozenset(
+        path
+        for path in set(current) | set(desired)
+        if not _same_artifact(current.get(path), desired.get(path))
+    )
+
+
+def _transaction_metrics(views: Iterable[PreparedView]) -> TransactionMetrics:
+    prepared = tuple(views)
+    return TransactionMetrics(
+        changed_files=sum(len(set(view.current) | set(view.desired)) for view in prepared),
+        staged_files=sum(len(view.desired) for view in prepared),
+        staged_bytes=sum(
+            artifact.size_bytes
+            for view in prepared
+            for artifact in view.desired.values()
+        ),
+        backed_up_files=sum(len(view.current) for view in prepared),
+        backed_up_bytes=sum(
+            artifact.size_bytes
+            for view in prepared
+            for artifact in view.current.values()
+        ),
+        destination_views=len(prepared),
+    )
 
 
 def _artifact_dict(artifact: SaveArtifact) -> dict[str, object]:
@@ -863,14 +996,18 @@ def _read_journal(
                 or previous_candidate != expected_previous_candidate
             ):
                 raise ValueError("journal contains an unexpected transaction path")
+            current = _manifest_from(raw["current"])
+            desired = _manifest_from(raw["desired"])
             views.append(
                 PreparedView(
                     root,
                     stage,
                     previous,
                     previous_candidate,
-                    _manifest_from(raw["current"]),
-                    _manifest_from(raw["desired"]),
+                    current,
+                    desired,
+                    current,
+                    desired,
                 )
             )
     except (OSError, KeyError, TypeError, ValueError, SaveSyncError) as exc:
@@ -881,6 +1018,7 @@ def _read_journal(
         operation_id,
         path,
         tuple(views),
+        _transaction_metrics(views),
         _live_touched=phase in {"applying", "promoted"},
     ), phase
 
