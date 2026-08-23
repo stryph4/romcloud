@@ -151,6 +151,179 @@ class TestConnectivityFailure:
 
 
 class TestBatoceraSaveSelection:
+    def test_exact_eden_config_marker_activates_audited_external_save_root(
+        self, tmp_path: Path
+    ):
+        from romcloud.bootstrap.container import _batocera_mapped_save_roots
+
+        userdata = tmp_path / "userdata"
+        local_saves = userdata / "saves"
+        _write(userdata / "system/configs/eden/qt-config.ini", b"[Data Storage]")
+
+        assert _batocera_mapped_save_roots(local_saves) == (
+            (
+                "eden-switch-user-saves",
+                str(userdata / "system/configs/eden/nand/user/save"),
+                "yuzu",
+            ),
+        )
+
+    def test_only_populated_compatible_switch_root_wins_without_merging(
+        self, tmp_path: Path
+    ):
+        from romcloud.bootstrap.container import _batocera_mapped_save_roots
+
+        userdata = tmp_path / "userdata"
+        local_saves = userdata / "saves"
+        (userdata / "system/configs/eden/nand/user/save").mkdir(parents=True)
+        account = "0123456789abcdef0123456789abcdef"
+        title = "010093801237c000"
+        citron = userdata / "system/configs/citron/nand/user/save"
+        (citron / "0000000000000000" / account / title).mkdir(parents=True)
+
+        assert _batocera_mapped_save_roots(local_saves) == (
+            ("citron-switch-user-saves", str(citron), "yuzu"),
+        )
+
+    def test_ymir_persistent_state_is_an_independent_mapped_root(
+        self, tmp_path: Path
+    ):
+        from romcloud.bootstrap.container import _batocera_mapped_save_roots
+
+        userdata = tmp_path / "userdata"
+        _write(userdata / "system/configs/ymir/Ymir.toml", b"ConfigVersion = 4")
+
+        assert _batocera_mapped_save_roots(userdata / "saves") == (
+            (
+                "ymir-persistent-state",
+                str(userdata / "system/configs/ymir/state"),
+                "ymir/state",
+            ),
+        )
+
+    def test_switch_root_mapping_does_not_guess_outside_batocera_boundary(
+        self, tmp_path: Path
+    ):
+        from romcloud.bootstrap.container import _batocera_mapped_save_roots
+
+        local_saves = tmp_path / "custom-saves"
+        _write(tmp_path / "system/configs/eden/qt-config.ini", b"configured")
+
+        assert _batocera_mapped_save_roots(local_saves) == ()
+
+    @pytest.mark.parametrize(
+        "relative",
+        (
+            (
+                "3ds/azahar-emu/sdmc/Nintendo 3DS/"
+                "0123456789ABCDEF0123456789ABCDEF/"
+                "FEDCBA9876543210FEDCBA9876543210/"
+                "title/00040000/001B5100/data/00000001/main"
+            ),
+            "wiiu/usr/save/00050000/101C9400/user/80000001/game_data.sav",
+            "psvita/ux0/user/00/savedata/PCSE00762/SlotParam_0.bin",
+            "dreamcast/flycast/vmu_save_A1.bin",
+            "ymir/backup/games/bup-int-NiGHTS into Dreams [MK-81020].bin",
+            "ymir/0123456789ABCDEF0123456789ABCDEF/0.savestate",
+            "dolphin-emu/StateSaves/RMCE01.s01",
+        ),
+        ids=(
+            "azahar",
+            "cemu",
+            "vita3k",
+            "flycast",
+            "ymir-backup",
+            "ymir-state",
+            "dolphin-state",
+        ),
+    )
+    def test_new_layouts_force_upload_and_download_materialize_exact_path(
+        self, tmp_path: Path, service: SaveSyncService, relative: str
+    ):
+        local = tmp_path / "local-saves" / relative
+        remote = tmp_path / "remote-saves" / relative
+        _write(local, b"audited-save")
+
+        service.commit_upload(service.preview_upload())
+        local.unlink()
+        service.commit_download(service.preview_download())
+
+        assert local.read_bytes() == b"audited-save"
+        assert remote.read_bytes() == b"audited-save"
+
+    def test_mapped_switch_force_upload_and_download_use_eden_nand_root(
+        self, tmp_path: Path, provider: _FakeProvider
+    ):
+        local_root = tmp_path / "userdata/saves"
+        eden_root = tmp_path / "userdata/system/configs/eden/nand/user/save"
+        local_root.mkdir(parents=True)
+        relative = (
+            Path("0000000000000000")
+            / "0123456789ABCDEF0123456789ABCDEF"
+            / "010093801237C000"
+            / "save.dat"
+        )
+        physical = eden_root / relative
+        canonical = tmp_path / "remote-saves/yuzu" / relative
+        legacy_relative = (
+            Path("0000000000000000")
+            / "FEDCBA9876543210FEDCBA9876543210"
+            / "01007EF00011E000"
+            / "save.dat"
+        )
+        unselected_legacy = local_root / "yuzu" / legacy_relative
+        _write(physical, b"metroid-force-sync")
+        _write(unselected_legacy, b"leave-legacy-tree-alone")
+        service = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "remote-data"),
+            local_root=str(local_root),
+            remote_root=str(tmp_path / "remote-saves"),
+            state_path=tmp_path / "data/savesync-state.json",
+            mapped_local_roots=(
+                ("eden-switch-user-saves", str(eden_root), "yuzu"),
+            ),
+        )
+
+        service.commit_upload(service.preview_upload())
+        physical.unlink()
+        service.commit_download(service.preview_download())
+
+        assert physical.read_bytes() == b"metroid-force-sync"
+        assert canonical.read_bytes() == b"metroid-force-sync"
+        assert unselected_legacy.read_bytes() == b"leave-legacy-tree-alone"
+        assert not (tmp_path / "remote-saves/yuzu" / legacy_relative).exists()
+
+    def test_mapped_ymir_global_backup_ram_round_trips_without_smpc_state(
+        self, tmp_path: Path, provider: _FakeProvider
+    ):
+        local_root = tmp_path / "userdata/saves"
+        ymir_state = tmp_path / "userdata/system/configs/ymir/state"
+        local_root.mkdir(parents=True)
+        physical = ymir_state / "bup-int.bin"
+        smpc = ymir_state / "smpc-us_eu.bin"
+        _write(physical, b"saturn-progress")
+        _write(smpc, b"system-clock")
+        service = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "remote-data"),
+            local_root=str(local_root),
+            remote_root=str(tmp_path / "remote-saves"),
+            state_path=tmp_path / "data/savesync-state.json",
+            mapped_local_roots=(
+                ("ymir-persistent-state", str(ymir_state), "ymir/state"),
+            ),
+        )
+
+        service.commit_upload(service.preview_upload())
+        physical.unlink()
+        service.commit_download(service.preview_download())
+
+        assert physical.read_bytes() == b"saturn-progress"
+        assert smpc.read_bytes() == b"system-clock"
+        assert (tmp_path / "remote-saves/ymir/state/bup-int.bin").exists()
+        assert not (tmp_path / "remote-saves/ymir/state/smpc-us_eu.bin").exists()
+
     def test_n64_dr_mario_upload_reaches_remote_dataset(self, tmp_path, service):
         local_save = (
             tmp_path / "local-saves" / "n64" / "Dr. Mario 64 (USA).srm"

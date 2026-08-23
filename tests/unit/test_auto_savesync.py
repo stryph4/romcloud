@@ -842,16 +842,27 @@ def test_lifecycle_mapping_is_registry_bounded_and_xemu_is_never_automatic():
     policy = DEFAULT_SAVE_SELECTION_POLICY
 
     assert layout_ids_for_session(policy, "gamecube") == frozenset(
-        {"dolphin-gc-memory-card-images", "dolphin-gc-gci-saves"}
+        {
+            "dolphin-gc-memory-card-images",
+            "dolphin-gc-gci-saves",
+            "dolphin-save-states",
+        }
     )
     assert layout_ids_for_session(policy, "wii") == frozenset(
-        {"dolphin-wii-title-saves"}
+        {"dolphin-wii-title-saves", "dolphin-save-states"}
     )
     assert layout_ids_for_session(policy, "psx", "duckstation") == frozenset(
         {"duckstation-memory-cards", "duckstation-root-sav"}
     )
     assert layout_ids_for_session(policy, "psx", "libretro", "pcsx-rearmed") == (
         frozenset({"retroarch-root-psx"})
+    )
+    assert layout_ids_for_session(policy, "saturn", "ymir", "ymir") == frozenset(
+        {
+            "ymir-global-backup-memory",
+            "ymir-per-game-backup-memory",
+            "ymir-save-states",
+        }
     )
     assert layout_ids_for_session(policy, "xbox", "xemu") == frozenset()
     assert layout_ids_for_session(policy, "unknown-system") == frozenset()
@@ -900,6 +911,172 @@ def test_gba_game_stop_uploads_and_periodic_quick_sync_repairs_materialization(
     assert local.read_bytes() == b"gba-progress"
     assert remote.read_bytes() == b"gba-progress"
     assert service.quick_sync().status == "unchanged"
+
+
+def test_eden_metroid_game_stop_and_peer_quick_sync_use_physical_nand_roots(
+    tmp_path: Path,
+):
+    provider = _Provider()
+    remote = tmp_path / "remote"
+    account = "0123456789ABCDEF0123456789ABCDEF"
+    title = "010093801237C000"
+    relative = Path("0000000000000000") / account / title / "slot_00" / "save.dat"
+
+    def device(name: str) -> tuple[SaveSyncService, AutoSaveSyncCoordinator, Path]:
+        root = tmp_path / name
+        local = root / "saves"
+        eden_save_root = root / "system/configs/eden/nand/user/save"
+        local.mkdir(parents=True)
+        service = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "remote-data"),
+            local_root=str(local),
+            remote_root=str(remote),
+            state_path=root / "data/savesync-state.json",
+            mapped_local_roots=(
+                ("eden-switch-user-saves", str(eden_save_root), "yuzu"),
+            ),
+        )
+        coordinator = AutoSaveSyncCoordinator(
+            service,
+            data_root=root / "data",
+            enabled=True,
+            policy=DEFAULT_SAVE_SELECTION_POLICY,
+            quiet_seconds=0,
+        )
+        return service, coordinator, eden_save_root / relative
+
+    service_a, coordinator_a, physical_a = device("device-a")
+    service_b, _coordinator_b, physical_b = device("device-b")
+    service_a.full_sync()
+    service_b.full_sync()
+
+    coordinator_a.game_start(
+        system="switch", emulator="eden", core="eden", rom="Metroid Dread.xci"
+    )
+    _write(physical_a, b"metroid-progress")
+    coordinator_a.game_stop(
+        system="switch", emulator="eden", core="eden", rom="Metroid Dread.xci"
+    )
+
+    canonical = remote / "yuzu" / relative
+    assert canonical.read_bytes() == b"metroid-progress"
+    assert service_b.quick_sync().status == "reconciled"
+    assert physical_b.read_bytes() == b"metroid-progress"
+    assert not (tmp_path / "device-b/saves/yuzu").exists()
+
+    coordinator_a.game_start(
+        system="switch", emulator="eden", core="eden", rom="Metroid Dread.xci"
+    )
+    physical_a.write_bytes(b"metroid-progress-updated")
+    coordinator_a.game_stop(
+        system="switch", emulator="eden", core="eden", rom="Metroid Dread.xci"
+    )
+    assert service_b.quick_sync().status == "reconciled"
+    assert physical_b.read_bytes() == b"metroid-progress-updated"
+
+    coordinator_a.game_start(
+        system="switch", emulator="eden", core="eden", rom="Metroid Dread.xci"
+    )
+    physical_a.unlink()
+    coordinator_a.game_stop(
+        system="switch", emulator="eden", core="eden", rom="Metroid Dread.xci"
+    )
+    assert service_b.quick_sync().status == "reconciled"
+    assert not physical_b.exists()
+    assert not canonical.exists()
+    assert service_b.quick_sync().status == "unchanged"
+
+
+def test_eden_switch_titles_merge_independently_but_same_title_conflicts(
+    tmp_path: Path,
+):
+    provider = _Provider()
+    remote = tmp_path / "remote"
+    account = "0123456789ABCDEF0123456789ABCDEF"
+    metroid = "010093801237C000"
+    other_title = "01007EF00011E000"
+
+    def device(name: str) -> tuple[SaveSyncService, AutoSaveSyncCoordinator, Path]:
+        root = tmp_path / name
+        local = root / "saves"
+        eden_save_root = root / "system/configs/eden/nand/user/save"
+        local.mkdir(parents=True)
+        service = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "remote-data"),
+            local_root=str(local),
+            remote_root=str(remote),
+            state_path=root / "data/savesync-state.json",
+            mapped_local_roots=(
+                ("eden-switch-user-saves", str(eden_save_root), "yuzu"),
+            ),
+        )
+        return (
+            service,
+            AutoSaveSyncCoordinator(
+                service,
+                data_root=root / "data",
+                enabled=True,
+                policy=DEFAULT_SAVE_SELECTION_POLICY,
+                quiet_seconds=0,
+            ),
+            eden_save_root / "0000000000000000" / account,
+        )
+
+    service_a, coordinator_a, account_a = device("device-a")
+    service_b, coordinator_b, account_b = device("device-b")
+    _write(account_a / metroid / "save.dat", b"metroid-base")
+    _write(account_a / other_title / "save.dat", b"other-base")
+    service_a.full_sync()
+    service_b.full_sync()
+
+    coordinator_a.game_start(
+        system="switch", emulator="eden", core="eden", rom="Metroid Dread.xci"
+    )
+    coordinator_b.game_start(
+        system="switch", emulator="eden", core="eden", rom="Other Game.xci"
+    )
+    (account_a / metroid / "save.dat").write_bytes(b"metroid-device-a")
+    (account_b / other_title / "save.dat").write_bytes(b"other-device-b")
+    coordinator_a.game_stop(
+        system="switch", emulator="eden", core="eden", rom="Metroid Dread.xci"
+    )
+    assert coordinator_b.game_stop(
+        system="switch", emulator="eden", core="eden", rom="Other Game.xci"
+    ) == ()
+
+    assert (account_b / metroid / "save.dat").read_bytes() == b"metroid-device-a"
+    assert (account_a / other_title / "save.dat").read_bytes() == b"other-base"
+    assert (
+        remote / "yuzu/0000000000000000" / account / other_title / "save.dat"
+    ).read_bytes() == b"other-device-b"
+    assert service_a.quick_sync().status == "reconciled"
+    assert (account_a / other_title / "save.dat").read_bytes() == b"other-device-b"
+
+    coordinator_a.game_start(
+        system="switch", emulator="eden", core="eden", rom="Metroid Dread.xci"
+    )
+    coordinator_b.game_start(
+        system="switch", emulator="eden", core="eden", rom="Metroid Dread.xci"
+    )
+    (account_a / metroid / "save.dat").write_bytes(b"metroid-a-conflict")
+    (account_b / metroid / "save.dat").write_bytes(b"metroid-b-conflict")
+    coordinator_a.game_stop(
+        system="switch", emulator="eden", core="eden", rom="Metroid Dread.xci"
+    )
+    conflicts = coordinator_b.game_stop(
+        system="switch", emulator="eden", core="eden", rom="Metroid Dread.xci"
+    )
+
+    assert len(conflicts) == 1
+    assert (account_b / metroid / "save.dat").read_bytes() == b"metroid-b-conflict"
+    assert (
+        remote / "yuzu/0000000000000000" / account / metroid / "save.dat"
+    ).read_bytes() == b"metroid-a-conflict"
+    assert service_b.get_state().active_conflicts[0].layout_id == (
+        "yuzu-account-title-save"
+    )
 
 
 def test_game_exit_remote_dirty_downloads_through_quick_sync(tmp_path: Path):

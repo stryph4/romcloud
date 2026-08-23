@@ -33,13 +33,17 @@ class TestKnownSystems:
             "ps2",
             "ps3",
             "dolphin-emu",
+            "3ds",
+            "wiiu",
+            "psvita",
+            "ymir",
         ):
             assert policy.is_known_system(system) is True
 
     def test_unvalidated_systems_are_unsupported(self):
         """Unregistered emulator trees stay unsupported, not blindly included."""
         policy = DEFAULT_SAVE_SELECTION_POLICY
-        for system in ("3ds", "citra", "dolphin", "gamecube", "totally-unknown-system"):
+        for system in ("citra", "dolphin", "gamecube", "totally-unknown-system"):
             assert policy.is_known_system(system) is False
             assert policy.is_included(system, "anything.bin") is False
 
@@ -318,6 +322,129 @@ class TestYuzu:
             f"nand/user/save/0000000000000000/{self._USER}/{self._TITLE}/save_data",
         ) is False
 
+    def test_compatible_switch_emulators_share_one_lifecycle_layout(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        expected = frozenset({"yuzu-account-title-save"})
+
+        for emulator in ("eden", "citron", "yuzu"):
+            assert policy.layout_ids_for_lifecycle(
+                system="switch", emulator=emulator
+            ) == expected
+
+
+class TestModernNintendoTitleTrees:
+    def test_azahar_includes_only_title_save_data_and_metadata(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        base = (
+            "azahar-emu/sdmc/Nintendo 3DS/"
+            "0123456789ABCDEF0123456789ABCDEF/"
+            "FEDCBA9876543210FEDCBA9876543210/"
+            "title/00040000/001B5100"
+        )
+        for relative in (
+            f"{base}/data/00000001/main",
+            f"{base}/data/00000001.metadata",
+        ):
+            assert policy.is_included("3ds", relative) is True
+        for relative in (
+            f"{base}/content/00000000.app",
+            "azahar-emu/nand/data/sysdata/account.dat",
+            "azahar-emu/shaders/001B5100.bin",
+            "azahar-emu/states/001B5100.state",
+        ):
+            assert policy.is_included("3ds", relative) is False
+
+    def test_cemu_groups_every_file_for_one_title_without_other_mlc_data(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        first = policy.group_for_path(
+            "wiiu/usr/save/00050000/101C9400/user/80000001/game_data.sav"
+        )
+        sibling = policy.group_for_path(
+            "wiiu/usr/save/00050000/101C9400/meta/saveinfo.xml"
+        )
+        other = policy.group_for_path(
+            "wiiu/usr/save/00050000/10143600/user/common.dat"
+        )
+
+        assert first is not None and sibling is not None and other is not None
+        assert first.group_id == sibling.group_id
+        assert first.group_id != other.group_id
+        assert policy.is_included(
+            "wiiu", "usr/title/00050000/101C9400/content/code.rpx"
+        ) is False
+        assert policy.is_included("wiiu", "graphicPacks/cache.bin") is False
+
+
+class TestVita3K:
+    def test_title_savedata_is_grouped_and_other_ux0_content_is_excluded(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        first = policy.group_for_path(
+            "psvita/ux0/user/00/savedata/PCSE00762/SlotParam_0.bin"
+        )
+        sibling = policy.group_for_path(
+            "psvita/ux0/user/00/savedata/PCSE00762/SystemData_0000.sav"
+        )
+        other = policy.group_for_path(
+            "psvita/ux0/user/00/savedata/PCSG01234/save.bin"
+        )
+
+        assert first is not None and sibling is not None and other is not None
+        assert first.group_id == sibling.group_id
+        assert first.group_id != other.group_id
+        assert policy.is_included("psvita", "ux0/app/PCSE00762/eboot.bin") is False
+        assert policy.is_included("psvita", "shader/PCSE00762/cache.bin") is False
+
+
+class TestFlycast:
+    def test_only_audited_vmu_images_are_included_as_opaque_cards(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        global_card = policy.group_for_path("dreamcast/flycast/vmu_save_A1.bin")
+        per_game = policy.group_for_path(
+            "dreamcast/flycast/MK-51052_vmu_save_A1.bin"
+        )
+
+        assert global_card is not None and per_game is not None
+        assert global_card.shared is True and per_game.shared is True
+        assert global_card.group_id != per_game.group_id
+        assert policy.is_included("dreamcast", "flycast/emu.cfg") is False
+        assert policy.is_included("dreamcast", "flycast/vmu_save_E1.bin") is False
+
+
+class TestYmir:
+    def test_only_audited_backup_memory_and_disc_state_files_are_included(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        disc = "0123456789ABCDEF0123456789ABCDEF"
+        state = policy.group_for_path(f"ymir/{disc}/0.savestate")
+        state_meta = policy.group_for_path(f"ymir/{disc}/meta.txt")
+        per_game = policy.group_for_path(
+            "ymir/backup/games/bup-int-NiGHTS into Dreams [MK-81020].bin"
+        )
+        global_ram = policy.group_for_path("ymir/state/bup-int.bin")
+
+        assert state is not None and state_meta is not None
+        assert state.group_id == state_meta.group_id
+        assert per_game is not None and per_game.shared is True
+        assert global_ram is not None and global_ram.shared is True
+        for relative in (
+            "backup/exported/NIGHTS.BUP",
+            "dumps/vdp2.bin",
+            "state/smpc-us_eu.bin",
+            "Ymir.toml",
+            f"{disc}/screenshot.png",
+        ):
+            assert policy.is_included("ymir", relative) is False
+
+    def test_ymir_lifecycle_uses_ymir_layouts_not_retroarch_saturn(self):
+        assert DEFAULT_SAVE_SELECTION_POLICY.layout_ids_for_lifecycle(
+            system="saturn", emulator="ymir", core="ymir"
+        ) == frozenset(
+            {
+                "ymir-global-backup-memory",
+                "ymir-per-game-backup-memory",
+                "ymir-save-states",
+            }
+        )
+
 
 class TestDolphin:
     def test_default_gamecube_memory_cards_and_gci_saves_are_included(self):
@@ -364,7 +491,6 @@ class TestDolphin:
             "Cache/Shaders/cache.bin",
             "Logs/dolphin.log",
             "ScreenShots/RMCE01.png",
-            "StateSaves/RMCE01.s01",
             "Load/Textures/RMCE01/texture.png",
             "GameSettings/RMCE01.ini",
             "GC/USA/IPL.bin",
@@ -379,6 +505,19 @@ class TestDolphin:
             "unknown/deep/save.gci",
         ):
             assert policy.is_included("dolphin-emu", path) is False
+
+    def test_state_slots_and_recording_companions_group_per_game(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        first = policy.group_for_path("dolphin-emu/StateSaves/RMCE01.s01")
+        sibling = policy.group_for_path("dolphin-emu/StateSaves/RMCE01.s01.dtm")
+        other_slot = policy.group_for_path("dolphin-emu/StateSaves/RMCE01.s02")
+        other_game = policy.group_for_path("dolphin-emu/StateSaves/RSBE01.s01")
+
+        assert first is not None and sibling is not None
+        assert other_slot is not None and other_game is not None
+        assert first.group_id == sibling.group_id == other_slot.group_id
+        assert first.group_id != other_game.group_id
+        assert policy.is_included("dolphin-emu", "StateSaves/lastState.sav") is False
 
 
 class TestFlatpakExclusion:
@@ -444,7 +583,11 @@ class TestPositiveLayoutRegistry:
             system="psx", emulator="libretro", core="pcsx-rearmed"
         ) == frozenset({"retroarch-root-psx"})
         assert policy.layout_ids_for_lifecycle(system="gamecube") == frozenset(
-            {"dolphin-gc-memory-card-images", "dolphin-gc-gci-saves"}
+            {
+                "dolphin-gc-memory-card-images",
+                "dolphin-gc-gci-saves",
+                "dolphin-save-states",
+            }
         )
         assert policy.layout_ids_for_lifecycle(
             system="xbox", emulator="xemu"

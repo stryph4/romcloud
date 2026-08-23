@@ -13,6 +13,7 @@ loaded config.  This keeps tests simple and avoids cross-request state.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path, PurePosixPath
 from typing import Optional
 
@@ -21,9 +22,14 @@ from romcloud.core.exceptions import ConfigurationError
 from romcloud.core.models.cache import CachePolicy
 from romcloud.core.storage import StorageProvider
 from romcloud.core.remote_data import RemoteDataProvider
+from romcloud.core.save_selection import (
+    BATOCERA_SAVE_ROOT_MAPPINGS,
+    BatoceraSaveRootMapping,
+)
 from romcloud.infrastructure.config import AppConfig, validate_remote_data_boundary
 from romcloud.infrastructure.capabilities import capability_policy
 from romcloud.infrastructure.database import Database
+from romcloud.infrastructure.logging import get_logger
 from romcloud.infrastructure.providers.local import (
     LocalFilesystemProvider,
     WritableLocalFilesystemProvider,
@@ -40,6 +46,94 @@ from romcloud.services.library_sync import LibrarySyncService
 from romcloud.services.transfer import TransferService
 
 _NETWORK_STORAGE_PROBE_TIMEOUT = 5.0
+log = get_logger("container")
+
+
+def _contains_switch_title_save(root: Path) -> bool:
+    """Check only the audited account/title levels, without broad traversal."""
+    account_root = root / "0000000000000000"
+    if account_root.is_symlink() or not account_root.is_dir():
+        return False
+    try:
+        accounts = tuple(account_root.iterdir())
+    except OSError:
+        return False
+    for account in accounts:
+        if re.fullmatch(r"[0-9A-Fa-f]{32}", account.name) is None:
+            continue
+        if account.is_symlink() or not account.is_dir():
+            continue
+        try:
+            titles = tuple(account.iterdir())
+        except OSError:
+            continue
+        if any(
+            re.fullmatch(r"[0-9A-Fa-f]{16}", title.name) is not None
+            and not title.is_symlink()
+            and title.is_dir()
+            for title in titles
+        ):
+            return True
+    return False
+
+
+def _batocera_mapped_save_roots(
+    local_saves_path: Path,
+) -> tuple[tuple[str, str, str], ...]:
+    """Resolve audited Batocera trees outside the main saves directory.
+
+    Mappings with different canonical prefixes coexist. Multiple physical
+    implementations of the same canonical namespace are not merged silently:
+    a compatible Switch root that already contains an audited account/title
+    tree wins; otherwise registry order is deterministic and a warning records
+    the ambiguity. The main saves directory remains the fallback for existing
+    Yuzu installs when neither compatible fork is active.
+    """
+    if (
+        local_saves_path.name != "saves"
+        or local_saves_path.parent.name != "userdata"
+    ):
+        return ()
+    userdata = local_saves_path.parent
+    candidates = []
+    for mapping in BATOCERA_SAVE_ROOT_MAPPINGS:
+        root = userdata / mapping.physical_root
+        active = root.is_dir() or any(
+            (userdata / marker).is_file() for marker in mapping.activation_markers
+        )
+        if active:
+            candidates.append((mapping, root))
+    if not candidates:
+        return ()
+    by_prefix: dict[str, list[tuple[BatoceraSaveRootMapping, Path]]] = {}
+    for mapping, root in candidates:
+        by_prefix.setdefault(mapping.canonical_prefix, []).append((mapping, root))
+    selected_roots: list[tuple[str, str, str]] = []
+    for canonical_prefix, alternatives in by_prefix.items():
+        selected = alternatives[0]
+        if canonical_prefix == "yuzu":
+            populated = [
+                candidate
+                for candidate in alternatives
+                if _contains_switch_title_save(candidate[1])
+            ]
+            if len(populated) == 1:
+                selected = populated[0]
+        if len(alternatives) > 1:
+            log.warning(
+                "Multiple compatible SaveSync roots are present for %s; using %s "
+                "and leaving the others untouched: candidates=%s",
+                canonical_prefix,
+                selected[0].mapping_id,
+                ",".join(
+                    mapping.mapping_id for mapping, _root in alternatives
+                ),
+            )
+        mapping, root = selected
+        selected_roots.append(
+            (mapping.mapping_id, str(root), mapping.canonical_prefix)
+        )
+    return tuple(selected_roots)
 
 
 def _remote_data_base_path(remote_data) -> object:  # noqa: ANN001
@@ -281,6 +375,7 @@ class Container:
                 legacy_rpcs3_root=(
                     str(legacy_rpcs3_root) if legacy_rpcs3_root is not None else None
                 ),
+                mapped_local_roots=_batocera_mapped_save_roots(local_saves_path),
                 capability_policy=self._policy(),
                 remote_store=remote_store,
             )

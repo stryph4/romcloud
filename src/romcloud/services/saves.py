@@ -17,7 +17,7 @@ import tempfile
 import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, Optional
 
 from romcloud.core.capabilities import Capability, CapabilityPolicy
@@ -116,6 +116,7 @@ class _ScratchDir:
 class _DestinationView:
     root: Path
     canonical_prefix: str = ""
+    mapping_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -176,6 +177,7 @@ class SaveSyncService:
         rpcs3_installed_games_enabled: bool = False,
         ownership_policy: object = None,
         legacy_rpcs3_root: Optional[str] = None,
+        mapped_local_roots: tuple[tuple[str, str, str], ...] = (),
         policy: SaveSelectionPolicy = DEFAULT_SAVE_SELECTION_POLICY,
         capability_policy: Optional[CapabilityPolicy] = None,
         remote_store: Optional[RemoteSaveStore] = None,
@@ -211,6 +213,23 @@ class SaveSyncService:
         self._legacy_rpcs3_root = (
             Path(legacy_rpcs3_root) if legacy_rpcs3_root is not None else None
         )
+        mapped_views: list[_DestinationView] = []
+        seen_prefixes: set[str] = set()
+        for mapping_id, physical_root, canonical_prefix in mapped_local_roots:
+            normalized = canonical_prefix.replace("\\", "/").strip("/")
+            if (
+                not mapping_id
+                or not normalized
+                or normalized in seen_prefixes
+                or PurePosixPath(normalized).as_posix() != normalized
+                or any(part in {".", ".."} for part in PurePosixPath(normalized).parts)
+            ):
+                raise ValueError("mapped SaveSync roots require unique canonical prefixes")
+            seen_prefixes.add(normalized)
+            mapped_views.append(
+                _DestinationView(Path(physical_root), normalized, mapping_id)
+            )
+        self._mapped_local_views = tuple(mapped_views)
         self._policy = policy
         self._capabilities = capability_policy or CapabilityPolicy("smart_cache")
         self._active_read_scratch: Optional[_ScratchDir] = None
@@ -783,27 +802,106 @@ class SaveSyncService:
             self._legacy_rpcs3_root.exists() or self._legacy_rpcs3_root.parent.exists()
         )
 
-    def _scan_primary(self, root: Path) -> save_tree.ScanReport:
+    def _scan_primary(
+        self,
+        root: Path,
+        policy: Optional[SaveSelectionPolicy] = None,
+    ) -> save_tree.ScanReport:
         return save_tree.scan_tree_report(
             root,
-            self._policy,
+            policy or self._policy,
             enabled_optional_systems=self._enabled_optional_systems(),
             enabled_optional_groups=self._enabled_optional_groups(),
         )
 
-    def _scan_local(self) -> save_tree.ScanReport:
-        primary = self._scan_primary(self._local_root)
-        if not self._uses_legacy_rpcs3():
-            return primary
-        assert self._legacy_rpcs3_root is not None
-        legacy = save_tree.scan_mapped_tree_report(
-            self._legacy_rpcs3_root,
-            self._policy,
-            system="ps3",
-            relative_prefix=RPCS3_DEV_HDD0_PREFIX,
+    def _primary_local_policy(
+        self, policy: SaveSelectionPolicy
+    ) -> SaveSelectionPolicy:
+        """Remove mapped subtrees before local discovery enters any of them."""
+        prefixes = [view.canonical_prefix for view in self._mapped_local_views]
+        if self._uses_legacy_rpcs3():
+            prefixes.append(_RPCS3_CANONICAL_PREFIX)
+        if not prefixes:
+            return policy
+        layouts = []
+        for layout in policy.layouts:
+            layout_root = "/".join(
+                part
+                for part in (layout.system, layout.root_pattern.strip("/"))
+                if part
+            )
+            if any(
+                layout_root == prefix or layout_root.startswith(f"{prefix}/")
+                for prefix in prefixes
+            ):
+                continue
+            layouts.append(layout)
+        return SaveSelectionPolicy(layouts=tuple(layouts))
+
+    def _without_mapped_local_prefixes(
+        self, report: save_tree.ScanReport
+    ) -> save_tree.ScanReport:
+        prefixes = tuple(
+            f"{view.canonical_prefix}/" for view in self._mapped_local_views
+        )
+        if self._uses_legacy_rpcs3():
+            prefixes = (*prefixes, f"{_RPCS3_CANONICAL_PREFIX}/")
+        if not prefixes:
+            return report
+        return save_tree.ScanReport(
+            {
+                path: artifact
+                for path, artifact in report.artifacts.items()
+                if not path.startswith(prefixes)
+            },
+            excluded_files=report.excluded_files,
+            excluded_bytes=report.excluded_bytes,
+            optional_groups=report.optional_groups,
+        )
+
+    def _scan_mapped_view(
+        self,
+        view: _DestinationView,
+        policy: SaveSelectionPolicy,
+        *,
+        root: Optional[Path] = None,
+    ) -> save_tree.ScanReport:
+        system, _, relative_prefix = view.canonical_prefix.partition("/")
+        return save_tree.scan_mapped_tree_report(
+            view.root if root is None else root,
+            policy,
+            system=system,
+            relative_prefix=relative_prefix,
             enabled_optional_groups=self._enabled_optional_groups(),
         )
-        return save_tree.merge_scan_reports(primary, legacy)
+
+    def _scan_local(self) -> save_tree.ScanReport:
+        primary_policy = self._primary_local_policy(self._policy)
+        reports = [
+            self._without_mapped_local_prefixes(
+                self._scan_primary(self._local_root, primary_policy)
+            )
+        ]
+        reports.extend(
+            self._scan_mapped_view(view, self._policy)
+            for view in self._mapped_local_views
+        )
+        if self._uses_legacy_rpcs3():
+            assert self._legacy_rpcs3_root is not None
+            reports.append(
+                self._scan_mapped_view(
+                    _DestinationView(
+                        self._legacy_rpcs3_root,
+                        _RPCS3_CANONICAL_PREFIX,
+                        "legacy-rpcs3-dev-hdd0",
+                    ),
+                    self._policy,
+                )
+            )
+        result = reports[0]
+        for report in reports[1:]:
+            result = save_tree.merge_scan_reports(result, report)
+        return result
 
     def _scan_local_layouts(
         self, layout_ids: frozenset[str]
@@ -817,25 +915,33 @@ class SaveSyncService:
         if not layouts:
             return save_tree.ScanReport({})
         selected_policy = SaveSelectionPolicy(layouts=layouts)
-        primary = save_tree.scan_tree_report(
-            self._local_root,
-            selected_policy,
-            enabled_optional_systems=self._enabled_optional_systems(),
-            enabled_optional_groups=self._enabled_optional_groups(),
+        primary_policy = self._primary_local_policy(selected_policy)
+        primary = self._without_mapped_local_prefixes(
+            self._scan_primary(self._local_root, primary_policy)
         )
-        if not self._uses_legacy_rpcs3() or not any(
-            layout.system == "ps3" for layout in layouts
-        ):
-            return primary
-        assert self._legacy_rpcs3_root is not None
-        legacy = save_tree.scan_mapped_tree_report(
-            self._legacy_rpcs3_root,
-            selected_policy,
-            system="ps3",
-            relative_prefix=RPCS3_DEV_HDD0_PREFIX,
-            enabled_optional_groups=self._enabled_optional_groups(),
+        reports = [primary]
+        selected_systems = {layout.system for layout in layouts}
+        reports.extend(
+            self._scan_mapped_view(view, selected_policy)
+            for view in self._mapped_local_views
+            if view.canonical_prefix.partition("/")[0] in selected_systems
         )
-        return save_tree.merge_scan_reports(primary, legacy)
+        if self._uses_legacy_rpcs3() and "ps3" in selected_systems:
+            assert self._legacy_rpcs3_root is not None
+            reports.append(
+                self._scan_mapped_view(
+                    _DestinationView(
+                        self._legacy_rpcs3_root,
+                        _RPCS3_CANONICAL_PREFIX,
+                        "legacy-rpcs3-dev-hdd0",
+                    ),
+                    selected_policy,
+                )
+            )
+        result = reports[0]
+        for report in reports[1:]:
+            result = save_tree.merge_scan_reports(result, report)
+        return result
 
     def _scan_remote(self) -> save_tree.ScanReport:
         assert self._remote_store is not None
@@ -980,9 +1086,16 @@ class SaveSyncService:
 
     def _local_views(self) -> tuple[_DestinationView, ...]:
         views = [_DestinationView(self._local_root)]
+        views.extend(self._mapped_local_views)
         if self._uses_legacy_rpcs3():
             assert self._legacy_rpcs3_root is not None
-            views.append(_DestinationView(self._legacy_rpcs3_root, _RPCS3_CANONICAL_PREFIX))
+            views.append(
+                _DestinationView(
+                    self._legacy_rpcs3_root,
+                    _RPCS3_CANONICAL_PREFIX,
+                    "legacy-rpcs3-dev-hdd0",
+                )
+            )
         return tuple(views)
 
     @property
@@ -2628,11 +2741,14 @@ class SaveSyncService:
     def _belongs_to_view(self, view: _DestinationView, canonical_path: str) -> bool:
         if view.canonical_prefix:
             return canonical_path.startswith(f"{view.canonical_prefix}/")
-        return not (
-            self._uses_legacy_rpcs3()
-            and view.root == self._local_root
-            and canonical_path.startswith(f"{_RPCS3_CANONICAL_PREFIX}/")
+        if view.root != self._local_root:
+            return True
+        mapped_prefixes = tuple(
+            f"{mapped.canonical_prefix}/"
+            for mapped in self._local_views()
+            if mapped.canonical_prefix
         )
+        return not canonical_path.startswith(mapped_prefixes)
 
     def _physical_manifest(
         self,
@@ -2661,23 +2777,15 @@ class SaveSyncService:
 
     def _scan_view(self, root: Path, view: _DestinationView) -> dict[str, SaveArtifact]:
         if view.canonical_prefix:
-            report = save_tree.scan_mapped_tree_report(
-                root,
-                self._policy,
-                system="ps3",
-                relative_prefix=RPCS3_DEV_HDD0_PREFIX,
-                enabled_optional_groups=self._enabled_optional_groups(),
-            )
+            report = self._scan_mapped_view(view, self._policy, root=root)
         else:
-            report = self._scan_primary(root)
-            if self._uses_legacy_rpcs3() and view.root == self._local_root:
-                report = save_tree.ScanReport(
-                    {
-                        path: artifact
-                        for path, artifact in report.artifacts.items()
-                        if not path.startswith(f"{_RPCS3_CANONICAL_PREFIX}/")
-                    }
+            if view.root == self._local_root:
+                report = self._scan_primary(
+                    root, self._primary_local_policy(self._policy)
                 )
+                report = self._without_mapped_local_prefixes(report)
+            else:
+                report = self._scan_primary(root)
         physical, _ = self._physical_manifest(view, report.artifacts)
         return physical
 

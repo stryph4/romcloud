@@ -32,6 +32,48 @@ YUZU_ACCOUNT_SAVE_GLOB = (
 )
 
 
+@dataclass(frozen=True)
+class BatoceraSaveRootMapping:
+    """One audited emulator path outside Batocera's main saves directory.
+
+    ``physical_root`` and ``activation_markers`` are relative to
+    ``/userdata``.  The service maps files below that root into
+    ``canonical_prefix``; remote data and conflict identities therefore do
+    not depend on which compatible emulator fork is installed locally.
+    """
+
+    mapping_id: str
+    emulator: str
+    physical_root: str
+    canonical_prefix: str
+    activation_markers: tuple[str, ...]
+
+
+BATOCERA_SAVE_ROOT_MAPPINGS: tuple[BatoceraSaveRootMapping, ...] = (
+    BatoceraSaveRootMapping(
+        mapping_id="eden-switch-user-saves",
+        emulator="eden",
+        physical_root="system/configs/eden/nand/user/save",
+        canonical_prefix="yuzu",
+        activation_markers=("system/configs/eden/qt-config.ini",),
+    ),
+    BatoceraSaveRootMapping(
+        mapping_id="citron-switch-user-saves",
+        emulator="citron",
+        physical_root="system/configs/citron/nand/user/save",
+        canonical_prefix="yuzu",
+        activation_markers=("system/configs/citron/qt-config.ini",),
+    ),
+    BatoceraSaveRootMapping(
+        mapping_id="ymir-persistent-state",
+        emulator="ymir",
+        physical_root="system/configs/ymir/state",
+        canonical_prefix="ymir/state",
+        activation_markers=("system/configs/ymir/Ymir.toml",),
+    ),
+)
+
+
 def _match(path: str, pattern: str) -> bool:
     return fnmatch.fnmatch(path, pattern.replace("**", "*"))
 
@@ -400,7 +442,114 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
         recursive=True,
         group_by="root",
         lifecycle_systems=("switch", "yuzu"),
-        description="Yuzu user/title saves; NAND, keys, cache, shaders and config omitted",
+        lifecycle_emulators=("eden", "citron", "yuzu"),
+        lifecycle_cores=("eden", "citron", "yuzu"),
+        description=(
+            "Switch account/title saves shared by compatible Yuzu-derived "
+            "emulators; system NAND, keys, cache, shaders and config omitted"
+        ),
+    ),
+    _layout(
+        "azahar-title-saves",
+        "3ds",
+        root=(
+            "azahar-emu/sdmc/Nintendo 3DS/{hex32}/{hex32}/"
+            "title/{hex8}/{hex8}"
+        ),
+        recursive=True,
+        files=("data/*",),
+        group_by="root",
+        lifecycle_systems=("3ds",),
+        lifecycle_emulators=("azahar",),
+        lifecycle_cores=("azahar",),
+        description=(
+            "Azahar per-account/per-title save archive including format metadata; "
+            "installed title content and unrelated SD/NAND data omitted"
+        ),
+    ),
+    _layout(
+        "cemu-title-saves",
+        "wiiu",
+        root="usr/save/{hex8}/{hex8}",
+        recursive=True,
+        group_by="root",
+        lifecycle_systems=("wiiu",),
+        lifecycle_emulators=("cemu",),
+        lifecycle_cores=("cemu",),
+        description="Cemu per-title MLC save tree; title/update/content trees omitted",
+    ),
+    _layout(
+        "vita3k-title-saves",
+        "psvita",
+        root="ux0/user/00/savedata/{sony_title_id}",
+        recursive=True,
+        group_by="root",
+        lifecycle_systems=("psvita", "vita"),
+        lifecycle_emulators=("vita3k",),
+        lifecycle_cores=("vita3k",),
+        description=(
+            "Vita3K user 00 per-title savedata; applications and shader data omitted"
+        ),
+    ),
+    _layout(
+        "flycast-vmu-cards",
+        "dreamcast",
+        root="flycast",
+        files=(
+            "vmu_save_[A-D][1-2].bin",
+            "*_vmu_save_[A-D][1-2].bin",
+        ),
+        shared=True,
+        group_by="root_file",
+        lifecycle_systems=("dreamcast",),
+        lifecycle_emulators=("flycast",),
+        lifecycle_cores=("flycast",),
+        description=(
+            "Opaque Flycast global and per-game VMU images; each physical card "
+            "is an independent conflict unit"
+        ),
+    ),
+    _layout(
+        "ymir-per-game-backup-memory",
+        "ymir",
+        root="backup/games",
+        files=("bup-int-*.bin", "bup-ext-*M-*.bin"),
+        shared=True,
+        group_by="root_file",
+        lifecycle_systems=("saturn",),
+        lifecycle_emulators=("ymir",),
+        lifecycle_cores=("ymir",),
+        description=(
+            "Opaque Ymir per-game internal/external backup RAM images; exports "
+            "and dumps omitted"
+        ),
+    ),
+    _layout(
+        "ymir-save-states",
+        "ymir",
+        root="{hex32}",
+        files=("*.savestate", "meta.txt"),
+        group_by="root",
+        lifecycle_systems=("saturn",),
+        lifecycle_emulators=("ymir",),
+        lifecycle_cores=("ymir",),
+        description=(
+            "Ymir save-state slots and metadata grouped by 128-bit disc hash"
+        ),
+    ),
+    _layout(
+        "ymir-global-backup-memory",
+        "ymir",
+        root="state",
+        files=("bup-int.bin",),
+        shared=True,
+        group_by="root_file",
+        lifecycle_systems=("saturn",),
+        lifecycle_emulators=("ymir",),
+        lifecycle_cores=("ymir",),
+        description=(
+            "Opaque Ymir global internal backup RAM; SMPC persistent state omitted"
+        ),
     ),
     _layout(
         "dolphin-gc-memory-card-images",
@@ -429,6 +578,18 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
         group_by="root",
         lifecycle_systems=("wii",),
         description="Per-title Dolphin Wii save data; other NAND content omitted",
+    ),
+    _layout(
+        "dolphin-save-states",
+        "dolphin-emu",
+        root="StateSaves",
+        files=("*.s[0-9][0-9]", "*.s[0-9][0-9].dtm"),
+        group_by="dolphin_state",
+        lifecycle_systems=("gamecube", "wii"),
+        description=(
+            "Dolphin per-game state slots and their input-recording companions; "
+            "temporary undo states omitted"
+        ),
     ),
     _layout(
         "xemu-hdd",
@@ -513,6 +674,12 @@ def _group_key(layout: SaveLayout, root: tuple[str, ...], remainder: tuple[str, 
         # ``Game.srm``. They are one game dataset, so independent edits across
         # those siblings must conflict rather than merge silently.
         return re.sub(r"\.\d+$", "", _root_stem(remainder[-1]))
+    if layout.group_by == "dolphin_state":
+        # A state slot and its optional input-recording companion must move
+        # together. All slots for one six-character Dolphin game ID share a
+        # conflict domain so independently edited slots cannot be combined
+        # into a generation the emulator never wrote.
+        return re.sub(r"\.s\d{2}(?:\.dtm)?$", "", remainder[-1], flags=re.I).casefold()
     raise ValueError(f"unknown SaveSync grouping strategy: {layout.group_by}")
 
 
