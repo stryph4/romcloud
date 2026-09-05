@@ -615,6 +615,7 @@ def _prepare_save_authority_transition(
         return routing, True, result
 
     if previous is OperatingMode.CONNECTED and routing.active:
+        routing.recover_for_mode(direct=True)
         shadow_service = transition_container.saves.with_local_root(routing.shadow_root)
         result = shadow_service.quick_sync(
             progress=progress,

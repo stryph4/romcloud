@@ -22,8 +22,20 @@ from romcloud.infrastructure.atomic_file import atomic_write_text
 from romcloud.infrastructure.config import AppConfig
 
 MANIFEST_FILENAME = "direct-save-routes.json"
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
+LEGACY_MANIFEST_VERSION = 1
 SHADOW_DIRECTORY = "direct-save-local"
+
+_LEGACY_DIRECT_LAYOUT_IDS = frozenset(
+    {
+        "mame-nvram",
+        "mame-state",
+        "pcsx2-legacy-states",
+        "pcsx2-states",
+        "ppsspp-savedata",
+        "ppsspp-states",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -92,18 +104,20 @@ class DirectSaveRouting:
         self._mounts = mount_operations or BindMountOperations()
         self._manifest_path = Path(config.data_path) / MANIFEST_FILENAME
         self._shadow_root = Path(config.data_path) / SHADOW_DIRECTORY
+        self._loaded_manifest_version: int | None = None
 
     @property
     def available(self) -> bool:
-        return self._remote_root is not None and bool(self.layout_ids)
+        return self._remote_root is not None and bool(self.planned_routes())
 
     @property
     def layout_ids(self) -> frozenset[str]:
-        return (
-            self._policy.direct_save_layout_ids()
-            if self._remote_root is not None
-            else frozenset()
-        )
+        # An active manifest may be a safe subset after a ROMCloud upgrade
+        # adds newly audited layouts. Those new routes are intentionally not
+        # adopted until a later Cache -> Direct handoff reconciles them first.
+        active = self._load_manifest()
+        routes = active or self.planned_routes()
+        return frozenset(route.layout_id for route in routes)
 
     @property
     def shadow_root(self) -> Path:
@@ -114,14 +128,27 @@ class DirectSaveRouting:
         return bool(self._load_manifest())
 
     def planned_routes(self) -> tuple[DirectSaveRoute, ...]:
+        return self._planned_routes(selected_only=True)
+
+    def _planned_routes(
+        self, *, selected_only: bool
+    ) -> tuple[DirectSaveRoute, ...]:
         if self._remote_root is None:
             return ()
         local_root = Path(self._config.saves.local_path)
+        selected_systems = self._config.source.selected_systems
         routes = []
         for layout in self._policy.layouts:
             if not layout.direct_save_capable:
                 continue
-            relative = Path(layout.system).joinpath(*Path(layout.root_pattern).parts)
+            lifecycle_systems = layout.lifecycle_systems or (layout.system,)
+            if (
+                selected_only
+                and selected_systems is not None
+                and not set(lifecycle_systems).intersection(selected_systems)
+            ):
+                continue
+            relative = Path(*layout.direct_route_root.split("/"))
             canonical = relative.as_posix()
             routes.append(
                 DirectSaveRoute(
@@ -237,6 +264,8 @@ class DirectSaveRouting:
             self._require_no_symlink_components(
                 route.remote_path, self._remote_root, "remote save"
             )
+            self._require_ordinary_tree(route.local_path, "local save")
+            self._require_ordinary_tree(route.remote_path, "remote save")
             local_ancestor = route.local_path
             while not local_ancestor.exists() and local_ancestor != local_root:
                 local_ancestor = local_ancestor.parent
@@ -262,6 +291,9 @@ class DirectSaveRouting:
                 raise ModeTransitionError(
                     f"Direct save remote directory is unavailable: {route.remote_path}"
                 )
+            self._require_ordinary_tree(route.remote_path, "remote save")
+            if route.shadow_path.exists():
+                self._require_ordinary_tree(route.shadow_path, "local save shadow")
             if self._mounts.is_owned(route.remote_path, route.local_path):
                 if not route.shadow_path.is_dir() or route.shadow_path.is_symlink():
                     raise ModeTransitionError(
@@ -288,7 +320,11 @@ class DirectSaveRouting:
                 )
             route.local_path.mkdir(parents=True, exist_ok=True)
             self._mounts.bind(route.remote_path, route.local_path)
-        self._write_manifest("active", routes)
+        self._write_manifest(
+            "active",
+            routes,
+            version=self._loaded_manifest_version or MANIFEST_VERSION,
+        )
 
     def _rollback_activation(
         self,
@@ -334,7 +370,11 @@ class DirectSaveRouting:
         try:
             self._ensure_active(routes)
         except Exception as exc:
-            self._write_manifest("recovery-required", routes)
+            self._write_manifest(
+                "recovery-required",
+                routes,
+                version=self._loaded_manifest_version or MANIFEST_VERSION,
+            )
             return exc
         return None
 
@@ -371,6 +411,7 @@ class DirectSaveRouting:
 
     def _load_manifest(self) -> tuple[DirectSaveRoute, ...]:
         if not os.path.lexists(self._manifest_path):
+            self._loaded_manifest_version = None
             return ()
         if self._manifest_path.is_symlink() or not self._manifest_path.is_file():
             raise ModeTransitionError(
@@ -380,7 +421,8 @@ class DirectSaveRouting:
             payload = json.loads(self._manifest_path.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("routing manifest must be an object")
-            if payload.get("version") != MANIFEST_VERSION:
+            version = payload.get("version")
+            if version not in {LEGACY_MANIFEST_VERSION, MANIFEST_VERSION}:
                 raise ValueError("unsupported version")
             if payload.get("state") not in {
                 "preparing",
@@ -402,24 +444,43 @@ class DirectSaveRouting:
             raise ModeTransitionError(
                 f"Direct save routing manifest is invalid: {self._manifest_path}"
             ) from exc
-        planned = {route.layout_id: route for route in self.planned_routes()}
+        planned = {
+            route.layout_id: route
+            for route in self._planned_routes(selected_only=False)
+        }
         record_ids = [route.layout_id for route in records]
         if (
-            len(record_ids) != len(set(record_ids))
-            or set(record_ids) != set(planned)
+            not records
+            or len(record_ids) != len(set(record_ids))
             or any(planned.get(route.layout_id) != route for route in records)
+            or (
+                version == LEGACY_MANIFEST_VERSION
+                and set(record_ids) != set(_LEGACY_DIRECT_LAYOUT_IDS)
+            )
+            or (
+                version == MANIFEST_VERSION
+                and set(record_ids)
+                != {route.layout_id for route in self.planned_routes()}
+            )
         ):
             raise ModeTransitionError(
                 "Direct save routing configuration changed; refusing to touch existing mounts."
             )
+        self._loaded_manifest_version = int(version)
         return records
 
-    def _write_manifest(self, state: str, routes: Iterable[DirectSaveRoute]) -> None:
+    def _write_manifest(
+        self,
+        state: str,
+        routes: Iterable[DirectSaveRoute],
+        *,
+        version: int = MANIFEST_VERSION,
+    ) -> None:
         atomic_write_text(
             self._manifest_path,
             json.dumps(
                 {
-                    "version": MANIFEST_VERSION,
+                    "version": version,
                     "state": state,
                     "routes": [route.to_dict() for route in routes],
                 },
@@ -427,6 +488,7 @@ class DirectSaveRouting:
             )
             + "\n",
         )
+        self._loaded_manifest_version = version
 
     def _remove_empty_shadow_parents(self) -> None:
         if not self._shadow_root.exists():
@@ -483,3 +545,33 @@ class DirectSaveRouting:
             return True
         except ValueError:
             return False
+
+    @staticmethod
+    def _require_ordinary_tree(root: Path, label: str) -> None:
+        """Reject links/devices without following anything outside the route."""
+        if not root.exists():
+            return
+        pending = [root]
+        try:
+            while pending:
+                current = pending.pop()
+                with os.scandir(current) as entries:
+                    for entry in entries:
+                        if entry.is_symlink():
+                            raise ModeTransitionError(
+                                f"Direct save routing refuses symlinked {label}: "
+                                f"{entry.path}"
+                            )
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(Path(entry.path))
+                        elif not entry.is_file(follow_symlinks=False):
+                            raise ModeTransitionError(
+                                f"Direct save routing refuses non-file {label} entry: "
+                                f"{entry.path}"
+                            )
+        except ModeTransitionError:
+            raise
+        except OSError as exc:
+            raise ModeTransitionError(
+                f"Direct save routing could not audit {label} tree: {root}"
+            ) from exc

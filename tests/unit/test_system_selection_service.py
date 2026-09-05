@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from romcloud.infrastructure.config import (
     AppConfig,
     CacheConfig,
@@ -61,6 +63,41 @@ def test_post_setup_action_updates_config_and_triggers_reconciliation(
     assert refresh_calls == [("ps2",)]
     assert access_calls == [("ps2",)]
     assert result["newly_deselected"] == ["nes"]
+
+
+def test_active_direct_routes_block_selected_system_changes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config_path = tmp_path / "romcloud.toml"
+    data_path = tmp_path / "data"
+    data_path.mkdir()
+    config = AppConfig(
+        source=SourceConfig(
+            "local", str(tmp_path / "source"), selected_systems=("nes", "snes")
+        ),
+        cache=CacheConfig(str(tmp_path / "cache")),
+        local_roms_path=str(tmp_path / "roms"),
+        data_path=str(data_path),
+        saves=SavesConfig(local_path=str(tmp_path / "saves")),
+    )
+    write_config(config, str(config_path))
+    (data_path / "direct-save-routes.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        system_selection,
+        "selection_status",
+        lambda _path: {
+            "detected_systems": ["nes", "snes"],
+            "selected_systems": ["nes", "snes"],
+            "setting_missing": False,
+        },
+    )
+
+    with pytest.raises(ValueError, match="Switch to Cached Storage"):
+        system_selection.update_selection(
+            config_path, {"selected_systems": ["nes"]}
+        )
+
+    assert load_config(str(config_path)).source.selected_systems == ("nes", "snes")
 
 
 def test_game_access_defensively_excludes_unselected_catalog_rows(monkeypatch):

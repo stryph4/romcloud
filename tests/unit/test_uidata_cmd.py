@@ -462,6 +462,15 @@ class TestStatus:
         assert "ppsspp-savedata" in payload["operating_state"][
             "direct_save_capable_layouts"
         ]
+        psx = next(
+            item
+            for item in payload["operating_state"]["direct_save_layout_details"]
+            if item["layout_id"] == "retroarch-root-psx"
+        )
+        assert psx["relative_root"] == "psx"
+        assert psx["emulators"] == ["libretro"]
+        assert psx["cores"] == ["pcsx_rearmed", "swanstation", "mednafen_psx"]
+        assert psx["requires_configuration_override"] is False
 
     def test_emits_smb_source_summary_when_smb_configured(self, tmp_path):
         config = _build_config(tmp_path, smb=SMBConfig(server="nas.local", share="ROMs", username="alice"))

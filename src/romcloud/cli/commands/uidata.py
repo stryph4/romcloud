@@ -70,6 +70,23 @@ def _emit(ctx: click.Context, payload: dict) -> None:
         ctx.exit(1)
 
 
+def _direct_save_layout_status(saves) -> list[dict[str, object]]:  # noqa: ANN001
+    """Serializable direct-storage details for UI and diagnostics."""
+    return [
+        {
+            "layout_id": layout.layout_id,
+            "system": layout.system,
+            "relative_root": layout.direct_route_root,
+            "emulators": list(layout.direct_save_emulators),
+            "cores": list(layout.direct_save_cores),
+            "categories": list(layout.direct_save_categories),
+            "requires_configuration_override": layout.direct_save_requires_override,
+        }
+        for layout in saves.selection_policy.layouts
+        if layout.direct_save_capable
+    ]
+
+
 def _run_action(ctx: click.Context, build_payload) -> None:
     try:
         payload = build_payload()
@@ -424,6 +441,9 @@ def uidata_status(ctx: click.Context) -> None:
         )
         operating_state["direct_save_capable_layouts"] = sorted(
             saves.selection_policy.direct_save_layout_ids()
+        )
+        operating_state["direct_save_layout_details"] = _direct_save_layout_status(
+            saves
         )
         payload = {
             "games_total": len(games),
@@ -1092,6 +1112,7 @@ def uidata_savesync_status(ctx: click.Context) -> None:
             "auto_sync_enabled": config.saves.auto_sync_enabled,
             "direct_save_storage_capable": saves.filesystem_remote_root is not None,
             "direct_save_capable_layouts": sorted(direct_layouts),
+            "direct_save_layout_details": _direct_save_layout_status(saves),
             "direct_save_local_only_layouts": sorted(
                 layout.layout_id
                 for layout in saves.selection_policy.layouts

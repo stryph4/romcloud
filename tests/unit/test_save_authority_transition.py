@@ -67,6 +67,9 @@ class _Routing:
         self.calls.append("deactivate")
         self.active = False
 
+    def recover_for_mode(self, *, direct):
+        self.calls.append(f"recover-{direct}")
+
 
 def _wire(monkeypatch, saves, routing):
     monkeypatch.setattr(game_access, "Container", lambda *args, **kwargs: SimpleNamespace(saves=saves))
@@ -130,12 +133,12 @@ def test_direct_exit_materializes_shadow_before_unrouting(tmp_path, monkeypatch)
     assert saves.calls[0] == ("shadow", routing.shadow_root)
     assert saves.calls[1][0] == "quick"
     assert saves.calls[1][1]["authoritative_side"] == "remote"
-    assert routing.calls == ["deactivate"]
+    assert routing.calls == ["recover-True", "deactivate"]
 
 
 def test_unsupported_layouts_do_not_create_an_authority_handoff(tmp_path, monkeypatch):
     unsupported = SimpleNamespace(
-        conflict_id="retroarch-conflict", layout_id="retroarch-root-snes"
+        conflict_id="retroarch-conflict", layout_id="retroarch-root-amiga500"
     )
     saves, routing = _Saves((unsupported,)), _Routing()
     routing.available = False
@@ -154,7 +157,7 @@ def test_unsupported_layouts_do_not_create_an_authority_handoff(tmp_path, monkey
 
 def test_remote_wins_leaves_unsupported_conflicts_untouched(tmp_path, monkeypatch):
     unsupported = SimpleNamespace(
-        conflict_id="retroarch-conflict", layout_id="retroarch-root-snes"
+        conflict_id="retroarch-conflict", layout_id="retroarch-root-amiga500"
     )
     saves, routing = _Saves((unsupported,)), _Routing()
     _wire(monkeypatch, saves, routing)
@@ -182,7 +185,7 @@ def test_direct_exit_sync_failure_preserves_remote_routing(tmp_path, monkeypatch
         )
 
     assert routing.active is True
-    assert routing.calls == []
+    assert routing.calls == ["recover-True"]
 
 
 def test_authority_handoff_is_blocked_for_an_active_direct_layout(
@@ -205,12 +208,33 @@ def test_authority_handoff_is_blocked_for_an_active_direct_layout(
     assert routing.calls == []
 
 
+def test_active_classic_libretro_layout_blocks_its_authority_handoff(
+    tmp_path, monkeypatch
+):
+    config = _config(tmp_path)
+    ActiveSessionStore(Path(config.data_path)).start(
+        system="nes", emulator="libretro", core="fceumm", rom="Game.nes"
+    )
+    saves, routing = _Saves(), _Routing()
+    routing.layout_ids = frozenset({"retroarch-root-nes"})
+    _wire(monkeypatch, saves, routing)
+
+    with pytest.raises(ModeTransitionError, match="retroarch-root-nes"):
+        game_access._prepare_save_authority_transition(
+            config, OperatingMode.CACHE, OperatingMode.CONNECTED, None,
+            conflict_action="stop",
+        )
+
+    assert saves.calls == []
+    assert routing.calls == []
+
+
 def test_active_local_only_layout_does_not_block_direct_rom_transition(
     tmp_path, monkeypatch
 ):
     config = _config(tmp_path)
     ActiveSessionStore(Path(config.data_path)).start(
-        system="snes", emulator="libretro", core="snes9x", rom="Game.sfc"
+        system="amiga500", emulator="libretro", core="puae", rom="Game.adf"
     )
     saves, routing = _Saves(), _Routing()
     _wire(monkeypatch, saves, routing)

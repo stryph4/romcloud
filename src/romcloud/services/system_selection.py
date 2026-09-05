@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -63,6 +64,16 @@ def update_selection(
 
     old_selected = tuple(status["selected_systems"])
     config = load_config(str(config_path))
+    from romcloud.integrations.batocera.direct_saves import MANIFEST_FILENAME
+
+    if (
+        os.path.lexists(Path(config.data_path) / MANIFEST_FILENAME)
+        and config.source.selected_systems != selected
+    ):
+        raise ValueError(
+            "Direct save routing is active. Switch to Cached Storage before "
+            "changing selected systems so save authority can be handed off safely."
+        )
     updated = replace(
         config,
         source=replace(config.source, selected_systems=selected),

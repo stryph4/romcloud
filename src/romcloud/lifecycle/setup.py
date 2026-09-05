@@ -1095,12 +1095,13 @@ def _guard_active_direct_save_provider_change(
         existing.data_path != requested.data_path
         or existing.saves.local_path != requested.saves.local_path
         or existing.remote_data != requested.remote_data
+        or existing.source.selected_systems != requested.source.selected_systems
     )
     if os.path.lexists(manifest) and identity_changed:
         raise ValueError(
             "Direct save routing is active. Switch to Cached Storage first so "
             "remote saves are materialized locally before changing the remote-data "
-            "provider or save paths."
+            "provider, save paths, or selected systems."
         )
 
 

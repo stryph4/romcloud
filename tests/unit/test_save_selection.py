@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from romcloud.core.save_selection import (
     DEFAULT_SAVE_SELECTION_POLICY,
     XBOX_HDD_RELATIVE_PATH,
@@ -63,8 +65,10 @@ class TestPS1Native:
     def test_srm_included(self):
         assert DEFAULT_SAVE_SELECTION_POLICY.is_included("psx", "Game.srm") is True
 
-    def test_non_srm_excluded(self):
-        assert DEFAULT_SAVE_SELECTION_POLICY.is_included("psx", "Game.mcr") is False
+    def test_libretro_memory_card_variants_are_included(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        assert policy.is_included("psx", "Game.mcr") is True
+        assert policy.is_included("psx", "pcsx-card2.mcd") is True
 
 
 class TestRetroArchNativeSaves:
@@ -81,27 +85,26 @@ class TestRetroArchNativeSaves:
         ):
             assert policy.is_included(system, "Game.srm") is True
 
-    def test_srm_rule_is_root_only(self):
+    def test_direct_classic_namespace_is_complete_and_recursive(self):
         policy = DEFAULT_SAVE_SELECTION_POLICY
         for relative_path in (
             "states/Game.srm",
             "savestates/Game.srm",
-            "shaders/Game.srm",
-            "config/Game.srm",
-            "cache/Game.srm",
-            "logs/Game.srm",
+            "Game.rtc",
         ):
-            assert policy.is_included("snes", relative_path) is False
+            assert policy.is_included("snes", relative_path) is True
 
-    def test_savestate_included_but_non_progress_formats_excluded(self):
+    def test_complete_classic_namespace_preserves_existing_files(self):
         policy = DEFAULT_SAVE_SELECTION_POLICY
         assert policy.is_included("snes", "Game.state") is True
         assert policy.is_included("snes", "Game.state.auto") is True
-        for relative_path in (
-            "Game.cfg",
-            "retroarch.log",
-        ):
-            assert policy.is_included("snes", relative_path) is False
+        assert policy.is_included("snes", "Game.cfg") is True
+
+    def test_unsupported_retroarch_namespace_remains_root_filtered(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+        assert policy.is_included("dreamcast", "Game.srm") is True
+        assert policy.is_included("dreamcast", "nested/Game.srm") is False
+        assert policy.is_included("dreamcast", "retroarch.log") is False
 
 
 class TestN64Native:
@@ -570,6 +573,32 @@ class TestPositiveLayoutRegistry:
             layout.system == "ps3" and "/game" in layout.root_pattern
             for layout in layouts
         )
+
+    def test_direct_layout_requires_explicit_complete_matching_route_root(self):
+        base = dict(
+            layout_id="unsafe-direct",
+            system="nes",
+            root_pattern="",
+            recursive=True,
+            eligible_files=("*",),
+            direct_save_capable=True,
+        )
+        with pytest.raises(ValueError, match="static, complete"):
+            SaveSelectionPolicy(
+                layouts=(SaveLayout(**base, direct_save_root="other-system"),)
+            )
+        with pytest.raises(ValueError, match="static, complete"):
+            SaveSelectionPolicy(
+                layouts=(
+                    SaveLayout(
+                        **{
+                            **base,
+                            "eligible_files": ("*.srm",),
+                            "direct_save_root": "nes",
+                        }
+                    ),
+                )
+            )
 
     def test_lifecycle_identity_resolution_is_declarative_and_fail_closed(self):
         policy = DEFAULT_SAVE_SELECTION_POLICY

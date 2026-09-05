@@ -147,6 +147,16 @@ class SaveLayout:
     save dataset; filename-filtered and partially selected trees remain local
     in Direct Mode.
     """
+    direct_save_root: str = ""
+    direct_save_emulators: tuple[str, ...] = ()
+    direct_save_cores: tuple[str, ...] = ()
+    direct_save_categories: tuple[str, ...] = ()
+    direct_save_requires_override: bool = False
+
+    @property
+    def direct_route_root(self) -> str:
+        """Exact path below Batocera's main saves directory owned by this layout."""
+        return self.direct_save_root
 
 
 @dataclass(frozen=True)
@@ -250,6 +260,28 @@ _RETROARCH_SRM_SYSTEMS = frozenset(
 
 _SPECIAL_ROOT_SYSTEMS = frozenset({"mame", "n64", "n64dd", "nds"})
 
+# Batocera's libretro generator forces both savefile_directory and
+# savestate_directory to /userdata/saves/<system>.  These conventional console
+# systems therefore have a complete, isolated per-system namespace rather than
+# a shared RetroArch directory.  Direct routing deliberately remains narrower
+# than the complete RetroArch system catalog: computers, ports, broad arcade
+# trees, and systems with mixed standalone-emulator storage are not opted in.
+_DIRECT_RETROARCH_CLASSIC_SYSTEMS = frozenset(
+    """
+    atari2600 atari5200 atari7800 colecovision fds gamegear gb gb2players gba
+    gbc gbc2players intellivision jaguar jaguarcd lynx mastersystem megacd
+    megadrive megadrive-msu neogeo neogeocd nes ngp ngpc odyssey2 pcengine
+    pcenginecd psx satellaview sega32x sg1000 sgb sgb-msu1 snes snes-msu1
+    sufami supergrafx supervision vectrex virtualboy wswan wswanc
+    """.split()
+)
+
+_DIRECT_PSX_LIBRETRO_CORES = (
+    "pcsx_rearmed",
+    "swanstation",
+    "mednafen_psx",
+)
+
 
 def _layout(
     layout_id: str,
@@ -273,6 +305,11 @@ def _layout(
     container_kind: str = "",
     root_markers: tuple[str, ...] = (),
     direct_save_capable: bool = False,
+    direct_save_root: str = "",
+    direct_save_emulators: tuple[str, ...] = (),
+    direct_save_cores: tuple[str, ...] = (),
+    direct_save_categories: tuple[str, ...] = (),
+    direct_save_requires_override: bool = False,
 ) -> SaveLayout:
     return SaveLayout(
         layout_id=layout_id,
@@ -295,6 +332,11 @@ def _layout(
         container_kind=container_kind,
         root_markers=root_markers,
         direct_save_capable=direct_save_capable,
+        direct_save_root=direct_save_root,
+        direct_save_emulators=direct_save_emulators,
+        direct_save_cores=direct_save_cores,
+        direct_save_categories=direct_save_categories,
+        direct_save_requires_override=direct_save_requires_override,
     )
 
 
@@ -302,8 +344,32 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
     _layout(
         f"retroarch-root-{system}",
         system,
-        files=("*.srm", "*.state*"),
-        description="Root-only RetroArch save RAM and save states",
+        recursive=system in _DIRECT_RETROARCH_CLASSIC_SYSTEMS,
+        files=(
+            ("*",)
+            if system in _DIRECT_RETROARCH_CLASSIC_SYSTEMS
+            else ("*.srm", "*.state*")
+        ),
+        description=(
+            "Complete Batocera-isolated RetroArch save and state namespace"
+            if system in _DIRECT_RETROARCH_CLASSIC_SYSTEMS
+            else "Root-only RetroArch save RAM and save states"
+        ),
+        direct_save_capable=system in _DIRECT_RETROARCH_CLASSIC_SYSTEMS,
+        direct_save_root=(
+            system if system in _DIRECT_RETROARCH_CLASSIC_SYSTEMS else ""
+        ),
+        direct_save_emulators=(
+            ("libretro",) if system in _DIRECT_RETROARCH_CLASSIC_SYSTEMS else ()
+        ),
+        direct_save_cores=(
+            _DIRECT_PSX_LIBRETRO_CORES if system == "psx" else ()
+        ),
+        direct_save_categories=(
+            ("game-save", "save-state")
+            if system in _DIRECT_RETROARCH_CLASSIC_SYSTEMS
+            else ()
+        ),
     )
     for system in sorted(_RETROARCH_SRM_SYSTEMS - _SPECIAL_ROOT_SYSTEMS)
 ) + (
@@ -334,10 +400,14 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
     _layout(
         "mame-nvram", "mame", root="nvram", recursive=True,
         group_by="first_descendant", direct_save_capable=True,
+        direct_save_root="mame/nvram",
+        direct_save_categories=("nvram",),
     ),
     _layout(
         "mame-state", "mame", root="state", recursive=True,
         group_by="first_descendant", direct_save_capable=True,
+        direct_save_root="mame/state",
+        direct_save_categories=("save-state",),
     ),
     _layout(
         "duckstation-memory-cards",
@@ -374,6 +444,8 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
         "pcsx2-legacy-states", "pcsx2", root="sstates", recursive=True,
         shared=True, group_by="layout", lifecycle_systems=("ps2", "pcsx2"),
         direct_save_capable=True,
+        direct_save_root="pcsx2/sstates",
+        direct_save_categories=("save-state",),
     ),
     _layout(
         "pcsx2-memory-cards", "ps2", root="pcsx2", files=("Mcd*.ps2",),
@@ -401,11 +473,15 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
         "pcsx2-states", "ps2", root="pcsx2/sstates", recursive=True,
         shared=True, group_by="layout", lifecycle_systems=("ps2", "pcsx2"),
         direct_save_capable=True,
+        direct_save_root="ps2/pcsx2/sstates",
+        direct_save_categories=("save-state",),
     ),
     _layout(
         "ppsspp-savedata", "ppsspp", root="PSP/SAVEDATA", recursive=True,
         group_by="first_descendant", lifecycle_systems=("psp", "ppsspp"),
         direct_save_capable=True,
+        direct_save_root="ppsspp/PSP/SAVEDATA",
+        direct_save_categories=("game-save",),
     ),
     _layout(
         "ppsspp-states",
@@ -415,6 +491,8 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
         group_by="root_stem",
         lifecycle_systems=("psp", "ppsspp"),
         direct_save_capable=True,
+        direct_save_root="ppsspp/PPSSPP_STATE",
+        direct_save_categories=("save-state",),
     ),
     _layout(
         "rpcs3-savedata",
@@ -777,8 +855,17 @@ class SaveSelectionPolicy:
             raise ValueError("SaveSync layout ids must be unique")
         self._by_id = {layout.layout_id: layout for layout in self._layouts}
         for layout in self._layouts:
+            selected_root = "/".join(
+                (layout.system, *_segments(layout.root_pattern))
+            )
             if layout.direct_save_capable and (
-                not layout.root_pattern
+                not layout.direct_route_root
+                or layout.direct_route_root != selected_root
+                or PurePosixPath(layout.direct_route_root).is_absolute()
+                or any(
+                    segment in {"", ".", ".."}
+                    for segment in PurePosixPath(layout.direct_route_root).parts
+                )
                 or any(
                     segment in _TOKEN_VALIDATORS
                     for segment in _segments(layout.root_pattern)
@@ -871,6 +958,29 @@ class SaveSelectionPolicy:
             for layout in self._layouts
             if layout.direct_save_capable
         )
+
+    def supports_direct_save_runtime(
+        self, layout_id: str, *, emulator: str, core: str = ""
+    ) -> bool:
+        """Whether one emulator/core uses the layout's audited direct path."""
+        layout = self._by_id.get(layout_id)
+        if layout is None or not layout.direct_save_capable:
+            return False
+
+        def identity(value: str) -> str:
+            return value.strip().casefold().replace("-", "_")
+
+        emulator_key = identity(emulator)
+        core_key = identity(core)
+        if layout.direct_save_emulators and emulator_key not in {
+            identity(value) for value in layout.direct_save_emulators
+        }:
+            return False
+        if layout.direct_save_cores and core_key not in {
+            identity(value) for value in layout.direct_save_cores
+        }:
+            return False
+        return True
 
     def known_systems(self) -> frozenset[str]:
         return frozenset(layout.system for layout in self._layouts)

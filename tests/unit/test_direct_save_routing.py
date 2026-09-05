@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -8,9 +9,13 @@ from types import SimpleNamespace
 import pytest
 
 from romcloud.core.exceptions import ModeTransitionError
-from romcloud.core.save_selection import DEFAULT_SAVE_SELECTION_POLICY
+from romcloud.core.save_selection import (
+    DEFAULT_SAVE_SELECTION_POLICY,
+    SaveSelectionPolicy,
+)
 from romcloud.core.storage import ProviderCapabilities
 from romcloud.infrastructure.config import AppConfig, CacheConfig, SavesConfig, SourceConfig
+from romcloud.infrastructure.providers.local import LocalFilesystemProvider
 from romcloud.integrations.batocera.direct_saves import (
     MANIFEST_FILENAME,
     BindMountOperations,
@@ -48,13 +53,17 @@ class _FakeMounts:
         return self.bindings.get(target) == source
 
 
-def _config(tmp_path: Path) -> AppConfig:
+def _config(
+    tmp_path: Path, *, selected_systems: tuple[str, ...] | None = None
+) -> AppConfig:
     saves = tmp_path / "userdata" / "saves"
     data = tmp_path / "userdata" / "romcloud" / "data"
     saves.mkdir(parents=True)
     data.mkdir(parents=True)
     return AppConfig(
-        source=SourceConfig("local", str(tmp_path / "roms")),
+        source=SourceConfig(
+            "local", str(tmp_path / "roms"), selected_systems=selected_systems
+        ),
         cache=CacheConfig(str(tmp_path / "cache")),
         local_roms_path=str(tmp_path / "local-roms"),
         data_path=str(data),
@@ -64,7 +73,7 @@ def _config(tmp_path: Path) -> AppConfig:
 
 def test_direct_capability_is_distinct_and_conservative() -> None:
     policy = DEFAULT_SAVE_SELECTION_POLICY
-    assert policy.direct_save_layout_ids() == {
+    original_direct = {
         "mame-nvram",
         "mame-state",
         "pcsx2-legacy-states",
@@ -72,8 +81,33 @@ def test_direct_capability_is_distinct_and_conservative() -> None:
         "ppsspp-savedata",
         "ppsspp-states",
     }
+    classic_direct = {
+        f"retroarch-root-{system}"
+        for system in (
+            "nes",
+            "snes",
+            "megadrive",
+            "mastersystem",
+            "gamegear",
+            "gb",
+            "gbc",
+            "gba",
+            "pcengine",
+            "neogeo",
+            "atari2600",
+            "atari5200",
+            "atari7800",
+            "psx",
+        )
+    }
+    assert original_direct.union(classic_direct).issubset(
+        policy.direct_save_layout_ids()
+    )
     for unsafe in (
-        "retroarch-root-snes",
+        "retroarch-root-amiga500",
+        "retroarch-root-dos",
+        "n64-root",
+        "nds-root",
         "duckstation-memory-cards",
         "rpcs3-savedata",
         "xemu-hdd",
@@ -81,6 +115,47 @@ def test_direct_capability_is_distinct_and_conservative() -> None:
         "yuzu-account-title-save",
     ):
         assert not policy.layout(unsafe).direct_save_capable
+
+
+@pytest.mark.parametrize(
+    "system",
+    ("nes", "snes", "megadrive", "gb", "gbc", "gba", "psx"),
+)
+def test_classic_layout_owns_one_complete_isolated_system_directory(
+    system: str,
+) -> None:
+    layout = DEFAULT_SAVE_SELECTION_POLICY.layout(f"retroarch-root-{system}")
+
+    assert layout.direct_save_capable
+    assert layout.direct_route_root == system
+    assert layout.recursive
+    assert layout.eligible_files == ("*",)
+    assert layout.direct_save_emulators == ("libretro",)
+    assert layout.direct_save_requires_override is False
+    assert layout.direct_save_categories == ("game-save", "save-state")
+
+
+@pytest.mark.parametrize("core", ("pcsx_rearmed", "swanstation", "mednafen_psx"))
+def test_ps1_direct_save_is_limited_to_current_batocera_libretro_cores(
+    tmp_path: Path, core: str
+) -> None:
+    policy = DEFAULT_SAVE_SELECTION_POLICY
+
+    assert policy.supports_direct_save_runtime(
+        "retroarch-root-psx", emulator="libretro", core=core
+    )
+    route = DirectSaveRouting(
+        _config(tmp_path, selected_systems=("psx",)),
+        policy,
+        tmp_path / "remote/saves",
+        mount_operations=_FakeMounts(),
+    ).planned_routes()
+    assert len(route) == 1
+    assert route[0].layout_id == "retroarch-root-psx"
+    assert route[0].canonical_root == "psx"
+    assert not policy.supports_direct_save_runtime(
+        "retroarch-root-psx", emulator="duckstation", core="duckstation"
+    )
 
 
 def test_non_filesystem_provider_has_no_direct_routes(tmp_path: Path) -> None:
@@ -136,6 +211,199 @@ def test_routes_only_exact_audited_directories_and_restores_local_data(tmp_path:
     assert untouched_empty.is_dir()
     assert mounts.bindings == {}
     assert not routing.active
+
+
+def test_selected_classic_system_does_not_redirect_another_system(tmp_path: Path) -> None:
+    config = _config(tmp_path, selected_systems=("nes",))
+    remote = tmp_path / "remote" / "saves"
+    remote.mkdir(parents=True)
+    snes = Path(config.saves.local_path) / "snes/Game.srm"
+    snes.parent.mkdir(parents=True)
+    snes.write_bytes(b"snes-local")
+    mounts = _FakeMounts()
+    routing = DirectSaveRouting(
+        config, DEFAULT_SAVE_SELECTION_POLICY, remote, mount_operations=mounts
+    )
+
+    routes = routing.activate()
+
+    assert {route.layout_id for route in routes} == {"retroarch-root-nes"}
+    assert set(mounts.bindings) == {Path(config.saves.local_path) / "nes"}
+    assert snes.read_bytes() == b"snes-local"
+    routing.deactivate()
+
+
+def test_existing_manifest_remains_a_safe_subset_after_capability_expansion(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    remote = tmp_path / "remote" / "saves"
+    remote.mkdir(parents=True)
+    mounts = _FakeMounts()
+    legacy_ids = {
+        "mame-nvram",
+        "mame-state",
+        "pcsx2-legacy-states",
+        "pcsx2-states",
+        "ppsspp-savedata",
+        "ppsspp-states",
+    }
+    legacy_policy = SaveSelectionPolicy(
+        layouts=tuple(
+            DEFAULT_SAVE_SELECTION_POLICY.layout(layout_id)
+            for layout_id in sorted(legacy_ids)
+        )
+    )
+    legacy = DirectSaveRouting(
+        config, legacy_policy, remote, mount_operations=mounts
+    )
+    legacy.activate()
+    manifest = Path(config.data_path) / MANIFEST_FILENAME
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["version"] = 1
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    expanded = DirectSaveRouting(
+        config,
+        DEFAULT_SAVE_SELECTION_POLICY,
+        remote,
+        mount_operations=mounts,
+    )
+
+    assert expanded.active
+    assert expanded.layout_ids == legacy_ids
+    assert Path(config.saves.local_path) / "nes" not in mounts.bindings
+    expanded.recover_for_mode(direct=True)
+    expanded.deactivate()
+    assert mounts.bindings == {}
+
+
+def test_current_manifest_cannot_silently_drop_an_owned_route(tmp_path: Path) -> None:
+    config = _config(tmp_path, selected_systems=("nes", "snes"))
+    remote = tmp_path / "remote" / "saves"
+    remote.mkdir(parents=True)
+    routing = DirectSaveRouting(
+        config,
+        DEFAULT_SAVE_SELECTION_POLICY,
+        remote,
+        mount_operations=_FakeMounts(),
+    )
+    routing.activate()
+    manifest = Path(config.data_path) / MANIFEST_FILENAME
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["routes"] = payload["routes"][:1]
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ModeTransitionError, match="configuration changed"):
+        _ = routing.active
+
+
+def test_classic_round_trip_preserves_existing_and_direct_created_save(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, selected_systems=("nes",))
+    local = Path(config.saves.local_path)
+    remote = tmp_path / "remote" / "saves"
+    remote.mkdir(parents=True)
+    save = local / "nes/Game.srm"
+    save.parent.mkdir(parents=True)
+    save.write_bytes(b"existing-local")
+    service = SaveSyncService(
+        provider=LocalFilesystemProvider(),
+        connectivity_root=str(remote.parent),
+        local_root=str(local),
+        remote_root=str(remote),
+        state_path=Path(config.data_path) / "savesync-state.json",
+    )
+    service.full_sync()
+    mounts = _FakeMounts()
+    routing = DirectSaveRouting(
+        config, DEFAULT_SAVE_SELECTION_POLICY, remote, mount_operations=mounts
+    )
+
+    routing.activate()
+    assert (remote / "nes/Game.srm").read_bytes() == b"existing-local"
+    (remote / "nes/Game.srm").write_bytes(b"direct-created")
+    shadow = service.with_local_root(routing.shadow_root)
+    shadow.quick_sync(
+        force_current_state=True,
+        include_layout_ids=routing.layout_ids,
+        authoritative_side="remote",
+    )
+    routing.deactivate()
+
+    assert save.read_bytes() == b"direct-created"
+    assert DEFAULT_SAVE_SELECTION_POLICY.is_included("nes", "Game.srm")
+
+    # A second complete authority cycle must retain the same paths and data.
+    service.quick_sync(
+        force_current_state=True, include_layout_ids=routing.layout_ids
+    )
+    routing.activate()
+    shadow = service.with_local_root(routing.shadow_root)
+    shadow.quick_sync(
+        force_current_state=True,
+        include_layout_ids=routing.layout_ids,
+        authoritative_side="remote",
+    )
+    routing.deactivate()
+    assert save.read_bytes() == b"direct-created"
+
+
+def test_direct_routing_never_mutates_user_retroarch_configuration(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, selected_systems=("snes",))
+    remote = tmp_path / "remote" / "saves"
+    remote.mkdir(parents=True)
+    user_config = (
+        Path(config.saves.local_path).parent
+        / "system/configs/retroarch/config/Snes9x/Snes9x.cfg"
+    )
+    user_config.parent.mkdir(parents=True)
+    original = b'savefile_directory = "/custom/user/path"\n'
+    user_config.write_bytes(original)
+    routing = DirectSaveRouting(
+        config,
+        DEFAULT_SAVE_SELECTION_POLICY,
+        remote,
+        mount_operations=_FakeMounts(),
+    )
+
+    routing.activate()
+    routing.deactivate()
+
+    assert user_config.read_bytes() == original
+
+
+def test_new_classic_layout_uses_existing_conflict_detection(tmp_path: Path) -> None:
+    config = _config(tmp_path, selected_systems=("gba",))
+    local = Path(config.saves.local_path)
+    remote = tmp_path / "remote" / "saves"
+    remote.mkdir(parents=True)
+    local_save = local / "gba/Game.srm"
+    local_save.parent.mkdir(parents=True)
+    local_save.write_bytes(b"baseline")
+    service = SaveSyncService(
+        provider=LocalFilesystemProvider(),
+        connectivity_root=str(remote.parent),
+        local_root=str(local),
+        remote_root=str(remote),
+        state_path=Path(config.data_path) / "savesync-state.json",
+    )
+    service.full_sync()
+    local_save.write_bytes(b"local-change")
+    (remote / "gba/Game.srm").write_bytes(b"direct-change")
+
+    result = service.quick_sync(
+        force_current_state=True,
+        include_layout_ids=frozenset({"retroarch-root-gba"}),
+    )
+
+    assert result.report is not None and result.report.conflicts == 1
+    assert {
+        conflict.layout_id for conflict in service.get_state().active_conflicts
+    } == {"retroarch-root-gba"}
 
 
 def test_partial_bind_failure_rolls_back_every_local_directory(tmp_path: Path) -> None:
@@ -240,6 +508,34 @@ def test_recovery_rejects_a_symlinked_owned_manifest(tmp_path: Path) -> None:
 
     with pytest.raises(ModeTransitionError, match="manifest is invalid"):
         routing.recover_for_mode(direct=True)
+
+
+def test_direct_route_rejects_descendant_symlinks_without_following_them(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, selected_systems=("nes",))
+    remote = tmp_path / "remote" / "saves"
+    remote.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked = Path(config.saves.local_path) / "nes/linked"
+    linked.parent.mkdir(parents=True)
+    try:
+        linked.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+    routing = DirectSaveRouting(
+        config,
+        DEFAULT_SAVE_SELECTION_POLICY,
+        remote,
+        mount_operations=_FakeMounts(),
+    )
+
+    with pytest.raises(ModeTransitionError, match="refuses symlinked local save"):
+        routing.activate()
+
+    assert linked.is_symlink()
+    assert not routing.active
 
 
 def test_unmanifested_existing_mount_is_never_adopted(tmp_path: Path) -> None:
