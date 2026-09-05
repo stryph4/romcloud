@@ -245,9 +245,25 @@ class SaveSyncService:
             )
         return self._remote_store.validate_access()
 
+    def is_remote_writable(
+        self, access: Optional[StorageAccessResult] = None
+    ) -> bool:
+        return self._remote_store is not None and self._remote_store.is_writable(access)
+
     @property
     def is_remote_configured(self) -> bool:
         return self._remote_store is not None
+
+    @property
+    def filesystem_remote_root(self) -> Optional[Path]:
+        """Safe Direct-save root, derived from provider guarantees, not identity."""
+        if (
+            self._remote_store is None
+            or not self._remote_store.capabilities.filesystem_transactions
+            or not self._remote_store.capabilities.filesystem_journal
+        ):
+            return None
+        return self._remote_root
 
     @property
     def xbox_enabled(self) -> bool:
@@ -784,6 +800,21 @@ class SaveSyncService:
     def selection_policy(self) -> SaveSelectionPolicy:
         return self._policy
 
+    def with_local_root(self, local_root: Path) -> "SaveSyncService":
+        """Create a transition view over an owned canonical local shadow tree."""
+        return SaveSyncService(
+            provider=self._provider,
+            connectivity_root=self._connectivity_root,
+            local_root=str(local_root),
+            remote_root=None,
+            state_path=self._state_path,
+            xbox_enabled=self._xbox_enabled,
+            policy=self._policy,
+            capability_policy=self._capabilities,
+            remote_store=self._remote_store,
+            container_registry=self._container_registry,
+        )
+
     # ── scanning and physical path mapping ───────────────────────────────
 
     def _uses_legacy_rpcs3(self) -> bool:
@@ -1137,15 +1168,24 @@ class SaveSyncService:
 
     # ── authoritative force-operation preview ────────────────────────────
 
-    def preview_upload(self) -> SaveDiff:
+    def preview_upload(
+        self, *, layout_ids: Optional[frozenset[str]] = None
+    ) -> SaveDiff:
         with self._locked_operation():
-            return self._preview("upload")
+            return self._preview("upload", layout_ids=layout_ids)
 
-    def preview_download(self) -> SaveDiff:
+    def preview_download(
+        self, *, layout_ids: Optional[frozenset[str]] = None
+    ) -> SaveDiff:
         with self._locked_operation():
-            return self._preview("download")
+            return self._preview("download", layout_ids=layout_ids)
 
-    def _preview(self, direction: str) -> SaveDiff:
+    def _preview(
+        self,
+        direction: str,
+        *,
+        layout_ids: Optional[frozenset[str]] = None,
+    ) -> SaveDiff:
         self._capabilities.require(Capability.SAVE_SYNC, f"SaveSync {direction}")
         self._require_remote()
         if not self.is_remote_reachable():
@@ -1153,8 +1193,16 @@ class SaveSyncService:
                 f"Remote save location is not reachable: {self._connectivity_root}"
             )
         self._recover()
-        local_report = self._scan_local()
-        remote_report = self._scan_remote()
+        local_report = (
+            self._scan_local_layouts(layout_ids)
+            if layout_ids is not None
+            else self._scan_local()
+        )
+        remote_report = (
+            self._scan_remote_layouts(layout_ids)
+            if layout_ids is not None
+            else self._scan_remote()
+        )
         state = self._get_state_unlocked()
         baseline = _baseline_manifest(state)
         new_side, old_side = (
@@ -1204,6 +1252,9 @@ class SaveSyncService:
         is_group_active: Optional[Callable[[str], bool]] = None,
         is_layout_active: Optional[Callable[[str], bool]] = None,
         exclude_layout_ids: Optional[frozenset[str]] = None,
+        force_current_state: bool = False,
+        include_layout_ids: Optional[frozenset[str]] = None,
+        authoritative_side: Optional[str] = None,
     ) -> SaveQuickSyncResult:
         """Journal-driven discovery optimization for authoritative reconciliation."""
         self._capabilities.require(Capability.SAVE_SYNC, "Quick SaveSync")
@@ -1213,6 +1264,121 @@ class SaveSyncService:
         if not self.is_remote_reachable():
             raise SaveSyncConnectivityError(
                 f"Remote save location is not reachable: {self._connectivity_root}"
+            )
+
+        if authoritative_side not in {None, "remote"}:
+            raise ValueError("Quick Sync transition authority must be remote or unset")
+        if authoritative_side is not None and not force_current_state:
+            raise ValueError("Quick Sync authority is valid only for a forced current-state scan")
+        if authoritative_side == "remote" and include_layout_ids is None:
+            raise ValueError(
+                "Remote transition authority requires an explicit layout scope"
+            )
+        if include_layout_ids is not None:
+            unknown = include_layout_ids.difference(
+                layout.layout_id for layout in self._policy.layouts
+            )
+            if unknown:
+                raise SaveSyncVerificationError(
+                    f"Unknown SaveSync transition layouts: {', '.join(sorted(unknown))}"
+                )
+
+        if force_current_state:
+            with self._locked_operation():
+                state = self._get_state_unlocked()
+                cursor = state.quick_sync_cursor_generation
+                quick_cursor_was_trusted = state.quick_sync_ready and cursor is not None
+                transition_baseline = {
+                    path: artifact
+                    for path, artifact in _baseline_manifest(state).items()
+                    if include_layout_ids is None
+                    or (
+                        (descriptor := self._policy.group_for_path(path)) is not None
+                        and descriptor.layout_id in include_layout_ids
+                    )
+                }
+                journal = self._load_remote_journal(reset_on_error=False)
+                journal_was_trusted = journal is not None
+                remote_generation = (
+                    int(journal["generation"]) if journal is not None else cursor or 0
+                )
+
+            if authoritative_side == "remote":
+                assert include_layout_ids is not None
+                scope = include_layout_ids
+                preview = self.preview_download(layout_ids=scope)
+                record = self.commit_download(
+                    preview, layout_ids=scope, progress=progress
+                )
+                direct_mutations = self._journal_mutations_for_remote_transition(
+                    before=transition_baseline,
+                    after={
+                        artifact.relative_path: artifact
+                        for artifact in record.manifest
+                    },
+                )
+                if direct_mutations:
+                    self._append_remote_journal(
+                        revision=record.revision,
+                        timestamp=record.timestamp,
+                        mutations=direct_mutations,
+                    )
+                report = SaveReconcileReport(
+                    revision=record.revision,
+                    timestamp=record.timestamp,
+                    uploaded=0,
+                    downloaded=len(preview.added) + len(preview.changed),
+                    conflicts=0,
+                    unchanged=len(preview.unchanged),
+                    upload_bytes=0,
+                    download_bytes=preview.transfer_bytes,
+                    scope="transition_remote_authority",
+                )
+            else:
+                report = self._reconcile(
+                    progress=progress,
+                    selected_layout_ids=include_layout_ids,
+                    upload_only=False,
+                    is_group_active=is_group_active,
+                    is_layout_active=is_layout_active,
+                )
+                if report is None:
+                    return SaveQuickSyncResult(
+                        status="deferred",
+                        remote_generation=remote_generation,
+                        cursor_before=cursor,
+                        cursor_after=cursor,
+                        reason="active-session",
+                    )
+            latest = self._load_remote_journal(reset_on_error=False)
+            advance_quick_cursor = quick_cursor_was_trusted and journal_was_trusted
+            cursor_after = (
+                int(latest["generation"])
+                if advance_quick_cursor and latest is not None
+                else cursor
+            )
+            with self._locked_operation():
+                state = self._get_state_unlocked()
+                _write_state(
+                    self._state_path,
+                    replace(
+                        state,
+                        quick_sync_ready=(
+                            state.quick_sync_ready
+                            if journal_was_trusted
+                            else False
+                        ),
+                        quick_sync_cursor_generation=cursor_after,
+                    ),
+                )
+            return SaveQuickSyncResult(
+                status="reconciled",
+                remote_generation=remote_generation,
+                cursor_before=cursor,
+                cursor_after=cursor_after,
+                processed_groups=tuple(sorted(include_layout_ids or frozenset())),
+                report=report,
+                reason="forced-current-state",
             )
 
         excluded_layouts = exclude_layout_ids or frozenset()
@@ -2555,7 +2721,11 @@ class SaveSyncService:
     # ── deliberate force upload/download ─────────────────────────────────
 
     def commit_upload(
-        self, diff: SaveDiff, *, progress: ProgressSink = None
+        self,
+        diff: SaveDiff,
+        *,
+        layout_ids: Optional[frozenset[str]] = None,
+        progress: ProgressSink = None,
     ) -> SaveSyncRecord:
         if diff.direction != "upload":
             raise SaveSyncVerificationError("Upload requires an upload preview.")
@@ -2564,7 +2734,12 @@ class SaveSyncService:
         self._require_remote()
         return self._commit_force(
             diff,
-            source_scan=self._scan_local,
+            layout_ids=layout_ids,
+            source_scan=(
+                (lambda: self._scan_local_layouts(layout_ids))
+                if layout_ids is not None
+                else self._scan_local
+            ),
             source_path=self._local_path,
             destination_views=(
                 _DestinationView(self._remote_transaction_root()),
@@ -2573,7 +2748,11 @@ class SaveSyncService:
         )
 
     def commit_download(
-        self, diff: SaveDiff, *, progress: ProgressSink = None
+        self,
+        diff: SaveDiff,
+        *,
+        layout_ids: Optional[frozenset[str]] = None,
+        progress: ProgressSink = None,
     ) -> SaveSyncRecord:
         if diff.direction != "download":
             raise SaveSyncVerificationError("Download requires a download preview.")
@@ -2581,7 +2760,12 @@ class SaveSyncService:
         self._require_remote()
         return self._commit_force(
             diff,
-            source_scan=self._scan_remote,
+            layout_ids=layout_ids,
+            source_scan=(
+                (lambda: self._scan_remote_layouts(layout_ids))
+                if layout_ids is not None
+                else self._scan_remote
+            ),
             source_path=self._remote_path,
             destination_views=self._local_views(),
             progress=progress,
@@ -2591,6 +2775,7 @@ class SaveSyncService:
         self,
         diff: SaveDiff,
         *,
+        layout_ids: Optional[frozenset[str]],
         source_scan: Callable[[], save_tree.ScanReport],
         source_path: Callable[[str], Path],
         destination_views: tuple[_DestinationView, ...],
@@ -2603,7 +2788,7 @@ class SaveSyncService:
                 )
             # Recompute after taking the lock. A stale or forged preview can
             # never authorize replacing content that the user did not see.
-            current_preview = self._preview(diff.direction)
+            current_preview = self._preview(diff.direction, layout_ids=layout_ids)
             if current_preview.entries != diff.entries:
                 raise SaveSyncVerificationError(
                     "Save/state data changed after the preview; review the operation again."
@@ -2632,7 +2817,17 @@ class SaveSyncService:
                 # Verify both sides after staging.  This closes the historical
                 # second-rescan race and ensures the committed bytes are
                 # exactly those shown in the confirmed preview.
-                if self._scan_local().artifacts != local or self._scan_remote().artifacts != remote:
+                current_local = (
+                    self._scan_local_layouts(layout_ids)
+                    if layout_ids is not None
+                    else self._scan_local()
+                )
+                current_remote = (
+                    self._scan_remote_layouts(layout_ids)
+                    if layout_ids is not None
+                    else self._scan_remote()
+                )
+                if current_local.artifacts != local or current_remote.artifacts != remote:
                     raise SaveSyncVerificationError(
                         "Save/state data changed while staging; review the operation again."
                     )

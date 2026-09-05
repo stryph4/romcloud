@@ -17,6 +17,14 @@ class ModeTransitionError(ROMCloudError):
     """A requested operating-mode transition failed without being committed."""
 
 
+class SaveAuthorityConflictError(ModeTransitionError):
+    """Fresh transition inspection found conflicts requiring a user decision."""
+
+    def __init__(self, message: str, *, conflict_ids: tuple[str, ...]) -> None:
+        super().__init__(message)
+        self.conflict_ids = conflict_ids
+
+
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 

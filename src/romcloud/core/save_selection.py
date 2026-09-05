@@ -139,6 +139,14 @@ class SaveLayout:
     container_policy_id: str = ""
     container_kind: str = ""
     root_markers: tuple[str, ...] = ()
+    direct_save_capable: bool = False
+    """The complete resolved directory may be redirected to remote storage.
+
+    This is deliberately stronger than SaveSync eligibility.  A layout is
+    marked only when every descendant of its concrete root belongs to the
+    save dataset; filename-filtered and partially selected trees remain local
+    in Direct Mode.
+    """
 
 
 @dataclass(frozen=True)
@@ -264,6 +272,7 @@ def _layout(
     container_policy_id: str = "",
     container_kind: str = "",
     root_markers: tuple[str, ...] = (),
+    direct_save_capable: bool = False,
 ) -> SaveLayout:
     return SaveLayout(
         layout_id=layout_id,
@@ -285,6 +294,7 @@ def _layout(
         container_policy_id=container_policy_id,
         container_kind=container_kind,
         root_markers=root_markers,
+        direct_save_capable=direct_save_capable,
     )
 
 
@@ -321,8 +331,14 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
         description="Nintendo DS root saves and states; shared SD images omitted",
     ),
     _layout("mame-root", "mame", files=("*.srm", "*.state*")),
-    _layout("mame-nvram", "mame", root="nvram", recursive=True, group_by="first_descendant"),
-    _layout("mame-state", "mame", root="state", recursive=True, group_by="first_descendant"),
+    _layout(
+        "mame-nvram", "mame", root="nvram", recursive=True,
+        group_by="first_descendant", direct_save_capable=True,
+    ),
+    _layout(
+        "mame-state", "mame", root="state", recursive=True,
+        group_by="first_descendant", direct_save_capable=True,
+    ),
     _layout(
         "duckstation-memory-cards",
         "duckstation",
@@ -357,6 +373,7 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
     _layout(
         "pcsx2-legacy-states", "pcsx2", root="sstates", recursive=True,
         shared=True, group_by="layout", lifecycle_systems=("ps2", "pcsx2"),
+        direct_save_capable=True,
     ),
     _layout(
         "pcsx2-memory-cards", "ps2", root="pcsx2", files=("Mcd*.ps2",),
@@ -383,10 +400,12 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
     _layout(
         "pcsx2-states", "ps2", root="pcsx2/sstates", recursive=True,
         shared=True, group_by="layout", lifecycle_systems=("ps2", "pcsx2"),
+        direct_save_capable=True,
     ),
     _layout(
         "ppsspp-savedata", "ppsspp", root="PSP/SAVEDATA", recursive=True,
         group_by="first_descendant", lifecycle_systems=("psp", "ppsspp"),
+        direct_save_capable=True,
     ),
     _layout(
         "ppsspp-states",
@@ -395,6 +414,7 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
         recursive=True,
         group_by="root_stem",
         lifecycle_systems=("psp", "ppsspp"),
+        direct_save_capable=True,
     ),
     _layout(
         "rpcs3-savedata",
@@ -756,6 +776,23 @@ class SaveSelectionPolicy:
         if len(ids) != len(set(ids)):
             raise ValueError("SaveSync layout ids must be unique")
         self._by_id = {layout.layout_id: layout for layout in self._layouts}
+        for layout in self._layouts:
+            if layout.direct_save_capable and (
+                not layout.root_pattern
+                or any(
+                    segment in _TOKEN_VALIDATORS
+                    for segment in _segments(layout.root_pattern)
+                )
+                or not layout.recursive
+                or layout.eligible_files != ("*",)
+                or layout.exclusions
+                or layout.root_markers
+                or layout.container_adapter_id
+            ):
+                raise ValueError(
+                    "Direct-save-capable layouts must own one static, complete, "
+                    f"ordinary directory tree: {layout.layout_id}"
+                )
 
     @property
     def layouts(self) -> tuple[SaveLayout, ...]:
@@ -825,6 +862,14 @@ class SaveSelectionPolicy:
             layout.layout_id
             for layout in self._layouts
             if not layout.lifecycle_enabled
+        )
+
+    def direct_save_layout_ids(self) -> frozenset[str]:
+        """Return layouts whose complete concrete directory is safe to route."""
+        return frozenset(
+            layout.layout_id
+            for layout in self._layouts
+            if layout.direct_save_capable
         )
 
     def known_systems(self) -> frozenset[str]:

@@ -375,6 +375,7 @@ class WizardState:
         self.show_details = False
         self.notice = ""
         self.technical_error = ""
+        self.save_authority_conflict_ids: tuple[str, ...] = ()
         self._progress_event: ActivityEvent | None = None
 
     @property
@@ -1183,6 +1184,16 @@ class WizardState:
         result = operation_result(self.runner)
         self.runner = None
         if not result.ok:
+            conflict_ids = result.data.get("conflict_ids", [])
+            if (
+                result.data.get("save_authority_conflict")
+                and isinstance(conflict_ids, list)
+                and all(isinstance(value, str) for value in conflict_ids)
+            ):
+                self.password = ""
+                self.remote_password = ""
+                self.save_authority_conflict_ids = tuple(conflict_ids)
+                return drained
             self.technical_error = result.error
             self.error = (
                 result.error

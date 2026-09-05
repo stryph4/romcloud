@@ -175,6 +175,18 @@ class SaveSyncScreenState:
             return "back"
         return None
 
+    def start_conflict_resolution(self) -> None:
+        """Open the existing resolver from a mode-transition warning."""
+        self.error = ""
+        self.resolver = ConflictPopupState(
+            self.romcloud_bin,
+            source="manual",
+            popen=self.popen,
+            clock=self.clock,
+        )
+        self.resolver.start()
+        self.step = CONFLICTS
+
     # -- preview (non-blocking backend call) ----------------------------
 
     def start_preview(self, direction: str) -> None:

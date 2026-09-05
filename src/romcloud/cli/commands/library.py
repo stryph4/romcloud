@@ -23,10 +23,16 @@ _MODE_LABELS = {
 }
 
 
-def _set(ctx: click.Context, mode: OperatingMode) -> None:
+def _set(
+    ctx: click.Context, mode: OperatingMode, *, use_remote_saves: bool = False
+) -> None:
     container = get_container(ctx)
     try:
-        report = set_operating_mode(container.config, mode)
+        report = set_operating_mode(
+            container.config,
+            mode,
+            conflict_action="remote-wins" if use_remote_saves else "stop",
+        )
     except ROMCloudError as exc:
         raise click.ClickException(str(exc)) from exc
     label = _MODE_LABELS[mode]
@@ -55,10 +61,15 @@ def library_status(ctx: click.Context) -> None:
 
 
 @library_group.command("connected")
+@click.option(
+    "--use-remote-saves",
+    is_flag=True,
+    help="Explicitly discard conflicting local progress and continue with remote saves.",
+)
 @click.pass_context
-def library_connected(ctx: click.Context) -> None:
+def library_connected(ctx: click.Context, use_remote_saves: bool) -> None:
     """Use the configured ROM source directly."""
-    _set(ctx, OperatingMode.CONNECTED)
+    _set(ctx, OperatingMode.CONNECTED, use_remote_saves=use_remote_saves)
 
 
 @library_group.command("cache")
@@ -76,7 +87,8 @@ def library_offline(ctx: click.Context) -> None:
 
 
 @library_group.command("online", hidden=True)
+@click.option("--use-remote-saves", is_flag=True)
 @click.pass_context
-def library_online_compat(ctx: click.Context) -> None:
+def library_online_compat(ctx: click.Context, use_remote_saves: bool) -> None:
     """Compatibility alias for Direct."""
-    _set(ctx, OperatingMode.CONNECTED)
+    _set(ctx, OperatingMode.CONNECTED, use_remote_saves=use_remote_saves)

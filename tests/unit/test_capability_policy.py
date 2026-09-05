@@ -8,7 +8,12 @@ import pytest
 from click.testing import CliRunner
 
 from romcloud.cli.main import cli
-from romcloud.core.capabilities import Capability, CapabilityPolicy, PresentationIntent
+from romcloud.core.capabilities import (
+    Capability,
+    CapabilityPolicy,
+    OperatingMode,
+    PresentationIntent,
+)
 from romcloud.core.exceptions import CapabilityUnavailableError
 from romcloud.core.models.cache import CachePolicy
 from romcloud.core.models.game import Game, GameAsset
@@ -64,6 +69,33 @@ def test_configured_strategy_does_not_override_authoritative_offline_state() -> 
     assert policy.serialize()["operating_mode"] == "offline"
     assert policy.serialize()["presentation_intent"] == "offline"
     assert not policy.allows(Capability.CATALOG_REFRESH)
+
+
+def test_direct_mode_keeps_manual_savesync_available(tmp_path: Path) -> None:
+    policy = CapabilityPolicy("direct_nas", OperatingMode.CONNECTED)
+
+    assert policy.allows(Capability.SAVE_SYNC)
+    policy.require(Capability.SAVE_SYNC, "Manual SaveSync")
+
+    local = tmp_path / "saves"
+    remote = tmp_path / "remote" / "saves"
+    save = local / "snes" / "Game.srm"
+    save.parent.mkdir(parents=True)
+    remote.mkdir(parents=True)
+    save.write_bytes(b"local-only-layout")
+    from romcloud.infrastructure.providers.local import LocalFilesystemProvider
+
+    service = SaveSyncService(
+        provider=LocalFilesystemProvider(),
+        connectivity_root=str(remote.parent),
+        local_root=str(local),
+        remote_root=str(remote),
+        state_path=tmp_path / "state.json",
+        capability_policy=policy,
+    )
+
+    preview = service.preview_upload()
+    assert any(entry.relative_path == "snes/Game.srm" for entry in preview.added)
 
 
 def test_catalog_guard_runs_before_provider_access(

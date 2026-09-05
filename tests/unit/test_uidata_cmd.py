@@ -458,6 +458,10 @@ class TestStatus:
         assert payload["source_type"] == "Local filesystem"
         assert payload["source_internal_provider"] == "local"
         assert payload["source_description"] == str(tmp_path / "roms")
+        assert payload["operating_state"]["direct_save_storage_capable"] is False
+        assert "ppsspp-savedata" in payload["operating_state"][
+            "direct_save_capable_layouts"
+        ]
 
     def test_emits_smb_source_summary_when_smb_configured(self, tmp_path):
         config = _build_config(tmp_path, smb=SMBConfig(server="nas.local", share="ROMs", username="alice"))

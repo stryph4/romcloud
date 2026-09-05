@@ -50,6 +50,7 @@ from romcloud.lifecycle.google_drive_setup import (
     google_drive_auth_status,
 )
 from romcloud.core.progress import ProgressEvent, emit_progress, redact_text
+from romcloud.core.exceptions import SaveAuthorityConflictError
 from romcloud.infrastructure.config import load_config
 from romcloud.infrastructure.capabilities import capability_policy
 from romcloud.infrastructure.source_display import source_display_summary
@@ -72,6 +73,17 @@ def _emit(ctx: click.Context, payload: dict) -> None:
 def _run_action(ctx: click.Context, build_payload) -> None:
     try:
         payload = build_payload()
+    except SaveAuthorityConflictError as exc:
+        _emit(
+            ctx,
+            {
+                "ok": False,
+                "error": str(exc),
+                "save_authority_conflict": True,
+                "conflict_ids": list(exc.conflict_ids),
+            },
+        )
+        return
     except Exception as exc:  # noqa: BLE001 — must never leak a traceback to stdout
         _emit(ctx, {"ok": False, "error": str(exc)})
         return
@@ -140,6 +152,10 @@ def _run_request_action(ctx: click.Context, action) -> None:
         progress = _progress_sink(request)
         try:
             return action(request, progress) if progress is not None else action(request)
+        except SaveAuthorityConflictError:
+            # This typed outcome carries only opaque conflict IDs and a fixed
+            # user-facing message; preserve it for the shared decision UI.
+            raise
         except Exception as exc:
             safe = redact_text(
                 str(exc),
@@ -402,6 +418,13 @@ def uidata_status(ctx: click.Context) -> None:
         operating_state["game_management_enabled"] = (
             container.config.source.enabled
         )
+        saves = container.saves
+        operating_state["direct_save_storage_capable"] = (
+            saves.filesystem_remote_root is not None
+        )
+        operating_state["direct_save_capable_layouts"] = sorted(
+            saves.selection_policy.direct_save_layout_ids()
+        )
         payload = {
             "games_total": len(games),
             "game_access_mode": container.config.game_access_mode,
@@ -426,7 +449,9 @@ def uidata_status(ctx: click.Context) -> None:
     _run_action(ctx, build)
 
 
-def _run_library_mode_action(ctx: click.Context, mode: str) -> None:
+def _run_library_mode_action(
+    ctx: click.Context, mode: str, *, conflict_action: str = "stop"
+) -> None:
     def build() -> dict:
         _load_context_config(ctx)
         container = get_container(ctx)
@@ -437,7 +462,12 @@ def _run_library_mode_action(ctx: click.Context, mode: str) -> None:
         emit_progress(
             progress, "library", "reconcile", "running", f"Entering {label}…"
         )
-        report = set_operating_mode(container.config, mode, progress=progress)
+        report = set_operating_mode(
+            container.config,
+            mode,
+            progress=progress,
+            conflict_action=conflict_action,
+        )
         emit_progress(
             progress, "library", "reconcile", "success", f"Entered {label}"
         )
@@ -475,6 +505,13 @@ def uidata_library_cache(ctx: click.Context) -> None:
 def uidata_library_connected(ctx: click.Context) -> None:
     """Use the configured primary source directly."""
     _run_library_mode_action(ctx, "connected")
+
+
+@uidata_group.command("library-connected-remote-wins")
+@click.pass_context
+def uidata_library_connected_remote_wins(ctx: click.Context) -> None:
+    """Explicitly accept remote conflicting saves before entering Direct."""
+    _run_library_mode_action(ctx, "connected", conflict_action="remote-wins")
 
 
 @uidata_group.command("refresh")
@@ -1049,9 +1086,17 @@ def uidata_savesync_status(ctx: click.Context) -> None:
         config = _load_context_config(ctx)
         saves = get_container(ctx).saves
         state = saves.get_state()
+        direct_layouts = saves.selection_policy.direct_save_layout_ids()
         return {
             "remote_configured": saves.is_remote_configured,
             "auto_sync_enabled": config.saves.auto_sync_enabled,
+            "direct_save_storage_capable": saves.filesystem_remote_root is not None,
+            "direct_save_capable_layouts": sorted(direct_layouts),
+            "direct_save_local_only_layouts": sorted(
+                layout.layout_id
+                for layout in saves.selection_policy.layouts
+                if layout.layout_id not in direct_layouts
+            ),
             "xbox_enabled": saves.xbox_enabled,
             "xbox_hdd_size_bytes": saves.xbox_hdd_size(),
             # Compatibility-only setting. The graphical SaveSync screen no

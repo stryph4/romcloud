@@ -227,6 +227,30 @@ def _patch_apply_dependencies(
     )
 
 
+def test_active_direct_routes_block_provider_identity_rewrite(tmp_path: Path) -> None:
+    old_data = tmp_path / "old-data"
+    old_data.mkdir()
+    common = {
+        "source": SourceConfig("local", str(tmp_path / "roms")),
+        "cache": CacheConfig(str(tmp_path / "cache")),
+        "local_roms_path": str(tmp_path / "local-roms"),
+        "data_path": str(old_data),
+        "saves": SavesConfig(local_path=str(tmp_path / "saves")),
+    }
+    existing = AppConfig(
+        **common, remote_data=RemoteDataConfig("local", str(tmp_path / "remote-a"))
+    )
+    requested = AppConfig(
+        **common, remote_data=RemoteDataConfig("local", str(tmp_path / "remote-b"))
+    )
+    (old_data / "direct-save-routes.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Switch to Cached Storage first"):
+        graphical_setup._guard_active_direct_save_provider_change(  # noqa: SLF001
+            existing, requested
+        )
+
+
 class TestSetupState:
     def test_fresh_install(self, tmp_path):
         result = graphical_setup.setup_state(tmp_path / "config" / "romcloud.toml")

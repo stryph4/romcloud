@@ -2151,3 +2151,127 @@ class TestQuickSyncAndJournal:
             service.quick_sync()
 
         assert service.get_state().quick_sync_cursor_generation == cursor_before
+class TestTransitionCurrentStateSync:
+    def test_forced_scan_establishes_scoped_baseline_without_quick_sync_history(
+        self, tmp_path, service
+    ):
+        local = tmp_path / "local-saves/ppsspp/PSP/SAVEDATA/GAME/save.bin"
+        _write(local, b"first-save")
+
+        forced = service.quick_sync(
+            force_current_state=True,
+            include_layout_ids=frozenset({"ppsspp-savedata"}),
+        )
+
+        assert forced.status == "reconciled"
+        assert forced.report is not None and forced.report.uploaded == 1
+        remote = tmp_path / "remote-saves/ppsspp/PSP/SAVEDATA/GAME/save.bin"
+        assert remote.read_bytes() == b"first-save"
+        assert service.get_state().quick_sync_ready is False
+
+    def test_forced_scan_detects_unjournaled_local_change(self, tmp_path, service):
+        local = tmp_path / "local-saves/ppsspp/PSP/SAVEDATA/GAME/save.bin"
+        _write(local, b"baseline")
+        service.full_sync()
+        local.write_bytes(b"changed-without-dirty-hint")
+
+        assert service.quick_sync().status == "unchanged"
+        forced = service.quick_sync(
+            force_current_state=True,
+            include_layout_ids=frozenset({"ppsspp-savedata"}),
+        )
+
+        assert forced.status == "reconciled"
+        assert forced.report is not None and forced.report.uploaded == 1
+        assert (tmp_path / "remote-saves/ppsspp/PSP/SAVEDATA/GAME/save.bin").read_bytes() == b"changed-without-dirty-hint"
+
+    def test_forced_scan_detects_real_divergence(self, tmp_path, service):
+        local = tmp_path / "local-saves/ppsspp/PSP/SAVEDATA/GAME/save.bin"
+        remote = tmp_path / "remote-saves/ppsspp/PSP/SAVEDATA/GAME/save.bin"
+        _write(local, b"baseline")
+        service.full_sync()
+        local.write_bytes(b"local")
+        remote.write_bytes(b"remote")
+
+        forced = service.quick_sync(
+            force_current_state=True,
+            include_layout_ids=frozenset({"ppsspp-savedata"}),
+        )
+
+        assert forced.report is not None and forced.report.conflicts == 1
+        assert len(service.get_state().active_conflicts) == 1
+        assert local.read_bytes() == b"local"
+        assert remote.read_bytes() == b"remote"
+
+    def test_remote_wins_cannot_reupload_abandoned_local_conflict(
+        self, tmp_path, service
+    ):
+        from romcloud.core.models.savesync import SaveConflictResolution
+
+        local = tmp_path / "local-saves/ppsspp/PSP/SAVEDATA/GAME/save.bin"
+        remote = tmp_path / "remote-saves/ppsspp/PSP/SAVEDATA/GAME/save.bin"
+        _write(local, b"baseline")
+        service.full_sync()
+        local.write_bytes(b"abandoned-local")
+        remote.write_bytes(b"accepted-remote")
+        service.quick_sync(
+            force_current_state=True,
+            include_layout_ids=frozenset({"ppsspp-savedata"}),
+        )
+        conflict = service.get_state().active_conflicts[0]
+
+        service.resolve_conflict(
+            conflict.conflict_id, SaveConflictResolution.KEEP_REMOTE
+        )
+        followup = service.quick_sync(
+            force_current_state=True,
+            include_layout_ids=frozenset({"ppsspp-savedata"}),
+        )
+
+        assert local.read_bytes() == b"accepted-remote"
+        assert remote.read_bytes() == b"accepted-remote"
+        assert followup.report is not None and followup.report.uploaded == 0
+        assert not service.get_state().active_conflicts
+
+    def test_remote_authority_materializes_shadow_and_journals_direct_write(
+        self, tmp_path, service
+    ):
+        local = tmp_path / "local-saves/ppsspp/PSP/SAVEDATA/GAME/save.bin"
+        remote = tmp_path / "remote-saves/ppsspp/PSP/SAVEDATA/GAME/save.bin"
+        _write(local, b"baseline")
+        service.full_sync()
+        cursor = service.get_state().quick_sync_cursor_generation
+        remote.write_bytes(b"direct-write")
+        shadow = tmp_path / "shadow"
+        shadow_local = shadow / "ppsspp/PSP/SAVEDATA/GAME/save.bin"
+        _write(shadow_local, b"baseline")
+
+        result = service.with_local_root(shadow).quick_sync(
+            force_current_state=True,
+            include_layout_ids=frozenset({"ppsspp-savedata"}),
+            authoritative_side="remote",
+        )
+
+        assert result.status == "reconciled"
+        assert shadow_local.read_bytes() == b"direct-write"
+        assert result.cursor_after is not None and result.cursor_after > (cursor or 0)
+        assert not service.get_state().active_conflicts
+
+    def test_remote_authority_materializes_without_prior_quick_sync_history(
+        self, tmp_path, service
+    ):
+        remote = tmp_path / "remote-saves/ppsspp/PSP/SAVEDATA/GAME/save.bin"
+        _write(remote, b"direct-save")
+        shadow = tmp_path / "shadow"
+
+        result = service.with_local_root(shadow).quick_sync(
+            force_current_state=True,
+            include_layout_ids=frozenset({"ppsspp-savedata"}),
+            authoritative_side="remote",
+        )
+
+        assert result.status == "reconciled"
+        assert (
+            shadow / "ppsspp/PSP/SAVEDATA/GAME/save.bin"
+        ).read_bytes() == b"direct-save"
+        assert service.get_state().quick_sync_ready is False

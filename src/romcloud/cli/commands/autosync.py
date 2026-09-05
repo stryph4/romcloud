@@ -10,11 +10,13 @@ from pathlib import Path
 import click
 
 from romcloud.cli.context import get_container
+from romcloud.core.capabilities import OperatingMode
 from romcloud.infrastructure import savesync_prompts
 from romcloud.infrastructure.config import load_config
+from romcloud.infrastructure.library_view import operating_mode
 from romcloud.infrastructure.logging import get_logger
 from romcloud.integrations.batocera import auto_savesync as batocera_auto_savesync
-from romcloud.services.auto_savesync import AutoSaveSyncCoordinator
+from romcloud.services.auto_savesync import ActiveSessionStore, AutoSaveSyncCoordinator
 
 log = get_logger("auto-savesync-cli")
 
@@ -33,14 +35,31 @@ def _event_arguments(command):  # noqa: ANN001, ANN201
 
 def _coordinator(ctx: click.Context) -> AutoSaveSyncCoordinator:
     container = get_container(ctx)
+    enabled = _auto_sync_enabled(container.config)
+
+    def enabled_check() -> bool:
+        current = load_config(ctx.obj["config_path"])
+        return _auto_sync_enabled(current)
+
     return AutoSaveSyncCoordinator(
         container.saves,
         data_root=Path(container.config.data_path),
-        enabled=container.config.saves.auto_sync_enabled,
-        enabled_check=lambda: load_config(
-            ctx.obj["config_path"]
-        ).saves.auto_sync_enabled,
+        enabled=enabled,
+        enabled_check=enabled_check,
     )
+
+
+def _auto_sync_enabled(config) -> bool:  # noqa: ANN001
+    """Automatic network SaveSync runs only with local Cached ownership."""
+    return (
+        bool(config.saves.auto_sync_enabled)
+        and operating_mode(config) is OperatingMode.CACHE
+    )
+
+
+def _session_store(config) -> ActiveSessionStore:  # noqa: ANN001
+    """Gameplay markers remain active even when network Auto SaveSync is off."""
+    return ActiveSessionStore(Path(config.data_path))
 
 
 def _launch_pending_conflict_popup(
@@ -176,7 +195,13 @@ def _launch_pending_conflict_popup(
 def game_start(
     ctx: click.Context, system: str, emulator: str, core: str, rom: str
 ) -> None:
-    if not ctx.obj["config"].saves.auto_sync_enabled:
+    if not _auto_sync_enabled(ctx.obj["config"]):
+        try:
+            _session_store(ctx.obj["config"]).start(
+                system=system, emulator=emulator, core=core, rom=rom
+            )
+        except Exception:  # noqa: BLE001 - lifecycle hooks never block Batocera
+            log.warning("Could not record Batocera game start", exc_info=True)
         return
     try:
         _coordinator(ctx).game_start(
@@ -192,7 +217,11 @@ def game_start(
 def game_stop(
     ctx: click.Context, system: str, emulator: str, core: str, rom: str
 ) -> None:
-    if not ctx.obj["config"].saves.auto_sync_enabled:
+    if not _auto_sync_enabled(ctx.obj["config"]):
+        try:
+            _session_store(ctx.obj["config"]).stop(system=system, rom=rom)
+        except Exception:  # noqa: BLE001 - lifecycle hooks never block Batocera
+            log.warning("Could not clear Batocera game session", exc_info=True)
         return
     worker_pid = os.getpid()
     caller_pid = batocera_auto_savesync.lifecycle_caller_pid()
@@ -246,7 +275,7 @@ def game_stop(
 @click.option("--force", is_flag=True, default=False)
 @click.pass_context
 def menu_tick(ctx: click.Context, force: bool) -> None:
-    if not ctx.obj["config"].saves.auto_sync_enabled:
+    if not _auto_sync_enabled(ctx.obj["config"]):
         return
     try:
         _coordinator(ctx).menu_tick(force=force)
@@ -258,7 +287,7 @@ def menu_tick(ctx: click.Context, force: bool) -> None:
 @click.pass_context
 def remote_reconnect(ctx: click.Context) -> None:
     """Handle one detached unavailable-to-available remote-data edge."""
-    if not ctx.obj["config"].saves.auto_sync_enabled:
+    if not _auto_sync_enabled(ctx.obj["config"]):
         return
     try:
         _coordinator(ctx).remote_reconnect()
@@ -269,7 +298,7 @@ def remote_reconnect(ctx: click.Context) -> None:
 @autosync_group.command("menu-loop", hidden=True)
 @click.pass_context
 def menu_loop(ctx: click.Context) -> None:
-    if not ctx.obj["config"].saves.auto_sync_enabled:
+    if not _auto_sync_enabled(ctx.obj["config"]):
         return
     try:
         _coordinator(ctx).menu_loop()

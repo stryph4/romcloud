@@ -136,50 +136,82 @@ def test_disabled_coordinator_is_an_immediate_filesystem_and_service_noop(
     assert not (tmp_path / "data").exists()
 
 
-def test_disabled_lifecycle_cli_does_not_construct_coordinator(
-    tmp_path: Path, monkeypatch
+def test_automatic_savesync_is_enabled_only_in_cached_mode(tmp_path: Path):
+    from romcloud.cli.commands.autosync import _auto_sync_enabled
+    from romcloud.infrastructure.library_view import write_operating_mode
+
+    config = AppConfig(
+        source=SourceConfig("local", str(tmp_path / "roms")),
+        cache=CacheConfig(str(tmp_path / "cache")),
+        local_roms_path=str(tmp_path / "local-roms"),
+        data_path=str(tmp_path / "data"),
+        saves=SavesConfig(local_path=str(tmp_path / "saves"), auto_sync_enabled=True),
+    )
+    for mode, expected in (
+        (OperatingMode.CACHE, True),
+        (OperatingMode.CONNECTED, False),
+        (OperatingMode.OFFLINE, False),
+    ):
+        write_operating_mode(config, mode)
+        assert _auto_sync_enabled(config) is expected
+
+
+@pytest.mark.parametrize(
+    ("auto_enabled", "mode"),
+    (
+        (False, OperatingMode.CACHE),
+        (True, OperatingMode.CONNECTED),
+        (True, OperatingMode.OFFLINE),
+    ),
+)
+def test_inactive_lifecycle_cli_does_not_construct_coordinator(
+    tmp_path: Path, monkeypatch, auto_enabled: bool, mode: OperatingMode
 ):
     from romcloud.cli.commands import autosync as autosync_commands
     from romcloud.cli.main import cli
+    from romcloud.infrastructure.library_view import write_operating_mode
 
     config_path = tmp_path / "romcloud.toml"
-    write_config(
-        AppConfig(
-            source=SourceConfig("local", (tmp_path / "roms").as_posix()),
-            cache=CacheConfig((tmp_path / "cache").as_posix()),
-            local_roms_path=(tmp_path / "local-roms").as_posix(),
-            data_path=(tmp_path / "data").as_posix(),
-            saves=SavesConfig(
-                local_path=(tmp_path / "saves").as_posix(),
-                auto_sync_enabled=False,
-            ),
-        ),
-        str(config_path),
-    )
-    monkeypatch.setattr(
-        autosync_commands,
-        "_coordinator",
-        lambda _ctx: (_ for _ in ()).throw(
-            AssertionError("disabled lifecycle entry constructed coordinator")
+    config = AppConfig(
+        source=SourceConfig("local", (tmp_path / "roms").as_posix()),
+        cache=CacheConfig((tmp_path / "cache").as_posix()),
+        local_roms_path=(tmp_path / "local-roms").as_posix(),
+        data_path=(tmp_path / "data").as_posix(),
+        saves=SavesConfig(
+            local_path=(tmp_path / "saves").as_posix(),
+            auto_sync_enabled=auto_enabled,
         ),
     )
+    write_config(config, str(config_path))
+    write_operating_mode(config, mode)
+    coordinator_calls = []
+
+    def unexpected_coordinator(_ctx):
+        coordinator_calls.append(True)
+        return object()
+
+    monkeypatch.setattr(autosync_commands, "_coordinator", unexpected_coordinator)
 
     runner = CliRunner()
-    for event in ("game-start", "game-stop"):
+    commands = [
+        ["game-start", "psx", "libretro", "pcsx", "Game.chd"],
+        ["game-stop", "psx", "libretro", "pcsx", "Game.chd"],
+        ["menu-tick"],
+        ["remote-reconnect"],
+        ["menu-loop"],
+    ]
+    for command in commands:
         result = runner.invoke(
             cli,
             [
                 "--config",
                 str(config_path),
                 "_autosync",
-                event,
-                "psx",
-                "libretro",
-                "pcsx",
-                "Game.chd",
+                *command,
             ],
         )
         assert result.exit_code == 0, result.output
+    assert coordinator_calls == []
 
 
 def test_game_stop_worker_skips_popup_when_quick_sync_finds_no_new_conflict(

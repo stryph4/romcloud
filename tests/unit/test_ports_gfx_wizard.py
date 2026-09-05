@@ -418,6 +418,31 @@ def test_sftp_browser_failure_surfaces_backend_diagnostic(monkeypatch):
     assert wizard.technical_error in wizard.error
 
 
+def test_setup_apply_exposes_typed_save_authority_conflict(monkeypatch):
+    wizard = WizardState()
+    wizard.step = WizardStep.APPLY
+    wizard.password = "source-secret"
+    wizard.remote_password = "remote-secret"
+    wizard.runner = _Runner()
+    monkeypatch.setattr(
+        "ports_gfx.wizard.operation_result",
+        lambda _runner: BackendResult(
+            False,
+            data={
+                "save_authority_conflict": True,
+                "conflict_ids": ["one", "two"],
+            },
+            error="Direct Mode was not activated",
+        ),
+    )
+
+    wizard.poll()
+
+    assert wizard.save_authority_conflict_ids == ("one", "two")
+    assert wizard.password == ""
+    assert wizard.remote_password == ""
+
+
 def test_sftp_detect_failure_surfaces_backend_diagnostic(monkeypatch):
     wizard = WizardState()
     wizard.source_type = "sftp"

@@ -90,6 +90,10 @@ from ports_gfx.menu import (
     MenuState,
     NavigationState,
 )
+from ports_gfx.mode_save_conflict import (
+    ACTION_LABELS as MODE_CONFLICT_ACTIONS,
+    ModeSaveConflictState,
+)
 from ports_gfx.operation import OperationRunner, OperationState
 from ports_gfx.operation_screen import (
     OPERATION_SCREEN,
@@ -142,6 +146,7 @@ LIBRARY_FULL_SYNC_ACTION = "library-sync-full"
 LIBRARY_MANAGER_ACTION = "library-manager"
 SELECT_SYSTEMS_ACTION = "select-systems"
 STARTUP_RESTART_SCREEN = "startup-restart"
+MODE_SAVE_CONFLICT_SCREEN = "mode-save-conflict"
 
 MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
     "Library": (
@@ -217,13 +222,25 @@ def root_menu_items_for_state(state: dict[str, object]) -> tuple[MenuItem, ...]:
     )
     active_mode = str(state.get("operating_mode", "cache"))
     if game_management_enabled:
+        if state.get("direct_save_storage_capable"):
+            direct_save_detail = (
+                "Audited save directories use remote storage directly; unsupported "
+                "save layouts remain local with manual SaveSync available."
+            )
+        else:
+            direct_save_detail = (
+                "This data provider cannot host live emulator saves, so saves remain "
+                "local with manual SaveSync available."
+            )
         items.append(
             MenuItem(
                 "Direct",
                 ACTIVE_MODE_ACTION if active_mode == "connected" else "library-connected",
-                "Active"
-                if active_mode == "connected"
-                else "Play games directly from the configured ROM source.",
+                (
+                    ("Active. " if active_mode == "connected" else "")
+                    + "Games run from the configured ROM source. "
+                    + direct_save_detail
+                ),
                 active=active_mode == "connected",
             )
         )
@@ -508,6 +525,21 @@ def start_operation(action: str, romcloud_bin: str, *, popen=None) -> OperationS
         runner=runner,
         arms_gui_relaunch=spec.arms_gui_relaunch,
         exits_after_mode_change=spec.exits_after_mode_change,
+    )
+
+
+def start_remote_wins_operation(
+    romcloud_bin: str, *, popen=None  # noqa: ANN001
+) -> OperationScreenState:
+    """Launch the destructive continuation only from the warning screen."""
+    runner_kwargs = {"popen": popen} if popen is not None else {}
+    runner = OperationRunner(
+        [romcloud_bin, "uidata", "library-connected-remote-wins"],
+        **runner_kwargs,
+    )
+    runner.start()
+    return OperationScreenState(
+        title="Direct", runner=runner, exits_after_mode_change=True
     )
 
 
@@ -960,6 +992,7 @@ def _run(  # noqa: ANN001
     library_manager_screen: Optional[LibraryManagerScreenState] = None
     system_selection_screen: Optional[SystemSelectionScreenState] = None
     startup_restart: StartupRestartPromptState | None = None
+    mode_save_conflict: ModeSaveConflictState | None = None
     update_check: UpdateCheckState | None = None
 
     try:
@@ -1091,6 +1124,8 @@ def _run(  # noqa: ANN001
                     rects = (layout.safe_area,)
                 elif current_screen == STARTUP_RESTART_SCREEN:
                     rects = tuple(_startup_restart_action_rects(layout))
+                elif current_screen == MODE_SAVE_CONFLICT_SCREEN:
+                    rects = tuple(_mode_save_conflict_action_rects(layout, fonts))
                 else:
                     rects = ()
                 ievent = input_manager.handle_event(
@@ -1224,6 +1259,23 @@ def _run(  # noqa: ANN001
                                 startup_restart.error = (
                                     result.error or "Could not restart Batocera."
                                 )
+                elif (
+                    current_screen == MODE_SAVE_CONFLICT_SCREEN
+                    and mode_save_conflict is not None
+                ):
+                    decision = mode_save_conflict.handle_event(ievent)
+                    if decision == "resolve":
+                        savesync_screen = SaveSyncScreenState(romcloud_bin=romcloud_bin)
+                        savesync_screen.start_conflict_resolution()
+                        current_screen = "savesync"
+                        mode_save_conflict = None
+                    elif decision == "remote-wins":
+                        operation_screen = start_remote_wins_operation(romcloud_bin)
+                        current_screen = OPERATION_SCREEN
+                        mode_save_conflict = None
+                    elif decision == "cancel":
+                        current_screen = "menu"
+                        mode_save_conflict = None
                 elif current_screen == "savesync" and savesync_screen is not None:
                     current_screen = _handle_savesync_event(ievent, savesync_screen)
                     if current_screen == "menu":
@@ -1304,6 +1356,12 @@ def _run(  # noqa: ANN001
                         # the updater's replacement-launch coordinator.
                         current_screen = "mode-transition-exit"
                         running = False
+                    elif mode_save_conflict_from_operation(operation_screen) is not None:
+                        mode_save_conflict = mode_save_conflict_from_operation(
+                            operation_screen
+                        )
+                        operation_screen = None
+                        current_screen = MODE_SAVE_CONFLICT_SCREEN
                     elif operation_screen.title == "Refresh Catalog":
                         if ievent.action == Action.UP:
                             catalog_progress.scroll(-1, 6)
@@ -1371,6 +1429,14 @@ def _run(  # noqa: ANN001
                     if render_completed_mode_transition_exit(operation_screen, splash):
                         current_screen = "mode-transition-exit"
                         running = False
+                    else:
+                        conflict_state = mode_save_conflict_from_operation(
+                            operation_screen
+                        )
+                        if conflict_state is not None:
+                            mode_save_conflict = conflict_state
+                            operation_screen = None
+                            current_screen = MODE_SAVE_CONFLICT_SCREEN
             elif current_screen == "savesync" and savesync_screen is not None:
                 for line in savesync_screen.poll():
                     activity.ingest(line.text)
@@ -1394,7 +1460,13 @@ def _run(  # noqa: ANN001
             elif current_screen == "wizard" and wizard is not None:
                 for line in wizard.poll():
                     activity.ingest(line.text)
-                if wizard.finished:
+                if wizard.save_authority_conflict_ids:
+                    mode_save_conflict = ModeSaveConflictState(
+                        wizard.save_authority_conflict_ids
+                    )
+                    wizard = None
+                    current_screen = MODE_SAVE_CONFLICT_SCREEN
+                elif wizard.finished:
                     setup_status = call_backend(romcloud_bin, "setup-status")
                     operating_state = operating_state_from_status(setup_status.data)
                     library_sync_enabled = bool(
@@ -1416,6 +1488,14 @@ def _run(  # noqa: ANN001
                         )
                         message = str(startup_failure or "Setup complete")
                         message_kind = "error" if startup_failure else "success"
+            elif (
+                current_screen == MODE_SAVE_CONFLICT_SCREEN
+                and mode_save_conflict is not None
+            ):
+                if mode_save_conflict.update(dt) == "remote-wins":
+                    operation_screen = start_remote_wins_operation(romcloud_bin)
+                    mode_save_conflict = None
+                    current_screen = OPERATION_SCREEN
 
             should_capture_text = bool(
                 current_screen == "wizard"
@@ -1487,6 +1567,13 @@ def _run(  # noqa: ANN001
             ):
                 _render_library_manager(
                     pygame, screen, fonts, layout, library_manager_screen
+                )
+            elif (
+                current_screen == MODE_SAVE_CONFLICT_SCREEN
+                and mode_save_conflict is not None
+            ):
+                _render_mode_save_conflict(
+                    pygame, screen, fonts, layout, mode_save_conflict
                 )
             elif (
                 current_screen == "system_selection"
@@ -1813,6 +1900,20 @@ def _system_selection_body_lines(
             for index, label in enumerate(visible)
         ],
     ]
+
+
+def mode_save_conflict_from_operation(
+    operation: OperationScreenState,
+) -> ModeSaveConflictState | None:
+    if not operation.is_finished or operation.succeeded:
+        return None
+    result = operation_result(operation.runner)
+    if not result.data.get("save_authority_conflict"):
+        return None
+    ids = result.data.get("conflict_ids", [])
+    if not isinstance(ids, list) or not all(isinstance(value, str) for value in ids):
+        return None
+    return ModeSaveConflictState(tuple(ids))
 
 
 def _library_manager_body_lines(screen: LibraryManagerScreenState) -> list[str]:
@@ -2407,6 +2508,54 @@ def _save_size(num_bytes: int) -> str:
             return f"{int(value)} {unit}" if unit == "B" else f"{value:.1f} {unit}"
         value /= 1024
     return f"{value:.1f} TB"
+
+
+def _render_mode_save_conflict(  # noqa: ANN001
+    pygame, screen, fonts: dict, layout: Layout, state: ModeSaveConflictState
+) -> None:
+    screen.fill(_BG_COLOR)
+    title = fonts["title"].render("Unresolved Save Conflicts", True, _WARNING_COLOR)
+    screen.blit(title, (layout.header_rect.x, layout.header_rect.y))
+    lines = (
+        "Direct Mode uses the remote save location directly.",
+        "Local save changes conflict with the remote versions.",
+        "Resolve them first, accept remote saves, or cancel the mode change.",
+        f"Conflicting save groups: {len(state.conflict_ids)}",
+    )
+    y = layout.navigation_rect.y
+    for line in lines:
+        rendered = fonts["body"].render(line, True, _FG_COLOR)
+        screen.blit(rendered, (layout.navigation_rect.x, y))
+        y += fonts["body"].get_height() + 6
+    controls = _mode_save_conflict_action_rects(layout, fonts)
+    for index, (label, rect) in enumerate(zip(MODE_CONFLICT_ACTIONS, controls)):
+        color = _SELECTED_BG if index == state.selected_index else _CARD_BG
+        pygame.draw.rect(screen, color, (rect.x, rect.y, rect.w, rect.h), border_radius=6)
+        text = fonts["body"].render(label, True, _FG_COLOR)
+        screen.blit(text, (rect.x + 16, rect.y + max(0, (rect.h - text.get_height()) // 2)))
+    hint = (
+        "Keep holding Confirm to discard local conflicts."
+        if state.selected_index == 1 and state.confirm.active
+        else "Remote wins requires hold-to-confirm. Back cancels."
+    )
+    screen.blit(
+        fonts["hint"].render(hint, True, _HINT_COLOR),
+        (layout.hint_rect.x, layout.hint_rect.y),
+    )
+    pygame.display.flip()
+
+
+def _mode_save_conflict_action_rects(layout: Layout, fonts: dict) -> list[Rect]:
+    body_bottom = layout.navigation_rect.y + 4 * (fonts["body"].get_height() + 6)
+    return compute_vertical_control_rects(
+        Rect(
+            layout.navigation_rect.x,
+            body_bottom + 12,
+            layout.navigation_rect.w,
+            max(1, layout.navigation_rect.bottom - body_bottom - 12),
+        ),
+        len(MODE_CONFLICT_ACTIONS),
+    )
 
 
 def _library_sync_body_lines(screen: LibrarySyncScreenState) -> list[str]:

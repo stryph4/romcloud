@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -800,7 +801,9 @@ def apply_setup(
     config = _build_config(
         config_path, request, existing, selected_systems=selected_systems
     )
+    _guard_active_direct_save_provider_change(existing, config)
     mounted_during_setup: list[str] = []
+    direct_save_routing = None
 
     step = "write configuration"
     emit_progress(progress, "configure", "save", "running", "Saving configuration…")
@@ -903,17 +906,6 @@ def apply_setup(
             "running",
             "Preparing games for EmulationStation…",
         )
-        # Optional metadata/media enrichment is a deliberate post-setup
-        # Library action. Setup needs only catalog-owned launch entries.
-        if config.source.enabled:
-            reconcile_game_access(config, render_library_metadata=False)
-        emit_progress(
-            progress,
-            "configure",
-            "emulationstation",
-            "success",
-            "EmulationStation entries prepared",
-        )
         if (
             config.remote_data is not None
             and container.saves._remote_supports_durable_transactions()  # noqa: SLF001
@@ -944,11 +936,76 @@ def apply_setup(
                 "success",
                 "Initial Full Sync complete — Auto SaveSync baseline ready",
             )
+        # SaveSync must establish its baseline before Direct routing hides the
+        # local directories behind emulator-visible remote bind mounts.
+        if config.source.enabled:
+            from romcloud.core.capabilities import OperatingMode
+            from romcloud.infrastructure.library_view import operating_mode
+
+            if operating_mode(config) is OperatingMode.CONNECTED:
+                from romcloud.core.exceptions import SaveAuthorityConflictError
+                from romcloud.integrations.batocera.direct_saves import (
+                    DirectSaveRouting,
+                )
+                from romcloud.infrastructure.library_view import write_operating_mode
+
+                direct_save_routing = DirectSaveRouting(
+                    config,
+                    container.saves.selection_policy,
+                    container.saves.filesystem_remote_root,
+                )
+                direct_conflicts = tuple(
+                    conflict
+                    for conflict in container.saves.get_state().active_conflicts
+                    if conflict.layout_id in direct_save_routing.layout_ids
+                )
+                if direct_conflicts:
+                    # Keep the newly configured installation usable with local
+                    # ownership. The GUI can now reuse the normal Direct-mode
+                    # Resolve / remote-wins / Cancel decision flow.
+                    write_operating_mode(config, OperatingMode.CACHE)
+                    reconcile_game_access(config, render_library_metadata=False)
+                    raise SaveAuthorityConflictError(
+                        "Unresolved Save Conflicts: Direct Mode was not activated. "
+                        "Resolve them, explicitly use remote saves, or remain in "
+                        "Cached Storage.",
+                        conflict_ids=tuple(
+                            conflict.conflict_id for conflict in direct_conflicts
+                        ),
+                    )
+                direct_save_routing.activate()
+            # Optional metadata/media enrichment remains a post-setup action.
+            reconcile_game_access(config, render_library_metadata=False)
+        emit_progress(
+            progress,
+            "configure",
+            "emulationstation",
+            "success",
+            "EmulationStation entries prepared",
+        )
         emit_progress(progress, "configure", "complete", "success", "ROMCloud setup complete")
     except Exception as exc:
+        from romcloud.core.exceptions import SaveAuthorityConflictError
+
+        if isinstance(exc, SaveAuthorityConflictError):
+            state_path.unlink(missing_ok=True)
+            emit_progress(
+                progress,
+                "configure",
+                step,
+                "warning",
+                "Setup is configured in Cached Storage pending a save-conflict decision.",
+                detail=str(exc),
+            )
+            raise
         from romcloud.infrastructure.mount import unmount_cifs_source
 
         cleanup_errors: list[str] = []
+        if direct_save_routing is not None and direct_save_routing.active:
+            try:
+                direct_save_routing.deactivate()
+            except Exception as cleanup_exc:  # noqa: BLE001
+                cleanup_errors.append(f"Direct save routing: {cleanup_exc}")
         for mount_point in reversed(mounted_during_setup):
             try:
                 unmount_cifs_source(mount_point)
@@ -1023,6 +1080,28 @@ def _existing_config(config_path: Path) -> AppConfig | None:
         return load_config(str(config_path))
     except Exception:  # noqa: BLE001 - a broken config is replaced by setup
         return None
+
+
+def _guard_active_direct_save_provider_change(
+    existing: AppConfig | None, requested: AppConfig
+) -> None:
+    """Never strand owned bind mounts by rewriting their path/provider identity."""
+    if existing is None:
+        return
+    from romcloud.integrations.batocera.direct_saves import MANIFEST_FILENAME
+
+    manifest = Path(existing.data_path) / MANIFEST_FILENAME
+    identity_changed = (
+        existing.data_path != requested.data_path
+        or existing.saves.local_path != requested.saves.local_path
+        or existing.remote_data != requested.remote_data
+    )
+    if os.path.lexists(manifest) and identity_changed:
+        raise ValueError(
+            "Direct save routing is active. Switch to Cached Storage first so "
+            "remote saves are materialized locally before changing the remote-data "
+            "provider or save paths."
+        )
 
 
 def _build_config(
