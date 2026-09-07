@@ -40,6 +40,7 @@ from romcloud.infrastructure.credentials import (
     write_smb_password,
 )
 from romcloud.infrastructure import mount_worker
+from romcloud.infrastructure.logging import get_logger
 from romcloud.infrastructure.smb_discovery_client import build_default_smb_discovery_service
 from romcloud.integrations.batocera import es_config, mount_service
 from romcloud.integrations.batocera.systems import BATOCERA_SYSTEMS
@@ -58,6 +59,8 @@ DEFAULT_CACHE_ROOT = "/userdata/romcloud/cache"
 DEFAULT_MAX_SIZE_GB = 50.0
 DEFAULT_MIN_FREE_GB = 5.0
 SETUP_STATE_FILENAME = "setup-state.json"
+
+log = get_logger("lifecycle.setup")
 
 
 @dataclass(frozen=True)
@@ -923,6 +926,10 @@ def apply_setup(
                 "running",
                 "Initializing SaveSync with an Initial Full Sync…",
             )
+            log.info(
+                "SaveSync bootstrap: entering Initial Full Sync (remote_data_provider=%s)",
+                config.remote_data.provider,
+            )
             save_sync_report = container.saves.full_sync(progress=progress)
             save_sync_state = container.saves.get_state()
             active_conflicts = tuple(
@@ -931,14 +938,46 @@ def apply_setup(
             save_conflict_ids = tuple(
                 conflict.conflict_id for conflict in active_conflicts
             )
+            log.info(
+                "SaveSync bootstrap: full_sync() returned uploaded=%d downloaded=%d "
+                "unchanged=%d conflicts=%d scope=%s bootstrap=%s",
+                save_sync_report.uploaded,
+                save_sync_report.downloaded,
+                save_sync_report.unchanged,
+                save_sync_report.conflicts,
+                save_sync_report.scope,
+                save_sync_report.bootstrap,
+            )
+            log.info(
+                "SaveSync bootstrap: reconciliation succeeded; unresolved_conflict_count=%d",
+                len(save_conflict_ids),
+            )
+            log.info(
+                "SaveSync bootstrap: baseline/journal state — quick_sync_ready=%s "
+                "quick_sync_cursor_generation=%s",
+                save_sync_state.quick_sync_ready,
+                save_sync_state.quick_sync_cursor_generation,
+            )
             if (
                 not save_sync_state.quick_sync_ready
                 or save_sync_state.quick_sync_cursor_generation is None
             ):
+                log.error(
+                    "SaveSync bootstrap: Auto SaveSync readiness — not ready; setup "
+                    "marked failed (condition=missing-quick-sync-baseline, "
+                    "quick_sync_ready=%s, quick_sync_cursor_generation=%s)",
+                    save_sync_state.quick_sync_ready,
+                    save_sync_state.quick_sync_cursor_generation,
+                )
                 raise RuntimeError(
                     "Initial Full Sync completed without establishing a trusted "
                     "Quick Sync baseline"
                 )
+            log.info(
+                "SaveSync bootstrap: Auto SaveSync readiness — ready "
+                "(unresolved conflicts pending=%d do not block setup completion)",
+                len(save_conflict_ids),
+            )
             emit_progress(
                 progress,
                 "configure",
@@ -1017,6 +1056,14 @@ def apply_setup(
         from romcloud.core.exceptions import SaveAuthorityConflictError
 
         if isinstance(exc, SaveAuthorityConflictError):
+            log.info(
+                "Setup step %r ended in a save-authority conflict (non-fatal): "
+                "exception_type=%s conflict_ids=%d — configured in Cached Storage "
+                "pending resolution",
+                step,
+                type(exc).__name__,
+                len(getattr(exc, "conflict_ids", ()) or ()),
+            )
             state_path.unlink(missing_ok=True)
             emit_progress(
                 progress,
@@ -1063,6 +1110,12 @@ def apply_setup(
                 state_path.unlink(missing_ok=True)
         else:
             _write_state(state_path, {"status": "failed", "failed_step": step, "error": safe_error})
+        log.error(
+            "Setup failed: step=%r exception_type=%s error=%s",
+            step,
+            type(exc).__name__,
+            safe_error,
+        )
         emit_progress(
             progress,
             "configure",
@@ -1074,6 +1127,13 @@ def apply_setup(
         raise RuntimeError(f"{step}: {safe_error}") from exc
 
     state_path.unlink(missing_ok=True)
+    log.info(
+        "Setup outcome: complete — save_sync_initialized=%s unresolved_conflict_count=%d "
+        "direct_mode_pending=%s",
+        save_sync_state is not None,
+        len(save_conflict_ids),
+        direct_mode_pending,
+    )
     return {
         "source_type": request.source_type,
         "game_access_mode": request.game_access_mode,

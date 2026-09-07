@@ -53,6 +53,7 @@ from romcloud.core.progress import ProgressEvent, emit_progress, redact_text
 from romcloud.core.exceptions import SaveAuthorityConflictError
 from romcloud.infrastructure.config import load_config
 from romcloud.infrastructure.capabilities import capability_policy
+from romcloud.infrastructure.logging import configure_logging
 from romcloud.infrastructure.source_display import source_display_summary
 from romcloud.infrastructure import savesync_prompts
 from romcloud.integrations.batocera import startup_activation
@@ -115,9 +116,31 @@ def _run_action(ctx: click.Context, build_payload) -> None:
     _emit(ctx, {"ok": True, **payload})
 
 
+def _configure_uidata_logging(ctx: click.Context) -> None:
+    """Wire the durable log file for this subprocess.
+
+    ``uidata`` is excluded from ``cli()``'s eager ``configure_logging()`` call
+    (see romcloud/cli/main.py) because most of its actions must work before a
+    config exists. Without this, every graphical-wizard action — including
+    ``setup-apply`` — ran with no log handlers at all, so nothing (not even
+    exceptions) ever reached ``romcloud.log``.
+    """
+    config_path = Path(ctx.obj["config_path"])
+    try:
+        config = load_config(str(config_path))
+        level = "DEBUG" if ctx.obj.get("debug") else config.logging.level
+        log_dir = config.logging.path
+    except Exception:  # noqa: BLE001 - logging must never block a fresh install
+        level = "DEBUG" if ctx.obj.get("debug") else "INFO"
+        log_dir = str(config_path.parent.parent / "logs")
+    configure_logging(level=level, log_dir=log_dir, console=True)
+
+
 @click.group("uidata", hidden=True)
-def uidata_group() -> None:
+@click.pass_context
+def uidata_group(ctx: click.Context) -> None:
     """Internal: JSON data endpoints for the graphical Ports UI."""
+    _configure_uidata_logging(ctx)
 
 
 def _load_context_config(ctx: click.Context):

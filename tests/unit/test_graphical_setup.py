@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -165,6 +166,12 @@ class _Container:
             save_sync_state.quick_sync_ready = True
             save_sync_state.quick_sync_cursor_generation = 7
             return save_sync_report or SimpleNamespace(
+                uploaded=0,
+                downloaded=0,
+                unchanged=0,
+                conflicts=len(save_conflicts),
+                scope="all_eligible",
+                bootstrap=True,
                 to_dict=lambda: {
                     "uploaded": 0,
                     "downloaded": 0,
@@ -172,7 +179,7 @@ class _Container:
                     "conflicts": len(save_conflicts),
                     "scope": "all_eligible",
                     "bootstrap": True,
-                }
+                },
             )
 
         self.saves = SimpleNamespace(
@@ -1318,6 +1325,12 @@ class TestApply:
             SimpleNamespace(conflict_id="two", layout_id="retroarch-root-snes"),
         )
         report = SimpleNamespace(
+            uploaded=80,
+            downloaded=70,
+            unchanged=13,
+            conflicts=12,
+            scope="all_eligible",
+            bootstrap=True,
             to_dict=lambda: {
                 "uploaded": 80,
                 "downloaded": 70,
@@ -1325,7 +1338,7 @@ class TestApply:
                 "conflicts": 12,
                 "scope": "all_eligible",
                 "bootstrap": True,
-            }
+            },
         )
         _patch_apply_dependencies(
             monkeypatch,
@@ -1352,6 +1365,123 @@ class TestApply:
         )
         assert events[-1].stage == "complete"
         assert events[-1].status == "success"
+
+    def test_bootstrap_conflicts_log_as_non_fatal_and_pending(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        remote_root = tmp_path / "remote-data"
+        conflicts = (
+            SimpleNamespace(conflict_id="one", layout_id="retroarch-root-psx"),
+            SimpleNamespace(conflict_id="two", layout_id="retroarch-root-snes"),
+        )
+        report = SimpleNamespace(
+            uploaded=80,
+            downloaded=70,
+            unchanged=13,
+            conflicts=12,
+            scope="all_eligible",
+            bootstrap=True,
+            to_dict=lambda: {
+                "uploaded": 80,
+                "downloaded": 70,
+                "unchanged": 13,
+                "conflicts": 12,
+                "scope": "all_eligible",
+                "bootstrap": True,
+            },
+        )
+        _patch_apply_dependencies(
+            monkeypatch,
+            save_conflicts=conflicts,
+            save_sync_report=report,
+        )
+
+        with caplog.at_level(logging.INFO, logger="romcloud.lifecycle.setup"):
+            result = graphical_setup.apply_setup(
+                config_path,
+                _payload(remote_data_type="local", remote_data_root=str(remote_root)),
+            )
+
+        assert result["save_sync_initialized"] is True
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("entering Initial Full Sync" in message for message in messages)
+        assert any(
+            "full_sync() returned" in message and "conflicts=12" in message
+            for message in messages
+        )
+        assert any(
+            "reconciliation succeeded" in message
+            and "unresolved_conflict_count=2" in message
+            for message in messages
+        )
+        assert any(
+            "Auto SaveSync readiness" in message and "ready" in message
+            for message in messages
+        )
+        # A successful bootstrap with preserved conflicts must never be
+        # logged at ERROR — that is reserved for genuine operational failure.
+        assert not any(record.levelno >= logging.ERROR for record in caplog.records)
+
+    def test_setup_bootstrap_exception_is_durably_logged(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        remote_root = tmp_path / "remote-data"
+
+        class _StorageBackendUnavailableError(RuntimeError):
+            pass
+
+        _patch_apply_dependencies(
+            monkeypatch,
+            full_sync_error=_StorageBackendUnavailableError("remote share vanished"),
+        )
+
+        with caplog.at_level(logging.INFO, logger="romcloud.lifecycle.setup"):
+            with pytest.raises(RuntimeError, match="initialize SaveSync"):
+                graphical_setup.apply_setup(
+                    config_path,
+                    _payload(
+                        remote_data_type="local", remote_data_root=str(remote_root)
+                    ),
+                )
+
+        error_records = [
+            record for record in caplog.records if record.levelno >= logging.ERROR
+        ]
+        assert error_records, "expected a durable ERROR-level log record on failure"
+        messages = [record.getMessage() for record in error_records]
+        assert any("Setup failed" in message for message in messages)
+        assert any("step='initialize SaveSync'" in message for message in messages)
+
+    def test_operational_failure_logs_exact_exception_class(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        remote_root = tmp_path / "remote-data"
+
+        class _CustomOperationalError(RuntimeError):
+            pass
+
+        _patch_apply_dependencies(
+            monkeypatch,
+            full_sync_error=_CustomOperationalError("journal corrupted"),
+        )
+
+        with caplog.at_level(logging.INFO, logger="romcloud.lifecycle.setup"):
+            with pytest.raises(RuntimeError):
+                graphical_setup.apply_setup(
+                    config_path,
+                    _payload(
+                        remote_data_type="local", remote_data_root=str(remote_root)
+                    ),
+                )
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any(
+            "exception_type=_CustomOperationalError" in message
+            for message in messages
+        )
 
     def test_direct_setup_conflict_finishes_in_cache_with_pending_decision(
         self, tmp_path, monkeypatch
