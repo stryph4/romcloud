@@ -507,7 +507,11 @@ def test_ps2_folder_rebuild_and_symlink_fallback(tmp_path: Path) -> None:
     assert adapter.validate(candidate, new).valid
     assert (candidate / "SAVE/nested/data").read_bytes() == b"new"
 
-    (candidate / "SAVE/link").symlink_to(tmp_path / "outside")
+    link = candidate / "SAVE/link"
+    try:
+        link.symlink_to(tmp_path / "outside")
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation is unavailable on this platform")
     probe = adapter.probe(candidate)
     assert not probe.supported
     assert probe.opaque_reason is OpaqueReason.SYMLINK_OR_PATH_SUBSTITUTION

@@ -10,7 +10,6 @@ deletes data.
 from __future__ import annotations
 
 import hashlib
-import fcntl
 import json
 import os
 import posixpath
@@ -1421,18 +1420,50 @@ def _copy_verified(source: Path, destination: Path, digest: str, size: int) -> N
         temporary.unlink(missing_ok=True)
 
 
+def _lock_file(handle):
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            raise LibrarySyncError(
+                "Another Library Sync writer is active; try again after it finishes."
+            ) from exc
+        return
+    import fcntl
+
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        raise LibrarySyncError(
+            "Another Library Sync writer is active; try again after it finishes."
+        ) from exc
+
+
+def _unlock_file(handle):
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        return
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 @contextmanager
 def _exclusive_lock(path: Path):
     """Serialize canonical writers across local filesystems and CIFS clients."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+", encoding="utf-8") as handle:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            raise LibrarySyncError(
-                "Another Library Sync writer is active; try again after it finishes."
-            ) from exc
+        _lock_file(handle)
         try:
             yield
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            _unlock_file(handle)
