@@ -2193,6 +2193,11 @@ class SaveSyncService:
             )
             verification_layout_ids: Optional[frozenset[str]] = None
             if selected_layout_ids is not None:
+                # Keep every safety and finalization scan on the exact layout
+                # scope used to build the transition plan.  Comparing this
+                # scoped snapshot with a later all-layout scan makes unrelated
+                # local-only layouts look like concurrent mutations.
+                verification_layout_ids = selected_layout_ids
                 local_report = self._scan_local_layouts(selected_layout_ids)
                 remote_report = self._scan_remote_layouts(selected_layout_ids)
                 local_report = self._automatic_report(local_report)
@@ -2376,6 +2381,16 @@ class SaveSyncService:
                     current_local.artifacts != complete_local
                     or current_remote.artifacts != complete_remote
                 ):
+                    self._log_staging_manifest_changes(
+                        side="local",
+                        expected=complete_local,
+                        observed=current_local.artifacts,
+                    )
+                    self._log_staging_manifest_changes(
+                        side="remote",
+                        expected=complete_remote,
+                        observed=current_remote.artifacts,
+                    )
                     raise SaveSyncVerificationError(
                         "Save/state data changed while staging; reconciliation was abandoned."
                     )
@@ -2730,6 +2745,40 @@ class SaveSyncService:
                 metadata=report.to_dict(),
             )
             return report
+
+    def _log_staging_manifest_changes(
+        self,
+        *,
+        side: str,
+        expected: dict[str, SaveArtifact],
+        observed: dict[str, SaveArtifact],
+    ) -> None:
+        """Log credential-free detail for a genuine staging invalidation."""
+        for path in sorted(set(expected) | set(observed)):
+            before = expected.get(path)
+            after = observed.get(path)
+            if _same_artifact(before, after):
+                continue
+            if before is None:
+                difference = "added"
+            elif after is None:
+                difference = "removed"
+            else:
+                difference = "modified"
+            descriptor = self._policy.group_for_path(path)
+            log.warning(
+                "SaveSync staging mutation detected: side=%s layout_id=%s "
+                "group_id=%r path=%r difference=%s",
+                side,
+                descriptor.layout_id if descriptor is not None else "unsupported",
+                (
+                    descriptor.group_id
+                    if descriptor is not None
+                    else f"unsupported:{path}"
+                ),
+                path,
+                difference,
+            )
 
     # ── deliberate force upload/download ─────────────────────────────────
 

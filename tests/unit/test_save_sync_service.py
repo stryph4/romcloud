@@ -2185,7 +2185,45 @@ class TestQuickSyncAndJournal:
             service.quick_sync()
 
         assert service.get_state().quick_sync_cursor_generation == cursor_before
+
+
 class TestTransitionCurrentStateSync:
+    @pytest.mark.parametrize("changed_side", ("local", "remote"))
+    def test_forced_scan_logs_exact_scoped_mutation_and_aborts(
+        self, tmp_path, service, monkeypatch, caplog, changed_side
+    ):
+        relative = "ppsspp/PSP/SAVEDATA/GAME/save.bin"
+        local = tmp_path / "local-saves" / relative
+        remote = tmp_path / "remote-saves" / relative
+        changed = local if changed_side == "local" else remote
+        _write(changed, b"initial")
+        real_prepare = save_transaction.prepare_transaction
+
+        def prepare_then_change(*args, **kwargs):
+            transaction = real_prepare(*args, **kwargs)
+            changed.write_bytes(b"concurrent-emulator-write")
+            return transaction
+
+        monkeypatch.setattr(
+            save_transaction, "prepare_transaction", prepare_then_change
+        )
+
+        with caplog.at_level("WARNING"), pytest.raises(
+            SaveSyncVerificationError, match="changed while staging"
+        ):
+            service.quick_sync(
+                force_current_state=True,
+                include_layout_ids=frozenset({"ppsspp-savedata"}),
+            )
+
+        assert f"side={changed_side}" in caplog.text
+        assert "layout_id=ppsspp-savedata" in caplog.text
+        assert "group_id='ppsspp-savedata/psp/savedata/game'" in caplog.text
+        assert f"path='{relative}'" in caplog.text
+        assert "difference=modified" in caplog.text
+        assert str(tmp_path) not in caplog.text
+        assert "concurrent-emulator-write" not in caplog.text
+
     def test_forced_scan_establishes_scoped_baseline_without_quick_sync_history(
         self, tmp_path, service
     ):
