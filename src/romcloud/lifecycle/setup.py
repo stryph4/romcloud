@@ -804,6 +804,10 @@ def apply_setup(
     _guard_active_direct_save_provider_change(existing, config)
     mounted_during_setup: list[str] = []
     direct_save_routing = None
+    save_sync_report = None
+    save_conflict_ids: tuple[str, ...] = ()
+    direct_conflict_ids: tuple[str, ...] = ()
+    direct_mode_pending = False
 
     step = "write configuration"
     emit_progress(progress, "configure", "save", "running", "Saving configuration…")
@@ -919,8 +923,14 @@ def apply_setup(
                 "running",
                 "Initializing SaveSync with an Initial Full Sync…",
             )
-            container.saves.full_sync(progress=progress)
+            save_sync_report = container.saves.full_sync(progress=progress)
             save_sync_state = container.saves.get_state()
+            active_conflicts = tuple(
+                getattr(save_sync_state, "active_conflicts", ())
+            )
+            save_conflict_ids = tuple(
+                conflict.conflict_id for conflict in active_conflicts
+            )
             if (
                 not save_sync_state.quick_sync_ready
                 or save_sync_state.quick_sync_cursor_generation is None
@@ -933,8 +943,18 @@ def apply_setup(
                 progress,
                 "configure",
                 "savesync_initialize",
-                "success",
-                "Initial Full Sync complete — Auto SaveSync baseline ready",
+                "warning" if save_conflict_ids else "success",
+                (
+                    "SaveSync initialized — "
+                    f"{len(save_conflict_ids)} save group(s) need attention"
+                    if save_conflict_ids
+                    else "Initial Full Sync complete — Auto SaveSync baseline ready"
+                ),
+                metadata=(
+                    save_sync_report.to_dict()
+                    if hasattr(save_sync_report, "to_dict")
+                    else None
+                ),
             )
         # SaveSync must establish its baseline before Direct routing hides the
         # local directories behind emulator-visible remote bind mounts.
@@ -943,7 +963,6 @@ def apply_setup(
             from romcloud.infrastructure.library_view import operating_mode
 
             if operating_mode(config) is OperatingMode.CONNECTED:
-                from romcloud.core.exceptions import SaveAuthorityConflictError
                 from romcloud.integrations.batocera.direct_saves import (
                     DirectSaveRouting,
                 )
@@ -960,20 +979,30 @@ def apply_setup(
                     if conflict.layout_id in direct_save_routing.layout_ids
                 )
                 if direct_conflicts:
-                    # Keep the newly configured installation usable with local
-                    # ownership. The GUI can now reuse the normal Direct-mode
-                    # Resolve / remote-wins / Cancel decision flow.
+                    # Bootstrap succeeded. Keep the installation usable with
+                    # local ownership and return a pending Direct decision as
+                    # data; preserved conflicts are not setup failures.
                     write_operating_mode(config, OperatingMode.CACHE)
                     reconcile_game_access(config, render_library_metadata=False)
-                    raise SaveAuthorityConflictError(
-                        "Unresolved Save Conflicts: Direct Mode was not activated. "
-                        "Resolve them, explicitly use remote saves, or remain in "
-                        "Cached Storage.",
-                        conflict_ids=tuple(
-                            conflict.conflict_id for conflict in direct_conflicts
-                        ),
+                    direct_mode_pending = True
+                    direct_conflict_ids = tuple(
+                        conflict.conflict_id for conflict in direct_conflicts
                     )
-                direct_save_routing.activate()
+                    emit_progress(
+                        progress,
+                        "configure",
+                        "direct_save_conflicts",
+                        "warning",
+                        "Direct Mode is pending a save-conflict decision",
+                        metadata={
+                            "conflict_ids": [
+                                conflict.conflict_id
+                                for conflict in direct_conflicts
+                            ]
+                        },
+                    )
+                else:
+                    direct_save_routing.activate()
             # Optional metadata/media enrichment remains a post-setup action.
             reconcile_game_access(config, render_library_metadata=False)
         emit_progress(
@@ -1072,6 +1101,16 @@ def apply_setup(
             if save_sync_state is not None
             else None
         ),
+        "save_reconcile": (
+            save_sync_report.to_dict()
+            if hasattr(save_sync_report, "to_dict")
+            else None
+        ),
+        "save_conflicts": len(save_conflict_ids),
+        "conflict_ids": list(save_conflict_ids),
+        "direct_conflict_ids": list(direct_conflict_ids),
+        "auto_savesync_pending_conflicts": bool(save_conflict_ids),
+        "direct_mode_pending": direct_mode_pending,
     }
 
 

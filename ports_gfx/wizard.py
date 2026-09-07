@@ -1184,7 +1184,12 @@ class WizardState:
         result = operation_result(self.runner)
         self.runner = None
         if not result.ok:
-            conflict_ids = result.data.get("conflict_ids", [])
+            conflict_ids = result.data.get(
+                "direct_conflict_ids"
+                if result.data.get("direct_mode_pending")
+                else "conflict_ids",
+                [],
+            )
             if (
                 result.data.get("save_authority_conflict")
                 and isinstance(conflict_ids, list)
@@ -1338,11 +1343,26 @@ class WizardState:
             self.notice = "Shared-data folder is accessible. A write test will run when setup is applied."
         elif self.step == WizardStep.APPLY:
             self.applied_summary = dict(result.data)
+            conflict_ids = result.data.get(
+                "direct_conflict_ids"
+                if result.data.get("direct_mode_pending")
+                else "conflict_ids",
+                [],
+            )
+            if (
+                isinstance(conflict_ids, list)
+                and all(isinstance(value, str) for value in conflict_ids)
+            ):
+                self.save_authority_conflict_ids = tuple(conflict_ids)
             self.password = ""
             self.remote_password = ""
             self.step = WizardStep.DONE
             self.selected_index = 0
-            self.notice = "ROMCloud setup is complete."
+            self.notice = (
+                "SaveSync initialized. Some saves need your attention."
+                if self.save_authority_conflict_ids
+                else "ROMCloud setup is complete."
+            )
         return drained
 
     def request_payload(self) -> dict[str, Any]:

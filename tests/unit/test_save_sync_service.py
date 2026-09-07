@@ -984,6 +984,38 @@ class TestRPCS3PolicyAndLegacyLayout:
 
 
 class TestThreeWayReconciliation:
+    def test_fresh_bootstrap_additively_merges_and_preserves_only_same_group_divergence(
+        self, tmp_path, managed_service
+    ):
+        service = managed_service
+        local_root = tmp_path / "local-saves/psx"
+        remote_root = tmp_path / "remote-saves/psx"
+        _write(local_root / "Local.srm", b"local-only")
+        _write(local_root / "Same.srm", b"identical")
+        _write(remote_root / "Same.srm", b"identical")
+        _write(remote_root / "Remote.srm", b"remote-only")
+        _write(local_root / "Game.srm", b"local-version")
+        _write(remote_root / "Game.srm", b"remote-version")
+
+        report = service.full_sync()
+        state = service.get_state()
+
+        assert report.scope == "all_eligible"
+        assert report.bootstrap is True
+        assert report.uploaded == 1
+        assert report.downloaded == 1
+        assert report.unchanged == 1
+        assert report.conflicts == 1
+        assert (remote_root / "Local.srm").read_bytes() == b"local-only"
+        assert (local_root / "Remote.srm").read_bytes() == b"remote-only"
+        assert (local_root / "Game.srm").read_bytes() == b"local-version"
+        assert (remote_root / "Game.srm").read_bytes() == b"remote-version"
+        assert state.quick_sync_ready is True
+        assert state.last_reconcile is not None
+        assert state.last_reconcile.bootstrap is True
+        assert len(state.active_conflicts) == 1
+        assert state.active_conflicts[0].group_id.endswith("/game")
+
     def test_applies_local_only_and_remote_only_changes(self, tmp_path, managed_service):
         service = managed_service
         shared = tmp_path / "local-saves/psx/Shared.srm"
@@ -1034,6 +1066,8 @@ class TestThreeWayReconciliation:
         second = service.reconcile()
 
         assert first.uploaded == 1
+        assert first.bootstrap is True
+        assert second.bootstrap is False
         assert second.uploaded == second.downloaded == second.conflicts == 0
         assert second.unchanged == 1
 

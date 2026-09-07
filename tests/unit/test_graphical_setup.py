@@ -117,6 +117,8 @@ class _Container:
         save_sync_calls=None,
         full_sync_error=None,
         remote_durable=True,
+        save_conflicts=(),
+        save_sync_report=None,
     ):
         self.config = config
         self.provider = SimpleNamespace(
@@ -152,6 +154,7 @@ class _Container:
         save_sync_state = SimpleNamespace(
             quick_sync_ready=False,
             quick_sync_cursor_generation=None,
+            active_conflicts=tuple(save_conflicts),
         )
 
         def full_sync(progress=None):
@@ -161,7 +164,16 @@ class _Container:
                 raise full_sync_error
             save_sync_state.quick_sync_ready = True
             save_sync_state.quick_sync_cursor_generation = 7
-            return SimpleNamespace()
+            return save_sync_report or SimpleNamespace(
+                to_dict=lambda: {
+                    "uploaded": 0,
+                    "downloaded": 0,
+                    "unchanged": 0,
+                    "conflicts": len(save_conflicts),
+                    "scope": "all_eligible",
+                    "bootstrap": True,
+                }
+            )
 
         self.saves = SimpleNamespace(
             is_remote_reachable=lambda: remote_reachable,
@@ -176,6 +188,8 @@ class _Container:
             full_sync=full_sync,
             get_state=lambda: save_sync_state,
             _remote_supports_durable_transactions=lambda: remote_durable,
+            selection_policy=SimpleNamespace(),
+            filesystem_remote_root=Path(config.data_path) / "remote-saves",
         )
 
 
@@ -190,6 +204,8 @@ def _patch_apply_dependencies(
     save_sync_calls=None,
     full_sync_error=None,
     remote_durable=True,
+    save_conflicts=(),
+    save_sync_report=None,
 ):
     monkeypatch.setattr(
         graphical_setup,
@@ -220,6 +236,8 @@ def _patch_apply_dependencies(
             save_sync_calls=save_sync_calls,
             full_sync_error=full_sync_error,
             remote_durable=remote_durable,
+            save_conflicts=save_conflicts,
+            save_sync_report=save_sync_report,
         ),
     )
     monkeypatch.setattr(
@@ -1289,6 +1307,95 @@ class TestApply:
             (config_path.parent / graphical_setup.SETUP_STATE_FILENAME).read_text()
         )
         assert state["failed_step"] == "initialize SaveSync"
+
+    def test_bootstrap_conflicts_complete_setup_and_are_returned_for_resolution(
+        self, tmp_path, monkeypatch
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        remote_root = tmp_path / "remote-data"
+        conflicts = (
+            SimpleNamespace(conflict_id="one", layout_id="retroarch-root-psx"),
+            SimpleNamespace(conflict_id="two", layout_id="retroarch-root-snes"),
+        )
+        report = SimpleNamespace(
+            to_dict=lambda: {
+                "uploaded": 80,
+                "downloaded": 70,
+                "unchanged": 13,
+                "conflicts": 12,
+                "scope": "all_eligible",
+                "bootstrap": True,
+            }
+        )
+        _patch_apply_dependencies(
+            monkeypatch,
+            save_conflicts=conflicts,
+            save_sync_report=report,
+        )
+        events = []
+
+        result = graphical_setup.apply_setup(
+            config_path,
+            _payload(remote_data_type="local", remote_data_root=str(remote_root)),
+            progress=events.append,
+        )
+
+        assert result["save_sync_initialized"] is True
+        assert result["save_conflicts"] == 2
+        assert result["conflict_ids"] == ["one", "two"]
+        assert result["auto_savesync_pending_conflicts"] is True
+        assert result["save_reconcile"]["scope"] == "all_eligible"
+        assert result["save_reconcile"]["bootstrap"] is True
+        assert any(
+            event.stage == "savesync_initialize" and event.status == "warning"
+            for event in events
+        )
+        assert events[-1].stage == "complete"
+        assert events[-1].status == "success"
+
+    def test_direct_setup_conflict_finishes_in_cache_with_pending_decision(
+        self, tmp_path, monkeypatch
+    ):
+        from romcloud.core.capabilities import OperatingMode
+        from romcloud.infrastructure.library_view import operating_mode
+        from romcloud.integrations.batocera import direct_saves, game_access
+
+        config_path = tmp_path / "config" / "romcloud.toml"
+        remote_root = tmp_path / "remote-data"
+        conflict = SimpleNamespace(
+            conflict_id="direct-conflict", layout_id="retroarch-root-psx"
+        )
+        _patch_apply_dependencies(monkeypatch, save_conflicts=(conflict,))
+
+        class Routing:
+            active = False
+            layout_ids = frozenset({"retroarch-root-psx"})
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def activate(self):
+                raise AssertionError("routing must not activate before conflict resolution")
+
+        monkeypatch.setattr(direct_saves, "DirectSaveRouting", Routing)
+        monkeypatch.setattr(
+            game_access, "reconcile_game_access", lambda *_args, **_kwargs: None
+        )
+
+        result = graphical_setup.apply_setup(
+            config_path,
+            _payload(
+                game_access_mode="direct_nas",
+                remote_data_type="local",
+                remote_data_root=str(remote_root),
+            ),
+        )
+
+        config = graphical_setup.load_config(str(config_path))
+        assert result["direct_mode_pending"] is True
+        assert result["conflict_ids"] == ["direct-conflict"]
+        assert result["direct_conflict_ids"] == ["direct-conflict"]
+        assert operating_mode(config) is OperatingMode.CACHE
 
     def test_unwritable_remote_data_fails_without_exposing_password(
         self, tmp_path, monkeypatch

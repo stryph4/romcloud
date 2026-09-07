@@ -872,6 +872,8 @@ def _validate_report(report: SaveReconcileReport) -> None:
     _nonempty_text(report.revision, "last_reconcile.revision")
     _nonempty_text(report.timestamp, "last_reconcile.timestamp")
     _nonempty_text(report.scope, "last_reconcile.scope")
+    if not isinstance(report.bootstrap, bool):
+        raise SaveSyncError("last_reconcile.bootstrap must be a boolean")
     for name in (
         "uploaded",
         "downloaded",
@@ -1258,6 +1260,7 @@ def _report_from_dict(payload: object) -> Optional[SaveReconcileReport]:
         scope=_nonempty_text(
             data.get("scope", "managed_games"), "last_reconcile.scope"
         ),
+        bootstrap=bool(data.get("bootstrap", False)),
     )
     _validate_report(report)
     return report

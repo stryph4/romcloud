@@ -96,13 +96,21 @@ def _run_action(ctx: click.Context, build_payload) -> None:
             {
                 "ok": False,
                 "error": str(exc),
+                "error_type": type(exc).__name__,
                 "save_authority_conflict": True,
                 "conflict_ids": list(exc.conflict_ids),
             },
         )
         return
     except Exception as exc:  # noqa: BLE001 — must never leak a traceback to stdout
-        _emit(ctx, {"ok": False, "error": str(exc)})
+        _emit(
+            ctx,
+            {
+                "ok": False,
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            },
+        )
         return
     _emit(ctx, {"ok": True, **payload})
 
@@ -482,11 +490,16 @@ def _run_library_mode_action(
         emit_progress(
             progress, "library", "reconcile", "running", f"Entering {label}…"
         )
+        transition_options = (
+            {"conflict_action": conflict_action}
+            if conflict_action != "stop"
+            else {}
+        )
         report = set_operating_mode(
             container.config,
             mode,
             progress=progress,
-            conflict_action=conflict_action,
+            **transition_options,
         )
         emit_progress(
             progress, "library", "reconcile", "success", f"Entered {label}"

@@ -128,6 +128,48 @@ def test_generic_engine_establishes_logical_baseline_despite_physical_inequality
     assert plan.next_baseline.domains[0].entries[0].canonical_hash == "0" * 64
 
 
+def test_generic_engine_bootstrap_unions_disjoint_domains_and_conflicts_only_overlap() -> None:
+    local_only = _entry("local", "game-local", "1")
+    remote_only = _entry("remote", "game-remote", "2")
+    identical = _entry("same", "game-same", "3")
+    local_conflict = _entry("left", "game-conflict", "4")
+    remote_conflict = _entry("right", "game-conflict", "5")
+
+    plan = plan_container_reconcile(
+        _snapshot(local_only, identical, local_conflict),
+        _snapshot(remote_only, identical, remote_conflict),
+        None,
+    )
+
+    actions = {
+        decision.merge_domain_id: decision.action
+        for decision in plan.decisions
+    }
+    assert actions == {
+        "game-conflict": DomainAction.CONFLICT,
+        "game-local": DomainAction.USE_LOCAL,
+        "game-remote": DomainAction.USE_REMOTE,
+        "game-same": DomainAction.CONVERGED,
+    }
+    assert {domain.merge_domain_id for domain in plan.desired_local} == {
+        "game-conflict",
+        "game-local",
+        "game-remote",
+        "game-same",
+    }
+    assert {domain.merge_domain_id for domain in plan.desired_remote} == {
+        "game-conflict",
+        "game-local",
+        "game-remote",
+        "game-same",
+    }
+    assert {domain.merge_domain_id for domain in plan.next_baseline.domains} == {
+        "game-local",
+        "game-remote",
+        "game-same",
+    }
+
+
 def test_logical_baseline_state_round_trip_and_v3_migration() -> None:
     baseline = baseline_from_snapshot(_snapshot(_entry("a", "game", "0")))
     restored = state_from_dict(
@@ -514,6 +556,59 @@ def _container_service(
         state_path=tmp_path / "data/state.json",
         **({"container_registry": container_registry} if container_registry else {}),
     )
+
+
+def test_service_bootstrap_merges_disjoint_ps1_saves_and_preserves_overlap(
+    tmp_path: Path,
+) -> None:
+    service = _container_service(tmp_path)
+    local = tmp_path / "local/duckstation/memcards/card.mcd"
+    remote = tmp_path / "remote/duckstation/memcards/card.mcd"
+    local.parent.mkdir(parents=True)
+    remote.parent.mkdir(parents=True)
+    local_name = b"BASLUS-00001SAVE"
+    remote_name = b"BESCES-00002SAVE"
+    conflict_name = b"BISLPS-00003SAVE"
+    local.write_bytes(
+        _ps1_card(
+            [(local_name, (1,), b"L"), (conflict_name, (3,), b"X")]
+        )
+    )
+    remote.write_bytes(
+        _ps1_card(
+            [(remote_name, (2,), b"R"), (conflict_name, (3,), b"Y")]
+        )
+    )
+
+    report = service.full_sync()
+
+    local_snapshot = Ps1RawMemoryCardAdapter().snapshot(local, container_id="card")
+    remote_snapshot = Ps1RawMemoryCardAdapter().snapshot(remote, container_id="card")
+    local_domains = {
+        entry.merge_domain_id: entry.canonical_hash
+        for entry in local_snapshot.entries
+    }
+    remote_domains = {
+        entry.merge_domain_id: entry.canonical_hash
+        for entry in remote_snapshot.entries
+    }
+    local_id = f"ps1-game:{local_name[:12].hex()}"
+    remote_id = f"ps1-game:{remote_name[:12].hex()}"
+    conflict_id = f"ps1-game:{conflict_name[:12].hex()}"
+    assert report.scope == "all_eligible"
+    assert report.bootstrap is True
+    assert report.uploaded == 1
+    assert report.downloaded == 1
+    assert report.conflicts == 1
+    assert local_domains[local_id] == remote_domains[local_id]
+    assert local_domains[remote_id] == remote_domains[remote_id]
+    assert local_domains[conflict_id] != remote_domains[conflict_id]
+    state = service.get_state()
+    assert len(state.active_conflicts) == 1
+    assert {
+        domain.merge_domain_id
+        for domain in state.container_baselines[0].domains
+    } == {local_id, remote_id}
 
 
 def test_service_automatically_merges_disjoint_ps1_domains_through_existing_transaction(

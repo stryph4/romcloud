@@ -36,6 +36,24 @@ def test_releasing_remote_wins_resets_confirmation() -> None:
     assert state.confirm.progress == 0.0
 
 
+def test_setup_conflicts_offer_resolution_or_finish_without_destructive_hold() -> None:
+    state = ModeSaveConflictState(("one",), purpose="setup")
+
+    assert state.action_labels == ("Resolve Save Conflicts", "Finish Setup")
+    state.select(1)
+    assert state.handle_event(InputEvent(action=Action.CONFIRM)) == "finish"
+    assert state.update(10.0) is None
+
+
+def test_direct_setup_conflict_keeps_remote_wins_hold_and_finish_setup() -> None:
+    state = ModeSaveConflictState(("one",), purpose="setup-direct")
+
+    assert state.action_labels[-1] == "Finish Setup"
+    state.select(1)
+    state.handle_event(InputEvent(action=Action.CONFIRM))
+    assert state.update(3.0) == "remote-wins"
+
+
 def test_only_structured_save_authority_failure_opens_conflict_decision() -> None:
     payload = (
         '{"ok": false, "save_authority_conflict": true, '

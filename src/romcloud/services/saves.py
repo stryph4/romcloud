@@ -1706,7 +1706,18 @@ class SaveSyncService:
 
     def reconcile(self, *, progress: ProgressSink = None) -> SaveReconcileReport:
         """Apply all non-conflicting changes and preserve both conflict versions."""
-        result = self._reconcile(progress=progress)
+        state = self.get_state()
+        bootstrap = not any(
+            (
+                state.quick_sync_ready,
+                state.last_reconcile is not None,
+                state.last_upload is not None,
+                state.last_download is not None,
+                bool(state.shared_manifest),
+                bool(state.container_baselines),
+            )
+        )
+        result = self._reconcile(progress=progress, bootstrap=bootstrap)
         assert result is not None
         return result
 
@@ -2135,6 +2146,7 @@ class SaveSyncService:
         selected_group_ids: Optional[frozenset[str]] = None,
         selected_layout_ids: Optional[frozenset[str]] = None,
         upload_only: bool = False,
+        bootstrap: bool = False,
         is_group_active: Optional[Callable[[str], bool]] = None,
         is_layout_active: Optional[Callable[[str], bool]] = None,
     ) -> Optional[SaveReconcileReport]:
@@ -2445,6 +2457,7 @@ class SaveSyncService:
                     + container_work.conflict_paths
                 ),
                 scope=plan.scope,
+                bootstrap=bootstrap,
             )
             selected_baseline = (
                 _upload_only_reconciled_baseline(plan, existing=baseline)

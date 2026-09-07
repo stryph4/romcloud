@@ -311,17 +311,52 @@ def plan_container_reconcile(
     remote_map = _domain_map(snapshot_to_domains(remote))
 
     if baseline is None:
-        if local_map != remote_map:
-            raise OpaqueContainerError(OpaqueReason.LOGICAL_BASELINE_REQUIRED)
-        established = baseline_from_snapshot(local)
+        # Bootstrap has no trustworthy common ancestor, but absence of an
+        # ancestor does not make disjoint games conflict.  Treat each adapter
+        # merge domain as the logical save artifact: one-sided domains are
+        # safe additions, identical domains have already converged, and only
+        # incompatible versions of the same domain are ambiguous.
+        decisions: list[DomainDecision] = []
+        desired_local = dict(local_map)
+        desired_remote = dict(remote_map)
+        next_domains: dict[str, LogicalDomainState] = {}
+        for domain in sorted(set(local_map).union(remote_map)):
+            local_domain = local_map.get(domain)
+            remote_domain = remote_map.get(domain)
+            if local_domain == remote_domain:
+                action = DomainAction.CONVERGED
+                selected = local_domain
+            elif remote_domain is None:
+                action = DomainAction.USE_LOCAL
+                selected = local_domain
+                assert selected is not None
+                desired_remote[domain] = selected
+            elif local_domain is None:
+                action = DomainAction.USE_REMOTE
+                selected = remote_domain
+                desired_local[domain] = selected
+            else:
+                action = DomainAction.CONFLICT
+                selected = None
+            decisions.append(
+                DomainDecision(domain, action, None, local_domain, remote_domain)
+            )
+            if selected is not None:
+                next_domains[domain] = selected
+
+        established = ContainerBaseline(
+            container_id=local.container_id,
+            adapter_id=local.adapter_id,
+            schema_version=local.schema_version,
+            format_variant=local.format_variant,
+            domains=tuple(next_domains[key] for key in sorted(next_domains)),
+            tombstones=(),
+        )
         return ContainerReconcilePlan(
             container_id=local.container_id,
-            decisions=tuple(
-                DomainDecision(domain, DomainAction.CONVERGED, None, value, value)
-                for domain, value in sorted(local_map.items())
-            ),
-            desired_local=tuple(local_map[key] for key in sorted(local_map)),
-            desired_remote=tuple(remote_map[key] for key in sorted(remote_map)),
+            decisions=tuple(decisions),
+            desired_local=tuple(desired_local[key] for key in sorted(desired_local)),
+            desired_remote=tuple(desired_remote[key] for key in sorted(desired_remote)),
             next_baseline=established,
         )
 

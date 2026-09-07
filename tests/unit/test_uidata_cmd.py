@@ -555,6 +555,51 @@ class TestLibraryModeAction:
         assert payload["mode_changed"] is False
         assert payload["es_restart_requested"] is False
 
+    def test_direct_conflict_is_a_structured_decision_not_generic_failure(
+        self, tmp_path, monkeypatch
+    ):
+        from romcloud.core.exceptions import SaveAuthorityConflictError
+
+        def conflict(*_args, **_kwargs):
+            raise SaveAuthorityConflictError(
+                "Unresolved Save Conflicts",
+                conflict_ids=("one", "two"),
+            )
+
+        monkeypatch.setattr(
+            "romcloud.integrations.batocera.game_access.set_operating_mode",
+            conflict,
+        )
+
+        result = _write_and_invoke(tmp_path, ["library-connected"])
+
+        assert result.exit_code == 1
+        payload = json.loads(result.output.strip().splitlines()[-1])
+        assert payload["save_authority_conflict"] is True
+        assert payload["conflict_ids"] == ["one", "two"]
+        assert payload["error_type"] == "SaveAuthorityConflictError"
+
+    def test_provider_failure_keeps_actionable_detail_and_type(
+        self, tmp_path, monkeypatch
+    ):
+        from romcloud.core.exceptions import ProviderNotReachableError
+
+        def unavailable(*_args, **_kwargs):
+            raise ProviderNotReachableError("Configured ROM source is unavailable")
+
+        monkeypatch.setattr(
+            "romcloud.integrations.batocera.game_access.set_operating_mode",
+            unavailable,
+        )
+
+        result = _write_and_invoke(tmp_path, ["library-connected"])
+
+        assert result.exit_code == 1
+        payload = json.loads(result.output.strip().splitlines()[-1])
+        assert payload["error"] == "Configured ROM source is unavailable"
+        assert payload["error_type"] == "ProviderNotReachableError"
+        assert "save_authority_conflict" not in payload
+
 
 class TestLibrarySyncBridge:
     def test_preview_returns_lightweight_import_counts(self, monkeypatch):

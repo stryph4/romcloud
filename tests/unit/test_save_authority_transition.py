@@ -6,7 +6,11 @@ from types import SimpleNamespace
 import pytest
 
 from romcloud.core.capabilities import OperatingMode
-from romcloud.core.exceptions import ModeTransitionError, SaveAuthorityConflictError
+from romcloud.core.exceptions import (
+    ModeTransitionError,
+    ProviderNotReachableError,
+    SaveAuthorityConflictError,
+)
 from romcloud.core.models.savesync import SaveQuickSyncResult
 from romcloud.core.save_selection import DEFAULT_SAVE_SELECTION_POLICY
 from romcloud.infrastructure.config import AppConfig, CacheConfig, SourceConfig
@@ -246,3 +250,49 @@ def test_active_local_only_layout_does_not_block_direct_rom_transition(
 
     assert [call[0] for call in saves.calls] == ["quick"]
     assert routing.calls == ["activate"]
+
+
+def test_provider_failure_keeps_specific_type_message_and_emits_actionable_progress(
+    tmp_path, monkeypatch
+):
+    config = _config(tmp_path)
+    events = []
+    monkeypatch.setattr(
+        game_access,
+        "_prepare_connected_source",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ProviderNotReachableError("Configured ROM source is unavailable: NAS offline")
+        ),
+    )
+
+    with pytest.raises(ProviderNotReachableError, match="NAS offline"):
+        game_access.set_operating_mode(
+            config, OperatingMode.CONNECTED, progress=events.append
+        )
+
+    assert events[-1].status == "error"
+    assert "NAS offline" in events[-1].message
+
+
+def test_routing_failure_is_not_replaced_by_generic_mode_failure(
+    tmp_path, monkeypatch
+):
+    config = _config(tmp_path)
+    events = []
+    monkeypatch.setattr(game_access, "_prepare_connected_source", lambda *_args: None)
+    monkeypatch.setattr(
+        game_access,
+        "_prepare_save_authority_transition",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ModeTransitionError(
+                "Direct Save Storage could not be prepared; routing recovery is required"
+            )
+        ),
+    )
+
+    with pytest.raises(ModeTransitionError, match="routing recovery is required"):
+        game_access.set_operating_mode(
+            config, OperatingMode.CONNECTED, progress=events.append
+        )
+
+    assert "Direct Save Storage could not be prepared" in events[-1].message

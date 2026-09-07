@@ -245,6 +245,7 @@ class SaveReconcileReport:
     download_bytes: int
     conflict_paths: tuple[str, ...] = ()
     scope: str = "all_eligible"
+    bootstrap: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -258,6 +259,7 @@ class SaveReconcileReport:
             "download_bytes": self.download_bytes,
             "conflict_paths": list(self.conflict_paths),
             "scope": self.scope,
+            "bootstrap": self.bootstrap,
         }
 
 

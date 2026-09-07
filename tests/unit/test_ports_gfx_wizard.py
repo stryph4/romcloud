@@ -443,6 +443,30 @@ def test_setup_apply_exposes_typed_save_authority_conflict(monkeypatch):
     assert wizard.remote_password == ""
 
 
+def test_successful_setup_with_preserved_conflicts_opens_attention_flow(monkeypatch):
+    wizard = WizardState()
+    wizard.step = WizardStep.APPLY
+    wizard.runner = _Runner()
+    monkeypatch.setattr(
+        "ports_gfx.wizard.operation_result",
+        lambda _runner: BackendResult(
+            True,
+            data={
+                "conflict_ids": ["one", "two"],
+                "direct_conflict_ids": ["one"],
+                "save_conflicts": 2,
+                "direct_mode_pending": True,
+            },
+        ),
+    )
+
+    wizard.poll()
+
+    assert wizard.step is WizardStep.DONE
+    assert wizard.save_authority_conflict_ids == ("one",)
+    assert "need your attention" in wizard.notice
+
+
 def test_sftp_detect_failure_surfaces_backend_diagnostic(monkeypatch):
     wizard = WizardState()
     wizard.source_type = "sftp"

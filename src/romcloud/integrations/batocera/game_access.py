@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -22,6 +23,7 @@ from romcloud.core.exceptions import (
     ConfigurationError,
     ModeTransitionError,
     ProviderNotReachableError,
+    ROMCloudError,
     SaveAuthorityConflictError,
 )
 from romcloud.core.models.savesync import SaveConflictResolution
@@ -33,6 +35,7 @@ from romcloud.integrations.batocera.systems import BATOCERA_SYSTEMS
 MANIFEST_FILENAME = "direct-links.json"
 LINK_NAME = "ROMCloud"
 MANIFEST_VERSION = 1
+log = logging.getLogger(__name__)
 
 
 class DirectLinkConflictError(RuntimeError):
@@ -843,9 +846,12 @@ def set_operating_mode(
         save_routing = None
         save_routing_changed = False
         save_reconcile = None
+        transition_stage = "prepare the mode transition"
         try:
             if requested is OperatingMode.CONNECTED:
+                transition_stage = "connect to the configured ROM source"
                 _prepare_connected_source(config, progress)
+            transition_stage = "reconcile save authority and prepare Direct Save Storage"
             save_routing, save_routing_changed, save_result = (
                 _prepare_save_authority_transition(
                     config,
@@ -861,10 +867,12 @@ def set_operating_mode(
                     if save_result.report is not None
                     else {"status": save_result.status, "reason": save_result.reason}
                 )
+            transition_stage = "prepare the game-library presentation"
             presentation_attempted = True
             report, container = _apply_mode_presentation(
                 config, requested, progress=progress
             )
+            transition_stage = "commit the operating mode"
             emit_progress(
                 progress,
                 "operating_mode",
@@ -877,6 +885,7 @@ def set_operating_mode(
             # a later manual ROMCloud launch both observe the requested mode.
             write_operating_mode(config, requested)
             state_committed = True
+            transition_stage = "refresh EmulationStation"
             _update_emulationstation(
                 config,
                 container,
@@ -900,6 +909,21 @@ def set_operating_mode(
             )
             return report
         except Exception as exc:
+            if isinstance(exc, SaveAuthorityConflictError):
+                log.info(
+                    "Operating-mode transition needs a save decision: "
+                    "previous=%s requested=%s conflicts=%d",
+                    previous.value,
+                    requested.value,
+                    len(exc.conflict_ids),
+                )
+            else:
+                log.exception(
+                    "Operating-mode transition failed: previous=%s requested=%s stage=%s",
+                    previous.value,
+                    requested.value,
+                    transition_stage,
+                )
             rollback_errors: list[Exception] = []
             if save_routing_changed and save_routing is not None:
                 try:
@@ -938,14 +962,46 @@ def set_operating_mode(
                 except Exception as rollback_exc:
                     rollback_errors.append(rollback_exc)
             if rollback_errors:
-                raise ModeTransitionError(
+                failure = ModeTransitionError(
                     f"ROMCloud could not enter {requested.value.title()} Mode, and "
                     "automatic rollback was incomplete. Do not launch a game until "
-                    "ROMCloud startup recovery or the mode transition is retried."
-                ) from exc
+                    "ROMCloud startup recovery or the mode transition is retried. "
+                    f"Original problem: {exc}"
+                )
+                emit_progress(
+                    progress,
+                    "operating_mode",
+                    "rollback",
+                    "error",
+                    str(failure),
+                    detail="; ".join(str(error) for error in rollback_errors),
+                )
+                raise failure from exc
             if isinstance(exc, SaveAuthorityConflictError):
+                emit_progress(
+                    progress,
+                    "operating_mode",
+                    "save_conflicts",
+                    "warning",
+                    str(exc),
+                )
                 raise
-            raise ModeTransitionError(
-                f"ROMCloud could not enter {requested.value.title()} Mode and remains "
-                f"in {previous.value.title()} Mode. Check the configured source and retry."
-            ) from exc
+            if isinstance(exc, ROMCloudError):
+                failure = exc
+            else:
+                failure = ModeTransitionError(
+                    f"ROMCloud could not enter {requested.value.title()} Mode while "
+                    f"trying to {transition_stage}; it remains in "
+                    f"{previous.value.title()} Mode. {exc}"
+                )
+            emit_progress(
+                progress,
+                "operating_mode",
+                "failed",
+                "error",
+                str(failure),
+                detail=f"{type(exc).__name__} during {transition_stage}",
+            )
+            if failure is exc:
+                raise
+            raise failure from exc

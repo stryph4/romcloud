@@ -553,6 +553,8 @@ def operation_summary_message(operation: OperationScreenState) -> tuple[str, str
     if operation.succeeded:
         return f"{operation.title}: succeeded", "success"
     detail = operation.runner.error
+    if hasattr(operation.runner, "lines"):
+        detail = operation_result(operation.runner).error or detail
     suffix = f" ({detail})" if detail else ""
     return f"{operation.title}: failed{suffix}", "error"
 
@@ -1273,7 +1275,7 @@ def _run(  # noqa: ANN001
                         operation_screen = start_remote_wins_operation(romcloud_bin)
                         current_screen = OPERATION_SCREEN
                         mode_save_conflict = None
-                    elif decision == "cancel":
+                    elif decision in {"cancel", "finish"}:
                         current_screen = "menu"
                         mode_save_conflict = None
                 elif current_screen == "savesync" and savesync_screen is not None:
@@ -1462,7 +1464,12 @@ def _run(  # noqa: ANN001
                     activity.ingest(line.text)
                 if wizard.save_authority_conflict_ids:
                     mode_save_conflict = ModeSaveConflictState(
-                        wizard.save_authority_conflict_ids
+                        wizard.save_authority_conflict_ids,
+                        purpose=(
+                            "setup-direct"
+                            if wizard.applied_summary.get("direct_mode_pending")
+                            else "setup"
+                        ),
                     )
                     wizard = None
                     current_screen = MODE_SAVE_CONFLICT_SCREEN
@@ -2514,12 +2521,27 @@ def _render_mode_save_conflict(  # noqa: ANN001
     pygame, screen, fonts: dict, layout: Layout, state: ModeSaveConflictState
 ) -> None:
     screen.fill(_BG_COLOR)
-    title = fonts["title"].render("Unresolved Save Conflicts", True, _WARNING_COLOR)
+    title_text = (
+        "SaveSync Initialized — Conflicts Need Attention"
+        if state.purpose.startswith("setup")
+        else "Unresolved Save Conflicts"
+    )
+    title = fonts["title"].render(title_text, True, _WARNING_COLOR)
     screen.blit(title, (layout.header_rect.x, layout.header_rect.y))
     lines = (
-        "Direct Mode uses the remote save location directly.",
+        (
+            "SaveSync merged every unambiguous local and remote save."
+            if state.purpose.startswith("setup")
+            else "Direct Mode uses the remote save location directly."
+        ),
         "Local save changes conflict with the remote versions.",
-        "Resolve them first, accept remote saves, or cancel the mode change.",
+        (
+            "Resolve them now or finish setup with the conflicts preserved."
+            if state.purpose == "setup"
+            else "Resolve them, accept remote saves, or keep Cached Storage."
+            if state.purpose == "setup-direct"
+            else "Resolve them first, accept remote saves, or cancel the mode change."
+        ),
         f"Conflicting save groups: {len(state.conflict_ids)}",
     )
     y = layout.navigation_rect.y
@@ -2527,16 +2549,20 @@ def _render_mode_save_conflict(  # noqa: ANN001
         rendered = fonts["body"].render(line, True, _FG_COLOR)
         screen.blit(rendered, (layout.navigation_rect.x, y))
         y += fonts["body"].get_height() + 6
-    controls = _mode_save_conflict_action_rects(layout, fonts)
-    for index, (label, rect) in enumerate(zip(MODE_CONFLICT_ACTIONS, controls)):
+    controls = _mode_save_conflict_action_rects(
+        layout, fonts, len(state.action_labels)
+    )
+    for index, (label, rect) in enumerate(zip(state.action_labels, controls)):
         color = _SELECTED_BG if index == state.selected_index else _CARD_BG
         pygame.draw.rect(screen, color, (rect.x, rect.y, rect.w, rect.h), border_radius=6)
         text = fonts["body"].render(label, True, _FG_COLOR)
         screen.blit(text, (rect.x + 16, rect.y + max(0, (rect.h - text.get_height()) // 2)))
     hint = (
         "Keep holding Confirm to discard local conflicts."
-        if state.selected_index == 1 and state.confirm.active
-        else "Remote wins requires hold-to-confirm. Back cancels."
+        if state.selected_index == state.remote_wins_index and state.confirm.active
+        else "Remote wins requires hold-to-confirm. Back leaves saves unresolved."
+        if state.remote_wins_index is not None
+        else "Resolve now or finish setup with both versions preserved."
     )
     screen.blit(
         fonts["hint"].render(hint, True, _HINT_COLOR),
@@ -2545,7 +2571,9 @@ def _render_mode_save_conflict(  # noqa: ANN001
     pygame.display.flip()
 
 
-def _mode_save_conflict_action_rects(layout: Layout, fonts: dict) -> list[Rect]:
+def _mode_save_conflict_action_rects(
+    layout: Layout, fonts: dict, action_count: int = len(MODE_CONFLICT_ACTIONS)
+) -> list[Rect]:
     body_bottom = layout.navigation_rect.y + 4 * (fonts["body"].get_height() + 6)
     return compute_vertical_control_rects(
         Rect(
@@ -2554,7 +2582,7 @@ def _mode_save_conflict_action_rects(layout: Layout, fonts: dict) -> list[Rect]:
             layout.navigation_rect.w,
             max(1, layout.navigation_rect.bottom - body_bottom - 12),
         ),
-        len(MODE_CONFLICT_ACTIONS),
+        action_count,
     )
 
 
@@ -3091,7 +3119,22 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
                 ]
             )
         if wizard.applied_summary.get("save_sync_initialized"):
-            lines.append("\u2713 Initial Full Sync complete — Quick Sync ready")
+            save_reconcile = wizard.applied_summary.get("save_reconcile") or {}
+            merged = sum(
+                int(save_reconcile.get(key, 0))
+                for key in ("uploaded", "downloaded", "unchanged")
+            )
+            conflicts = int(wizard.applied_summary.get("save_conflicts", 0))
+            if conflicts:
+                lines.extend(
+                    [
+                        f"\u2713 SaveSync initialized — {merged:,} save artifact(s) merged",
+                        f"⚠ {conflicts:,} save group(s) need your attention",
+                        "Auto SaveSync is pending for conflicting saves until resolution.",
+                    ]
+                )
+            else:
+                lines.append("\u2713 Initial Full Sync complete — Quick Sync ready")
         if wizard.game_access_mode == "smart_cache":
             lines.append(
                 f"Cache size: {wizard.applied_summary.get('max_size_gb', wizard.max_size_gb):g} GB"
