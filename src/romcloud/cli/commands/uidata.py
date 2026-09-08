@@ -54,6 +54,7 @@ from romcloud.core.exceptions import SaveAuthorityConflictError
 from romcloud.infrastructure.config import load_config
 from romcloud.infrastructure.capabilities import capability_policy
 from romcloud.infrastructure.logging import configure_logging
+from romcloud.infrastructure.diagnostics import DiagnosticQuery, DiagnosticStore
 from romcloud.infrastructure.source_display import source_display_summary
 from romcloud.infrastructure import savesync_prompts
 from romcloud.integrations.batocera import startup_activation
@@ -130,10 +131,14 @@ def _configure_uidata_logging(ctx: click.Context) -> None:
         config = load_config(str(config_path))
         level = "DEBUG" if ctx.obj.get("debug") else config.logging.level
         log_dir = config.logging.path
+        diagnostic_db = str(Path(config.data_path) / "diagnostics.db")
     except Exception:  # noqa: BLE001 - logging must never block a fresh install
         level = "DEBUG" if ctx.obj.get("debug") else "INFO"
         log_dir = str(config_path.parent.parent / "logs")
-    configure_logging(level=level, log_dir=log_dir, console=True)
+        diagnostic_db = str(config_path.parent.parent / "data" / "diagnostics.db")
+    configure_logging(
+        level=level, log_dir=log_dir, console=True, diagnostic_db=diagnostic_db
+    )
 
 
 @click.group("uidata", hidden=True)
@@ -921,6 +926,58 @@ def uidata_healthcheck(ctx: click.Context) -> None:
         }
         payload.update(source_display_summary(config))
         return payload
+
+    _run_action(ctx, build)
+
+
+@uidata_group.command("diagnostics")
+@click.option("--subsystem", default=None)
+@click.option("--level", default=None)
+@click.option("--operation-id", default=None)
+@click.option("--start-utc", default=None)
+@click.option("--end-utc", default=None)
+@click.option("--search", "text", default=None)
+@click.option("--page", type=click.IntRange(min=1), default=1)
+@click.option("--page-size", type=click.IntRange(min=1, max=200), default=50)
+@click.pass_context
+def uidata_diagnostics(
+    ctx: click.Context,
+    subsystem: str | None,
+    level: str | None,
+    operation_id: str | None,
+    start_utc: str | None,
+    end_utc: str | None,
+    text: str | None,
+    page: int,
+    page_size: int,
+) -> None:
+    """Paginated, filterable Maintenance diagnostics endpoint."""
+    def build() -> dict:
+        config = _load_context_config(ctx)
+        store = DiagnosticStore(Path(config.data_path) / "diagnostics.db")
+        if not store.initialize():
+            raise RuntimeError("Diagnostics database is unavailable; text logs remain active.")
+        query = DiagnosticQuery(
+            subsystem=subsystem, level=level, operation_id=operation_id,
+            start_utc=start_utc, end_utc=end_utc, text=text,
+            page=page, page_size=page_size,
+            chronological=bool(operation_id),
+        )
+        events = store.query(query)
+        operations = (
+            store.operation_summaries(
+                page=page, page_size=min(page_size, 20),
+                subsystem=subsystem or "savesync",
+            )
+            if not operation_id and subsystem in (None, "savesync")
+            else []
+        )
+        return {
+            "page": page, "page_size": page_size, "events": events,
+            "operations": operations,
+            "has_more": len(events) == page_size,
+            "operation_view": bool(operation_id),
+        }
 
     _run_action(ctx, build)
 

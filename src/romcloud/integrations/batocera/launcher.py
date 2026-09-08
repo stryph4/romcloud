@@ -262,6 +262,7 @@ def _resolve_and_cache(proxy_path: str) -> str:
         level=config.logging.level,
         log_dir=config.logging.path,
         console=True,
+        diagnostic_db=str(Path(config.data_path) / "diagnostics.db"),
     )
     container = Container(config)
 

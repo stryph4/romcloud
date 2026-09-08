@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import click
+from pathlib import Path
 
 from romcloud.infrastructure.config import load_config, default_config_path
 from romcloud.infrastructure.logging import configure_logging
@@ -49,6 +50,7 @@ def cli(ctx: click.Context, config_path: str | None, debug: bool) -> None:
                 level="DEBUG" if debug else config.logging.level,
                 log_dir=config.logging.path,
                 console=True,
+                diagnostic_db=str(Path(config.data_path) / "diagnostics.db"),
             )
         except ConfigurationNotFoundError as exc:
             click.echo(f"error: {exc}", err=True)
@@ -56,6 +58,16 @@ def cli(ctx: click.Context, config_path: str | None, debug: bool) -> None:
         except ROMCloudError as exc:
             click.echo(f"error: {exc}", err=True)
             ctx.exit(1)
+    else:
+        # Setup/update commands also belong in the central pipeline even when
+        # no valid configuration exists yet.
+        base = Path(ctx.obj["config_path"]).parent.parent
+        configure_logging(
+            level="DEBUG" if debug else "INFO",
+            log_dir=str(base / "logs"),
+            console=True,
+            diagnostic_db=str(base / "data" / "diagnostics.db"),
+        )
 
 
 # ── sub-command registration ──────────────────────────────────────────────────

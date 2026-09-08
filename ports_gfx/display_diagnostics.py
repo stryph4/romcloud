@@ -5,8 +5,11 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+
+from ports_gfx.central_diagnostics import GuiDiagnosticWriter
 
 
 DISPLAY_LOG_ENV = "ROMCLOUD_DISPLAY_LOG"
@@ -33,6 +36,11 @@ class DisplayDiagnostics:
     def __init__(self, romcloud_bin: str) -> None:
         self.path = default_display_log(romcloud_bin)
         self.started = time.monotonic()
+        self.operation_id = uuid.uuid4().hex
+        self._central = GuiDiagnosticWriter(
+            Path(romcloud_bin).resolve().parent.parent / "data" / "diagnostics.db",
+            operation_id=self.operation_id,
+        )
 
     def environment(self) -> dict[str, str]:
         return {key: os.environ.get(key, "") for key in _DISPLAY_ENV_KEYS}
@@ -55,5 +63,6 @@ class DisplayDiagnostics:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as stream:
                 stream.write(f"{line}\n")
+            self._central.write(event, line, values)
         except Exception:  # noqa: BLE001 - diagnostics must never affect the GUI
             pass

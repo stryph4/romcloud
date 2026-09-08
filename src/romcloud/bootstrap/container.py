@@ -444,6 +444,7 @@ class Container:
                 mapped_local_roots=_batocera_mapped_save_roots(local_saves_path),
                 capability_policy=self._policy(),
                 remote_store=remote_store,
+                effective_mode=self._policy().effective_mode.value,
             )
         return self._saves
 

@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, urlparse
 
 from romcloud.core.exceptions import ROMCloudError
 from romcloud.infrastructure.logging import get_logger
+from romcloud.infrastructure.diagnostics import event as diagnostic_event
 from romcloud.services.library_manager import LibraryManagerService
 from romcloud.web.auth import (
     REMEMBER_90_DAYS_SECONDS,
@@ -71,6 +72,11 @@ class ControllerDiagnosticLog:
             if len(line) > _CONTROLLER_EVENT_MAX_BYTES:
                 raise ValueError("Controller diagnostic event is too large.")
             lines.append(line)
+            diagnostic_event(
+                "web-controller", f"controller.{event}",
+                f"Browser controller event: {event}",
+                metadata={"event": event, "detail": detail},
+            )
         if not lines:
             return 0
         with self._lock:

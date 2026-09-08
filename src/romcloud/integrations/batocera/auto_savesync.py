@@ -370,6 +370,7 @@ def spawn_drain_pending(
     *,
     python_executable: Optional[str] = None,
     popen: Callable[..., subprocess.Popen] = subprocess.Popen,
+    operation_id: Optional[str] = None,
 ) -> int:
     """Detach a guaranteed follow-up sync after a busy worker lock is freed.
 
@@ -378,6 +379,9 @@ def spawn_drain_pending(
     Manual/Auto Quick Sync was still running; this ensures the pending work
     is coalesced into a follow-up rather than left to the next periodic tick.
     """
+    environment = os.environ.copy()
+    if operation_id:
+        environment["ROMCLOUD_DIAGNOSTIC_OPERATION_ID"] = operation_id
     process = popen(
         [
             python_executable or sys.executable,
@@ -390,6 +394,7 @@ def spawn_drain_pending(
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
+        env=environment,
     )
     return process.pid
 

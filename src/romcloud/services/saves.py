@@ -74,6 +74,11 @@ from romcloud.core.remote_data import RemoteDataProvider
 from romcloud.infrastructure import save_tree
 from romcloud.infrastructure import save_transaction
 from romcloud.infrastructure.logging import get_logger
+from romcloud.infrastructure.diagnostics import (
+    correlated_operation,
+    current_operation_id,
+    event as diagnostic_event,
+)
 from romcloud.infrastructure import savesync_state as durable_state
 from romcloud.infrastructure import savesync_journal
 from romcloud.infrastructure.remote_saves import RemoteSaveStore, build_remote_save_store
@@ -182,6 +187,7 @@ class SaveSyncService:
         capability_policy: Optional[CapabilityPolicy] = None,
         remote_store: Optional[RemoteSaveStore] = None,
         container_registry: SaveContainerRegistry = DEFAULT_SAVE_CONTAINER_REGISTRY,
+        effective_mode: str = "local-saves",
     ) -> None:
         self._provider = provider
         self._connectivity_root = connectivity_root
@@ -200,6 +206,7 @@ class SaveSyncService:
             else None
         )
         self._state_path = Path(state_path)
+        self._effective_mode = effective_mode
         self._xbox_enabled = xbox_enabled
         # Kept as accepted constructor arguments for configuration/API
         # compatibility. Eligibility is defined solely by the positive
@@ -353,6 +360,9 @@ class SaveSyncService:
             paths=hints,
         )
 
+    @correlated_operation(
+        "Local SaveSync discovery", subsystem="savesync", source="local-discovery"
+    )
     def detect_and_mark_local_changes(
         self,
         layout_ids: frozenset[str],
@@ -451,6 +461,19 @@ class SaveSyncService:
                     len(local_group),
                     len(baseline_group),
                 )
+                diagnostic_event(
+                    "savesync", "group.classified",
+                    f"SaveSync group {group_id} classified",
+                    metadata={
+                        "layout_id": descriptor.layout_id, "group_id": group_id,
+                        "classification": "changed" if changed else "unchanged",
+                        "reason": reason,
+                        "local_hash": _manifest_hash_summary(local_group),
+                        "baseline_hash": _manifest_hash_summary(baseline_group),
+                        "local_artifacts": len(local_group),
+                        "baseline_artifacts": len(baseline_group),
+                    },
+                )
                 if not changed:
                     unchanged_groups += 1
                     log.info(
@@ -475,6 +498,12 @@ class SaveSyncService:
                     "paths=%s",
                     group_id,
                     ",".join(hints),
+                )
+                diagnostic_event(
+                    "savesync", "dirty_marker.created",
+                    f"Dirty marker created for {group_id}",
+                    metadata={"group_id": group_id, "layout_id": descriptor.layout_id,
+                              "dirty_paths": hints, "reason": reason},
                 )
             if next_state != state:
                 _write_state(self._state_path, next_state)
@@ -544,6 +573,9 @@ class SaveSyncService:
             self._state_path
         ).acknowledge_conflict(conflict_id)
 
+    @correlated_operation(
+        "Conflict resolution", subsystem="savesync", source="conflict resolution"
+    )
     def resolve_conflict(
         self,
         conflict_id: str,
@@ -637,7 +669,7 @@ class SaveSyncService:
                     "bytes": sum(item.size_bytes for item in desired.values()),
                 },
             )
-            operation_id = uuid.uuid4().hex
+            operation_id = current_operation_id() or uuid.uuid4().hex
             transaction = self._prepare_selected_transaction(
                 destination_views,
                 current=destination,
@@ -1333,6 +1365,7 @@ class SaveSyncService:
             optional_groups=_merge_optional_groups(local_report, remote_report),
         )
 
+    @correlated_operation("Full Sync", subsystem="savesync", source="Full Sync")
     def full_sync(self, *, progress: ProgressSink = None) -> SaveReconcileReport:
         """Run authoritative reconciliation and establish Quick Sync baseline."""
         self._require_remote()
@@ -1361,8 +1394,19 @@ class SaveSyncService:
                 len(state.shared_manifest),
                 report.revision,
             )
+            diagnostic_event(
+                "savesync", "cursor.advanced", "Full SaveSync cursor advanced",
+                metadata={
+                    "cursor_before": cursor_before,
+                    "cursor_after": observed_generation,
+                    "baseline_artifacts": len(state.shared_manifest),
+                    "revision": report.revision,
+                    "reason": "full-sync-complete",
+                },
+            )
         return report
 
+    @correlated_operation("Quick Sync", subsystem="savesync", source="Quick Sync")
     def quick_sync(
         self,
         *,
@@ -1689,6 +1733,13 @@ class SaveSyncService:
                     cursor if cursor is not None else "none",
                     remote_generation,
                 )
+                diagnostic_event(
+                    "savesync", "cursor.advanced", "Quick SaveSync cursor advanced",
+                    metadata={
+                        "cursor_before": cursor, "cursor_after": remote_generation,
+                        "reason": "journal-no-eligible-changes",
+                    },
+                )
             return SaveQuickSyncResult(
                 status="unchanged",
                 remote_generation=remote_generation,
@@ -1738,6 +1789,13 @@ class SaveSyncService:
                 cursor if cursor is not None else "none",
                 cursor_after,
                 report.revision,
+            )
+            diagnostic_event(
+                "savesync", "cursor.advanced", "Quick SaveSync cursor advanced",
+                metadata={
+                    "cursor_before": cursor, "cursor_after": cursor_after,
+                    "revision": report.revision, "reason": "reconciliation-complete",
+                },
             )
         return SaveQuickSyncResult(
             status="reconciled",
@@ -1871,6 +1929,7 @@ class SaveSyncService:
             finally:
                 container_work.cleanup()
 
+    @correlated_operation("Reconcile", subsystem="savesync", source="Manual")
     def reconcile(self, *, progress: ProgressSink = None) -> SaveReconcileReport:
         """Apply all non-conflicting changes and preserve both conflict versions."""
         state = self.get_state()
@@ -2352,6 +2411,24 @@ class SaveSyncService:
             )
             self._recover()
             state = self._get_state_unlocked()
+            diagnostic_event(
+                "savesync", "reconciliation.started",
+                "SaveSync authoritative reconciliation started",
+                metadata={
+                    "effective_mode": self._effective_mode,
+                    "provider_id": getattr(self._provider, "provider_id", "none"),
+                    "provider_type": (
+                        type(self._provider).__name__ if self._provider is not None else "none"
+                    ),
+                    "cursor_before": state.quick_sync_cursor_generation,
+                    "scope": (
+                        "groups" if selected_group_ids is not None else
+                        "layouts" if selected_layout_ids is not None else "all"
+                    ),
+                    "processed_groups": tuple(sorted(selected_group_ids or ())),
+                    "layouts": tuple(sorted(selected_layout_ids or ())),
+                },
+            )
             repair_local_group_ids = frozenset(
                 status.group_id
                 for status in self._local_materialization_gaps(
@@ -2505,7 +2582,7 @@ class SaveSyncService:
                 elif entry.action is SaveReconcileAction.DOWNLOAD and not upload_only:
                     _assign(desired_local, entry.relative_path, entry.remote)
 
-            operation_id = uuid.uuid4().hex
+            operation_id = current_operation_id() or uuid.uuid4().hex
             destination_views: list[_DestinationView] = []
             selected_views: list[save_transaction.SelectedView] = []
             try:
@@ -2976,6 +3053,25 @@ class SaveSyncService:
                 len(next_state.shared_manifest),
                 len(affected_group_ids),
             )
+            diagnostic_event(
+                "savesync", "baseline.advanced", "SaveSync baseline advanced",
+                metadata={
+                    "transaction_id": operation_id, "revision": report.revision,
+                    "baseline_artifacts": len(next_state.shared_manifest),
+                    "affected_groups": len(affected_group_ids),
+                },
+                operation_id=operation_id,
+            )
+            for group_id in sorted(affected_group_ids):
+                diagnostic_event(
+                    "savesync", "dirty_marker.cleared",
+                    f"Dirty marker cleared for {group_id}",
+                    metadata={
+                        "group_id": group_id, "reason": "verified-reconciliation",
+                        "transaction_id": operation_id,
+                    },
+                    operation_id=operation_id,
+                )
             if transaction is not None:
                 try:
                     transaction.finalize()
@@ -3032,6 +3128,7 @@ class SaveSyncService:
 
     # ── deliberate force upload/download ─────────────────────────────────
 
+    @correlated_operation("Upload All", subsystem="savesync", source="Upload All")
     def commit_upload(
         self,
         diff: SaveDiff,
@@ -3059,6 +3156,7 @@ class SaveSyncService:
             progress=progress,
         )
 
+    @correlated_operation("Download All", subsystem="savesync", source="Download All")
     def commit_download(
         self,
         diff: SaveDiff,
@@ -3117,7 +3215,7 @@ class SaveSyncService:
                 f"Staging {diff.direction} save/state replacement",
                 metadata={"files": len(source), "bytes": sum(a.size_bytes for a in source.values())},
             )
-            operation_id = uuid.uuid4().hex
+            operation_id = current_operation_id() or uuid.uuid4().hex
             transaction = self._prepare_selected_transaction(
                 destination_views,
                 current=destination,
@@ -3440,6 +3538,13 @@ class SaveSyncService:
                     source_for=lambda relative, artifact, reverse=reverse: source_for(
                         reverse[relative], desired[reverse[relative]]
                     ),
+                    logical_group_for=lambda relative, reverse={
+                        **current_reverse, **reverse
+                    }: (
+                        descriptor.group_id
+                        if (descriptor := self._policy.group_for_path(reverse[relative]))
+                        is not None else None
+                    ),
                 )
             )
         return selected_views
@@ -3738,6 +3843,13 @@ class SaveSyncService:
             revision,
             generation,
             len(mutations),
+        )
+        diagnostic_event(
+            "savesync", "journal.committed", "SaveSync remote journal committed",
+            metadata={
+                "revision": revision, "generation": generation,
+                "mutation_count": len(mutations),
+            },
         )
         return generation
 
@@ -4110,6 +4222,22 @@ def _reconcile_plan(
             len(local_group),
             len(remote_group),
             len(baseline_group),
+        )
+        diagnostic_event(
+            "savesync", "reconciliation.decision",
+            f"SaveSync decision for {group_id}: {group_action.value}",
+            metadata={
+                "scope": scope,
+                "layout_id": descriptor.layout_id if descriptor is not None else "unsupported",
+                "group_id": group_id, "decision": group_action.value,
+                "reason": reason,
+                "local_hash": _manifest_hash_summary(local_group),
+                "remote_hash": _manifest_hash_summary(remote_group),
+                "baseline_hash": _manifest_hash_summary(baseline_group),
+                "local_artifacts": len(local_group),
+                "remote_artifacts": len(remote_group),
+                "baseline_artifacts": len(baseline_group),
+            },
         )
         for path in group_paths:
             local_artifact = local.get(path)

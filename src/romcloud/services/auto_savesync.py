@@ -19,6 +19,7 @@ from romcloud.core.exceptions import (
 from romcloud.core.models.savesync import SaveGroupCondition
 from romcloud.core.save_selection import SaveSelectionPolicy
 from romcloud.infrastructure.logging import get_logger
+from romcloud.infrastructure.diagnostics import correlated_operation, event as diagnostic_event
 from romcloud.infrastructure import savesync_prompts
 from romcloud.integrations.batocera import auto_savesync as batocera_auto_savesync
 from romcloud.services.saves import SaveSyncService
@@ -168,11 +169,15 @@ class AutoSaveSyncCoordinator:
         self._enabled_check = enabled_check
         self._menu_state_path = self._data_root / "savesync-menu-pull.json"
 
+    @correlated_operation("gameStart", subsystem="savesync", source="Auto gameStart")
     def game_start(self, *, system: str, emulator: str, core: str, rom: str) -> None:
         if not self._enabled:
             return
         self._sessions.start(system=system, emulator=emulator, core=core, rom=rom)
 
+    @correlated_operation(
+        "gameStop Quick Sync", subsystem="savesync", source="Auto gameStop Quick"
+    )
     def game_stop(
         self, *, system: str, emulator: str, core: str, rom: str
     ) -> tuple[str, ...]:
@@ -263,6 +268,9 @@ class AutoSaveSyncCoordinator:
         )
         return conflict_ids
 
+    @correlated_operation(
+        "Remote reconnect Quick Sync", subsystem="savesync", source="remote reconnect"
+    )
     def remote_reconnect(self) -> None:
         """Run one eligible Quick Sync after a detached reconnect edge."""
         if not self._enabled:
@@ -275,6 +283,9 @@ class AutoSaveSyncCoordinator:
             return
         self._run_quick_sync(trigger="remote-data reconnect")
 
+    @correlated_operation(
+        "Periodic Auto Quick Sync", subsystem="savesync", source="periodic Auto"
+    )
     def menu_tick(self, *, force: bool = False) -> None:
         if not self._enabled:
             return
@@ -308,6 +319,14 @@ class AutoSaveSyncCoordinator:
                     "Auto SaveSync final result: trigger=%s status=deferred "
                     "reason=worker-busy",
                     trigger,
+                )
+                diagnostic_event(
+                    "savesync", "worker.busy", "Auto SaveSync worker is busy",
+                    level="WARNING",
+                    metadata={
+                        "trigger": trigger, "status": "deferred",
+                        "reason": "worker-busy", "worker_state": "busy",
+                    },
                 )
                 if require_completion:
                     raise SaveSyncWorkerBusyError(
@@ -484,6 +503,22 @@ class AutoSaveSyncCoordinator:
                     result.report.downloaded if result.report is not None else 0,
                     result.report.conflicts if result.report is not None else 0,
                 )
+                diagnostic_event(
+                    "savesync", "operation.result", "Auto Quick Sync completed",
+                    metadata={
+                        "trigger": trigger, "status": result.status,
+                        "reason": result.reason,
+                        "generation": result.remote_generation,
+                        "cursor_before": result.cursor_before,
+                        "cursor_after": result.cursor_after,
+                        "processed_entries": result.processed_entries,
+                        "processed_groups": result.processed_groups,
+                        "uploaded": result.report.uploaded if result.report else 0,
+                        "downloaded": result.report.downloaded if result.report else 0,
+                        "conflicts": result.report.conflicts if result.report else 0,
+                        "unchanged": result.report.unchanged if result.report else 0,
+                    },
+                )
                 if result.status in {"deferred", "requires-full-sync"}:
                     log.warning(
                         "Auto SaveSync final result: trigger=%s status=%s reason=%s",
@@ -637,6 +672,9 @@ class AutoSaveSyncCoordinator:
         temporary.write_text(json.dumps({"last_pull": value}), encoding="utf-8")
         temporary.replace(self._menu_state_path)
 
+    @correlated_operation(
+        "Drain pending Quick Sync", subsystem="savesync", source="drain-pending"
+    )
     def drain_pending(self) -> None:
         """Guaranteed follow-up sync after a busy worker released its lock.
 

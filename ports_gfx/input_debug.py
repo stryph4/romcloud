@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
 from ports_gfx.controller import ControllerSnapshot
+from ports_gfx.central_diagnostics import GuiDiagnosticWriter
+import uuid
 
 DEBUG_ENV_VAR = "ROMCLOUD_PORTS_GFX_INPUT_DEBUG"
 DEBUG_LOG_PATH = Path("/userdata/system/romcloud/logs/controller-debug.log")
@@ -55,6 +57,10 @@ class InputDebugLogger:
         self._log_path = log_path
         self._enabled = is_enabled_from_env() if enabled is None else enabled
         self._stream = None
+        self._central = GuiDiagnosticWriter(
+            self._log_path.parent.parent / "data" / "diagnostics.db",
+            operation_id=uuid.uuid4().hex,
+        )
         self._event_names = self._build_event_names()
         self._controller_button_names = self._build_constant_names("CONTROLLER_BUTTON_")
         self._controller_axis_names = self._build_constant_names("CONTROLLER_AXIS_")
@@ -169,5 +175,6 @@ class InputDebugLogger:
         try:
             stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
             self._stream.write(f"{stamp} {line}\n")
+            self._central.write("controller.input", line, {"detail": line})
         except Exception:  # noqa: BLE001 - best effort only
             self.close()

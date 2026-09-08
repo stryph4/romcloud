@@ -268,7 +268,9 @@ def game_stop(
     except Exception as exc:
         if isinstance(exc, SaveSyncWorkerBusyError):
             try:
-                pid = batocera_auto_savesync.spawn_drain_pending()
+                pid = batocera_auto_savesync.spawn_drain_pending(
+                    operation_id=getattr(exc, "diagnostic_operation_id", None)
+                )
                 log.warning(
                     "gameStop worker-busy follow-up scheduled: drain_pending_pid=%d",
                     pid,

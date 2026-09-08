@@ -11,6 +11,12 @@ import logging.handlers
 from pathlib import Path
 from typing import Optional
 
+from romcloud.infrastructure.diagnostics import (
+    DEFAULT_FILENAME,
+    SQLiteDiagnosticHandler,
+    configure_diagnostics,
+)
+
 _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 _DATE_FORMAT = "%Y-%m-%dT%H:%M:%S"
 
@@ -19,6 +25,7 @@ def configure_logging(
     level: str = "INFO",
     log_dir: Optional[str] = None,
     console: bool = True,
+    diagnostic_db: Optional[str] = None,
 ) -> None:
     """Configure the root ``romcloud`` logger.
 
@@ -35,8 +42,10 @@ def configure_logging(
     """
     root = logging.getLogger("romcloud")
     root.setLevel(level.upper())
-    # Avoid duplicate handlers if called more than once.
-    root.handlers.clear()
+    # Avoid duplicate handlers and release file/SQLite handles on reconfigure.
+    for existing in tuple(root.handlers):
+        root.removeHandler(existing)
+        existing.close()
 
     formatter = logging.Formatter(_LOG_FORMAT, datefmt=_DATE_FORMAT)
 
@@ -56,6 +65,17 @@ def configure_logging(
         )
         fh.setFormatter(formatter)
         root.addHandler(fh)
+
+    # The central DB is primary, while console/text handlers remain a useful
+    # fail-open fallback. Derivation preserves compatibility for callers that
+    # only know the conventional sibling ``logs`` directory.
+    db_path = diagnostic_db
+    if db_path is None and log_dir:
+        db_path = str(Path(log_dir).parent / "data" / DEFAULT_FILENAME)
+    if db_path:
+        store = configure_diagnostics(db_path)
+        if store is not None:
+            root.addHandler(SQLiteDiagnosticHandler(store))
 
 
 def get_logger(name: str) -> logging.Logger:

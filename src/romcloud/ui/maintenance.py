@@ -15,6 +15,7 @@ try:
 except Exception:
     curses = None  # type: ignore[assignment]
 import sys
+from pathlib import Path
 from typing import Callable, Optional
 
 
@@ -59,6 +60,7 @@ def _main_menu(stdscr: "curses.window", container) -> None:
         stdscr.nodelay(True)
 
     items = [
+        MenuItem("Diagnostics / Logs", lambda: _diagnostics_browser(stdscr, container)),
         MenuItem("Catalog Status", lambda: show_message(_status_text(container))),
         MenuItem("Refresh Catalog", lambda: show_message(_refresh_text(container))),
         MenuItem("Health Check", lambda: show_message(_health_text(container))),
@@ -144,3 +146,56 @@ def _cache_text(container) -> str:
         f"Free:    {fmt(summary['free_bytes'])}\n"
         f"Quota:   {fmt(summary['total_bytes'])} / {fmt(summary['max_bytes'])}\n"
     )
+
+
+def _diagnostics_browser(stdscr: "curses.window", container) -> None:
+    """Controller-friendly, bounded newest-first browser with operation drill-in."""
+    from romcloud.infrastructure.diagnostics import DiagnosticQuery, DiagnosticStore
+
+    store = DiagnosticStore(Path(container.config.data_path) / "diagnostics.db")
+    if not store.initialize():
+        return
+    page = 1
+    selected = 0
+    operation_id = None
+    while True:
+        events = store.query(
+            DiagnosticQuery(
+                page=page, page_size=20, operation_id=operation_id,
+                chronological=operation_id is not None,
+            )
+        )
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+        title = "Diagnostics — operation chain" if operation_id else "Diagnostics — newest first"
+        stdscr.addstr(1, 2, title[: w - 4], curses.A_BOLD)
+        for index, item in enumerate(events[: max(0, h - 5)]):
+            stamp = str(item["timestamp_utc"])[11:19]
+            line = f"{stamp} {item['level']:<7} {item['subsystem']}: {item['message']}"
+            stdscr.addstr(3 + index, 2, line[: w - 4], curses.A_REVERSE if index == selected else 0)
+        stdscr.addstr(h - 1, 2, "↑↓ select  ←→ page  Enter operation  B/Esc back"[: w - 4])
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch in (curses.KEY_UP, ord("k")) and events:
+            selected = (selected - 1) % len(events)
+        elif ch in (curses.KEY_DOWN, ord("j")) and events:
+            selected = (selected + 1) % len(events)
+        elif ch == curses.KEY_RIGHT:
+            page += 1
+            selected = 0
+        elif ch == curses.KEY_LEFT:
+            page = max(1, page - 1)
+            selected = 0
+        elif ch in (curses.KEY_ENTER, ord("\n"), ord("\r")) and events:
+            selected_id = events[selected].get("operation_id")
+            if selected_id:
+                operation_id = str(selected_id)
+                page = 1
+                selected = 0
+        elif ch in (ord("q"), ord("Q"), 27):
+            if operation_id:
+                operation_id = None
+                page = 1
+                selected = 0
+            else:
+                return

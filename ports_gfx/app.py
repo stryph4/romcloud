@@ -171,6 +171,11 @@ MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
         MenuItem("Unmount", "connection-unmount"),
     ),
     "Maintenance": (
+        MenuItem(
+            "Diagnostics / Logs",
+            "diagnostics",
+            "Browse the newest redacted ROMCloud diagnostic events.",
+        ),
         MenuItem("Check for Updates", "update-check"),
         MenuItem("Update ROMCloud", "update-install"),
         MenuItem("Health Check", "healthcheck"),
@@ -432,6 +437,41 @@ def format_result(action: str, result: BackendResult) -> str:
     """
     if not result.ok:
         return f"Error: {result.error}"
+    if action == "diagnostics":
+        events = result.data.get("events", [])
+        operations = result.data.get("operations", [])
+        if not isinstance(events, list) or not events:
+            return "Diagnostics / Logs: no matching events"
+        operation_lines = []
+        if isinstance(operations, list) and operations:
+            operation_lines.append("SaveSync operations:")
+            for operation in operations[:8]:
+                if not isinstance(operation, dict):
+                    continue
+                stamp = str(operation.get("timestamp_utc", ""))[11:19]
+                generation = operation.get("generation")
+                generation_text = f" gen={generation}" if generation is not None else ""
+                operation_lines.append(
+                    f"{stamp} {operation.get('name', 'SaveSync')} - "
+                    f"{operation.get('status', 'unknown')}{generation_text} "
+                    f"up={operation.get('uploaded', 0)} "
+                    f"down={operation.get('downloaded', 0)} "
+                    f"conflicts={operation.get('conflicts', 0)}"
+                )
+            operation_lines.append("Raw events:")
+        lines = [f"Diagnostics / Logs — page {result.data.get('page', 1)}"]
+        lines.extend(operation_lines)
+        for item in events[:20]:
+            if not isinstance(item, dict):
+                continue
+            stamp = str(item.get("timestamp_utc", ""))[11:19]
+            lines.append(
+                f"{stamp} {item.get('level', ''):<7} "
+                f"{item.get('subsystem', '')}: {item.get('message', '')}"
+            )
+        if result.data.get("has_more"):
+            lines.append("More events are available through paginated diagnostics queries.")
+        return "\n".join(lines)
     if action == "connection-status":
         state = str(result.data.get("state", "unknown")).replace("_", " ").title()
         source = result.data.get("source", "")
