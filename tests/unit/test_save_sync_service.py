@@ -1723,38 +1723,88 @@ class TestSaveSyncFinalizationSafety:
         assert local.read_bytes() == b"known-local"
         assert service.get_state().last_download is None
 
-    def test_shared_layout_disjoint_changes_are_one_explicit_conflict(
+    def test_duckstation_independent_cards_reconcile_without_cross_card_conflict(
         self, tmp_path, service
     ):
+        # Two distinct DuckStation cards diverging in opposite directions
+        # must never be conflated into one whole-namespace conflict: each
+        # physical card is its own conflict unit, so this converges cleanly
+        # with no conflict and no unrelated card touched.
         card1 = tmp_path / "local-saves/duckstation/memcards/card1.mcd"
         card2 = tmp_path / "local-saves/duckstation/memcards/card2.mcd"
         _write(card1, b"card-one-base")
         _write(card2, b"card-two-base")
         service.commit_upload(service.preview_upload())
         card1.write_bytes(b"card-one-local")
+        remote_card1 = tmp_path / "remote-saves/duckstation/memcards/card1.mcd"
         remote_card2 = tmp_path / "remote-saves/duckstation/memcards/card2.mcd"
         remote_card2.write_bytes(b"card-two-remote")
 
         plan = service.preview_reconciliation()
+
+        assert [entry.relative_path for entry in plan.uploads] == [
+            "duckstation/memcards/card1.mcd"
+        ]
+        assert [entry.relative_path for entry in plan.downloads] == [
+            "duckstation/memcards/card2.mcd"
+        ]
+        assert plan.conflicts == ()
+
         report = service.reconcile()
 
-        assert {entry.relative_path for entry in plan.conflicts} == {
-            "duckstation/memcards/card1.mcd",
-            "duckstation/memcards/card2.mcd",
-        }
-        assert report.conflicts == 2
+        assert report.uploaded == 1
+        assert report.downloaded == 1
+        assert report.conflicts == 0
         assert card1.read_bytes() == b"card-one-local"
-        assert card2.read_bytes() == b"card-two-base"
+        assert remote_card1.read_bytes() == b"card-one-local"
+        assert card2.read_bytes() == b"card-two-remote"
         assert remote_card2.read_bytes() == b"card-two-remote"
-        reloaded = SaveSyncService(
-            provider=service._provider,
-            connectivity_root=service._connectivity_root,
-            local_root=str(service._local_root),
-            remote_root=str(service._remote_root),
-            state_path=service._state_path,
-        ).get_state()
-        assert len(reloaded.active_conflicts) == 1
-        assert reloaded.active_conflicts[0].acknowledged_at is None
+        assert not service.get_state().active_conflicts
+
+    def test_duckstation_card_conflict_resolution_never_touches_unrelated_cards(
+        self, tmp_path, service
+    ):
+        from romcloud.core.models.savesync import SaveConflictResolution
+
+        # Regression for the real-world data-loss shape: resolving the one
+        # card that actually conflicts must never replace or delete other
+        # cards in the same directory (an identical card, a local-only card,
+        # and a remote-only card all coexist here).
+        conflict_local = tmp_path / "local-saves/duckstation/memcards/007.mcd"
+        conflict_remote = tmp_path / "remote-saves/duckstation/memcards/007.mcd"
+        identical_local = tmp_path / "local-saves/duckstation/memcards/resident_evil.mcd"
+        identical_remote = tmp_path / "remote-saves/duckstation/memcards/resident_evil.mcd"
+        _write(conflict_local, b"007-base")
+        _write(identical_local, b"resident-evil-clear")
+        service.commit_upload(service.preview_upload())
+
+        conflict_local.write_bytes(b"007-local-change")
+        conflict_remote.write_bytes(b"007-remote-change")
+        local_only = tmp_path / "local-saves/duckstation/memcards/metal_gear_solid.mcd"
+        _write(local_only, b"mgs-local-only")
+        remote_only = tmp_path / "remote-saves/duckstation/memcards/final_fantasy_viii.mcd"
+        _write(remote_only, b"ff8-remote-only")
+
+        service.reconcile()
+        active = service.get_state().active_conflicts
+        assert len(active) == 1
+        assert active[0].group_id.endswith("/007")
+
+        service.resolve_conflict(active[0].conflict_id, SaveConflictResolution.KEEP_LOCAL)
+        # Reconcile the rest of the namespace (the still-unrelated one-sided
+        # additions) the way a real Quick Sync would.
+        service.reconcile()
+
+        assert conflict_local.read_bytes() == b"007-local-change"
+        assert conflict_remote.read_bytes() == b"007-local-change"
+        assert identical_local.read_bytes() == b"resident-evil-clear"
+        assert identical_remote.read_bytes() == b"resident-evil-clear"
+        local_only_remote = tmp_path / "remote-saves/duckstation/memcards/metal_gear_solid.mcd"
+        remote_only_local = tmp_path / "local-saves/duckstation/memcards/final_fantasy_viii.mcd"
+        assert local_only.read_bytes() == b"mgs-local-only"
+        assert local_only_remote.read_bytes() == b"mgs-local-only"
+        assert remote_only.read_bytes() == b"ff8-remote-only"
+        assert remote_only_local.read_bytes() == b"ff8-remote-only"
 
     def test_dolphin_shared_memory_card_divergence_is_an_explicit_conflict(
         self, tmp_path, service

@@ -219,6 +219,34 @@ class TestPCSX2:
         policy = DEFAULT_SAVE_SELECTION_POLICY
         assert policy.is_included("pcsx2", "videos/Game.mp4") is False
 
+    def test_independent_memory_card_slots_are_independent_conflict_units(self):
+        # Multiple enabled PCSX2 memory-card slots are independent physical
+        # cards; grouping the whole layout together would let resolving one
+        # slot's conflict replace or delete an unrelated slot.
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+
+        legacy_first = policy.group_for_path("pcsx2/Mcd001.ps2")
+        legacy_second = policy.group_for_path("pcsx2/Mcd002.ps2")
+        current_first = policy.group_for_path("ps2/pcsx2/Mcd001.ps2")
+        current_second = policy.group_for_path("ps2/pcsx2/Mcd002.ps2")
+
+        assert legacy_first is not None and legacy_second is not None
+        assert current_first is not None and current_second is not None
+        assert legacy_first.shared is True and current_first.shared is True
+        assert legacy_first.group_id != legacy_second.group_id
+        assert current_first.group_id != current_second.group_id
+
+    def test_sibling_folder_memory_cards_are_independent_conflict_units(self):
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+
+        first = policy.group_for_path("ps2/pcsx2/Card1/SAVE-A/data")
+        second = policy.group_for_path("ps2/pcsx2/Card2/SAVE-A/data")
+
+        assert first is not None and second is not None
+        assert first.shared is True and second.shared is True
+        assert first.group_id != second.group_id
+        assert first.container_id != second.container_id
+
 
 class TestPPSSPP:
     def test_savedata_included(self):
@@ -664,14 +692,25 @@ class TestPositiveLayoutRegistry:
     def test_shared_layouts_are_explicit_and_use_safe_dataset_group(self):
         policy = DEFAULT_SAVE_SELECTION_POLICY
 
-        first = policy.group_for_path("duckstation/memcards/card1.mcd")
-        second = policy.group_for_path("duckstation/memcards/card2.mcd")
         xenia = policy.group_for_path("xbox360/0000000000000000/save/data.bin")
 
-        assert first is not None and second is not None and xenia is not None
-        assert first.shared is True
-        assert first.group_id == second.group_id
+        assert xenia is not None
         assert xenia.shared is True
+
+    def test_duckstation_cards_are_shared_but_independent_conflict_units(self):
+        # Unlike Xenia's genuinely indivisible content tree, DuckStation can
+        # emit one independently named card per game; each physical card
+        # must be its own conflict unit so resolving one card's conflict can
+        # never replace or discard an unrelated card in the same directory.
+        policy = DEFAULT_SAVE_SELECTION_POLICY
+
+        first = policy.group_for_path("duckstation/memcards/card1.mcd")
+        second = policy.group_for_path("duckstation/memcards/card2.mcd")
+
+        assert first is not None and second is not None
+        assert first.shared is True and second.shared is True
+        assert first.group_id != second.group_id
+
 
     def test_dynamic_title_layouts_produce_stable_groups(self):
         policy = DEFAULT_SAVE_SELECTION_POLICY

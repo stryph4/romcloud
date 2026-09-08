@@ -811,6 +811,89 @@ def test_service_keeps_ps2_file_cards_opaque_with_automatic_container_merging(
     assert service.get_state().container_baselines == ()
 
 
+def test_pcsx2_independent_memory_card_slots_reconcile_without_cross_card_conflict(
+    tmp_path: Path,
+) -> None:
+    # Batocera/PCSX2 can enable multiple independent card slots
+    # (Mcd001.ps2, Mcd002.ps2, ...). Two slots diverging in opposite
+    # directions must never be conflated into one whole-namespace conflict:
+    # each physical card is its own conflict unit.
+    service = _container_service(tmp_path)
+    card1 = tmp_path / "local/ps2/pcsx2/Mcd001.ps2"
+    card2 = tmp_path / "local/ps2/pcsx2/Mcd002.ps2"
+    card1.parent.mkdir(parents=True)
+    card1.write_bytes(b"card-one-base")
+    card2.write_bytes(b"card-two-base")
+    service.commit_upload(service.preview_upload())
+    card1.write_bytes(b"card-one-local")
+    remote_card1 = tmp_path / "remote/ps2/pcsx2/Mcd001.ps2"
+    remote_card2 = tmp_path / "remote/ps2/pcsx2/Mcd002.ps2"
+    remote_card2.write_bytes(b"card-two-remote")
+
+    plan = service.preview_reconciliation()
+
+    assert [entry.relative_path for entry in plan.uploads] == ["ps2/pcsx2/Mcd001.ps2"]
+    assert [entry.relative_path for entry in plan.downloads] == ["ps2/pcsx2/Mcd002.ps2"]
+    assert plan.conflicts == ()
+
+    report = service.reconcile()
+
+    assert report.uploaded == 1
+    assert report.downloaded == 1
+    assert report.conflicts == 0
+    assert card1.read_bytes() == b"card-one-local"
+    assert remote_card1.read_bytes() == b"card-one-local"
+    assert card2.read_bytes() == b"card-two-remote"
+    assert remote_card2.read_bytes() == b"card-two-remote"
+    assert not service.get_state().active_conflicts
+
+
+def test_pcsx2_memory_card_conflict_resolution_never_touches_unrelated_cards(
+    tmp_path: Path,
+) -> None:
+    from romcloud.core.models.savesync import SaveConflictResolution
+
+    # Regression for the same data-loss shape proven for DuckStation:
+    # resolving the one card slot that actually conflicts must never
+    # replace or delete unrelated card slots (an identical card, a
+    # local-only card, and a remote-only card all coexist here).
+    service = _container_service(tmp_path)
+    conflict_local = tmp_path / "local/ps2/pcsx2/Mcd001.ps2"
+    conflict_remote = tmp_path / "remote/ps2/pcsx2/Mcd001.ps2"
+    identical_local = tmp_path / "local/ps2/pcsx2/Mcd002.ps2"
+    identical_remote = tmp_path / "remote/ps2/pcsx2/Mcd002.ps2"
+    conflict_local.parent.mkdir(parents=True)
+    conflict_local.write_bytes(b"card-one-base")
+    identical_local.write_bytes(b"gran-turismo-card")
+    service.commit_upload(service.preview_upload())
+
+    conflict_local.write_bytes(b"card-one-local-change")
+    conflict_remote.write_bytes(b"card-one-remote-change")
+    local_only = tmp_path / "local/ps2/pcsx2/Mcd003.ps2"
+    local_only.write_bytes(b"metal-gear-solid-3-local-only")
+    remote_only = tmp_path / "remote/ps2/pcsx2/Mcd004.ps2"
+    remote_only.write_bytes(b"final-fantasy-x-remote-only")
+
+    service.reconcile()
+    active = service.get_state().active_conflicts
+    assert len(active) == 1
+    assert active[0].group_id.endswith("/mcd001")
+
+    service.resolve_conflict(active[0].conflict_id, SaveConflictResolution.KEEP_LOCAL)
+    service.reconcile()
+
+    assert conflict_local.read_bytes() == b"card-one-local-change"
+    assert conflict_remote.read_bytes() == b"card-one-local-change"
+    assert identical_local.read_bytes() == b"gran-turismo-card"
+    assert identical_remote.read_bytes() == b"gran-turismo-card"
+    remote_only_local = tmp_path / "local/ps2/pcsx2/Mcd004.ps2"
+    local_only_remote = tmp_path / "remote/ps2/pcsx2/Mcd003.ps2"
+    assert local_only.read_bytes() == b"metal-gear-solid-3-local-only"
+    assert local_only_remote.read_bytes() == b"metal-gear-solid-3-local-only"
+    assert remote_only.read_bytes() == b"final-fantasy-x-remote-only"
+    assert remote_only_local.read_bytes() == b"final-fantasy-x-remote-only"
+
+
 def test_service_automatically_merges_ps2_folder_card_with_complete_versioned_grouping(
     tmp_path: Path,
 ) -> None:

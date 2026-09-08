@@ -432,13 +432,26 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
         recursive=True,
         exclusions=("*_resume.sav",),
         shared=True,
-        group_by="layout",
+        # Each physical .mcd is an independently named, independently
+        # addressable card (DuckStation can emit one per game), not one
+        # shared indivisible namespace. Grouping conflicts by the whole
+        # layout would let resolving one card's conflict silently replace
+        # or delete every unrelated card in the directory. One group per
+        # physical card keeps that blast radius to the card that actually
+        # diverged; per-domain merging inside a card is still handled by
+        # the ps1-raw-memory-card container adapter below.
+        group_by="root_file",
         lifecycle_systems=("psx",),
         lifecycle_emulators=("duckstation",),
         lifecycle_cores=("duckstation",),
         container_adapter_id="ps1-raw-memory-card",
         container_policy_id="ps1-commercial-namespace",
         container_kind="file",
+        description=(
+            "Per-card DuckStation raw memory-card images; each physical "
+            "card is an independent conflict unit, with commercial-game "
+            "domains inside a valid 128 KiB card merged automatically"
+        ),
     ),
     _layout(
         "duckstation-root-sav",
@@ -451,7 +464,13 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
     ),
     _layout(
         "pcsx2-legacy-memory-cards", "pcsx2", files=("Mcd*.ps2",),
-        shared=True, group_by="layout", lifecycle_systems=("ps2", "pcsx2"),
+        shared=True,
+        # Batocera/PCSX2 can enable multiple independent card slots
+        # (Mcd001.ps2, Mcd002.ps2, ...); grouping the whole layout together
+        # would let resolving one slot's conflict replace or delete an
+        # unrelated slot. Each physical card file is its own conflict unit;
+        # a single card's own contents still stay opaque (unproven format).
+        group_by="root_file", lifecycle_systems=("ps2", "pcsx2"),
         container_adapter_id="pcsx2-monolithic-file-card",
         container_policy_id="opaque-only",
         container_kind="file",
@@ -465,8 +484,11 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
     ),
     _layout(
         "pcsx2-memory-cards", "ps2", root="pcsx2", files=("Mcd*.ps2",),
-        shared=True, group_by="layout", lifecycle_systems=("ps2", "pcsx2"),
-        description="Opaque monolithic PCSX2 .ps2 memory-card images",
+        shared=True,
+        # Same independent-slot reasoning as pcsx2-legacy-memory-cards: each
+        # Mcd*.ps2 file is its own physical card and conflict unit.
+        group_by="root_file", lifecycle_systems=("ps2", "pcsx2"),
+        description="Opaque monolithic PCSX2 .ps2 memory-card images; each card is an independent conflict unit",
         container_adapter_id="pcsx2-monolithic-file-card",
         container_policy_id="opaque-only",
         container_kind="file",
