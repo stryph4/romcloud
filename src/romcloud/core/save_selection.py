@@ -65,6 +65,13 @@ BATOCERA_SAVE_ROOT_MAPPINGS: tuple[BatoceraSaveRootMapping, ...] = (
         activation_markers=("system/configs/citron/qt-config.ini",),
     ),
     BatoceraSaveRootMapping(
+        mapping_id="yuzu-switch-user-saves",
+        emulator="yuzu",
+        physical_root="system/configs/yuzu/nand/user/save",
+        canonical_prefix="yuzu",
+        activation_markers=("system/configs/yuzu/qt-config.ini",),
+    ),
+    BatoceraSaveRootMapping(
         mapping_id="ymir-persistent-state",
         emulator="ymir",
         physical_root="system/configs/ymir/state",
@@ -72,6 +79,15 @@ BATOCERA_SAVE_ROOT_MAPPINGS: tuple[BatoceraSaveRootMapping, ...] = (
         activation_markers=("system/configs/ymir/Ymir.toml",),
     ),
 )
+
+# Recent Batocera Update Assistant (BUA) Switch emulator installs no longer
+# give Eden/Citron/Yuzu each an independent physical nand/user/save — every
+# compatible fork's config path is instead a symlink alias into this one
+# shared physical tree, relative to ``/userdata``. This is the only alias
+# target ROMCloud's Switch save-root resolution trusts; see
+# ``romcloud.bootstrap.container._resolve_audited_switch_physical_root``.
+SWITCH_SHARED_CANONICAL_SAVE_ROOT = "saves/switch/eden_citron/save/save_user"
+
 
 
 def _match(path: str, pattern: str) -> bool:

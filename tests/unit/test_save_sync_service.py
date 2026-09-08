@@ -211,6 +211,166 @@ class TestBatoceraSaveSelection:
 
         assert _batocera_mapped_save_roots(local_saves) == ()
 
+
+class TestBuaSwitchAliasTopology:
+    """Reproduces the real Batocera Update Assistant (BUA) Switch layout:
+
+    every compatible fork's ``nand/user/save`` is a symlink alias into one
+    shared physical directory, rather than an independent real directory.
+    """
+
+    @staticmethod
+    def _canonical_root(userdata: Path) -> Path:
+        from romcloud.core.save_selection import SWITCH_SHARED_CANONICAL_SAVE_ROOT
+
+        return userdata / SWITCH_SHARED_CANONICAL_SAVE_ROOT
+
+    def _symlink_alias(self, alias: Path, target: Path) -> None:
+        alias.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            alias.symlink_to(target, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlink creation is unavailable on this platform")
+
+    def test_eden_and_citron_aliases_collapse_into_one_canonical_root(
+        self, tmp_path: Path
+    ):
+        from romcloud.bootstrap.container import _batocera_mapped_save_roots
+
+        userdata = tmp_path / "userdata"
+        canonical = self._canonical_root(userdata)
+        account = "0123456789abcdef0123456789abcdef"
+        title = "010093801237c000"
+        (canonical / "0000000000000000" / account / title).mkdir(parents=True)
+        self._symlink_alias(
+            userdata / "system/configs/eden/nand/user/save", canonical
+        )
+        self._symlink_alias(
+            userdata / "system/configs/citron/nand/user/save", canonical
+        )
+
+        result = _batocera_mapped_save_roots(userdata / "saves")
+
+        assert result == (("eden-switch-user-saves", str(canonical), "yuzu"),)
+
+    def test_yuzu_eden_and_citron_aliases_all_collapse_into_one_canonical_root(
+        self, tmp_path: Path
+    ):
+        from romcloud.bootstrap.container import _batocera_mapped_save_roots
+
+        userdata = tmp_path / "userdata"
+        canonical = self._canonical_root(userdata)
+        account = "0123456789abcdef0123456789abcdef"
+        title = "010093801237c000"
+        (canonical / "0000000000000000" / account / title).mkdir(parents=True)
+        self._symlink_alias(
+            userdata / "system/configs/yuzu/nand/user/save", canonical
+        )
+        self._symlink_alias(
+            userdata / "system/configs/eden/nand/user/save", canonical
+        )
+        self._symlink_alias(
+            userdata / "system/configs/citron/nand/user/save", canonical
+        )
+
+        result = _batocera_mapped_save_roots(userdata / "saves")
+
+        # Registry order (eden, citron, yuzu) makes selection deterministic;
+        # the same physical save is never reconciled through more than one alias.
+        assert result == (("eden-switch-user-saves", str(canonical), "yuzu"),)
+
+    def test_bua_alias_download_materializes_into_canonical_root_without_symlink_error(
+        self, tmp_path: Path, provider: "_FakeProvider"
+    ):
+        from romcloud.bootstrap.container import _batocera_mapped_save_roots
+
+        userdata = tmp_path / "userdata"
+        local_saves = userdata / "saves"
+        local_saves.mkdir(parents=True)
+        canonical = self._canonical_root(userdata)
+        relative = (
+            Path("0000000000000000")
+            / "0123456789ABCDEF0123456789ABCDEF"
+            / "010093801237C000"
+            / "save.dat"
+        )
+        canonical_physical = canonical / relative
+        _write(canonical_physical, b"switch-progress")
+        self._symlink_alias(
+            userdata / "system/configs/eden/nand/user/save", canonical
+        )
+
+        mapped_roots = _batocera_mapped_save_roots(local_saves)
+        assert mapped_roots == (("eden-switch-user-saves", str(canonical), "yuzu"),)
+
+        service = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "remote-data"),
+            local_root=str(local_saves),
+            remote_root=str(tmp_path / "remote-saves"),
+            state_path=tmp_path / "data/savesync-state.json",
+            mapped_local_roots=mapped_roots,
+        )
+
+        # This previously raised "SaveSync destination root has a symlinked
+        # ancestor" because the raw emulator-facing alias was used directly.
+        service.commit_upload(service.preview_upload())
+        canonical_physical.unlink()
+        service.commit_download(service.preview_download())
+
+        assert canonical_physical.read_bytes() == b"switch-progress"
+        remote_copy = tmp_path / "remote-saves/yuzu" / relative
+        assert remote_copy.read_bytes() == b"switch-progress"
+
+    def test_escaping_switch_alias_is_rejected_not_trusted(self, tmp_path: Path):
+        from romcloud.bootstrap.container import _batocera_mapped_save_roots
+
+        userdata = tmp_path / "userdata"
+        escape_target = tmp_path / "outside-userdata-escape"
+        escape_target.mkdir(parents=True)
+        self._symlink_alias(
+            userdata / "system/configs/eden/nand/user/save", escape_target
+        )
+
+        assert _batocera_mapped_save_roots(userdata / "saves") == ()
+
+    def test_broken_switch_alias_is_rejected_not_trusted(self, tmp_path: Path):
+        from romcloud.bootstrap.container import _batocera_mapped_save_roots
+
+        userdata = tmp_path / "userdata"
+        missing_target = userdata / "saves/switch/eden_citron/save/save_user"
+        self._symlink_alias(
+            userdata / "system/configs/eden/nand/user/save", missing_target
+        )
+
+        assert _batocera_mapped_save_roots(userdata / "saves") == ()
+
+    def test_looping_switch_alias_is_rejected_not_trusted(self, tmp_path: Path):
+        from romcloud.bootstrap.container import _batocera_mapped_save_roots
+
+        userdata = tmp_path / "userdata"
+        alias = userdata / "system/configs/eden/nand/user/save"
+        self._symlink_alias(alias, alias)
+
+        assert _batocera_mapped_save_roots(userdata / "saves") == ()
+
+    def test_global_transaction_symlink_safety_is_unchanged_for_arbitrary_destinations(
+        self, tmp_path: Path
+    ):
+        """The Switch alias carve-out never widens the general prohibition
+        against staging/materializing through an arbitrary symlinked root."""
+        real_dir = tmp_path / "real-destination"
+        real_dir.mkdir()
+        arbitrary_alias = tmp_path / "unrelated-system-save-root"
+        try:
+            arbitrary_alias.symlink_to(real_dir, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlink creation is unavailable on this platform")
+
+        with pytest.raises(SaveSyncError, match="symlinked ancestor"):
+            save_transaction._validated_root(arbitrary_alias)
+
+
     @pytest.mark.parametrize(
         "relative",
         (

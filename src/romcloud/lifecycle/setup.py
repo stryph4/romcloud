@@ -753,6 +753,24 @@ def browse_sftp_directory(
     }
 
 
+def _save_sync_requires_reinitialization(
+    existing: AppConfig | None, config: AppConfig
+) -> bool:
+    """Explicit, audited list of setup changes that invalidate an existing
+    SaveSync Quick Sync baseline.
+
+    Anything else — cache size, selected systems, library sync, credential
+    rotation for the *same* remote location, etc. — must never force a rerun
+    of Initial Full Sync; a completed baseline is preserved and reused.
+    """
+    if existing is None:
+        return True
+    return (
+        existing.remote_data != config.remote_data
+        or existing.saves.local_path != config.saves.local_path
+    )
+
+
 def apply_setup(
     config_path: Path, payload: dict[str, Any], progress: ProgressSink = None
 ) -> dict[str, Any]:
@@ -917,84 +935,114 @@ def apply_setup(
             config.remote_data is not None
             and container.saves._remote_supports_durable_transactions()  # noqa: SLF001
         ):
-            step = "initialize SaveSync"
-            _write_state(state_path, {"status": "applying", "step": step})
-            emit_progress(
-                progress,
-                "configure",
-                "savesync_initialize",
-                "running",
-                "Initializing SaveSync with an Initial Full Sync…",
+            existing_save_sync_state = container.saves.get_state()
+            needs_initial_full_sync = (
+                not existing_save_sync_state.quick_sync_ready
+                or existing_save_sync_state.quick_sync_cursor_generation is None
+                or _save_sync_requires_reinitialization(existing, config)
             )
-            log.info(
-                "SaveSync bootstrap: entering Initial Full Sync (remote_data_provider=%s)",
-                config.remote_data.provider,
-            )
-            save_sync_report = container.saves.full_sync(progress=progress)
-            save_sync_state = container.saves.get_state()
-            active_conflicts = tuple(
-                getattr(save_sync_state, "active_conflicts", ())
-            )
-            save_conflict_ids = tuple(
-                conflict.conflict_id for conflict in active_conflicts
-            )
-            log.info(
-                "SaveSync bootstrap: full_sync() returned uploaded=%d downloaded=%d "
-                "unchanged=%d conflicts=%d scope=%s bootstrap=%s",
-                save_sync_report.uploaded,
-                save_sync_report.downloaded,
-                save_sync_report.unchanged,
-                save_sync_report.conflicts,
-                save_sync_report.scope,
-                save_sync_report.bootstrap,
-            )
-            log.info(
-                "SaveSync bootstrap: reconciliation succeeded; unresolved_conflict_count=%d",
-                len(save_conflict_ids),
-            )
-            log.info(
-                "SaveSync bootstrap: baseline/journal state — quick_sync_ready=%s "
-                "quick_sync_cursor_generation=%s",
-                save_sync_state.quick_sync_ready,
-                save_sync_state.quick_sync_cursor_generation,
-            )
-            if (
-                not save_sync_state.quick_sync_ready
-                or save_sync_state.quick_sync_cursor_generation is None
-            ):
-                log.error(
-                    "SaveSync bootstrap: Auto SaveSync readiness — not ready; setup "
-                    "marked failed (condition=missing-quick-sync-baseline, "
-                    "quick_sync_ready=%s, quick_sync_cursor_generation=%s)",
+            if needs_initial_full_sync:
+                step = "initialize SaveSync"
+                _write_state(state_path, {"status": "applying", "step": step})
+                emit_progress(
+                    progress,
+                    "configure",
+                    "savesync_initialize",
+                    "running",
+                    "Initializing SaveSync with an Initial Full Sync…",
+                )
+                log.info(
+                    "SaveSync bootstrap: entering Initial Full Sync (remote_data_provider=%s)",
+                    config.remote_data.provider,
+                )
+                save_sync_report = container.saves.full_sync(progress=progress)
+                save_sync_state = container.saves.get_state()
+                active_conflicts = tuple(
+                    getattr(save_sync_state, "active_conflicts", ())
+                )
+                save_conflict_ids = tuple(
+                    conflict.conflict_id for conflict in active_conflicts
+                )
+                log.info(
+                    "SaveSync bootstrap: full_sync() returned uploaded=%d downloaded=%d "
+                    "unchanged=%d conflicts=%d scope=%s bootstrap=%s",
+                    save_sync_report.uploaded,
+                    save_sync_report.downloaded,
+                    save_sync_report.unchanged,
+                    save_sync_report.conflicts,
+                    save_sync_report.scope,
+                    save_sync_report.bootstrap,
+                )
+                log.info(
+                    "SaveSync bootstrap: reconciliation succeeded; unresolved_conflict_count=%d",
+                    len(save_conflict_ids),
+                )
+                log.info(
+                    "SaveSync bootstrap: baseline/journal state — quick_sync_ready=%s "
+                    "quick_sync_cursor_generation=%s",
                     save_sync_state.quick_sync_ready,
                     save_sync_state.quick_sync_cursor_generation,
                 )
-                raise RuntimeError(
-                    "Initial Full Sync completed without establishing a trusted "
-                    "Quick Sync baseline"
+                if (
+                    not save_sync_state.quick_sync_ready
+                    or save_sync_state.quick_sync_cursor_generation is None
+                ):
+                    log.error(
+                        "SaveSync bootstrap: Auto SaveSync readiness — not ready; setup "
+                        "marked failed (condition=missing-quick-sync-baseline, "
+                        "quick_sync_ready=%s, quick_sync_cursor_generation=%s)",
+                        save_sync_state.quick_sync_ready,
+                        save_sync_state.quick_sync_cursor_generation,
+                    )
+                    raise RuntimeError(
+                        "Initial Full Sync completed without establishing a trusted "
+                        "Quick Sync baseline"
+                    )
+                log.info(
+                    "SaveSync bootstrap: Auto SaveSync readiness — ready "
+                    "(unresolved conflicts pending=%d do not block setup completion)",
+                    len(save_conflict_ids),
                 )
-            log.info(
-                "SaveSync bootstrap: Auto SaveSync readiness — ready "
-                "(unresolved conflicts pending=%d do not block setup completion)",
-                len(save_conflict_ids),
-            )
-            emit_progress(
-                progress,
-                "configure",
-                "savesync_initialize",
-                "warning" if save_conflict_ids else "success",
-                (
-                    "SaveSync initialized — "
-                    f"{len(save_conflict_ids)} save group(s) need attention"
-                    if save_conflict_ids
-                    else "Initial Full Sync complete — Auto SaveSync baseline ready"
-                ),
-                metadata=(
-                    save_sync_report.to_dict()
-                    if hasattr(save_sync_report, "to_dict")
-                    else None
-                ),
-            )
+                emit_progress(
+                    progress,
+                    "configure",
+                    "savesync_initialize",
+                    "warning" if save_conflict_ids else "success",
+                    (
+                        "SaveSync initialized — "
+                        f"{len(save_conflict_ids)} save group(s) need attention"
+                        if save_conflict_ids
+                        else "Initial Full Sync complete — Auto SaveSync baseline ready"
+                    ),
+                    metadata=(
+                        save_sync_report.to_dict()
+                        if hasattr(save_sync_report, "to_dict")
+                        else None
+                    ),
+                )
+            else:
+                save_sync_state = existing_save_sync_state
+                active_conflicts = tuple(
+                    getattr(save_sync_state, "active_conflicts", ())
+                )
+                save_conflict_ids = tuple(
+                    conflict.conflict_id for conflict in active_conflicts
+                )
+                log.info(
+                    "SaveSync bootstrap: skipped Initial Full Sync — existing baseline "
+                    "remains valid for this configuration (quick_sync_ready=%s "
+                    "quick_sync_cursor_generation=%s unresolved_conflict_count=%d)",
+                    save_sync_state.quick_sync_ready,
+                    save_sync_state.quick_sync_cursor_generation,
+                    len(save_conflict_ids),
+                )
+                emit_progress(
+                    progress,
+                    "configure",
+                    "savesync_initialize",
+                    "success",
+                    "SaveSync already initialized — Initial Full Sync skipped",
+                )
         # SaveSync must establish its baseline before Direct routing hides the
         # local directories behind emulator-visible remote bind mounts.
         if config.source.enabled:

@@ -1618,3 +1618,205 @@ class TestApply:
         state_text = (config_path.parent / graphical_setup.SETUP_STATE_FILENAME).read_text()
         assert "target busy" in state_text
         assert "remote-secret-value" not in state_text
+
+
+class TestSaveSyncBootstrapSkipping:
+    """Initial Full Sync is bootstrap behavior, not a consequence of
+    reopening setup to change an unrelated setting (Bug 2)."""
+
+    @staticmethod
+    def _persistent_container_factory(calls, state_holder, *, full_sync_error=None):
+        """*state_holder* is one mutable dict shared across every
+        ``Container(config)`` construction in a test, mirroring how real
+        SaveSync state persists on disk across separate setup invocations."""
+
+        def factory(config):
+            def full_sync(progress=None):
+                calls.append("full-sync")
+                if full_sync_error is not None:
+                    raise full_sync_error
+                state_holder["quick_sync_ready"] = True
+                state_holder["quick_sync_cursor_generation"] = (
+                    state_holder.get("quick_sync_cursor_generation") or 0
+                ) + 1
+                return SimpleNamespace(
+                    uploaded=0,
+                    downloaded=0,
+                    unchanged=0,
+                    conflicts=0,
+                    scope="all_eligible",
+                    bootstrap=True,
+                    to_dict=lambda: {
+                        "uploaded": 0,
+                        "downloaded": 0,
+                        "unchanged": 0,
+                        "conflicts": 0,
+                        "scope": "all_eligible",
+                        "bootstrap": True,
+                    },
+                )
+
+            def get_state():
+                return SimpleNamespace(
+                    quick_sync_ready=state_holder.get("quick_sync_ready", False),
+                    quick_sync_cursor_generation=state_holder.get(
+                        "quick_sync_cursor_generation"
+                    ),
+                    active_conflicts=(),
+                )
+
+            return SimpleNamespace(
+                config=config,
+                provider=SimpleNamespace(
+                    validate_access=lambda root: StorageAccessResult(True, True)
+                ),
+                catalog=SimpleNamespace(
+                    refresh=lambda progress=None: SimpleNamespace(errors=())
+                ),
+                game_repo=SimpleNamespace(list_systems=lambda: ["psx"]),
+                saves=SimpleNamespace(
+                    is_remote_reachable=lambda: True,
+                    validate_remote_storage=lambda: StorageAccessResult(
+                        True, True, write_verified=True, cleanup_verified=True
+                    ),
+                    full_sync=full_sync,
+                    get_state=get_state,
+                    _remote_supports_durable_transactions=lambda: True,
+                    selection_policy=SimpleNamespace(),
+                    filesystem_remote_root=Path(config.data_path) / "remote-saves",
+                ),
+            )
+
+        return factory
+
+    def test_fresh_setup_runs_initial_full_sync_exactly_once(
+        self, tmp_path, monkeypatch
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        remote_root = tmp_path / "remote-data"
+        _patch_apply_dependencies(monkeypatch)
+        calls: list[str] = []
+        monkeypatch.setattr(
+            graphical_setup,
+            "Container",
+            self._persistent_container_factory(calls, {}),
+        )
+
+        result = graphical_setup.apply_setup(
+            config_path,
+            _payload(remote_data_type="local", remote_data_root=str(remote_root)),
+        )
+
+        assert calls == ["full-sync"]
+        assert result["quick_sync_ready"] is True
+
+    def test_reopening_setup_to_change_cache_size_skips_initial_full_sync(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        remote_root = tmp_path / "remote-data"
+        _patch_apply_dependencies(monkeypatch)
+        calls: list[str] = []
+        state_holder: dict = {}
+        monkeypatch.setattr(
+            graphical_setup,
+            "Container",
+            self._persistent_container_factory(calls, state_holder),
+        )
+        payload = _payload(remote_data_type="local", remote_data_root=str(remote_root))
+
+        graphical_setup.apply_setup(config_path, payload)
+        assert calls == ["full-sync"]
+
+        with caplog.at_level(logging.INFO, logger="romcloud.lifecycle.setup"):
+            result = graphical_setup.apply_setup(
+                config_path, {**payload, "max_size_gb": 80}
+            )
+
+        assert calls == ["full-sync"]
+        assert result["quick_sync_ready"] is True
+        assert result["save_reconcile"] is None
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("skipped Initial Full Sync" in message for message in messages)
+
+    def test_reopening_setup_with_unrelated_settings_change_skips_initial_full_sync(
+        self, tmp_path, monkeypatch
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        remote_root = tmp_path / "remote-data"
+        _patch_apply_dependencies(monkeypatch)
+        calls: list[str] = []
+        state_holder: dict = {}
+        monkeypatch.setattr(
+            graphical_setup,
+            "Container",
+            self._persistent_container_factory(calls, state_holder),
+        )
+        payload = _payload(remote_data_type="local", remote_data_root=str(remote_root))
+
+        graphical_setup.apply_setup(config_path, payload)
+        assert calls == ["full-sync"]
+
+        graphical_setup.apply_setup(config_path, {**payload, "min_free_gb": 9})
+
+        assert calls == ["full-sync"]
+
+    def test_remote_data_root_change_requires_reinitialization(
+        self, tmp_path, monkeypatch
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        first_remote_root = tmp_path / "remote-data-a"
+        second_remote_root = tmp_path / "remote-data-b"
+        _patch_apply_dependencies(monkeypatch)
+        calls: list[str] = []
+        state_holder: dict = {}
+        monkeypatch.setattr(
+            graphical_setup,
+            "Container",
+            self._persistent_container_factory(calls, state_holder),
+        )
+
+        graphical_setup.apply_setup(
+            config_path,
+            _payload(remote_data_type="local", remote_data_root=str(first_remote_root)),
+        )
+        assert calls == ["full-sync"]
+
+        graphical_setup.apply_setup(
+            config_path,
+            _payload(remote_data_type="local", remote_data_root=str(second_remote_root)),
+        )
+
+        assert calls == ["full-sync", "full-sync"]
+
+    def test_interrupted_initial_full_sync_can_be_retried(
+        self, tmp_path, monkeypatch
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        remote_root = tmp_path / "remote-data"
+        _patch_apply_dependencies(monkeypatch)
+        calls: list[str] = []
+        state_holder: dict = {}
+        payload = _payload(remote_data_type="local", remote_data_root=str(remote_root))
+
+        monkeypatch.setattr(
+            graphical_setup,
+            "Container",
+            self._persistent_container_factory(
+                calls, state_holder, full_sync_error=RuntimeError("bootstrap interrupted")
+            ),
+        )
+        with pytest.raises(RuntimeError, match="initialize SaveSync"):
+            graphical_setup.apply_setup(config_path, payload)
+        assert calls == ["full-sync"]
+        assert state_holder.get("quick_sync_ready", False) is False
+
+        monkeypatch.setattr(
+            graphical_setup,
+            "Container",
+            self._persistent_container_factory(calls, state_holder),
+        )
+        result = graphical_setup.apply_setup(config_path, payload)
+
+        assert calls == ["full-sync", "full-sync"]
+        assert result["quick_sync_ready"] is True

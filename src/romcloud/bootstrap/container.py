@@ -24,6 +24,7 @@ from romcloud.core.storage import StorageProvider
 from romcloud.core.remote_data import RemoteDataProvider
 from romcloud.core.save_selection import (
     BATOCERA_SAVE_ROOT_MAPPINGS,
+    SWITCH_SHARED_CANONICAL_SAVE_ROOT,
     BatoceraSaveRootMapping,
 )
 from romcloud.infrastructure.config import AppConfig, validate_remote_data_boundary
@@ -77,6 +78,34 @@ def _contains_switch_title_save(root: Path) -> bool:
     return False
 
 
+def _resolve_audited_switch_physical_root(
+    candidate: Path, canonical_root: Path
+) -> Optional[Path]:
+    """Trust *candidate* only as itself, or as a BUA alias resolving exactly
+    into the one audited canonical Switch save root.
+
+    A recent Batocera Update Assistant (BUA) install points every compatible
+    emulator's ``nand/user/save`` at one shared physical directory via a
+    symlink. This never trusts an arbitrary resolved symlink target: a
+    missing candidate, broken link, symlink loop, or a resolution landing
+    outside ``canonical_root`` is rejected (returns ``None``) rather than
+    silently accepted. A candidate that is not a symlink at all (the
+    pre-BUA/legacy layout, where each fork owns a real physical directory)
+    is returned unchanged, whether or not it exists yet.
+    """
+    if not candidate.is_symlink():
+        return candidate
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if resolved != canonical_root and canonical_root not in resolved.parents:
+        return None
+    if not resolved.is_dir():
+        return None
+    return resolved
+
+
 def _batocera_mapped_save_roots(
     local_saves_path: Path,
 ) -> tuple[tuple[str, str, str], ...]:
@@ -88,6 +117,15 @@ def _batocera_mapped_save_roots(
     tree wins; otherwise registry order is deterministic and a warning records
     the ambiguity. The main saves directory remains the fallback for existing
     Yuzu installs when neither compatible fork is active.
+
+    A BUA install instead makes every compatible fork's config path (Eden,
+    Citron, and the legacy Yuzu path) a symlink alias into one shared
+    physical directory (:data:`SWITCH_SHARED_CANONICAL_SAVE_ROOT`). Such
+    aliases are resolved to that one audited canonical directory — see
+    :func:`_resolve_audited_switch_physical_root` — so the destination
+    ROMCloud ever stages/materializes into is always the real physical save
+    tree, never the emulator-facing symlink, and aliases sharing that same
+    resolved directory collapse into a single mapped root.
     """
     if (
         local_saves_path.name != "saves"
@@ -95,6 +133,9 @@ def _batocera_mapped_save_roots(
     ):
         return ()
     userdata = local_saves_path.parent
+    switch_canonical_root = (
+        userdata / SWITCH_SHARED_CANONICAL_SAVE_ROOT
+    ).resolve(strict=False)
     candidates = []
     for mapping in BATOCERA_SAVE_ROOT_MAPPINGS:
         root = userdata / mapping.physical_root
@@ -110,29 +151,54 @@ def _batocera_mapped_save_roots(
         by_prefix.setdefault(mapping.canonical_prefix, []).append((mapping, root))
     selected_roots: list[tuple[str, str, str]] = []
     for canonical_prefix, alternatives in by_prefix.items():
-        selected = alternatives[0]
-        if canonical_prefix == "yuzu":
+        if canonical_prefix != "yuzu":
+            selected = alternatives[0]
+            if len(alternatives) > 1:
+                log.warning(
+                    "Multiple compatible SaveSync roots are present for %s; using %s "
+                    "and leaving the others untouched: candidates=%s",
+                    canonical_prefix,
+                    selected[0].mapping_id,
+                    ",".join(mapping.mapping_id for mapping, _root in alternatives),
+                )
+            mapping, root = selected
+            selected_roots.append((mapping.mapping_id, str(root), canonical_prefix))
+            continue
+
+        resolved_alternatives: list[tuple[BatoceraSaveRootMapping, Path]] = []
+        for mapping, root in alternatives:
+            resolved = _resolve_audited_switch_physical_root(
+                root, switch_canonical_root
+            )
+            if resolved is None:
+                log.warning(
+                    "Rejected unrecognized/unsafe Switch save alias: mapping=%s path=%s",
+                    mapping.mapping_id,
+                    root,
+                )
+                continue
+            resolved_alternatives.append((mapping, resolved))
+        if not resolved_alternatives:
+            continue
+        distinct_roots = {resolved for _mapping, resolved in resolved_alternatives}
+        if len(distinct_roots) == 1:
+            selected = resolved_alternatives[0]
+        else:
             populated = [
-                candidate
-                for candidate in alternatives
-                if _contains_switch_title_save(candidate[1])
+                pair
+                for pair in resolved_alternatives
+                if _contains_switch_title_save(pair[1])
             ]
-            if len(populated) == 1:
-                selected = populated[0]
-        if len(alternatives) > 1:
+            selected = populated[0] if len(populated) == 1 else resolved_alternatives[0]
             log.warning(
                 "Multiple compatible SaveSync roots are present for %s; using %s "
                 "and leaving the others untouched: candidates=%s",
                 canonical_prefix,
                 selected[0].mapping_id,
-                ",".join(
-                    mapping.mapping_id for mapping, _root in alternatives
-                ),
+                ",".join(mapping.mapping_id for mapping, _root in resolved_alternatives),
             )
         mapping, root = selected
-        selected_roots.append(
-            (mapping.mapping_id, str(root), mapping.canonical_prefix)
-        )
+        selected_roots.append((mapping.mapping_id, str(root), canonical_prefix))
     return tuple(selected_roots)
 
 
