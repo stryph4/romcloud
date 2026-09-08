@@ -116,6 +116,7 @@ class _DestinationView:
     root: Path
     canonical_prefix: str = ""
     mapping_id: str = ""
+    ownership_domain: str = ""
 
 
 @dataclass(frozen=True)
@@ -225,7 +226,12 @@ class SaveSyncService:
                 raise ValueError("mapped SaveSync roots require unique canonical prefixes")
             seen_prefixes.add(normalized)
             mapped_views.append(
-                _DestinationView(Path(physical_root), normalized, mapping_id)
+                _DestinationView(
+                    Path(physical_root),
+                    normalized,
+                    mapping_id,
+                    f"mapped:{normalized}",
+                )
             )
         self._mapped_local_views = tuple(mapped_views)
         self._policy = policy
@@ -1158,7 +1164,13 @@ class SaveSyncService:
         return self._remote_store.materialize(relative_path, local_path)
 
     def _local_views(self) -> tuple[_DestinationView, ...]:
-        views = [_DestinationView(self._local_root)]
+        views = [
+            _DestinationView(
+                self._local_root,
+                mapping_id="primary-local-saves",
+                ownership_domain="primary-local",
+            )
+        ]
         views.extend(self._mapped_local_views)
         if self._uses_legacy_rpcs3():
             assert self._legacy_rpcs3_root is not None
@@ -1193,6 +1205,15 @@ class SaveSyncService:
 
     def _all_destination_roots(self) -> tuple[Path, ...]:
         roots = [view.root for view in self._local_views()]
+        # The transaction planner narrows an overlapping primary local view to
+        # one registered top-level system ownership domain. Keep those exact
+        # roots available to restart recovery without broadening the journal
+        # reader's configured-root equality check.
+        roots.extend(
+            self._local_root / system
+            for system in sorted({layout.system for layout in self._policy.layouts})
+            if not (self._local_root / system).is_symlink()
+        )
         if self._remote_store is not None:
             remote_root = self._remote_store.filesystem_transaction_root
             if remote_root is not None:
@@ -2488,6 +2509,7 @@ class SaveSyncService:
                             ),
                         )
                     )
+                self._log_transaction_root_collisions(selected_views)
                 transaction = (
                     save_transaction.prepare_transaction(
                         self._transaction_journal_path,
@@ -3214,6 +3236,107 @@ class SaveSyncService:
             reverse[relative_path] = canonical_path
         return physical, reverse
 
+    @staticmethod
+    def _absolute_root(path: Path) -> Path:
+        return Path(os.path.abspath(os.fspath(path)))
+
+    def _transaction_destination_views(
+        self,
+        views: tuple[_DestinationView, ...],
+        *,
+        current: dict[str, SaveArtifact],
+        desired: dict[str, SaveArtifact],
+    ) -> tuple[_DestinationView, ...]:
+        """Assign changed paths to non-overlapping physical ownership roots.
+
+        A BUA Switch mapping can live below the ordinary ``/userdata/saves``
+        directory. Discovery correctly removes the mapped canonical namespace
+        from the primary scan, but a transaction rooted at the whole primary
+        directory would still claim an ancestor of the mapped ``save_user``
+        root. Narrow only that broad primary view to registered top-level
+        system roots. Logical grouping and canonical paths remain unchanged.
+        """
+        absolute_views = tuple(self._absolute_root(view.root) for view in views)
+        local_root = self._absolute_root(self._local_root)
+        registered_systems = {layout.system for layout in self._policy.layouts}
+        planned: list[_DestinationView] = []
+        for index, view in enumerate(views):
+            root = absolute_views[index]
+            nested = tuple(
+                other_root
+                for other_index, other_root in enumerate(absolute_views)
+                if other_index != index
+                if other_root != root and other_root.is_relative_to(root)
+            )
+            is_primary_local = (
+                not view.canonical_prefix
+                and root == local_root
+            )
+            if not is_primary_local or not nested:
+                planned.append(view)
+                continue
+
+            changed_domains: set[str] = set()
+            for canonical_path in sorted(set(current) | set(desired)):
+                if not self._belongs_to_view(view, canonical_path):
+                    continue
+                if _same_artifact(current.get(canonical_path), desired.get(canonical_path)):
+                    continue
+                relative = self._path_for_view(view, canonical_path)
+                if relative is None or not relative.parts:
+                    raise SaveSyncVerificationError(
+                        f"SaveSync path has no physical ownership domain: {canonical_path}"
+                    )
+                domain = relative.parts[0]
+                if domain not in registered_systems:
+                    raise SaveSyncVerificationError(
+                        "SaveSync path has no registered physical ownership domain: "
+                        f"{canonical_path}"
+                    )
+                changed_domains.add(domain)
+
+            log.info(
+                "SaveSync transaction ownership partition: broad_root=%s "
+                "nested_roots=%s physical_ownership_domains=%s",
+                root,
+                ",".join(str(value) for value in sorted(nested, key=str)),
+                ",".join(sorted(changed_domains)) or "none",
+            )
+            planned.extend(
+                _DestinationView(
+                    view.root / domain,
+                    domain,
+                    f"primary-local-{domain}",
+                    f"primary:{domain}",
+                )
+                for domain in sorted(changed_domains)
+            )
+        return tuple(planned)
+
+    def _log_transaction_root_collisions(
+        self, views: list[save_transaction.SelectedView]
+    ) -> None:
+        roots: list[Path] = []
+        for view in views:
+            root = self._absolute_root(view.root)
+            for other in roots:
+                if root == other:
+                    relationship = "duplicate"
+                elif root.is_relative_to(other):
+                    relationship = "descendant"
+                elif other.is_relative_to(root):
+                    relationship = "ancestor"
+                else:
+                    continue
+                log.error(
+                    "SaveSync transaction ownership collision: root=%s other_root=%s "
+                    "collision_relationship=%s",
+                    root,
+                    other,
+                    relationship,
+                )
+            roots.append(root)
+
     def _scan_view(self, root: Path, view: _DestinationView) -> dict[str, SaveArtifact]:
         if view.canonical_prefix:
             report = self._scan_mapped_view(view, self._policy, root=root)
@@ -3237,11 +3360,40 @@ class SaveSyncService:
         source_for: Callable[[str, SaveArtifact], Path],
     ) -> list[save_transaction.SelectedView]:
         selected_views: list[save_transaction.SelectedView] = []
-        for view in views:
-            view_current, _ = self._physical_manifest(view, current)
+        planned_views = self._transaction_destination_views(
+            views, current=current, desired=desired
+        )
+        for view in planned_views:
+            view_current, current_reverse = self._physical_manifest(view, current)
             view_desired, reverse = self._physical_manifest(view, desired)
             if view_current == view_desired:
                 continue
+            canonical_paths = sorted(
+                set(current_reverse.values()) | set(reverse.values())
+            )
+            descriptors = tuple(
+                descriptor
+                for path in canonical_paths
+                for descriptor in (self._policy.group_for_path(path),)
+                if descriptor is not None
+            )
+            log.info(
+                "SaveSync transaction view planned: normalized_physical_root=%s "
+                "transaction_view_identity=%s physical_ownership_domain=%s "
+                "layout_ids=%s logical_group_ids=%s selected_transaction_path_count=%d",
+                self._absolute_root(view.root),
+                view.mapping_id or "dataset-root",
+                view.ownership_domain or "dataset",
+                ",".join(sorted({value.layout_id for value in descriptors})) or "none",
+                ",".join(sorted({value.group_id for value in descriptors})) or "none",
+                sum(
+                    1
+                    for path in set(view_current) | set(view_desired)
+                    if not _same_artifact(
+                        view_current.get(path), view_desired.get(path)
+                    )
+                ),
+            )
             selected_views.append(
                 save_transaction.SelectedView(
                     root=view.root,
@@ -3269,6 +3421,7 @@ class SaveSyncService:
             desired=desired,
             source_for=source_for,
         )
+        self._log_transaction_root_collisions(selected_views)
         return (
             save_transaction.prepare_transaction(
                 self._transaction_journal_path,
@@ -3284,15 +3437,40 @@ class SaveSyncService:
         transaction: save_transaction.SelectedTransaction,
         views: tuple[_DestinationView, ...],
     ) -> None:
-        by_root = {view.root.absolute(): view for view in views}
+        by_root = {self._absolute_root(view.root): view for view in views}
+        primary = next(
+            (
+                view
+                for view in views
+                if not view.canonical_prefix
+                and self._absolute_root(view.root)
+                == self._absolute_root(self._local_root)
+            ),
+            None,
+        )
+        if primary is not None:
+            registered_systems = {layout.system for layout in self._policy.layouts}
+            for prepared in transaction.views:
+                prepared_root = self._absolute_root(prepared.root)
+                if (
+                    prepared_root.parent == self._absolute_root(primary.root)
+                    and prepared_root.name in registered_systems
+                ):
+                    by_root[prepared_root] = _DestinationView(
+                        prepared.root,
+                        prepared_root.name,
+                        f"primary-local-{prepared_root.name}",
+                        f"primary:{prepared_root.name}",
+                    )
         selected_paths = {
-            view.root.absolute(): frozenset(view.verification_current)
+            self._absolute_root(view.root): frozenset(view.verification_current)
             | frozenset(view.verification_desired)
             for view in transaction.views
         }
 
         def verify(root: Path, expected: dict[str, SaveArtifact]) -> None:
-            view = by_root.get(root.absolute())
+            normalized_root = self._absolute_root(root)
+            view = by_root.get(normalized_root)
             if view is None:
                 raise SaveSyncVerificationError(
                     f"Unexpected SaveSync transaction destination: {root}"
@@ -3301,7 +3479,7 @@ class SaveSyncService:
             observed = {
                 path: artifact
                 for path, artifact in observed.items()
-                if path in selected_paths.get(root.absolute(), frozenset())
+                if path in selected_paths.get(normalized_root, frozenset())
             }
             if observed != expected:
                 raise SaveSyncVerificationError(

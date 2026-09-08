@@ -16,6 +16,7 @@ from romcloud.core.exceptions import (
 )
 from romcloud.core.models.game import Game, GameAsset
 from romcloud.core.models.savesync import (
+    SaveArtifact,
     SaveChangeKind,
     SaveDiff,
     SaveGroupCondition,
@@ -279,6 +280,39 @@ class TestBuaSwitchAliasTopology:
         # the same physical save is never reconciled through more than one alias.
         assert result == (("eden-switch-user-saves", str(canonical), "yuzu"),)
 
+    def test_eden_config_alias_and_yuzu_save_alias_share_one_physical_root(
+        self, tmp_path: Path
+    ):
+        from romcloud.bootstrap.container import _batocera_mapped_save_roots
+
+        userdata = tmp_path / "userdata"
+        canonical = self._canonical_root(userdata)
+        canonical.mkdir(parents=True)
+        yuzu_config = userdata / "system/configs/yuzu"
+        yuzu_config.mkdir(parents=True)
+        _write(yuzu_config / "qt-config.ini", b"configured")
+        self._symlink_alias(yuzu_config / "nand/user/save", canonical)
+        self._symlink_alias(userdata / "system/configs/eden", yuzu_config)
+
+        # Citron is intentionally absent, as it is on the affected hardware.
+        result = _batocera_mapped_save_roots(userdata / "saves")
+
+        assert result == (("eden-switch-user-saves", str(canonical), "yuzu"),)
+
+    def test_switch_system_save_alias_is_not_accepted_as_user_save_storage(
+        self, tmp_path: Path
+    ):
+        from romcloud.bootstrap.container import _batocera_mapped_save_roots
+
+        userdata = tmp_path / "userdata"
+        system_save = userdata / "saves/switch/eden_citron/save/save_system"
+        system_save.mkdir(parents=True)
+        self._symlink_alias(
+            userdata / "system/configs/yuzu/nand/user/save", system_save
+        )
+
+        assert _batocera_mapped_save_roots(userdata / "saves") == ()
+
     def test_bua_alias_download_materializes_into_canonical_root_without_symlink_error(
         self, tmp_path: Path, provider: "_FakeProvider"
     ):
@@ -321,6 +355,211 @@ class TestBuaSwitchAliasTopology:
         assert canonical_physical.read_bytes() == b"switch-progress"
         remote_copy = tmp_path / "remote-saves/yuzu" / relative
         assert remote_copy.read_bytes() == b"switch-progress"
+
+    def test_mixed_snes_and_bua_switch_quick_sync_uses_disjoint_ownership_roots(
+        self, tmp_path: Path, provider: "_FakeProvider", monkeypatch, caplog
+    ):
+        userdata = tmp_path / "userdata"
+        local_saves = userdata / "saves"
+        canonical = self._canonical_root(userdata)
+        switch_relative = (
+            Path("0000000000000000")
+            / "0123456789ABCDEF0123456789ABCDEF"
+            / "010093801237C000"
+            / "save.dat"
+        )
+        switch_physical = canonical / switch_relative
+        snes_relative = Path("snes/Super Metroid (JU) [!].srm")
+        snes_physical = local_saves / snes_relative
+        snes_repair_relative = Path("snes/Zelda.srm")
+        snes_repair_physical = local_saves / snes_repair_relative
+        system_save = userdata / "saves/switch/eden_citron/save/save_system/system.dat"
+        _write(switch_physical, b"switch-progress")
+        _write(snes_physical, b"snes-baseline")
+        _write(snes_repair_physical, b"snes-remote-generation")
+        _write(system_save, b"system-save-must-remain-distinct")
+        service = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "remote-data"),
+            local_root=str(local_saves),
+            remote_root=str(tmp_path / "remote-saves"),
+            state_path=tmp_path / "data/savesync-state.json",
+            mapped_local_roots=(
+                ("eden-switch-user-saves", str(canonical), "yuzu"),
+            ),
+        )
+        service.full_sync()
+        switch_physical.unlink()
+        snes_repair_physical.unlink()
+        snes_physical.write_bytes(b"snes-local-change")
+        service.mark_local_dirty(snes_relative.as_posix())
+
+        captured_roots: list[tuple[Path, ...]] = []
+        real_prepare = save_transaction.prepare_transaction
+
+        def capture_prepare(journal_path, views, **kwargs):
+            selected = tuple(views)
+            captured_roots.append(tuple(Path(view.root) for view in selected))
+            return real_prepare(journal_path, selected, **kwargs)
+
+        monkeypatch.setattr(save_transaction, "prepare_transaction", capture_prepare)
+
+        with caplog.at_level("INFO"):
+            result = service.quick_sync()
+
+        assert result.status == "reconciled"
+        assert result.report is not None
+        assert result.report.uploaded == 1
+        assert result.report.downloaded == 2
+        assert switch_physical.read_bytes() == b"switch-progress"
+        assert snes_physical.read_bytes() == b"snes-local-change"
+        assert snes_repair_physical.read_bytes() == b"snes-remote-generation"
+        assert (
+            tmp_path / "remote-saves" / snes_relative
+        ).read_bytes() == b"snes-local-change"
+        assert system_save.read_bytes() == b"system-save-must-remain-distinct"
+
+        assert len(captured_roots) == 1
+        roots = tuple(path.absolute() for path in captured_roots[0])
+        # Before ownership partitioning, the primary local view used the first
+        # root below and collided with the descendant mapped Switch root.
+        assert canonical.absolute().is_relative_to(local_saves.absolute())
+        assert (local_saves / "snes").absolute() in roots
+        assert canonical.absolute() in roots
+        assert local_saves.absolute() not in roots
+        assert all(
+            left != right
+            and not left.is_relative_to(right)
+            and not right.is_relative_to(left)
+            for index, left in enumerate(roots)
+            for right in roots[index + 1 :]
+        )
+        assert "physical_ownership_domain=primary:snes" in caplog.text
+        assert "layout_ids=retroarch-root-snes" in caplog.text
+        assert "physical_ownership_domain=mapped:yuzu" in caplog.text
+        assert "layout_ids=yuzu-account-title-save" in caplog.text
+
+    def test_mixed_bua_transaction_preparation_failure_preserves_state(
+        self, tmp_path: Path, provider: "_FakeProvider", monkeypatch
+    ):
+        userdata = tmp_path / "userdata"
+        local_saves = userdata / "saves"
+        canonical = self._canonical_root(userdata)
+        switch_relative = (
+            Path("0000000000000000")
+            / "0123456789ABCDEF0123456789ABCDEF"
+            / "010093801237C000"
+            / "save.dat"
+        )
+        switch_physical = canonical / switch_relative
+        snes_relative = Path("snes/Super Metroid (JU) [!].srm")
+        snes_physical = local_saves / snes_relative
+        snes_repair_relative = Path("snes/Zelda.srm")
+        snes_repair_physical = local_saves / snes_repair_relative
+        _write(switch_physical, b"switch-progress")
+        _write(snes_physical, b"snes-baseline")
+        _write(snes_repair_physical, b"snes-remote-generation")
+        service = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "remote-data"),
+            local_root=str(local_saves),
+            remote_root=str(tmp_path / "remote-saves"),
+            state_path=tmp_path / "data/savesync-state.json",
+            mapped_local_roots=(
+                ("eden-switch-user-saves", str(canonical), "yuzu"),
+            ),
+        )
+        service.full_sync()
+        state_before = service.get_state()
+        switch_physical.unlink()
+        snes_repair_physical.unlink()
+        snes_physical.write_bytes(b"snes-local-change")
+        service.mark_local_dirty(snes_relative.as_posix())
+        monkeypatch.setattr(
+            save_transaction,
+            "prepare_transaction",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                SaveSyncError("forced transaction preparation failure")
+            ),
+        )
+
+        with pytest.raises(SaveSyncError, match="preparation failure"):
+            service.quick_sync()
+
+        state_after = service.get_state()
+        assert state_after.quick_sync_cursor_generation == (
+            state_before.quick_sync_cursor_generation
+        )
+        assert state_after.shared_manifest == state_before.shared_manifest
+        assert not switch_physical.exists()
+        assert not snes_repair_physical.exists()
+        assert snes_physical.read_bytes() == b"snes-local-change"
+        assert (
+            tmp_path / "remote-saves" / snes_relative
+        ).read_bytes() == b"snes-baseline"
+
+    def test_partitioned_local_transaction_recovers_after_restart(
+        self, tmp_path: Path, provider: "_FakeProvider"
+    ):
+        userdata = tmp_path / "userdata"
+        local_saves = userdata / "saves"
+        canonical = self._canonical_root(userdata)
+        switch_relative = (
+            Path("0000000000000000")
+            / "0123456789ABCDEF0123456789ABCDEF"
+            / "010093801237C000"
+            / "save.dat"
+        )
+        switch_canonical = (Path("yuzu") / switch_relative).as_posix()
+        snes_canonical = "snes/Recovery.srm"
+        switch_physical = canonical / switch_relative
+        snes_physical = local_saves / snes_canonical
+        _write(switch_physical, b"switch-before")
+        _write(snes_physical, b"snes-before")
+        service = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "remote-data"),
+            local_root=str(local_saves),
+            remote_root=str(tmp_path / "remote-saves"),
+            state_path=tmp_path / "data/savesync-state.json",
+            mapped_local_roots=(
+                ("eden-switch-user-saves", str(canonical), "yuzu"),
+            ),
+        )
+        current = service._scan_local().artifacts
+        sources = {
+            snes_canonical: tmp_path / "sources/snes.srm",
+            switch_canonical: tmp_path / "sources/switch.dat",
+        }
+        _write(sources[snes_canonical], b"snes-after")
+        _write(sources[switch_canonical], b"switch-after")
+        desired = dict(current)
+        for canonical_path, source in sources.items():
+            desired[canonical_path] = SaveArtifact(
+                canonical_path,
+                source.stat().st_size,
+                save_tree.hash_file(source),
+            )
+
+        transaction = service._prepare_selected_transaction(
+            service._local_views(),
+            current=current,
+            desired=desired,
+            source_for=lambda path, _artifact: sources[path],
+            operation_id="f" * 32,
+        )
+        assert transaction is not None
+        service._apply_selected_transaction(transaction, service._local_views())
+        assert snes_physical.read_bytes() == b"snes-after"
+        assert switch_physical.read_bytes() == b"switch-after"
+
+        # No completion receipt was written. Startup recovery must recognize
+        # the narrowed system root and restore both physical ownership domains.
+        service._recover()
+
+        assert snes_physical.read_bytes() == b"snes-before"
+        assert switch_physical.read_bytes() == b"switch-before"
+        assert not service._transaction_journal_path.exists()
 
     def test_escaping_switch_alias_is_rejected_not_trusted(self, tmp_path: Path):
         from romcloud.bootstrap.container import _batocera_mapped_save_roots
