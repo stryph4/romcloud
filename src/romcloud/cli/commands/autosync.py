@@ -1,4 +1,4 @@
-"""Internal Batocera lifecycle commands for background SaveSync."""
+"""Internal Batocera lifecycle commands for durable Auto SaveSync."""
 
 from __future__ import annotations
 
@@ -217,6 +217,7 @@ def game_start(
 def game_stop(
     ctx: click.Context, system: str, emulator: str, core: str, rom: str
 ) -> None:
+    """Finish required Quick Sync work before the lifecycle command succeeds."""
     if not _auto_sync_enabled(ctx.obj["config"]):
         try:
             _session_store(ctx.obj["config"]).stop(system=system, rom=rom)
@@ -226,9 +227,13 @@ def game_stop(
     worker_pid = os.getpid()
     caller_pid = batocera_auto_savesync.lifecycle_caller_pid()
     log.info(
-        "gameStop detached worker started: pid=%d lifecycle_caller_pid=%s",
+        "gameStop synchronous worker started: pid=%d lifecycle_caller_pid=%s "
+        "system=%s emulator=%s core=%s",
         worker_pid,
         caller_pid or "unknown",
+        system,
+        emulator,
+        core,
     )
     try:
         quick_sync_started = time.monotonic()
@@ -253,22 +258,32 @@ def game_stop(
             len(conflict_ids),
             ",".join(conflict_ids) or "none",
         )
-        if conflict_ids:
-            log.info(
-                "gameStop new conflict IDs detected: count=%d ids=%s",
-                len(conflict_ids),
-                ",".join(conflict_ids),
-            )
-            _launch_pending_conflict_popup(
-                Path(ctx.obj["config"].data_path),
-                lifecycle_caller_pid=caller_pid,
-            )
-        else:
-            log.info("gameStop popup handoff skipped: no new conflict IDs")
-    except Exception:  # noqa: BLE001 - lifecycle integration must fail open
+        log.info(
+            "gameStop durable Quick Sync result: status=complete "
+            "new_conflicts=%d ids=%s",
+            len(conflict_ids),
+            ",".join(conflict_ids) or "none",
+        )
+    except Exception as exc:
         log.warning("SaveSync game-exit pass failed", exc_info=True)
+        raise click.ClickException(
+            "Auto SaveSync did not complete; pending local work was retained."
+        ) from exc
     finally:
-        log.info("gameStop detached worker exited: pid=%d", worker_pid)
+        log.info("gameStop synchronous worker exited: pid=%d", worker_pid)
+
+
+@autosync_group.command("conflict-popup", hidden=True)
+@click.pass_context
+def conflict_popup(ctx: click.Context) -> None:
+    """Present queued conflicts only after the gameStop hook has returned."""
+    try:
+        _launch_pending_conflict_popup(
+            Path(ctx.obj["config"].data_path),
+            lifecycle_caller_pid=batocera_auto_savesync.lifecycle_caller_pid(),
+        )
+    except Exception:  # noqa: BLE001 - queued conflicts remain durable
+        log.warning("SaveSync conflict popup handoff failed", exc_info=True)
 
 
 @autosync_group.command("menu-tick", hidden=True)

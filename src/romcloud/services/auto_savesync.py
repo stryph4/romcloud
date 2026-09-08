@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from romcloud.core.exceptions import SaveSyncVerificationError
+from romcloud.core.exceptions import SaveSyncError, SaveSyncVerificationError
 from romcloud.core.models.savesync import SaveGroupCondition
 from romcloud.core.save_selection import SaveSelectionPolicy
 from romcloud.infrastructure.logging import get_logger
@@ -132,7 +132,7 @@ class ActiveSessionStore:
 
 
 class AutoSaveSyncCoordinator:
-    """Coalesce game exits into one bounded, serialized background worker."""
+    """Coalesce automatic triggers into one bounded, serialized worker."""
 
     def __init__(
         self,
@@ -178,10 +178,17 @@ class AutoSaveSyncCoordinator:
             core,
         )
         session = self._sessions.stop(system=system, rom=rom)
-        if self._sessions.has_active_session():
-            log.info("gameStop conflict check skipped: another game session is active")
-            return ()
         layout_ids = layout_ids_for_session(self._policy, system, emulator, core)
+        log.info(
+            "gameStop SaveSync scope: system=%s emulator=%s core=%s "
+            "layout_count=%d layout_ids=%s session_record=%s",
+            system,
+            emulator,
+            core,
+            len(layout_ids),
+            ",".join(sorted(layout_ids)) or "none",
+            "present" if session is not None else "missing",
+        )
         if layout_ids:
             changed_since = (
                 session.started_at if session is not None else time.time() - 5.0
@@ -189,10 +196,17 @@ class AutoSaveSyncCoordinator:
             self._service.detect_and_mark_local_changes(
                 layout_ids, changed_since=changed_since
             )
+        if self._sessions.has_active_session():
+            log.info(
+                "Auto SaveSync final result: trigger=game stop status=deferred "
+                "reason=another-session-active durable_dirty_state_retained=true"
+            )
+            return ()
         conflict_ids = self._run_quick_sync(
             trigger="game stop",
             wait_for_handoff=True,
             collect_new_conflicts=True,
+            require_completion=True,
         )
         log.info(
             "gameStop conflict check complete: new_conflicts=%d ids=%s",
@@ -226,6 +240,7 @@ class AutoSaveSyncCoordinator:
         trigger: str,
         wait_for_handoff: bool = False,
         collect_new_conflicts: bool = False,
+        require_completion: bool = False,
     ) -> tuple[str, ...]:
         """Serialize every automatic trigger through ``SaveSyncService.quick_sync``.
 
@@ -240,12 +255,32 @@ class AutoSaveSyncCoordinator:
             if lock.acquire():
                 break
             if attempt == attempts - 1:
+                log.warning(
+                    "Auto SaveSync final result: trigger=%s status=deferred "
+                    "reason=worker-busy",
+                    trigger,
+                )
+                if require_completion:
+                    raise SaveSyncError(
+                        "Auto SaveSync could not acquire its worker lock; "
+                        "pending local work was retained."
+                    )
                 return ()
             # A just-finishing leader may have completed its final durable
             # state read while gameStop was recording new work.
             time.sleep(0.1)
         try:
             if self._sessions.has_active_session():
+                log.info(
+                    "Auto SaveSync final result: trigger=%s status=deferred "
+                    "reason=active-session",
+                    trigger,
+                )
+                if require_completion:
+                    raise SaveSyncError(
+                        "Auto SaveSync found another active game session; "
+                        "pending local work was retained."
+                    )
                 return ()
             for _ in range(32):
                 state = self._service.get_state()
@@ -261,6 +296,19 @@ class AutoSaveSyncCoordinator:
                         or bool(group.dirty_path_hints)
                     )
                 )
+                log.info(
+                    "Auto SaveSync pass: trigger=%s quick_ready=%s cursor=%s "
+                    "tracked_groups=%d pending_local_groups=%d",
+                    trigger,
+                    state.quick_sync_ready,
+                    (
+                        state.quick_sync_cursor_generation
+                        if state.quick_sync_cursor_generation is not None
+                        else "none"
+                    ),
+                    len(state.groups),
+                    len(pending),
+                )
                 if pending and not self._wait_until_stable(pending):
                     log.warning(
                         "Auto SaveSync deferred: local save data did not "
@@ -268,6 +316,17 @@ class AutoSaveSyncCoordinator:
                         "state retained",
                         self._stability_checks,
                     )
+                    log.warning(
+                        "Auto SaveSync final result: trigger=%s status=deferred "
+                        "reason=local-data-unstable pending_local_groups=%d",
+                        trigger,
+                        len(pending),
+                    )
+                    if require_completion:
+                        raise SaveSyncError(
+                            "Auto SaveSync local save data did not stabilize; "
+                            "pending local work was retained."
+                        )
                     return ()
 
                 def is_group_active(group_id: str) -> bool:
@@ -318,13 +377,68 @@ class AutoSaveSyncCoordinator:
                                     "Auto SaveSync deferred: local save data remained "
                                     "unstable; durable dirty state retained"
                                 )
+                                if require_completion:
+                                    raise SaveSyncError(
+                                        "Auto SaveSync local save data remained "
+                                        "unstable; pending local work was retained."
+                                    )
                                 return ()
                 except Exception:  # noqa: BLE001 - detached work is best-effort
                     log.warning(
                         "Auto SaveSync %s Quick Sync deferred", trigger, exc_info=True
                     )
+                    log.warning(
+                        "Auto SaveSync final result: trigger=%s status=failed "
+                        "reason=exception",
+                        trigger,
+                    )
+                    if require_completion:
+                        raise
                     return ()
-                if result is None or result.status == "deferred":
+                if result is None:
+                    log.warning(
+                        "Auto SaveSync final result: trigger=%s status=failed "
+                        "reason=missing-quick-sync-result",
+                        trigger,
+                    )
+                    if require_completion:
+                        raise SaveSyncError(
+                            "Auto SaveSync ended without a Quick Sync result; "
+                            "pending local work was retained."
+                        )
+                    return self._still_active_conflicts(
+                        new_conflict_ids, enqueue=collect_new_conflicts
+                    )
+                log.info(
+                    "Auto SaveSync Quick Sync result: trigger=%s status=%s "
+                    "reason=%s remote_generation=%d cursor_before=%s "
+                    "cursor_after=%s processed_entries=%d processed_groups=%d "
+                    "uploaded=%d downloaded=%d conflicts=%d",
+                    trigger,
+                    result.status,
+                    result.reason or "none",
+                    result.remote_generation,
+                    result.cursor_before if result.cursor_before is not None else "none",
+                    result.cursor_after if result.cursor_after is not None else "none",
+                    result.processed_entries,
+                    len(result.processed_groups),
+                    result.report.uploaded if result.report is not None else 0,
+                    result.report.downloaded if result.report is not None else 0,
+                    result.report.conflicts if result.report is not None else 0,
+                )
+                if result.status in {"deferred", "requires-full-sync"}:
+                    log.warning(
+                        "Auto SaveSync final result: trigger=%s status=%s reason=%s",
+                        trigger,
+                        result.status,
+                        result.reason or "none",
+                    )
+                    if require_completion:
+                        raise SaveSyncError(
+                            "Auto SaveSync Quick Sync did not complete "
+                            f"({result.status}: {result.reason or 'no reason'}); "
+                            "pending local work was retained."
+                        )
                     return self._still_active_conflicts(
                         new_conflict_ids, enqueue=collect_new_conflicts
                     )
@@ -342,13 +456,37 @@ class AutoSaveSyncCoordinator:
                         or "none",
                     )
                 after = self._pending_local_groups()
+                if after == pending and after and require_completion:
+                    log.warning(
+                        "Auto SaveSync final result: trigger=%s status=failed "
+                        "reason=pending-local-work-no-progress "
+                        "remaining_pending_local_groups=%d",
+                        trigger,
+                        len(after),
+                    )
+                    raise SaveSyncError(
+                        "Auto SaveSync Quick Sync made no progress while local work "
+                        "remained pending."
+                    )
                 if not after or after == pending:
                     self._write_menu_pull_timestamp(time.time())
+                    log.info(
+                        "Auto SaveSync final result: trigger=%s status=%s "
+                        "remaining_pending_local_groups=%d",
+                        trigger,
+                        result.status,
+                        len(after),
+                    )
                     return self._still_active_conflicts(
                         new_conflict_ids, enqueue=collect_new_conflicts
                     )
         finally:
             lock.release()
+        if require_completion:
+            raise SaveSyncError(
+                "Auto SaveSync did not drain pending local work within its bounded "
+                "passes; pending local work was retained."
+            )
         return self._still_active_conflicts(
             new_conflict_ids, enqueue=collect_new_conflicts
         )

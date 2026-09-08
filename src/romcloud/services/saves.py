@@ -382,7 +382,26 @@ class SaveSyncService:
                 paths_by_group.setdefault(descriptor.group_id, set()).add(path)
                 descriptors[descriptor.group_id] = descriptor
 
+            log.info(
+                "SaveSync local discovery: layout_count=%d layouts=%s "
+                "current_artifacts=%d baseline_artifacts=%d candidate_groups=%d "
+                "cursor=%s quick_ready=%s",
+                len(allowed_layouts),
+                ",".join(sorted(allowed_layouts)),
+                len(current),
+                len(baseline),
+                len(paths_by_group),
+                (
+                    state.quick_sync_cursor_generation
+                    if state.quick_sync_cursor_generation is not None
+                    else "none"
+                ),
+                state.quick_sync_ready,
+            )
+
             next_state = state
+            changed_groups = 0
+            unchanged_groups = 0
             for group_id, group_paths in sorted(paths_by_group.items()):
                 descriptor = descriptors[group_id]
                 local_group = _group_manifest(current, sorted(group_paths))
@@ -390,6 +409,11 @@ class SaveSyncService:
                 has_baseline = group_id in known_groups or bool(baseline_group)
                 if has_baseline:
                     changed = not _same_manifest(local_group, baseline_group)
+                    reason = (
+                        "manifest-diff-from-baseline"
+                        if changed
+                        else "manifest-matches-baseline"
+                    )
                 else:
                     changed = any(
                         _mtime_at_or_after(
@@ -398,8 +422,26 @@ class SaveSyncService:
                         )
                         for artifact in local_group
                     )
+                    reason = (
+                        "new-group-mtime-in-session"
+                        if changed
+                        else "new-group-outside-session-window"
+                    )
+                log.info(
+                    "SaveSync local classification: layout_id=%s group_id=%r "
+                    "classification=%s reason=%s local_artifacts=%d "
+                    "baseline_artifacts=%d",
+                    descriptor.layout_id,
+                    group_id,
+                    "changed" if changed else "unchanged",
+                    reason,
+                    len(local_group),
+                    len(baseline_group),
+                )
                 if not changed:
+                    unchanged_groups += 1
                     continue
+                changed_groups += 1
                 hints = tuple(
                     path
                     for path in sorted(group_paths)
@@ -413,6 +455,14 @@ class SaveSyncService:
                 )
             if next_state != state:
                 _write_state(self._state_path, next_state)
+            log.info(
+                "SaveSync local discovery complete: candidate_groups=%d "
+                "changed_groups=%d unchanged_groups=%d durable_dirty_state_updated=%s",
+                len(paths_by_group),
+                changed_groups,
+                unchanged_groups,
+                next_state != state,
+            )
             return next_state
 
     def observe_local_groups(
@@ -1235,6 +1285,7 @@ class SaveSyncService:
         observed_generation = int(journal["generation"])
         with self._locked_operation():
             state = self._get_state_unlocked()
+            cursor_before = state.quick_sync_cursor_generation
             _write_state(
                 self._state_path,
                 replace(
@@ -1242,6 +1293,14 @@ class SaveSyncService:
                     quick_sync_ready=True,
                     quick_sync_cursor_generation=observed_generation,
                 ),
+            )
+            log.info(
+                "Full SaveSync cursor committed: cursor_before=%s cursor_after=%d "
+                "baseline_artifacts=%d report_revision=%s",
+                cursor_before if cursor_before is not None else "none",
+                observed_generation,
+                len(state.shared_manifest),
+                report.revision,
             )
         return report
 
@@ -1424,6 +1483,18 @@ class SaveSyncService:
                     or bool(group.dirty_path_hints)
                 )
             ).union(materialization_groups)
+            log.info(
+                "Quick SaveSync preflight: quick_ready=%s cursor=%s "
+                "baseline_artifacts=%d tracked_groups=%d pending_groups=%d "
+                "materialization_groups=%d excluded_layouts=%d",
+                state.quick_sync_ready,
+                cursor if cursor is not None else "none",
+                len(self._automatic_baseline(state)),
+                len(state.groups),
+                len(pending_groups),
+                len(materialization_groups),
+                len(excluded_layouts),
+            )
             if not state.quick_sync_ready or cursor is None:
                 return SaveQuickSyncResult(
                     status="requires-full-sync",
@@ -1443,6 +1514,14 @@ class SaveSyncService:
                 )
             remote_generation = int(journal["generation"])
             generation_unchanged = remote_generation == cursor
+            log.info(
+                "Quick SaveSync journal: cursor=%d remote_generation=%d "
+                "generation_state=%s retained_entries=%d",
+                cursor,
+                remote_generation,
+                "current" if generation_unchanged else "advanced",
+                len(journal["history"]),
+            )
             if generation_unchanged and not pending_groups:
                 return SaveQuickSyncResult(
                     status="unchanged",
@@ -1518,6 +1597,22 @@ class SaveSyncService:
                 )
                 selected_groups = None
 
+        log.info(
+            "Quick SaveSync scope: mode=%s selected_groups=%d "
+            "selected_layouts=%d pending_groups=%d unseen_journal_entries=%d",
+            (
+                "layout"
+                if selected_layouts is not None
+                else "group"
+                if selected_groups is not None
+                else "none"
+            ),
+            len(selected_groups or frozenset()),
+            len(selected_layouts or frozenset()),
+            len(pending_groups),
+            len(unseen),
+        )
+
         if selected_groups == frozenset() and selected_layouts is None:
             with self._locked_operation():
                 state = self._get_state_unlocked()
@@ -1528,6 +1623,12 @@ class SaveSyncService:
                         quick_sync_ready=True,
                         quick_sync_cursor_generation=remote_generation,
                     ),
+                )
+                log.info(
+                    "Quick SaveSync cursor advanced: cursor_before=%s "
+                    "cursor_after=%d reason=journal-no-eligible-changes",
+                    cursor if cursor is not None else "none",
+                    remote_generation,
                 )
             return SaveQuickSyncResult(
                 status="unchanged",
@@ -1571,6 +1672,13 @@ class SaveSyncService:
                     quick_sync_ready=True,
                     quick_sync_cursor_generation=cursor_after,
                 ),
+            )
+            log.info(
+                "Quick SaveSync cursor committed: cursor_before=%s "
+                "cursor_after=%d report_revision=%s",
+                cursor if cursor is not None else "none",
+                cursor_after,
+                report.revision,
             )
         return SaveQuickSyncResult(
             status="reconciled",
@@ -2294,6 +2402,28 @@ class SaveSyncService:
                 ),
                 repair_local_group_ids=repair_local_group_ids,
             )
+            decision_counts = {
+                action.value: len(
+                    {
+                        _group_id(self._policy, entry.relative_path)
+                        for entry in plan.entries
+                        if entry.action is action
+                    }
+                )
+                for action in SaveReconcileAction
+            }
+            log.info(
+                "SaveSync reconciliation plan: scope=%s candidate_artifacts=%d "
+                "upload_groups=%d download_groups=%d conflict_groups=%d "
+                "unchanged_groups=%d container_groups=%d",
+                plan.scope,
+                len(plan.entries),
+                decision_counts.get(SaveReconcileAction.UPLOAD.value, 0),
+                decision_counts.get(SaveReconcileAction.DOWNLOAD.value, 0),
+                decision_counts.get(SaveReconcileAction.CONFLICT.value, 0),
+                decision_counts.get(SaveReconcileAction.UNCHANGED.value, 0),
+                len(container_work.descriptors),
+            )
             emit_progress(
                 progress,
                 "savesync",
@@ -2366,6 +2496,26 @@ class SaveSyncService:
                     )
                     if selected_views
                     else None
+                )
+                log.info(
+                    "SaveSync transaction start: operation_id=%s scope=%s "
+                    "remote_write=%s local_write=%s destination_views=%d "
+                    "selected_transaction_paths=%d",
+                    operation_id,
+                    plan.scope,
+                    remote_changed,
+                    local_changed and not upload_only,
+                    len(selected_views),
+                    sum(
+                        sum(
+                            1
+                            for path in set(view.current).union(view.desired)
+                            if not _same_artifact(
+                                view.current.get(path), view.desired.get(path)
+                            )
+                        )
+                        for view in selected_views
+                    ),
                 )
                 if verification_layout_ids is None:
                     current_local = self._scan_automatic_local()
@@ -2444,11 +2594,24 @@ class SaveSyncService:
                     raise SaveSyncVerificationError(
                         "Save/state data changed before reconciliation completed."
                     )
-            except BaseException:
+                log.info(
+                    "SaveSync transaction materialization committed: "
+                    "operation_id=%s remote_write=%s local_write=%s",
+                    operation_id,
+                    remote_changed,
+                    local_changed and not upload_only,
+                )
+            except BaseException as exc:
                 transaction = locals().get("transaction")
                 if transaction is not None:
                     transaction.rollback()
                 container_work.cleanup()
+                log.warning(
+                    "SaveSync transaction aborted: operation_id=%s "
+                    "reason=%s baseline_advanced=false cursor_advanced=false",
+                    operation_id,
+                    type(exc).__name__,
+                )
                 raise
 
             timestamp = datetime.now(timezone.utc).isoformat()
@@ -2715,17 +2878,44 @@ class SaveSyncService:
                     after=desired_remote,
                 )
                 if mutations:
-                    generation = self._append_remote_journal(
-                        revision=report.revision,
-                        timestamp=timestamp,
-                        mutations=mutations,
-                    )
+                    try:
+                        generation = self._append_remote_journal(
+                            revision=report.revision,
+                            timestamp=timestamp,
+                            mutations=mutations,
+                        )
+                    except BaseException as exc:
+                        # A remote write is not a completed incremental commit
+                        # until peers can discover it through the journal. The
+                        # journal writer is atomic, so a raised append leaves
+                        # the previous generation intact; roll the materialized
+                        # bytes and local baseline back to the preflight state.
+                        if transaction is not None:
+                            transaction.rollback()
+                        _write_state(self._state_path, state)
+                        container_work.cleanup()
+                        log.warning(
+                            "SaveSync transaction aborted: operation_id=%s "
+                            "reason=%s stage=remote-journal "
+                            "baseline_advanced=false cursor_advanced=false",
+                            operation_id,
+                            type(exc).__name__,
+                        )
+                        raise
                     if next_state.quick_sync_ready:
                         next_state = replace(
                             next_state,
                             quick_sync_cursor_generation=generation,
                         )
                         _write_state(self._state_path, next_state)
+            log.info(
+                "SaveSync baseline committed: operation_id=%s revision=%s "
+                "baseline_artifacts=%d affected_groups=%d",
+                operation_id,
+                report.revision,
+                len(next_state.shared_manifest),
+                len(affected_group_ids),
+            )
             if transaction is not None:
                 try:
                     transaction.finalize()
@@ -3319,13 +3509,21 @@ class SaveSyncService:
         if path is None:
             return 0
         state = self._get_state_unlocked()
-        return savesync_journal.append_mutations(
+        generation = savesync_journal.append_mutations(
             path,
             device_id=state.device_id,
             revision=revision,
             timestamp=timestamp,
             mutations=mutations,
         )
+        log.info(
+            "SaveSync remote journal committed: revision=%s generation=%d "
+            "mutation_count=%d",
+            revision,
+            generation,
+            len(mutations),
+        )
+        return generation
 
     def _journal_mutations_for_remote_transition(
         self,
@@ -3629,6 +3827,7 @@ def _reconcile_plan(
         baseline_group = _group_manifest(baseline, group_paths)
         if _same_manifest(local_group, remote_group):
             group_action = SaveReconcileAction.UNCHANGED
+            reason = "local-matches-remote"
         elif (
             group_id in repair_local_group_ids
             and _is_incomplete_local_materialization(
@@ -3640,6 +3839,7 @@ def _reconcile_plan(
             # repaired this by making the remote manifest authoritative; normal
             # reconciliation now makes the same safe decision for a pure gap.
             group_action = SaveReconcileAction.DOWNLOAD
+            reason = "incomplete-local-materialization"
             descriptor = policy.group_for_path(
                 remote_group[0].relative_path
             )
@@ -3664,10 +3864,27 @@ def _reconcile_plan(
             )
         elif _same_manifest(remote_group, baseline_group):
             group_action = SaveReconcileAction.UPLOAD
+            reason = "local-diverged-remote-matches-baseline"
         elif _same_manifest(local_group, baseline_group):
             group_action = SaveReconcileAction.DOWNLOAD
+            reason = "remote-diverged-local-matches-baseline"
         else:
             group_action = SaveReconcileAction.CONFLICT
+            reason = "local-and-remote-diverged-from-baseline"
+        descriptor = policy.group_for_path(group_paths[0])
+        log.info(
+            "SaveSync reconciliation decision: scope=%s layout_id=%s "
+            "group_id=%r decision=%s reason=%s local_artifacts=%d "
+            "remote_artifacts=%d baseline_artifacts=%d",
+            scope,
+            descriptor.layout_id if descriptor is not None else "unsupported",
+            group_id,
+            group_action.value,
+            reason,
+            len(local_group),
+            len(remote_group),
+            len(baseline_group),
+        )
         for path in group_paths:
             local_artifact = local.get(path)
             remote_artifact = remote.get(path)

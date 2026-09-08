@@ -1,4 +1,4 @@
-"""Batocera game lifecycle hook for background SaveSync."""
+"""Batocera game lifecycle hook for durable SaveSync handoff."""
 
 from __future__ import annotations
 
@@ -412,6 +412,13 @@ def stop_menu_loop(
 
 
 def hook_content(romcloud_bin: Path) -> str:
+    """Build a hook whose gameStop return is the Auto SaveSync durability edge.
+
+    Conflict presentation stays detached because it must wait for the caller to
+    finish restoring EmulationStation's display. The save transaction itself is
+    intentionally synchronous so a concurrent Batocera shutdown cannot discard
+    the only observation of the just-finished game's local modification.
+    """
     binary = str(romcloud_bin).replace('"', '\\"')
     lifecycle_log = str(
         Path(romcloud_bin).parent.parent / "logs" / "auto-savesync-lifecycle.log"
@@ -420,6 +427,7 @@ def hook_content(romcloud_bin: Path) -> str:
         "#!/bin/bash\n"
         f'export ROMCLOUD_BIN="{binary}"\n'
         f'ROMCLOUD_AUTOSYNC_LOG="{lifecycle_log}"\n'
+        "ROMCLOUD_HOOK_STATUS=0\n"
         'mkdir -p "$(dirname "$ROMCLOUD_AUTOSYNC_LOG")" 2>/dev/null || true\n'
         'case "$1" in\n'
         "  gameStart)\n"
@@ -436,30 +444,39 @@ def hook_content(romcloud_bin: Path) -> str:
         'reason="romcloud_bin_unavailable"\\n\' '
         '"$(date -Iseconds 2>/dev/null || date)" "$$" '
         '>> "$ROMCLOUD_AUTOSYNC_LOG" 2>/dev/null || true\n'
+        "      ROMCLOUD_AUTOSYNC_STATUS=127\n"
+        "      ROMCLOUD_HOOK_STATUS=127\n"
         "    else\n"
-        '      ROMCLOUD_AUTOSYNC_CALLER_PID="$PPID" nohup "$ROMCLOUD_BIN" '
-        '_autosync game-stop "$2" "$3" "$4" "$5" '
-        '>> "$ROMCLOUD_AUTOSYNC_LOG" 2>&1 </dev/null &\n'
-        "      ROMCLOUD_AUTOSYNC_STATUS=$?\n"
-        "      ROMCLOUD_AUTOSYNC_WORKER_PID=$!\n"
-        '      if [[ "$ROMCLOUD_AUTOSYNC_STATUS" -eq 0 ]]; then\n'
-        '        printf \'%s pid=%s caller_pid=%s worker_pid=%s '
-        'event="game_stop_handoff_started"\\n\' '
+        '      printf \'%s pid=%s caller_pid=%s event="game_stop_sync_started"\\n\' '
         '"$(date -Iseconds 2>/dev/null || date)" "$$" "$PPID" '
-        '"$ROMCLOUD_AUTOSYNC_WORKER_PID" '
         '>> "$ROMCLOUD_AUTOSYNC_LOG" 2>/dev/null || true\n'
+        "      ROMCLOUD_AUTOSYNC_STATUS=0\n"
+        '      ROMCLOUD_AUTOSYNC_CALLER_PID="$PPID" "$ROMCLOUD_BIN" '
+        '_autosync game-stop "$2" "$3" "$4" "$5" '
+        '>> "$ROMCLOUD_AUTOSYNC_LOG" 2>&1 </dev/null '
+        '|| ROMCLOUD_AUTOSYNC_STATUS=$?\n'
+        '      if [[ "$ROMCLOUD_AUTOSYNC_STATUS" -eq 0 ]]; then\n'
+        '        printf \'%s pid=%s caller_pid=%s '
+        'event="game_stop_sync_completed" status=0\\n\' '
+        '"$(date -Iseconds 2>/dev/null || date)" "$$" "$PPID" '
+        '>> "$ROMCLOUD_AUTOSYNC_LOG" 2>/dev/null || true\n'
+        '        ROMCLOUD_AUTOSYNC_CALLER_PID="$PPID" nohup "$ROMCLOUD_BIN" '
+        '_autosync conflict-popup '
+        '>> "$ROMCLOUD_AUTOSYNC_LOG" 2>&1 </dev/null &\n'
         "      else\n"
-        '        printf \'%s pid=%s event="game_stop_handoff_failed" '
+        '        printf \'%s pid=%s event="game_stop_sync_failed" '
         'status=%s\\n\' '
         '"$(date -Iseconds 2>/dev/null || date)" "$$" '
         '"$ROMCLOUD_AUTOSYNC_STATUS" '
         '>> "$ROMCLOUD_AUTOSYNC_LOG" 2>/dev/null || true\n'
+        "        ROMCLOUD_HOOK_STATUS=$ROMCLOUD_AUTOSYNC_STATUS\n"
         "      fi\n"
         "    fi\n"
         '    nohup "$ROMCLOUD_BIN" _autosync menu-loop '
         ">/dev/null 2>&1 </dev/null &\n"
-        '    printf \'%s pid=%s event="game_stop_hook_returned"\\n\' '
+        '    printf \'%s pid=%s event="game_stop_hook_returned" status=%s\\n\' '
         '"$(date -Iseconds 2>/dev/null || date)" "$$" '
+        '"${ROMCLOUD_AUTOSYNC_STATUS:-127}" '
         '>> "$ROMCLOUD_AUTOSYNC_LOG" 2>/dev/null || true\n'
         "    ;;\n"
         "  emulationstationStart|systemStart|frontendStart)\n"
@@ -467,7 +484,7 @@ def hook_content(romcloud_bin: Path) -> str:
         ">/dev/null 2>&1 </dev/null &\n"
         "    ;;\n"
         "esac\n"
-        "exit 0\n"
+        'exit "$ROMCLOUD_HOOK_STATUS"\n'
     )
 
 
