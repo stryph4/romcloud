@@ -11,7 +11,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from romcloud.core.exceptions import SaveSyncError, SaveSyncVerificationError
+from romcloud.core.exceptions import (
+    SaveSyncError,
+    SaveSyncVerificationError,
+    SaveSyncWorkerBusyError,
+)
 from romcloud.core.models.savesync import SaveGroupCondition
 from romcloud.core.save_selection import SaveSelectionPolicy
 from romcloud.infrastructure.logging import get_logger
@@ -23,6 +27,10 @@ log = get_logger("auto-savesync")
 _MENU_PULL_INTERVAL_SECONDS = 300.0
 _DEFAULT_STABILITY_CHECKS = 4
 _DEFAULT_STAGING_RETRIES = 2
+# A detached drain-pending worker never blocks a lifecycle hook, so it can
+# afford to wait much longer than an interactive trigger for a busy worker
+# lock to free up — still bounded, never indefinitely.
+_DRAIN_PENDING_LOCK_RETRY_ATTEMPTS = 300  # ~30s at the existing 0.1s poll interval
 
 
 @dataclass(frozen=True)
@@ -172,6 +180,13 @@ class AutoSaveSyncCoordinator:
             log.info("gameStop conflict check skipped: Auto SaveSync disabled")
             return ()
         log.info(
+            "gameStop received: system=%s emulator=%s core=%s rom=%s",
+            system,
+            emulator,
+            core,
+            rom,
+        )
+        log.info(
             "gameStop conflict check started: system=%s emulator=%s core=%s",
             system,
             emulator,
@@ -190,8 +205,41 @@ class AutoSaveSyncCoordinator:
             "present" if session is not None else "missing",
         )
         if layout_ids:
+            log.info(
+                "gameStop waiting for save stability: layout_ids=%s "
+                "bounded_checks=%d interval=%.2fs",
+                ",".join(sorted(layout_ids)),
+                self._stability_checks,
+                self._stability_interval,
+            )
+            if self._wait_for_pre_discovery_stability(layout_ids):
+                log.info(
+                    "gameStop save stability achieved: layout_ids=%s",
+                    ",".join(sorted(layout_ids)),
+                )
+            else:
+                log.warning(
+                    "gameStop save stability timeout: layout_ids=%s "
+                    "bounded_checks=%d; local discovery skipped this pass to "
+                    "avoid classifying an in-flight write",
+                    ",".join(sorted(layout_ids)),
+                    self._stability_checks,
+                )
+                log.warning(
+                    "Auto SaveSync final result: trigger=game stop status=deferred "
+                    "reason=local-data-unstable-pre-discovery "
+                    "durable_dirty_state_retained=true"
+                )
+                raise SaveSyncError(
+                    "Auto SaveSync save data did not stabilize before discovery; "
+                    "pending local work was retained."
+                )
             changed_since = (
                 session.started_at if session is not None else time.time() - 5.0
+            )
+            log.info(
+                "gameStop local discovery started: layout_ids=%s",
+                ",".join(sorted(layout_ids)),
             )
             self._service.detect_and_mark_local_changes(
                 layout_ids, changed_since=changed_since
@@ -241,6 +289,7 @@ class AutoSaveSyncCoordinator:
         wait_for_handoff: bool = False,
         collect_new_conflicts: bool = False,
         require_completion: bool = False,
+        lock_retry_attempts: Optional[int] = None,
     ) -> tuple[str, ...]:
         """Serialize every automatic trigger through ``SaveSyncService.quick_sync``.
 
@@ -250,7 +299,7 @@ class AutoSaveSyncCoordinator:
         """
         lock = _AutoWorkerLock(self._data_root / ".savesync-auto.lock")
         new_conflict_ids: set[str] = set()
-        attempts = 6 if wait_for_handoff else 1
+        attempts = lock_retry_attempts or (6 if wait_for_handoff else 1)
         for attempt in range(attempts):
             if lock.acquire():
                 break
@@ -261,14 +310,17 @@ class AutoSaveSyncCoordinator:
                     trigger,
                 )
                 if require_completion:
-                    raise SaveSyncError(
-                        "Auto SaveSync could not acquire its worker lock; "
-                        "pending local work was retained."
+                    raise SaveSyncWorkerBusyError(
+                        "Auto SaveSync could not acquire its worker lock "
+                        "because another Quick Sync was still running; "
+                        "pending local work was retained and a follow-up "
+                        "sync will be scheduled."
                     )
                 return ()
             # A just-finishing leader may have completed its final durable
             # state read while gameStop was recording new work.
             time.sleep(0.1)
+        log.info("Auto SaveSync worker lock acquired: trigger=%s", trigger)
         try:
             if self._sessions.has_active_session():
                 log.info(
@@ -349,6 +401,12 @@ class AutoSaveSyncCoordinator:
                         len(conflicts_before),
                         ",".join(sorted(conflicts_before)) or "none",
                     )
+                log.info(
+                    "Auto SaveSync quick sync started: trigger=%s "
+                    "pending_local_groups=%d",
+                    trigger,
+                    len(pending),
+                )
                 try:
                     for staging_attempt in range(self._staging_retries + 1):
                         try:
@@ -580,12 +638,24 @@ class AutoSaveSyncCoordinator:
         temporary.replace(self._menu_state_path)
 
     def drain_pending(self) -> None:
-        """Compatibility entry point routed through authoritative Quick Sync."""
+        """Guaranteed follow-up sync after a busy worker released its lock.
+
+        This is the coalescing target for a gameStop (or other trigger) that
+        durably recorded local-dirty state but could not itself acquire the
+        worker lock because another Manual/Auto Quick Sync was still
+        running. It waits considerably longer than an interactive trigger
+        may (still bounded, never indefinitely) since it always runs
+        detached and never blocks a lifecycle hook.
+        """
         if not self._enabled:
             return
         if not self._pending_local_groups():
             return
-        self._run_quick_sync(trigger="pending work", wait_for_handoff=True)
+        self._run_quick_sync(
+            trigger="pending work",
+            wait_for_handoff=True,
+            lock_retry_attempts=_DRAIN_PENDING_LOCK_RETRY_ATTEMPTS,
+        )
 
     def _pending_local_groups(self) -> frozenset[str]:
         state = self._service.get_state()
@@ -598,6 +668,31 @@ class AutoSaveSyncCoordinator:
                 or bool(group.dirty_path_hints)
             )
         )
+
+    def _wait_for_pre_discovery_stability(self, layout_ids: frozenset[str]) -> bool:
+        """Require two equal raw layout observations before dirty classification.
+
+        This runs *before* :meth:`SaveSyncService.detect_and_mark_local_changes`
+        ever compares content against a baseline. Without it, a single upfront
+        scan racing an emulator/core's still-in-flight save write can observe
+        stale, baseline-matching bytes and permanently classify a real change
+        as unchanged: nothing downstream re-scans a group that was never
+        marked dirty, so the change would silently never sync.
+        """
+        unavailable = object()
+        previous: object = unavailable
+        for observation in range(self._stability_checks + 1):
+            try:
+                current = self._service.observe_local_layouts(layout_ids)
+            except OSError:
+                previous = unavailable
+            else:
+                if previous is not unavailable and current == previous:
+                    return True
+                previous = current
+            if observation < self._stability_checks and self._stability_interval:
+                time.sleep(self._stability_interval)
+        return False
 
     def _wait_until_stable(self, group_ids: frozenset[str]) -> bool:
         """Require two equal local hash/size observations within a bound."""

@@ -1051,6 +1051,178 @@ def test_two_client_snes_existing_save_game_stop_quick_and_full_converge(
     assert laptop_save.read_bytes() == remote_save.read_bytes() == b"main-pc-newer"
 
 
+def test_game_stop_normal_uncontended_path_traces_every_required_step(
+    tmp_path: Path, caplog
+):
+    """End-to-end proof for the normal, uncontended gameStop path: every one
+    of the required observable steps (hook received, local discovery,
+    per-group hash observation, dirty marker creation, worker lock
+    acquisition, quick sync start, reconciliation decision, transaction
+    commit, remote journal commit, cursor advancement, final result) is
+    present in the durable log, in the order a real hardware trace would
+    need to diagnose this exact bug."""
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    local = tmp_path / "local/snes/Super Metroid.srm"
+    remote = tmp_path / "remote/snes/Super Metroid.srm"
+    _write(local, b"baseline")
+    service.full_sync()
+    cursor_before = service.get_state().quick_sync_cursor_generation
+
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        coordinator.game_start(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+        local.write_bytes(b"final-save-bytes")
+        conflict_ids = coordinator.game_stop(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+
+    assert conflict_ids == ()
+    assert remote.read_bytes() == b"final-save-bytes"
+    trace = caplog.text
+    for evidence in (
+        "gameStop received: system=snes emulator=libretro core=snes9x rom=Super Metroid.sfc",
+        "gameStop local discovery started: layout_ids=retroarch-root-snes",
+        "SaveSync local hash observation: group_id=",
+        "SaveSync local classification: layout_id=retroarch-root-snes",
+        "classification=changed reason=manifest-diff-from-baseline",
+        "SaveSync local discovery: dirty marker created: group_id=",
+        "Auto SaveSync worker lock acquired: trigger=game stop",
+        "Auto SaveSync quick sync started: trigger=game stop",
+        "decision=upload reason=local-diverged-remote-matches-baseline",
+        "SaveSync transaction materialization committed:",
+        "SaveSync remote journal committed:",
+        "Quick SaveSync cursor committed:",
+        "Auto SaveSync final result: trigger=game stop status=reconciled",
+    ):
+        assert evidence in trace, f"missing required trace evidence: {evidence!r}"
+    # Hardware-log tracing must never require reading save contents.
+    assert "final-save-bytes" not in trace
+    assert service.get_state().quick_sync_cursor_generation != cursor_before
+
+    # Manual Quick Sync immediately afterward must see no remaining mutation.
+    manual = service.quick_sync()
+    assert manual.status == "unchanged"
+
+
+def test_game_stop_waits_through_inflight_save_write_and_uploads_final_bytes(
+    tmp_path: Path,
+):
+    """Prove the exact hardware-suspected race: the emulator/core is still
+    writing the save (observably changing content) at the instant gameStop
+    fires. This must not be classified as unchanged; gameStop must wait for
+    real settling and then publish the true final bytes, not a torn/stale
+    intermediate value."""
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = AutoSaveSyncCoordinator(
+        service,
+        data_root=tmp_path / "data",
+        enabled=True,
+        policy=DEFAULT_SAVE_SELECTION_POLICY,
+        quiet_seconds=0.05,
+    )
+    local = tmp_path / "local/snes/Super Metroid.srm"
+    remote = tmp_path / "remote/snes/Super Metroid.srm"
+    _write(local, b"baseline")
+    service.full_sync()
+    coordinator.game_start(
+        system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+    )
+
+    def emulator_flush() -> None:
+        time.sleep(0.02)
+        local.write_bytes(b"torn-in-flight-write")
+        time.sleep(0.06)
+        local.write_bytes(b"true-final-save-bytes")
+
+    writer = threading.Thread(target=emulator_flush)
+    writer.start()
+    try:
+        conflict_ids = coordinator.game_stop(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+    finally:
+        writer.join(timeout=5)
+
+    assert conflict_ids == ()
+    assert not writer.is_alive()
+    assert remote.read_bytes() == b"true-final-save-bytes"
+    assert local.read_bytes() == b"true-final-save-bytes"
+
+
+def test_game_stop_never_stabilizing_save_is_conservatively_deferred(
+    tmp_path: Path, caplog
+):
+    """Prove the conservative side of the same race: if the save never
+    settles within the bounded window, gameStop must defer/fail loudly
+    rather than silently classify a moving target as unchanged (false
+    success) or publish a torn intermediate value. Nothing durable is
+    marked dirty from an unstable pass, and a later, genuinely stable
+    gameStop is not permanently blocked."""
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = AutoSaveSyncCoordinator(
+        service,
+        data_root=tmp_path / "data",
+        enabled=True,
+        policy=DEFAULT_SAVE_SELECTION_POLICY,
+        quiet_seconds=0.03,
+        stability_checks=3,
+    )
+    local = tmp_path / "local/snes/Super Metroid.srm"
+    remote = tmp_path / "remote/snes/Super Metroid.srm"
+    _write(local, b"baseline")
+    service.full_sync()
+    coordinator.game_start(
+        system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+    )
+
+    stop_writing = threading.Event()
+
+    def never_settles() -> None:
+        counter = 0
+        while not stop_writing.is_set():
+            local.write_bytes(f"still-writing-{counter}".encode())
+            counter += 1
+            time.sleep(0.01)
+
+    writer = threading.Thread(target=never_settles)
+    writer.start()
+    try:
+        with caplog.at_level("WARNING"):
+            with pytest.raises(SaveSyncError, match="did not stabilize"):
+                coordinator.game_stop(
+                    system="snes",
+                    emulator="libretro",
+                    core="snes9x",
+                    rom="Super Metroid.sfc",
+                )
+    finally:
+        stop_writing.set()
+        writer.join(timeout=5)
+
+    assert "gameStop save stability timeout" in caplog.text
+    assert (
+        "status=deferred reason=local-data-unstable-pre-discovery" in caplog.text
+    )
+    assert remote.read_bytes() == b"baseline"
+    assert all(
+        group.condition is SaveGroupCondition.CLEAN
+        for group in service.get_state().groups
+    )
+
+    # Once the save genuinely settles, a later gameStop is not locked out.
+    local.write_bytes(b"finally-settled")
+    coordinator.game_stop(
+        system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+    )
+    assert remote.read_bytes() == b"finally-settled"
+
+
 def test_snes_game_stop_never_invokes_container_reconciliation(tmp_path: Path):
     class _UnexpectedContainerRegistry:
         def get(self, _adapter_id):
@@ -1756,6 +1928,138 @@ def test_failed_game_stop_transaction_retains_baseline_cursor_and_dirty_hint(
 
     assert remote.read_bytes() == b"new-revision"
     assert service.get_state().groups[0].condition is SaveGroupCondition.CLEAN
+
+
+def test_game_stop_worker_busy_retains_dirty_state_and_drain_pending_completes_it(
+    tmp_path: Path, monkeypatch
+):
+    """A gameStop that loses the worker lock to a live Quick Sync must not
+    silently discard the change: durable dirty state is captured before the
+    lock is even attempted, and the guaranteed drain-pending follow-up (what
+    the CLI spawns detached on this exact failure) completes it once the
+    busy operation releases the lock."""
+    from romcloud.core.exceptions import SaveSyncWorkerBusyError
+
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    other_worker = _coordinator(tmp_path, service)
+    psx_local = tmp_path / "local/psx/Game.srm"
+    snes_local = tmp_path / "local/snes/Super Metroid.srm"
+    snes_remote = tmp_path / "remote/snes/Super Metroid.srm"
+    _write(psx_local, b"psx-base")
+    _write(snes_local, b"baseline")
+    service.full_sync()
+
+    busy_entered = threading.Event()
+    release_busy = threading.Event()
+    original_quick_sync = service.quick_sync
+
+    def slow_quick_sync(*args, **kwargs):
+        busy_entered.set()
+        assert release_busy.wait(timeout=2)
+        return original_quick_sync(*args, **kwargs)
+
+    monkeypatch.setattr(service, "quick_sync", slow_quick_sync)
+    psx_local.write_bytes(b"psx-changed")
+    service.mark_local_dirty("psx/Game.srm")
+    busy_thread = threading.Thread(target=other_worker.drain_pending)
+    busy_thread.start()
+    assert busy_entered.wait(timeout=2)
+
+    coordinator.game_start(
+        system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+    )
+    snes_local.write_bytes(b"main-pc-newer")
+    with pytest.raises(SaveSyncWorkerBusyError):
+        coordinator.game_stop(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+
+    # Not silently discarded: durable dirty state was captured before the
+    # lock was even attempted, and the remote was never touched by this pass.
+    snes_group = next(
+        group
+        for group in service.get_state().groups
+        if group.layout_id == "retroarch-root-snes"
+    )
+    assert snes_group.condition is SaveGroupCondition.LOCAL_DIRTY
+    assert snes_remote.read_bytes() == b"baseline"
+
+    release_busy.set()
+    busy_thread.join(timeout=5)
+    assert not busy_thread.is_alive()
+    assert (tmp_path / "remote/psx/Game.srm").read_bytes() == b"psx-changed"
+
+    # The guaranteed follow-up (spawned detached by the CLI on this exact
+    # failure) drains the retained work once the busy operation has released
+    # the lock.
+    coordinator.drain_pending()
+
+    assert snes_remote.read_bytes() == b"main-pc-newer"
+    snes_group = next(
+        group
+        for group in service.get_state().groups
+        if group.layout_id == "retroarch-root-snes"
+    )
+    assert snes_group.condition is SaveGroupCondition.CLEAN
+
+
+def test_game_stop_cli_schedules_drain_pending_follow_up_on_worker_busy(
+    tmp_path: Path, monkeypatch
+):
+    from romcloud.cli.commands import autosync as autosync_commands
+    from romcloud.cli.main import cli
+    from romcloud.core.exceptions import SaveSyncWorkerBusyError
+
+    config_path = tmp_path / "romcloud.toml"
+    write_config(
+        AppConfig(
+            source=SourceConfig("local", (tmp_path / "roms").as_posix()),
+            cache=CacheConfig((tmp_path / "cache").as_posix()),
+            local_roms_path=(tmp_path / "local-roms").as_posix(),
+            data_path=(tmp_path / "data").as_posix(),
+            saves=SavesConfig(
+                local_path=(tmp_path / "saves").as_posix(),
+                auto_sync_enabled=True,
+            ),
+        ),
+        str(config_path),
+    )
+    coordinator = type(
+        "Coordinator",
+        (),
+        {
+            "game_stop": lambda self, **_kwargs: (_ for _ in ()).throw(
+                SaveSyncWorkerBusyError("worker lock busy")
+            )
+        },
+    )()
+    monkeypatch.setattr(autosync_commands, "_coordinator", lambda _ctx: coordinator)
+    spawn_calls = []
+    monkeypatch.setattr(
+        batocera_auto_savesync,
+        "spawn_drain_pending",
+        lambda **kwargs: spawn_calls.append(kwargs) or 4242,
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config",
+            str(config_path),
+            "_autosync",
+            "game-stop",
+            "snes",
+            "libretro",
+            "snes9x",
+            "Super Metroid.sfc",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "did not complete" in result.output
+    assert len(spawn_calls) == 1
 
 
 def test_failed_remote_journal_commit_rolls_back_bytes_baseline_and_cursor(

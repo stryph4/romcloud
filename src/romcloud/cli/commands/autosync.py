@@ -11,6 +11,7 @@ import click
 
 from romcloud.cli.context import get_container
 from romcloud.core.capabilities import OperatingMode
+from romcloud.core.exceptions import SaveSyncWorkerBusyError
 from romcloud.infrastructure import savesync_prompts
 from romcloud.infrastructure.config import load_config
 from romcloud.infrastructure.library_view import operating_mode
@@ -265,6 +266,19 @@ def game_stop(
             ",".join(conflict_ids) or "none",
         )
     except Exception as exc:
+        if isinstance(exc, SaveSyncWorkerBusyError):
+            try:
+                pid = batocera_auto_savesync.spawn_drain_pending()
+                log.warning(
+                    "gameStop worker-busy follow-up scheduled: drain_pending_pid=%d",
+                    pid,
+                )
+            except Exception:  # noqa: BLE001 - the failure below still surfaces
+                log.error(
+                    "gameStop could not schedule a worker-busy follow-up sync; "
+                    "durable dirty state remains for the next periodic tick",
+                    exc_info=True,
+                )
         log.warning("SaveSync game-exit pass failed", exc_info=True)
         raise click.ClickException(
             "Auto SaveSync did not complete; pending local work was retained."
@@ -308,6 +322,23 @@ def remote_reconnect(ctx: click.Context) -> None:
         _coordinator(ctx).remote_reconnect()
     except Exception:  # noqa: BLE001 - detached best-effort background work
         log.warning("Remote-data reconnect Quick Sync failed", exc_info=True)
+
+
+@autosync_group.command("drain-pending", hidden=True)
+@click.pass_context
+def drain_pending(ctx: click.Context) -> None:
+    """Detached, patient follow-up after a worker-busy gameStop deferral.
+
+    Never blocks a lifecycle hook: this always runs as its own spawned
+    process, so it can wait considerably longer than an interactive trigger
+    for the worker lock a busy Manual/Auto Quick Sync is holding to free up.
+    """
+    if not _auto_sync_enabled(ctx.obj["config"]):
+        return
+    try:
+        _coordinator(ctx).drain_pending()
+    except Exception:  # noqa: BLE001 - detached best-effort background work
+        log.warning("Worker-busy follow-up Quick Sync failed", exc_info=True)
 
 
 @autosync_group.command("menu-loop", hidden=True)

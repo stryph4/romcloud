@@ -434,6 +434,13 @@ class SaveSyncService:
                         else "new-group-outside-session-window"
                     )
                 log.info(
+                    "SaveSync local hash observation: group_id=%r "
+                    "old_hash=%s observed_hash=%s",
+                    group_id,
+                    _manifest_hash_summary(baseline_group),
+                    _manifest_hash_summary(local_group),
+                )
+                log.info(
                     "SaveSync local classification: layout_id=%s group_id=%r "
                     "classification=%s reason=%s local_artifacts=%d "
                     "baseline_artifacts=%d",
@@ -446,6 +453,10 @@ class SaveSyncService:
                 )
                 if not changed:
                     unchanged_groups += 1
+                    log.info(
+                        "SaveSync local discovery: no change detected: group_id=%r",
+                        group_id,
+                    )
                     continue
                 changed_groups += 1
                 hints = tuple(
@@ -458,6 +469,12 @@ class SaveSyncService:
                     group_id=group_id,
                     layout_id=descriptor.layout_id,
                     paths=hints,
+                )
+                log.info(
+                    "SaveSync local discovery: dirty marker created: group_id=%r "
+                    "paths=%s",
+                    group_id,
+                    ",".join(hints),
                 )
             if next_state != state:
                 _write_state(self._state_path, next_state)
@@ -499,6 +516,27 @@ class SaveSyncService:
             return {}
         report = self._scan_local_layouts(layout_ids)
         return _manifest_for_groups(report.artifacts, group_ids, self._policy)
+
+    def observe_local_layouts(
+        self, layout_ids: frozenset[str]
+    ) -> dict[str, SaveArtifact]:
+        """Hash whatever local files currently exist under these layouts.
+
+        Unlike :meth:`observe_local_groups`, this observes content *before*
+        any group has been durably classified as dirty, so a caller can wait
+        for an emulator/core's save write to settle before that
+        classification is ever computed. Advisory and read-only: no durable
+        state, provider, or remote path is touched here.
+        """
+        allowed_layouts = frozenset(
+            layout_id
+            for layout_id in layout_ids
+            if self._policy.is_lifecycle_enabled(layout_id)
+            and self._layout_enabled(layout_id)
+        )
+        if not allowed_layouts:
+            return {}
+        return dict(self._scan_local_layouts(allowed_layouts).artifacts)
 
     def acknowledge_conflict(self, conflict_id: str) -> SaveSyncState:
         """Record Review-Later acknowledgement without resolving a conflict."""
@@ -3801,6 +3839,16 @@ def _same_manifest(
     left: tuple[SaveArtifact, ...], right: tuple[SaveArtifact, ...]
 ) -> bool:
     return left == right
+
+
+def _manifest_hash_summary(manifest: tuple[SaveArtifact, ...]) -> str:
+    """Compact, log-safe per-path content-hash summary for hardware tracing."""
+    if not manifest:
+        return "none"
+    return ",".join(
+        f"{artifact.relative_path}:{artifact.content_hash[:12]}"
+        for artifact in manifest
+    )
 
 
 def _is_incomplete_local_materialization(

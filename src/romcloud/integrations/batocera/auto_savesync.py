@@ -366,6 +366,34 @@ def spawn_remote_reconnect(
     return process.pid
 
 
+def spawn_drain_pending(
+    *,
+    python_executable: Optional[str] = None,
+    popen: Callable[..., subprocess.Popen] = subprocess.Popen,
+) -> int:
+    """Detach a guaranteed follow-up sync after a busy worker lock is freed.
+
+    Used when a synchronous trigger (e.g. gameStop) durably recorded local
+    dirty state but could not itself acquire the worker lock because another
+    Manual/Auto Quick Sync was still running; this ensures the pending work
+    is coalesced into a follow-up rather than left to the next periodic tick.
+    """
+    process = popen(
+        [
+            python_executable or sys.executable,
+            "-m",
+            "romcloud.cli.main",
+            "_autosync",
+            "drain-pending",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return process.pid
+
+
 def _signal_owned_process(pid: int, sig: int) -> None:
     getpgid = getattr(os, "getpgid", None)
     killpg = getattr(os, "killpg", None)
