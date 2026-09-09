@@ -71,6 +71,40 @@ def test_local_back_exit_terminates_browser_but_not_manager(tmp_path: Path, monk
     assert result["closed"] is True
 
 
+def test_diagnostics_view_uses_same_blocking_controller_browser(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        lifecycle, "manager_status",
+        lambda data_path: {"local_url": "https://127.0.0.1:8765/"},
+    )
+    monkeypatch.setattr(
+        "romcloud.web.tls.manager_certificate_spki_pin", lambda data_path: "pin"
+    )
+    calls = []
+
+    def request(data_path, path, **kwargs):
+        calls.append(path)
+        return {"launch_id": "diag"} if path.endswith("local-launch") else {"exit_requested": True}
+
+    monkeypatch.setattr(lifecycle, "_manager_request", request)
+
+    class Process:
+        returncode = None
+        def poll(self): return self.returncode
+        def terminate(self): self.returncode = 0
+        def wait(self, timeout): return self.returncode
+
+    captured = {}
+    lifecycle.launch_local_browser(
+        tmp_path,
+        browser="/usr/bin/chromium",
+        view="diagnostics",
+        popen=lambda argv, **kwargs: (captured.setdefault("argv", argv), Process())[1],
+        sleep=lambda _: None,
+    )
+    assert captured["argv"][-1].endswith("?interaction=controller&view=diagnostics")
+    assert calls == ["/api/auth/local-launch", "/api/local-session-status/diag"]
+
+
 def test_known_batocera_appimage_is_capability_validated(tmp_path: Path) -> None:
     appimage = tmp_path / "GoogleChrome.AppImage"
     appimage.write_text("browser")

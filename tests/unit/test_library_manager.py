@@ -279,6 +279,60 @@ def test_http_api_requires_token_and_serves_paginated_json(
         thread.join(timeout=2)
 
 
+def test_local_diagnostics_api_is_paginated_filterable_and_structured(
+    db, game_repo, cache_repo, cache_service, tmp_path
+):
+    from romcloud.infrastructure.diagnostics import DiagnosticStore
+
+    diagnostic_path = tmp_path / "diagnostics.db"
+    store = DiagnosticStore(diagnostic_path)
+    assert store.initialize()
+    store.write(
+        level="INFO", subsystem="savesync", event_code="operation.started",
+        message="Auto Quick Sync started", operation_id="op-browser",
+        metadata={"operation_name": "Auto Quick Sync", "effective_mode": "cache"},
+    )
+    store.write(
+        level="INFO", subsystem="savesync", event_code="reconciliation.decision",
+        message="Selected logical group", operation_id="op-browser",
+        metadata={
+            "group_id": "game-42/save-a", "layout_id": "retroarch",
+            "decision": "upload", "reason": "local-changed", "local_hash": "abc",
+        },
+    )
+    store.close()
+    server = ManagerHTTPServer(
+        ("127.0.0.1", 0), _manager(db, game_repo, cache_repo, cache_service),
+        "secret", diagnostics_path=diagnostic_path,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        with urllib.request.urlopen(
+            f"{base}/api/diagnostics?kind=operations&search=game-42&page_size=1",
+            timeout=2,
+        ) as response:
+            operations = json.load(response)
+        assert operations["operations"][0]["operation_id"] == "op-browser"
+        assert operations["operations"][0]["examined"] == 1
+        assert "savesync" in operations["facets"]["subsystems"]
+
+        with urllib.request.urlopen(
+            f"{base}/api/diagnostics?kind=events&detail=1&operation_id=op-browser",
+            timeout=2,
+        ) as response:
+            events = json.load(response)["events"]
+        assert [item["event_code"] for item in events] == [
+            "operation.started", "reconciliation.decision",
+        ]
+        assert events[1]["metadata"]["group_id"] == "game-42/save-a"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_real_browser_loads_authenticated_manager_app(
     db, game_repo, cache_repo, cache_service, tmp_path
 ):

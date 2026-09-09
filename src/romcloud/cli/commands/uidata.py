@@ -136,8 +136,11 @@ def _configure_uidata_logging(ctx: click.Context) -> None:
         level = "DEBUG" if ctx.obj.get("debug") else "INFO"
         log_dir = str(config_path.parent.parent / "logs")
         diagnostic_db = str(config_path.parent.parent / "data" / "diagnostics.db")
+    # stdout is the machine-readable JSON channel and Click's test/runtime
+    # capture may merge stderr into it. The rotating file and SQLite store are
+    # the durable uidata sinks, so never attach a console handler here.
     configure_logging(
-        level=level, log_dir=log_dir, console=True, diagnostic_db=diagnostic_db
+        level=level, log_dir=log_dir, console=False, diagnostic_db=diagnostic_db
     )
 
 
@@ -764,8 +767,11 @@ def uidata_manager_stop(ctx: click.Context) -> None:
     is_flag=True,
     help="Explicitly disable sandboxing for a user-installed browser only.",
 )
+@click.option("--view", type=click.Choice(["library", "diagnostics"]), default="library")
 @click.pass_context
-def uidata_manager_open_local(ctx: click.Context, allow_no_sandbox: bool) -> None:
+def uidata_manager_open_local(
+    ctx: click.Context, allow_no_sandbox: bool, view: str
+) -> None:
     """Open the manager in the local fullscreen browser until it exits."""
 
     def build() -> dict:
@@ -777,7 +783,7 @@ def uidata_manager_open_local(ctx: click.Context, allow_no_sandbox: bool) -> Non
         )
         start_manager(romcloud_bin, config.data_path)
         return launch_local_browser(
-            config.data_path, allow_no_sandbox=allow_no_sandbox
+            config.data_path, allow_no_sandbox=allow_no_sandbox, view=view
         )
 
     _run_action(ctx, build)
@@ -966,10 +972,11 @@ def uidata_diagnostics(
         events = store.query(query)
         operations = (
             store.operation_summaries(
-                page=page, page_size=min(page_size, 20),
-                subsystem=subsystem or "savesync",
+                page=page, page_size=min(page_size, 100), subsystem=subsystem,
+                level=level, operation_id=operation_id, start_utc=start_utc,
+                end_utc=end_utc, text=text,
             )
-            if not operation_id and subsystem in (None, "savesync")
+            if not operation_id
             else []
         )
         return {
@@ -977,6 +984,7 @@ def uidata_diagnostics(
             "operations": operations,
             "has_more": len(events) == page_size,
             "operation_view": bool(operation_id),
+            "facets": store.facets(),
         }
 
     _run_action(ctx, build)

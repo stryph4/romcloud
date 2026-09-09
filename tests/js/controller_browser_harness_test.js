@@ -11,8 +11,12 @@
     let pageDelta = 0;
     document.getElementById("system-1").addEventListener("click", () => { activated += 1; });
     window.addEventListener("romcloud:page-jump", (event) => { pageDelta += event.detail.delta; });
+    window.testButton(0, true);
     const navigator = window.ROMCloudController.startBrowserController();
     assert(document.activeElement.id === "system-0", "connect did not establish deterministic focus");
+    window.testTick(-20);
+    assert(activated === 0, "held launch confirm double-triggered in browser");
+    window.testButton(0, false); window.testTick(-10);
 
     window.testButton(13, true); window.testTick(0);
     assert(document.activeElement.id === "system-1", "D-pad down did not move one system");

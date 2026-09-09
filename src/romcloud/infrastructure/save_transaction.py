@@ -164,6 +164,17 @@ class SelectedTransaction:
         if not errors:
             self._cleanup(remove_journal=True)
             self._finished = True
+            diagnostic_event(
+                "savesync", "transaction.rolled_back",
+                "SaveSync transaction rollback completed",
+                metadata={
+                    "status": "rolled_back", "transaction_id": self.operation_id,
+                    "affected_groups": sorted({
+                        group for view in self.views for group in view.logical_groups.values()
+                    }),
+                },
+                operation_id=self.operation_id,
+            )
             log.info(
                 "SaveSync transaction rolled back: operation_id=%s "
                 "cleanup=complete metrics=%s",
@@ -189,6 +200,17 @@ class SelectedTransaction:
             _install_previous(view)
         self._cleanup(remove_journal=True)
         self._finished = True
+        diagnostic_event(
+            "savesync", "transaction.finalized",
+            "SaveSync transaction finalized",
+            metadata={
+                "status": "finalized", "transaction_id": self.operation_id,
+                "affected_groups": sorted({
+                    group for view in self.views for group in view.logical_groups.values()
+                }),
+            },
+            operation_id=self.operation_id,
+        )
         log.info(
             "SaveSync transaction finalized: operation_id=%s metrics=%s",
             self.operation_id,
@@ -313,6 +335,17 @@ def prepare_transaction(
             _fsync_tree(view.stage)
             _fsync_tree(view.previous_candidate)
         _write_journal(transaction, phase="prepared")
+        diagnostic_event(
+            "savesync", "transaction.prepared",
+            "SaveSync transaction staging completed",
+            metadata={
+                "status": "prepared", "transaction_id": transaction.operation_id,
+                "affected_groups": sorted({
+                    group for view in transaction.views for group in view.logical_groups.values()
+                }),
+            },
+            operation_id=transaction.operation_id,
+        )
         log.info(
             "SaveSync transaction prepared: operation_id=%s metrics=%s",
             transaction.operation_id,
@@ -350,6 +383,16 @@ def apply_transaction(
 ) -> None:
     """Apply all prepared views, rolling every view back on any failure."""
     _write_journal(transaction, phase="applying")
+    diagnostic_event(
+        "savesync", "transaction.applying", "SaveSync transaction applying",
+        metadata={
+            "status": "applying", "transaction_id": transaction.operation_id,
+            "affected_groups": sorted({
+                group for view in transaction.views for group in view.logical_groups.values()
+            }),
+        },
+        operation_id=transaction.operation_id,
+    )
     try:
         # A final full positive scan closes the preview/stage window.  It also
         # detects newly-created eligible paths, not merely edits to known files.
@@ -362,6 +405,16 @@ def apply_transaction(
         for view in transaction.views:
             _fsync_changed_live_paths(view)
         _write_journal(transaction, phase="promoted")
+        diagnostic_event(
+            "savesync", "transaction.promoted", "SaveSync transaction promoted",
+            metadata={
+                "status": "promoted", "transaction_id": transaction.operation_id,
+                "affected_groups": sorted({
+                    group for view in transaction.views for group in view.logical_groups.values()
+                }),
+            },
+            operation_id=transaction.operation_id,
+        )
     except BaseException:
         transaction.rollback()
         raise

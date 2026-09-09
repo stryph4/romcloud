@@ -1,0 +1,16 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Diagnostics controller harness</title></head>
+<body data-result="pending">
+  <span id="app-section-title"></span><main id="library-main"></main>
+  <main id="diagnostics-main" class="hidden">
+    <button id="diag-operations-tab" data-controller-zone="diagnostic-nav" data-controller-row="0">Operations</button>
+    <button id="diag-events-tab" data-controller-zone="diagnostic-nav" data-controller-row="1">Events</button>
+    <section id="diagnostics-list-view"><input id="diag-search" type="search"><select id="diag-subsystem"><option value=""></option></select><select id="diag-level"><option value=""></option></select><input id="diag-operation"><select id="diag-time"><option value=""></option></select><button id="diag-apply">Apply</button><button id="diag-clear">Clear</button><div id="diag-notice" class="hidden"></div><div id="diagnostic-list"></div><button id="diag-previous"></button><span id="diag-page-label"></span><button id="diag-next"></button></section>
+    <section id="diagnostics-detail-view" class="hidden"><h1 id="diag-detail-title"></h1><button id="diag-detail-back" data-controller-zone="diagnostic-actions" data-controller-row="0">Back</button><div id="diag-summary"></div><button id="diag-groups-tab"></button><button id="diag-raw-tab"></button><div id="diag-detail-content"></div><div id="diag-detail-pager"><button id="diag-detail-previous"></button><span id="diag-detail-page-label"></span><button id="diag-detail-next"></button></div></section>
+    <section id="diagnostics-group-view" class="hidden"><h1 id="diag-group-title"></h1><button id="diag-group-back"></button><div id="diag-group-content"></div></section>
+  </main>
+  <script src="controller_browser_harness_setup.js"></script>
+  <script src="../../src/romcloud/web/static/controller.js"></script>
+  <script src="../../src/romcloud/web/static/diagnostics.js"></script>
+  <script src="diagnostics_browser_harness_test.js"></script>
+</body></html>

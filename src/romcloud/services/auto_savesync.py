@@ -176,7 +176,7 @@ class AutoSaveSyncCoordinator:
         self._sessions.start(system=system, emulator=emulator, core=core, rom=rom)
 
     @correlated_operation(
-        "gameStop Quick Sync", subsystem="savesync", source="Auto gameStop Quick"
+        "Auto Quick Sync", subsystem="savesync", source="Auto gameStop"
     )
     def game_stop(
         self, *, system: str, emulator: str, core: str, rom: str
@@ -269,7 +269,7 @@ class AutoSaveSyncCoordinator:
         return conflict_ids
 
     @correlated_operation(
-        "Remote reconnect Quick Sync", subsystem="savesync", source="remote reconnect"
+        "Auto Quick Sync", subsystem="savesync", source="remote reconnect"
     )
     def remote_reconnect(self) -> None:
         """Run one eligible Quick Sync after a detached reconnect edge."""
@@ -284,7 +284,7 @@ class AutoSaveSyncCoordinator:
         self._run_quick_sync(trigger="remote-data reconnect")
 
     @correlated_operation(
-        "Periodic Auto Quick Sync", subsystem="savesync", source="periodic Auto"
+        "Auto Quick Sync", subsystem="savesync", source="periodic Auto"
     )
     def menu_tick(self, *, force: bool = False) -> None:
         if not self._enabled:
@@ -673,7 +673,7 @@ class AutoSaveSyncCoordinator:
         temporary.replace(self._menu_state_path)
 
     @correlated_operation(
-        "Drain pending Quick Sync", subsystem="savesync", source="drain-pending"
+        "Auto Quick Sync", subsystem="savesync", source="drain-pending"
     )
     def drain_pending(self) -> None:
         """Guaranteed follow-up sync after a busy worker released its lock.

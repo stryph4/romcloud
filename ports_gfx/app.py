@@ -174,7 +174,7 @@ MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
         MenuItem(
             "Diagnostics / Logs",
             "diagnostics",
-            "Browse the newest redacted ROMCloud diagnostic events.",
+            "Open the controller-friendly retained diagnostics browser.",
         ),
         MenuItem("Check for Updates", "update-check"),
         MenuItem("Update ROMCloud", "update-install"),
@@ -385,6 +385,10 @@ _OPERATIONS: dict[str, OperationSpec] = {
     ),
     "browser-runtime-status": OperationSpec(
         title="Local Browser Runtime", args=("uidata", "browser-runtime-status")
+    ),
+    "diagnostics": OperationSpec(
+        title="Diagnostics / Logs",
+        args=("uidata", "manager-open-local", "--view", "diagnostics"),
     ),
 }
 _MODE_TRANSITION_ACTIONS = frozenset(

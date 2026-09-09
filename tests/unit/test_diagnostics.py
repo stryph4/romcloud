@@ -274,12 +274,15 @@ def test_savesync_upload_noop_download_and_conflict_chains(tmp_path: Path) -> No
 
 
 def test_graphical_maintenance_exposes_operation_summary() -> None:
-    from ports_gfx.app import MENU_CATEGORIES, format_result
+    from ports_gfx.app import MENU_CATEGORIES, _OPERATIONS, format_result
     from ports_gfx.client import BackendResult
 
     assert any(
         item.action == "diagnostics" and item.label == "Diagnostics / Logs"
         for item in MENU_CATEGORIES["Maintenance"]
+    )
+    assert _OPERATIONS["diagnostics"].args == (
+        "uidata", "manager-open-local", "--view", "diagnostics"
     )
     rendered = format_result(
         "diagnostics",
@@ -360,3 +363,45 @@ def test_maintenance_endpoint_filters_and_pages(tmp_path: Path) -> None:
     payload = json.loads(result.output.splitlines()[-1])
     assert payload["events"][0]["event_code"] == "needle"
     assert payload["operation_view"] is True
+
+
+def test_operation_pages_use_v2_summary_table_not_event_chain_reconstruction(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = DiagnosticStore(tmp_path / "diagnostics.db")
+    assert store.initialize()
+    store.write(
+        level="INFO", subsystem="savesync", event_code="operation.started",
+        message="Quick Sync started", operation_id="indexed-op",
+        metadata={"operation_name": "Auto Quick Sync", "group_id": "game/save"},
+    )
+    monkeypatch.setattr(
+        store, "operation_chain",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("N+1 chain query")),
+    )
+    rows = store.operation_summaries(text="game/save")
+    assert rows[0]["operation_id"] == "indexed-op"
+    assert rows[0]["event_count"] == 1
+    assert store.query(DiagnosticQuery(text="indexed-op"))[0]["operation_id"] == "indexed-op"
+
+
+def test_v1_schema_migrates_and_backfills_operation_summaries(tmp_path: Path) -> None:
+    import sqlite3
+
+    path = tmp_path / "diagnostics.db"
+    store = DiagnosticStore(path)
+    assert store.initialize()
+    store.write(
+        level="INFO", subsystem="savesync", event_code="operation.started",
+        message="Legacy operation", operation_id="legacy-op",
+        metadata={"operation_name": "Legacy Quick Sync"},
+    )
+    store.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute("UPDATE diagnostic_schema_version SET version = 1")
+        connection.execute("DELETE FROM diagnostic_operations")
+        connection.commit()
+
+    migrated = DiagnosticStore(path)
+    assert migrated.initialize()
+    assert migrated.operation_summaries()[0]["operation_id"] == "legacy-op"

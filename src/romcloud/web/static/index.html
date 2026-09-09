@@ -22,7 +22,7 @@
 
   <div id="shell" class="shell hidden">
     <header>
-      <div class="brand"><span class="brand-mark">RC</span><span><b>ROMCloud</b><small>Library Manager</small></span></div>
+      <div class="brand"><span class="brand-mark">RC</span><span><b>ROMCloud</b><small id="app-section-title">Library Manager</small></span></div>
       <div id="controller-status" class="controller-status hidden" aria-live="polite">Controller connected</div>
       <div id="mode" class="mode">Connecting…</div>
       <button id="controller-menu-button" class="icon-button local-only hidden" data-controller-zone="global" data-controller-row="0" data-controller-col="0">Help / Exit</button>
@@ -31,7 +31,7 @@
     </header>
     <div id="offline-banner" class="banner hidden"><b>Offline</b> — showing local content only. Remote-only games and downloads are unavailable.</div>
 
-    <main>
+    <main id="library-main">
       <aside>
         <h2>Systems</h2>
         <div id="systems" class="systems"></div>
@@ -61,6 +61,43 @@
         <div class="list-head"><label><input id="select-page" type="checkbox" data-controller-zone="select" data-controller-row="0" data-controller-col="0"> Select page</label><span id="result-count"></span></div>
         <div id="games" class="games"><div class="empty">Choose a system to browse its library.</div></div>
         <nav class="pager"><button id="previous" data-controller-zone="pager" data-controller-row="0" data-controller-col="0">Previous</button><span id="page-label">Page 0 of 0</span><label>Jump to <input id="jump" type="number" min="1" value="1" data-controller-zone="pager" data-controller-row="0" data-controller-col="1"></label><button id="next" data-controller-zone="pager" data-controller-row="0" data-controller-col="2">Next</button></nav>
+      </section>
+    </main>
+
+    <main id="diagnostics-main" class="hidden diagnostics-main">
+      <aside>
+        <h2>Diagnostics</h2>
+        <div class="systems">
+          <button id="diag-operations-tab" class="system active" data-controller-zone="diagnostic-nav" data-controller-row="0" data-controller-col="0">Operations</button>
+          <button id="diag-events-tab" class="system" data-controller-zone="diagnostic-nav" data-controller-row="1" data-controller-col="0">Raw Events</button>
+        </div>
+      </aside>
+      <section class="content">
+        <div id="diagnostics-list-view">
+          <div class="content-head"><div><p class="eyebrow">Maintenance</p><h1>Diagnostics / Logs</h1></div></div>
+          <div class="diagnostic-toolbar">
+            <label class="search"><span>Search metadata and messages</span><input id="diag-search" type="search" placeholder="Group, layout, game, operation, message…" data-controller-zone="diagnostic-filters" data-controller-row="0" data-controller-col="0"></label>
+            <label><span>Subsystem</span><select id="diag-subsystem" data-controller-zone="diagnostic-filters" data-controller-row="0" data-controller-col="1"><option value="">All subsystems</option></select></label>
+            <label><span>Level</span><select id="diag-level" data-controller-zone="diagnostic-filters" data-controller-row="0" data-controller-col="2"><option value="">All levels</option></select></label>
+            <label><span>Operation ID</span><input id="diag-operation" type="text" placeholder="ID prefix" data-controller-zone="diagnostic-filters" data-controller-row="1" data-controller-col="0"></label>
+            <label><span>Time</span><select id="diag-time" data-controller-zone="diagnostic-filters" data-controller-row="1" data-controller-col="1"><option value="">All retained history</option><option value="24h">Last 24 hours</option><option value="7d">Last 7 days</option><option value="30d">Last 30 days</option></select></label>
+            <div class="filter-actions"><button id="diag-apply" class="primary" data-controller-zone="diagnostic-filters" data-controller-row="1" data-controller-col="2">Apply</button><button id="diag-clear" data-controller-zone="diagnostic-filters" data-controller-row="1" data-controller-col="3">Clear</button></div>
+          </div>
+          <div id="diag-notice" class="notice hidden"></div>
+          <div id="diagnostic-list" class="diagnostic-list"><div class="empty">Loading diagnostics…</div></div>
+          <nav class="pager"><button id="diag-previous" data-controller-zone="pager" data-controller-row="0" data-controller-col="0">Previous</button><span id="diag-page-label">Page 1</span><button id="diag-next" data-controller-zone="pager" data-controller-row="0" data-controller-col="1">Next</button></nav>
+        </div>
+        <div id="diagnostics-detail-view" class="hidden">
+          <div class="content-head"><div><p class="eyebrow">Operation detail</p><h1 id="diag-detail-title">Operation</h1></div><button id="diag-detail-back" data-controller-zone="diagnostic-actions" data-controller-row="0" data-controller-col="0">Back to results</button></div>
+          <div id="diag-summary" class="diagnostic-summary"></div>
+          <div class="tabs"><button id="diag-groups-tab" class="tab active" data-controller-zone="diagnostic-actions" data-controller-row="1" data-controller-col="0">Changed saves / groups</button><button id="diag-raw-tab" class="tab" data-controller-zone="diagnostic-actions" data-controller-row="1" data-controller-col="1">Advanced / Raw Events</button></div>
+          <div id="diag-detail-content" class="diagnostic-list"></div>
+          <nav id="diag-detail-pager" class="pager"><button id="diag-detail-previous" data-controller-zone="pager" data-controller-row="0" data-controller-col="0">Previous</button><span id="diag-detail-page-label">Page 1</span><button id="diag-detail-next" data-controller-zone="pager" data-controller-row="0" data-controller-col="1">Next</button></nav>
+        </div>
+        <div id="diagnostics-group-view" class="hidden">
+          <div class="content-head"><div><p class="eyebrow">Save / group detail</p><h1 id="diag-group-title">Logical group</h1></div><button id="diag-group-back" data-controller-zone="diagnostic-actions" data-controller-row="0" data-controller-col="0">Back to operation</button></div>
+          <div id="diag-group-content" class="diagnostic-list"></div>
+        </div>
       </section>
     </main>
   </div>
@@ -105,6 +142,7 @@
     </div>
   </dialog>
   <script src="/controller.js" defer></script>
+  <script src="/diagnostics.js" defer></script>
   <script src="/app.js" defer></script>
 </body>
 </html>

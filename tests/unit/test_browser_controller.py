@@ -15,6 +15,7 @@ def test_controller_assets_wire_all_required_inputs_and_focus_scopes() -> None:
     html = (STATIC / "index.html").read_text(encoding="utf-8")
     javascript = (STATIC / "controller.js").read_text(encoding="utf-8")
     app = (STATIC / "app.js").read_text(encoding="utf-8")
+    diagnostics = (STATIC / "diagnostics.js").read_text(encoding="utf-8")
     css = (STATIC / "app.css").read_text(encoding="utf-8")
 
     assert html.index('/controller.js') < html.index('/app.js')
@@ -45,6 +46,28 @@ def test_controller_assets_wire_all_required_inputs_and_focus_scopes() -> None:
     assert 'id="exit-open-here"' in html
     assert "standard mapping unavailable" in app
     assert 'controller-focus' in css and 'controller-editing' in css
+    assert "compatibleGamepad" in javascript
+    assert "pushContext" in javascript and "popContext" in javascript
+    for zone in ("diagnostic-nav", "diagnostic-filters", "diagnostic-list", "diagnostic-actions"):
+        assert f'data-controller-zone="{zone}"' in html or zone in diagnostics
+    assert "romcloudGamepad.pushContext" in diagnostics
+    assert "romcloudGamepad.popContext" in diagnostics
+    assert 'get("view") === "diagnostics"' in app
+
+
+def test_game_and_diagnostics_are_consumers_of_the_shared_browser_navigator() -> None:
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    app = (STATIC / "app.js").read_text(encoding="utf-8")
+    diagnostics = (STATIC / "diagnostics.js").read_text(encoding="utf-8")
+    controller = (STATIC / "controller.js").read_text(encoding="utf-8")
+
+    assert 'row.dataset.controllerZone = "games"' in app
+    assert 'dataset.controllerZone = "diagnostic-list"' in diagnostics
+    assert "class BrowserGamepadNavigator" in controller
+    assert "class DiagnosticsBrowser" in diagnostics
+    assert "keydown" not in diagnostics or "event.key === \"Enter\"" in diagnostics
+    assert "scrollIntoView" in controller
+    assert "RepeatButton" in controller
 
 
 def test_browser_and_native_share_one_logical_action_contract() -> None:
@@ -156,3 +179,29 @@ def test_gamepad_navigation_executes_in_chromium_when_available(tmp_path: Path) 
         pytest.skip("Chromium crash reporter is blocked by this test sandbox")
     assert result.returncode == 0, result.stdout + result.stderr
     assert 'data-result="passed"' in result.stdout, result.stdout + result.stderr
+
+
+def test_diagnostics_navigation_executes_in_chromium_when_available(tmp_path: Path) -> None:
+    candidates = [
+        shutil.which("chromium"), shutil.which("google-chrome"), shutil.which("chrome"),
+        Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+        Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
+    ]
+    browser = next((str(path) for path in candidates if path and Path(path).is_file()), None)
+    if browser is None:
+        pytest.skip("Chromium is not installed on this development host")
+    harness = (ROOT / "tests" / "js" / "diagnostics_browser_harness.html").resolve().as_uri()
+    result = subprocess.run(
+        [
+            browser, "--headless=new", "--disable-gpu", "--no-sandbox",
+            f"--user-data-dir={tmp_path / 'diagnostics-profile'}",
+            "--virtual-time-budget=1000", "--dump-dom", harness,
+        ],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=20, check=False,
+    )
+    diagnostic = result.stdout + result.stderr
+    if result.returncode and "crashpad" in diagnostic and "Operation not permitted" in diagnostic:
+        pytest.skip("Chromium crash reporter is blocked by this test sandbox")
+    assert result.returncode == 0, diagnostic
+    assert 'data-result="passed"' in result.stdout, diagnostic

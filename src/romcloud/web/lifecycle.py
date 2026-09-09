@@ -662,10 +662,14 @@ def launch_local_browser(
     *,
     browser: str | None = None,
     allow_no_sandbox: bool = False,
+    view: str = "library",
     popen=subprocess.Popen,
     sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, object]:
     """Launch a kiosk browser and return only after it exits cleanly."""
+
+    if view not in {"library", "diagnostics"}:
+        raise ValueError(f"Unsupported local browser view: {view}")
 
     discovery = None if browser else discover_local_browser(data_path=data_path)
     selected = discovery.get("browser") if discovery else None
@@ -707,6 +711,8 @@ def launch_local_browser(
     local_url = str(manager_status(data_path).get("local_url", ""))
     separator = "&" if "?" in local_url else "?"
     controller_url = f"{local_url}{separator}interaction=controller"
+    if view != "library":
+        controller_url += f"&view={view}"
     argv = [
         executable,
         "--kiosk",

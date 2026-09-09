@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, urlparse
 from romcloud.core.exceptions import ROMCloudError
 from romcloud.infrastructure.logging import get_logger
 from romcloud.infrastructure.diagnostics import event as diagnostic_event
+from romcloud.infrastructure.diagnostics import DiagnosticQuery, DiagnosticStore
 from romcloud.services.library_manager import LibraryManagerService
 from romcloud.web.auth import (
     REMEMBER_90_DAYS_SECONDS,
@@ -182,6 +183,7 @@ class ManagerHTTPServer(ThreadingHTTPServer):
         token: str,
         auth_registry: BrowserAuthRegistry | None = None,
         controller_log_path: str | Path | None = None,
+        diagnostics_path: str | Path | None = None,
     ) -> None:
         self.manager = manager
         self.auth_token = token
@@ -191,9 +193,21 @@ class ManagerHTTPServer(ThreadingHTTPServer):
             if controller_log_path is not None
             else None
         )
+        diagnostic_store = DiagnosticStore(diagnostics_path) if diagnostics_path else None
+        self.diagnostic_store = (
+            diagnostic_store
+            if diagnostic_store is not None and diagnostic_store.initialize()
+            else None
+        )
         self.mutation_lock = threading.RLock()
         self.jobs = JobRegistry(manager, self.mutation_lock)
         super().__init__(address, ManagerRequestHandler)
+
+    def server_close(self) -> None:
+        if self.diagnostic_store is not None:
+            self.diagnostic_store.close()
+            self.diagnostic_store = None
+        super().server_close()
 
 
 class ManagerRequestHandler(BaseHTTPRequestHandler):
@@ -220,6 +234,19 @@ class ManagerRequestHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/games":
                 query = {key: values[-1] for key, values in parse_qs(parsed.query).items()}
                 self._json(HTTPStatus.OK, self.server.manager.browse(**query))
+            elif parsed.path == "/api/diagnostics":
+                if not self._trusted_local_request():
+                    self._json(
+                        HTTPStatus.FORBIDDEN,
+                        {"error": "Diagnostics are available only in the local Open Here session."},
+                    )
+                elif self.server.diagnostic_store is None:
+                    self._json(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        {"error": "Diagnostics database is unavailable; text logs remain active."},
+                    )
+                else:
+                    self._diagnostics(parsed.query)
             elif parsed.path.startswith("/api/jobs/"):
                 job = self.server.jobs.get(parsed.path.rsplit("/", 1)[-1])
                 self._json(
@@ -234,7 +261,7 @@ class ManagerRequestHandler(BaseHTTPRequestHandler):
                 )
             elif parsed.path == "/" or parsed.path == "/index.html":
                 self._static("index.html")
-            elif parsed.path in {"/app.js", "/app.css", "/controller.js"}:
+            elif parsed.path in {"/app.js", "/app.css", "/controller.js", "/diagnostics.js"}:
                 self._static(parsed.path[1:])
             else:
                 self.send_error(HTTPStatus.NOT_FOUND)
@@ -325,6 +352,52 @@ class ManagerRequestHandler(BaseHTTPRequestHandler):
         provided = self.headers.get("Authorization", "")
         expected = f"Bearer {self.server.auth_token}"
         return hmac.compare_digest(provided, expected)
+
+    def _diagnostics(self, raw_query: str) -> None:
+        values = {key: items[-1] for key, items in parse_qs(raw_query).items()}
+        page = max(1, int(values.get("page", "1")))
+        page_size = max(1, min(100, int(values.get("page_size", "30"))))
+        kind = values.get("kind", "operations")
+        operation_id = values.get("operation_id") or None
+        common = {
+            "subsystem": values.get("subsystem") or None,
+            "level": values.get("level") or None,
+            "start_utc": values.get("start_utc") or None,
+            "end_utc": values.get("end_utc") or None,
+            "text": values.get("search") or None,
+        }
+        store = self.server.diagnostic_store
+        assert store is not None
+        if kind == "operations" and not values.get("detail"):
+            items = store.operation_summaries(
+                **common,
+                operation_id=operation_id,
+                page=page,
+                page_size=page_size + 1,
+            )
+            payload_key = "operations"
+        else:
+            items = store.query(
+                DiagnosticQuery(
+                    **common,
+                    operation_id=operation_id,
+                    page=page,
+                    page_size=page_size + 1,
+                    chronological=bool(values.get("detail") and operation_id),
+                )
+            )
+            payload_key = "events"
+        has_more = len(items) > page_size
+        self._json(
+            HTTPStatus.OK,
+            {
+                payload_key: items[:page_size],
+                "page": page,
+                "page_size": page_size,
+                "has_more": has_more,
+                "facets": store.facets(),
+            },
+        )
 
     def _trusted_local_request(self) -> bool:
         if not is_loopback(self.client_address[0]):
@@ -452,6 +525,7 @@ def serve_manager(
     tls_key: str | None = None,
     auth_state_path: str | None = None,
     controller_log_path: str | None = None,
+    diagnostics_path: str | None = None,
     on_ready: Callable[[], None] | None = None,
 ) -> None:
     registry = BrowserAuthRegistry(state_path=auth_state_path) if auth_state_path else None
@@ -461,6 +535,7 @@ def serve_manager(
         token,
         auth_registry=registry,
         controller_log_path=controller_log_path,
+        diagnostics_path=diagnostics_path,
     )
     if tls_cert or tls_key:
         if not tls_cert or not tls_key:
