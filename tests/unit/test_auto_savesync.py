@@ -2983,3 +2983,298 @@ def test_periodic_pull_never_auto_pulls_xemu(tmp_path: Path):
     coordinator.menu_tick(force=True)
 
     assert local.read_bytes() == b"local"
+
+
+class _FakeProgress:
+    """Records every stage()/close() call in order, for asserting the exact
+    sequence gameStop's Auto SaveSync progress popup would have shown."""
+
+    def __init__(self, *, raise_on_call: bool = False) -> None:
+        self.calls: list[tuple] = []
+        self._raise_on_call = raise_on_call
+
+    def stage(self, text: str) -> None:
+        self.calls.append(("stage", text))
+        if self._raise_on_call:
+            raise RuntimeError("progress popup UI crashed")
+
+    def close(self, ok: bool, message=None) -> None:
+        self.calls.append(("close", ok, message))
+        if self._raise_on_call:
+            raise RuntimeError("progress popup UI crashed")
+
+    @property
+    def stages(self) -> list[str]:
+        return [call[1] for call in self.calls if call[0] == "stage"]
+
+
+class TestGameStopProgressPopup:
+    """Requirement coverage for the gameStop Auto SaveSync progress popup:
+    the popup is requested immediately, synchronous SaveSync behavior is
+    unchanged, real stage/result text is surfaced, and any UI failure never
+    affects the real SaveSync outcome."""
+
+    def test_progress_is_requested_immediately_as_the_very_first_call(
+        self, tmp_path: Path
+    ):
+        provider = _Provider()
+        service = _service(tmp_path, provider)
+        coordinator = _coordinator(tmp_path, service)
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        _write(local, b"baseline")
+        service.full_sync()
+        local.write_bytes(b"final-save-bytes")
+
+        progress = _FakeProgress()
+        coordinator.game_stop(
+            system="snes",
+            emulator="libretro",
+            core="snes9x",
+            rom="Super Metroid.sfc",
+            progress=progress,
+        )
+
+        assert progress.calls[0] == ("stage", "Checking save changes…")
+
+    def test_synchronous_savesync_result_is_unchanged_by_the_popup(
+        self, tmp_path: Path
+    ):
+        provider = _Provider()
+        service = _service(tmp_path, provider)
+        coordinator = _coordinator(tmp_path, service)
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        remote = tmp_path / "remote/snes/Super Metroid.srm"
+        _write(local, b"baseline")
+        service.full_sync()
+        local.write_bytes(b"final-save-bytes")
+
+        progress = _FakeProgress()
+        conflict_ids = coordinator.game_stop(
+            system="snes",
+            emulator="libretro",
+            core="snes9x",
+            rom="Super Metroid.sfc",
+            progress=progress,
+        )
+
+        assert conflict_ids == ()
+        assert remote.read_bytes() == b"final-save-bytes"
+
+    def test_real_stage_progression_is_surfaced_for_an_uploaded_save(
+        self, tmp_path: Path
+    ):
+        provider = _Provider()
+        service = _service(tmp_path, provider)
+        coordinator = _coordinator(tmp_path, service)
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        _write(local, b"baseline")
+        service.full_sync()
+        local.write_bytes(b"final-save-bytes")
+
+        progress = _FakeProgress()
+        coordinator.game_stop(
+            system="snes",
+            emulator="libretro",
+            core="snes9x",
+            rom="Super Metroid.sfc",
+            progress=progress,
+        )
+
+        assert progress.stages == [
+            "Checking save changes…",
+            "Waiting for save data to settle…",
+            "Preparing save sync…",
+            "Uploading changed save…",
+        ]
+        assert progress.calls[-1] == ("close", True, None)
+
+    def test_fast_no_change_path_still_shows_immediate_feedback_and_closes(
+        self, tmp_path: Path
+    ):
+        provider = _Provider()
+        service = _service(tmp_path, provider)
+        coordinator = _coordinator(tmp_path, service)
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        _write(local, b"baseline")
+        service.full_sync()
+        # No change at all since the last full sync.
+
+        progress = _FakeProgress()
+        conflict_ids = coordinator.game_stop(
+            system="snes",
+            emulator="libretro",
+            core="snes9x",
+            rom="Super Metroid.sfc",
+            progress=progress,
+        )
+
+        assert conflict_ids == ()
+        assert progress.stages[0] == "Checking save changes…"
+        assert "No save changes detected." in progress.stages
+        assert progress.calls[-1] == ("close", True, None)
+
+    def test_failure_produces_a_visible_failure_state_without_a_traceback(
+        self, tmp_path: Path, caplog
+    ):
+        provider = _Provider()
+        service = _service(tmp_path, provider)
+        coordinator = AutoSaveSyncCoordinator(
+            service,
+            data_root=tmp_path / "data",
+            enabled=True,
+            policy=DEFAULT_SAVE_SELECTION_POLICY,
+            quiet_seconds=0.03,
+            stability_checks=3,
+        )
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        _write(local, b"baseline")
+        service.full_sync()
+        coordinator.game_start(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+
+        stop_writing = threading.Event()
+
+        def never_settles() -> None:
+            counter = 0
+            while not stop_writing.is_set():
+                local.write_bytes(f"still-writing-{counter}".encode())
+                counter += 1
+                time.sleep(0.01)
+
+        writer = threading.Thread(target=never_settles)
+        writer.start()
+        progress = _FakeProgress()
+        try:
+            with pytest.raises(SaveSyncError):
+                coordinator.game_stop(
+                    system="snes",
+                    emulator="libretro",
+                    core="snes9x",
+                    rom="Super Metroid.sfc",
+                    progress=progress,
+                )
+        finally:
+            stop_writing.set()
+            writer.join(timeout=5)
+
+        assert progress.calls[-1] == (
+            "close",
+            False,
+            "Save sync failed.\nYour local save has been preserved.",
+        )
+        # No internal traceback text ever reaches the popup.
+        assert "Traceback" not in progress.calls[-1][2]
+
+    def test_ui_failure_never_fails_savesync(self, tmp_path: Path):
+        """A progress reporter whose stage()/close() raise must never abort
+        or corrupt the real synchronous SaveSync operation."""
+        provider = _Provider()
+        service = _service(tmp_path, provider)
+        coordinator = _coordinator(tmp_path, service)
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        remote = tmp_path / "remote/snes/Super Metroid.srm"
+        _write(local, b"baseline")
+        service.full_sync()
+        local.write_bytes(b"final-save-bytes")
+
+        progress = _FakeProgress(raise_on_call=True)
+        conflict_ids = coordinator.game_stop(
+            system="snes",
+            emulator="libretro",
+            core="snes9x",
+            rom="Super Metroid.sfc",
+            progress=progress,
+        )
+
+        assert conflict_ids == ()
+        assert remote.read_bytes() == b"final-save-bytes"
+
+    def test_default_progress_is_a_safe_noop_when_none_is_provided(
+        self, tmp_path: Path
+    ):
+        provider = _Provider()
+        service = _service(tmp_path, provider)
+        coordinator = _coordinator(tmp_path, service)
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        remote = tmp_path / "remote/snes/Super Metroid.srm"
+        _write(local, b"baseline")
+        service.full_sync()
+        local.write_bytes(b"final-save-bytes")
+
+        conflict_ids = coordinator.game_stop(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+
+        assert conflict_ids == ()
+        assert remote.read_bytes() == b"final-save-bytes"
+
+    def test_conflict_handling_is_unaffected_by_the_progress_popup(
+        self, tmp_path: Path
+    ):
+        """New conflicts discovered during gameStop are still returned for
+        the existing conflict-popup handoff even with a progress reporter
+        attached — no new conflict-resolution UI is invented here."""
+        provider = _Provider()
+        service = _service(tmp_path, provider)
+        coordinator = _coordinator(tmp_path, service)
+        local = tmp_path / "local" / "psx" / "Game.srm"
+        remote = tmp_path / "remote" / "psx" / "Game.srm"
+        _write(local, b"base")
+        service.full_sync()
+        coordinator.game_start(
+            system="psx", emulator="libretro", core="pcsx", rom="Game.chd"
+        )
+        _write(local, b"local-progress")
+        _write(remote, b"peer-progress")
+        service._append_remote_journal(  # type: ignore[attr-defined]
+            revision="peer-conflict",
+            timestamp="2026-01-01T00:00:00+00:00",
+            mutations=[
+                {
+                    "system": "psx",
+                    "layout_id": "retroarch-root-psx",
+                    "group_id": "retroarch-root-psx:psx/Game",
+                    "object_id": "psx/Game.srm",
+                    "operation": "update",
+                }
+            ],
+        )
+
+        progress = _FakeProgress()
+        conflict_ids = coordinator.game_stop(
+            system="psx",
+            emulator="libretro",
+            core="pcsx",
+            rom="Game.chd",
+            progress=progress,
+        )
+
+        assert conflict_ids != ()
+        assert service.get_state().groups[0].condition is SaveGroupCondition.CONFLICT
+        # The popup itself only ever shows sync-progress text — never a
+        # conflict-resolution UI.
+        assert not any("conflict" in text.lower() for text in progress.stages)
+
+    def test_no_duplicate_quick_sync_operation_is_introduced_by_the_popup(
+        self, tmp_path: Path, caplog
+    ):
+        provider = _Provider()
+        service = _service(tmp_path, provider)
+        coordinator = _coordinator(tmp_path, service)
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        _write(local, b"baseline")
+        service.full_sync()
+        local.write_bytes(b"final-save-bytes")
+
+        progress = _FakeProgress()
+        with caplog.at_level("INFO"):
+            coordinator.game_stop(
+                system="snes",
+                emulator="libretro",
+                core="snes9x",
+                rom="Super Metroid.sfc",
+                progress=progress,
+            )
+
+        assert caplog.text.count("Auto SaveSync quick sync started: trigger=game stop") == 1

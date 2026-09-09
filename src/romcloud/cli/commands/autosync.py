@@ -18,6 +18,7 @@ from romcloud.infrastructure.library_view import operating_mode
 from romcloud.infrastructure.logging import get_logger
 from romcloud.integrations.batocera import auto_savesync as batocera_auto_savesync
 from romcloud.services.auto_savesync import ActiveSessionStore, AutoSaveSyncCoordinator
+from romcloud.ui.savesync_progress import start_savesync_progress
 
 log = get_logger("auto-savesync-cli")
 
@@ -63,6 +64,21 @@ def _session_store(config) -> ActiveSessionStore:  # noqa: ANN001
     return ActiveSessionStore(Path(config.data_path))
 
 
+def _resolve_ports_launcher(data_root: Path) -> Path:
+    """Resolve the installed graphical Ports UI wrapper (``romcloud-ports``).
+
+    Shared by both the SaveSync conflict popup and the gameStop Auto
+    SaveSync progress popup — the same wrapper subprocess dispatches to
+    either mode via a CLI flag (see ``ports_gfx/__main__.py``).
+    """
+    romcloud_bin = os.environ.get("ROMCLOUD_BIN")
+    return (
+        Path(romcloud_bin).with_name("romcloud-ports")
+        if romcloud_bin
+        else data_root.parent / "bin" / "romcloud-ports"
+    )
+
+
 def _launch_pending_conflict_popup(
     data_root: Path, *, lifecycle_caller_pid: int | None = None
 ) -> None:
@@ -72,11 +88,7 @@ def _launch_pending_conflict_popup(
         log.info("SaveSync conflict popup launch skipped: durable queue is empty")
         return
     romcloud_bin = os.environ.get("ROMCLOUD_BIN")
-    launcher = (
-        Path(romcloud_bin).with_name("romcloud-ports")
-        if romcloud_bin
-        else data_root.parent / "bin" / "romcloud-ports"
-    )
+    launcher = _resolve_ports_launcher(data_root)
     if not launcher.is_file():
         log.warning(
             "SaveSync conflict popup launch skipped: launcher=%s is unavailable; "
@@ -236,12 +248,19 @@ def game_stop(
         emulator,
         core,
     )
+    data_root = Path(ctx.obj["config"].data_path)
+    launcher = _resolve_ports_launcher(data_root)
+    # Best-effort and fail-open: any failure to launch/drive this popup must
+    # never affect the synchronous SaveSync work below (see
+    # NullSaveSyncProgress / SaveSyncProgressReporter).
+    progress = start_savesync_progress(launcher)
     try:
         quick_sync_started = time.monotonic()
         log.info("gameStop Quick Sync started: worker_pid=%d", worker_pid)
         try:
             conflict_ids = _coordinator(ctx).game_stop(
-                system=system, emulator=emulator, core=core, rom=rom
+                system=system, emulator=emulator, core=core, rom=rom,
+                progress=progress,
             )
         except Exception:
             log.warning(
@@ -286,6 +305,13 @@ def game_stop(
             "Auto SaveSync did not complete; pending local work was retained."
         ) from exc
     finally:
+        # Idempotent safety net: the coordinator already closes the popup on
+        # every normal exit path; this only guards an unexpected failure
+        # before/around that call so the popup subprocess is never orphaned.
+        try:
+            progress.close(False, "Save sync failed.\nYour local save has been preserved.")
+        except Exception:  # noqa: BLE001 - never affects the lifecycle hook's result
+            log.warning("Could not close SaveSync progress popup", exc_info=True)
         log.info("gameStop synchronous worker exited: pid=%d", worker_pid)
 
 

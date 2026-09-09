@@ -9,7 +9,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Protocol
 
 from romcloud.core.exceptions import (
     SaveSyncError,
@@ -140,6 +140,54 @@ class ActiveSessionStore:
         return self._root / f"{key}.json"
 
 
+class SaveSyncProgressReporterLike(Protocol):
+    """Duck-typed hook for the optional gameStop graphical progress popup.
+
+    Deliberately independent of :mod:`romcloud.ui.savesync_progress` — this
+    service layer never imports pygame/subprocess machinery directly, and
+    every real implementation must already be fail-open (never raise).
+    """
+
+    def stage(self, text: str) -> None: ...
+
+    def close(self, ok: bool, message: Optional[str] = None) -> None: ...
+
+
+class _NullSaveSyncProgress:
+    """Default no-op progress reporter — every other trigger (periodic
+    menu tick, remote reconnect, drain-pending) never shows a popup."""
+
+    def stage(self, text: str) -> None:  # noqa: ARG002
+        return None
+
+    def close(self, ok: bool, message: Optional[str] = None) -> None:  # noqa: ARG002
+        return None
+
+
+class _SafeProgress:
+    """Defensive wrapper guaranteeing a broken/misbehaving progress reporter
+    can never affect the real SaveSync outcome. Even though every real
+    implementation is documented as fail-open already, gameStop's
+    correctness must not depend on that promise being upheld correctly —
+    any exception raised by ``stage``/``close`` is caught and logged here,
+    never propagated into the SaveSync control flow above it."""
+
+    def __init__(self, inner: SaveSyncProgressReporterLike) -> None:
+        self._inner = inner
+
+    def stage(self, text: str) -> None:
+        try:
+            self._inner.stage(text)
+        except Exception:  # noqa: BLE001 - UI failures must never affect SaveSync
+            log.warning("gameStop progress popup stage update failed", exc_info=True)
+
+    def close(self, ok: bool, message: Optional[str] = None) -> None:
+        try:
+            self._inner.close(ok, message)
+        except Exception:  # noqa: BLE001 - UI failures must never affect SaveSync
+            log.warning("gameStop progress popup close failed", exc_info=True)
+
+
 class AutoSaveSyncCoordinator:
     """Coalesce automatic triggers into one bounded, serialized worker."""
 
@@ -179,11 +227,22 @@ class AutoSaveSyncCoordinator:
         "Auto Quick Sync", subsystem="savesync", source="Auto gameStop"
     )
     def game_stop(
-        self, *, system: str, emulator: str, core: str, rom: str
+        self,
+        *,
+        system: str,
+        emulator: str,
+        core: str,
+        rom: str,
+        progress: Optional[SaveSyncProgressReporterLike] = None,
     ) -> tuple[str, ...]:
         if not self._enabled:
             log.info("gameStop conflict check skipped: Auto SaveSync disabled")
             return ()
+        # The progress popup is purely observational: it never owns or gates
+        # any SaveSync decision below, and its failures are never allowed to
+        # propagate (see NullSaveSyncProgress / SaveSyncProgressReporter).
+        progress = _SafeProgress(progress if progress is not None else _NullSaveSyncProgress())
+        progress.stage("Checking save changes…")
         log.info(
             "gameStop received: system=%s emulator=%s core=%s rom=%s",
             system,
@@ -197,76 +256,91 @@ class AutoSaveSyncCoordinator:
             emulator,
             core,
         )
-        session = self._sessions.stop(system=system, rom=rom)
-        layout_ids = layout_ids_for_session(self._policy, system, emulator, core)
-        log.info(
-            "gameStop SaveSync scope: system=%s emulator=%s core=%s "
-            "layout_count=%d layout_ids=%s session_record=%s",
-            system,
-            emulator,
-            core,
-            len(layout_ids),
-            ",".join(sorted(layout_ids)) or "none",
-            "present" if session is not None else "missing",
-        )
-        if layout_ids:
+        try:
+            session = self._sessions.stop(system=system, rom=rom)
+            layout_ids = layout_ids_for_session(self._policy, system, emulator, core)
             log.info(
-                "gameStop waiting for save stability: layout_ids=%s "
-                "bounded_checks=%d interval=%.2fs",
-                ",".join(sorted(layout_ids)),
-                self._stability_checks,
-                self._stability_interval,
+                "gameStop SaveSync scope: system=%s emulator=%s core=%s "
+                "layout_count=%d layout_ids=%s session_record=%s",
+                system,
+                emulator,
+                core,
+                len(layout_ids),
+                ",".join(sorted(layout_ids)) or "none",
+                "present" if session is not None else "missing",
             )
-            if self._wait_for_pre_discovery_stability(layout_ids):
+            if layout_ids:
+                progress.stage("Waiting for save data to settle…")
                 log.info(
-                    "gameStop save stability achieved: layout_ids=%s",
-                    ",".join(sorted(layout_ids)),
-                )
-            else:
-                log.warning(
-                    "gameStop save stability timeout: layout_ids=%s "
-                    "bounded_checks=%d; local discovery skipped this pass to "
-                    "avoid classifying an in-flight write",
+                    "gameStop waiting for save stability: layout_ids=%s "
+                    "bounded_checks=%d interval=%.2fs",
                     ",".join(sorted(layout_ids)),
                     self._stability_checks,
+                    self._stability_interval,
                 )
-                log.warning(
+                if self._wait_for_pre_discovery_stability(layout_ids):
+                    log.info(
+                        "gameStop save stability achieved: layout_ids=%s",
+                        ",".join(sorted(layout_ids)),
+                    )
+                else:
+                    log.warning(
+                        "gameStop save stability timeout: layout_ids=%s "
+                        "bounded_checks=%d; local discovery skipped this pass to "
+                        "avoid classifying an in-flight write",
+                        ",".join(sorted(layout_ids)),
+                        self._stability_checks,
+                    )
+                    log.warning(
+                        "Auto SaveSync final result: trigger=game stop status=deferred "
+                        "reason=local-data-unstable-pre-discovery "
+                        "durable_dirty_state_retained=true"
+                    )
+                    raise SaveSyncError(
+                        "Auto SaveSync save data did not stabilize before discovery; "
+                        "pending local work was retained."
+                    )
+                changed_since = (
+                    session.started_at if session is not None else time.time() - 5.0
+                )
+                log.info(
+                    "gameStop local discovery started: layout_ids=%s",
+                    ",".join(sorted(layout_ids)),
+                )
+                self._service.detect_and_mark_local_changes(
+                    layout_ids, changed_since=changed_since
+                )
+            if self._sessions.has_active_session():
+                log.info(
                     "Auto SaveSync final result: trigger=game stop status=deferred "
-                    "reason=local-data-unstable-pre-discovery "
-                    "durable_dirty_state_retained=true"
+                    "reason=another-session-active durable_dirty_state_retained=true"
                 )
-                raise SaveSyncError(
-                    "Auto SaveSync save data did not stabilize before discovery; "
-                    "pending local work was retained."
-                )
-            changed_since = (
-                session.started_at if session is not None else time.time() - 5.0
+                progress.close(True, "Save sync deferred.")
+                return ()
+            progress.stage("Preparing save sync…")
+            conflict_ids = self._run_quick_sync(
+                trigger="game stop",
+                wait_for_handoff=True,
+                collect_new_conflicts=True,
+                require_completion=True,
+                progress=progress,
             )
             log.info(
-                "gameStop local discovery started: layout_ids=%s",
-                ",".join(sorted(layout_ids)),
+                "gameStop conflict check complete: new_conflicts=%d ids=%s",
+                len(conflict_ids),
+                ",".join(conflict_ids) if conflict_ids else "none",
             )
-            self._service.detect_and_mark_local_changes(
-                layout_ids, changed_since=changed_since
+            # ``stage`` above already set the truthful final phrase ("No save
+            # changes detected."/"Save sync complete."); ``close`` here only
+            # starts the auto-dismiss countdown without overwriting it.
+            progress.close(True)
+            return conflict_ids
+        except Exception:
+            progress.close(
+                False,
+                "Save sync failed.\nYour local save has been preserved.",
             )
-        if self._sessions.has_active_session():
-            log.info(
-                "Auto SaveSync final result: trigger=game stop status=deferred "
-                "reason=another-session-active durable_dirty_state_retained=true"
-            )
-            return ()
-        conflict_ids = self._run_quick_sync(
-            trigger="game stop",
-            wait_for_handoff=True,
-            collect_new_conflicts=True,
-            require_completion=True,
-        )
-        log.info(
-            "gameStop conflict check complete: new_conflicts=%d ids=%s",
-            len(conflict_ids),
-            ",".join(conflict_ids) if conflict_ids else "none",
-        )
-        return conflict_ids
+            raise
 
     @correlated_operation(
         "Auto Quick Sync", subsystem="savesync", source="remote reconnect"
@@ -301,6 +375,7 @@ class AutoSaveSyncCoordinator:
         collect_new_conflicts: bool = False,
         require_completion: bool = False,
         lock_retry_attempts: Optional[int] = None,
+        progress: Optional[SaveSyncProgressReporterLike] = None,
     ) -> tuple[str, ...]:
         """Serialize every automatic trigger through ``SaveSyncService.quick_sync``.
 
@@ -486,6 +561,21 @@ class AutoSaveSyncCoordinator:
                     return self._still_active_conflicts(
                         new_conflict_ids, enqueue=collect_new_conflicts
                     )
+                if progress is not None:
+                    uploaded = result.report.uploaded if result.report is not None else 0
+                    downloaded = (
+                        result.report.downloaded if result.report is not None else 0
+                    )
+                    if result.status == "unchanged":
+                        progress.stage("No save changes detected.")
+                    elif uploaded and not downloaded:
+                        progress.stage("Uploading changed save…")
+                    elif downloaded and not uploaded:
+                        progress.stage("Downloading newer save…")
+                    elif uploaded or downloaded:
+                        progress.stage("Finalizing sync…")
+                    else:
+                        progress.stage("Save sync complete.")
                 log.info(
                     "Auto SaveSync Quick Sync result: trigger=%s status=%s "
                     "reason=%s remote_generation=%d cursor_before=%s "
