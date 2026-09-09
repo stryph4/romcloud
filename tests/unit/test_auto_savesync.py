@@ -239,7 +239,10 @@ def test_game_stop_worker_runs_quick_sync_in_cached_and_direct_modes(
     calls = []
     coordinator = type(
         "Coordinator", (),
-        {"game_stop": lambda self, **kwargs: calls.append(kwargs) or ()},
+        {
+            "game_stop_eligible": lambda self, **kwargs: True,
+            "game_stop": lambda self, **kwargs: calls.append(kwargs) or (),
+        },
     )()
     monkeypatch.setattr(autosync_commands, "_coordinator", lambda _ctx: coordinator)
     monkeypatch.setattr(
@@ -266,6 +269,68 @@ def test_game_stop_worker_runs_quick_sync_in_cached_and_direct_modes(
 
     assert result.exit_code == 0, result.output
     assert len(calls) == 1
+
+
+def test_ineligible_lifecycle_cli_returns_before_starting_progress_popup(
+    tmp_path: Path, monkeypatch
+):
+    from romcloud.cli.commands import autosync as autosync_commands
+    from romcloud.cli.main import cli
+
+    config_path = tmp_path / "romcloud.toml"
+    config = AppConfig(
+        source=SourceConfig(
+            "local", (tmp_path / "roms").as_posix(), selected_systems=("snes",)
+        ),
+        cache=CacheConfig((tmp_path / "cache").as_posix()),
+        local_roms_path=(tmp_path / "local-roms").as_posix(),
+        data_path=(tmp_path / "data").as_posix(),
+        saves=SavesConfig(
+            local_path=(tmp_path / "saves").as_posix(), auto_sync_enabled=True
+        ),
+    )
+    write_config(config, str(config_path))
+    calls = []
+    coordinator = type(
+        "Coordinator",
+        (),
+        {
+            "game_stop_eligible": lambda self, **_kwargs: False,
+            "game_stop": lambda self, **kwargs: calls.append(kwargs) or (),
+        },
+    )()
+    monkeypatch.setattr(autosync_commands, "_coordinator", lambda _ctx: coordinator)
+    monkeypatch.setattr(
+        autosync_commands,
+        "start_savesync_progress",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ineligible exit started progress UI")
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config",
+            str(config_path),
+            "_autosync",
+            "game-stop",
+            "ports",
+            "pygame",
+            "pygame",
+            "Application.sh",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == [
+        {
+            "system": "ports",
+            "emulator": "pygame",
+            "core": "pygame",
+            "rom": "Application.sh",
+        }
+    ]
 
 
 def test_conflict_popup_worker_passes_exact_lifecycle_caller(
@@ -746,6 +811,7 @@ def test_game_stop_cli_reports_failure_when_required_sync_does_not_complete(
         "Coordinator",
         (),
         {
+            "game_stop_eligible": lambda self, **_kwargs: True,
             "game_stop": lambda self, **_kwargs: (_ for _ in ()).throw(
                 RuntimeError("remote commit failed")
             )
@@ -960,6 +1026,98 @@ def test_lifecycle_mapping_is_registry_bounded_and_xemu_is_never_automatic():
     )
     assert layout_ids_for_session(policy, "xbox", "xemu") == frozenset()
     assert layout_ids_for_session(policy, "unknown-system") == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("selected_systems", "system", "emulator", "core"),
+    (
+        (None, "ports", "pygame", "pygame"),
+        (("gba",), "snes", "libretro", "snes9x"),
+        (("switch",), "switch", "ryujinx", "ryujinx"),
+    ),
+    ids=(
+        "unsupported-application",
+        "supported-system-not-selected",
+        "unsupported-layout",
+    ),
+)
+def test_ineligible_game_stop_is_total_savesync_noop_before_popup_or_service_access(
+    tmp_path: Path,
+    monkeypatch,
+    selected_systems,
+    system: str,
+    emulator: str,
+    core: str,
+):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = AutoSaveSyncCoordinator(
+        service,
+        data_root=tmp_path / "data",
+        enabled=True,
+        policy=DEFAULT_SAVE_SELECTION_POLICY,
+        quiet_seconds=0,
+        selected_systems=selected_systems,
+    )
+    coordinator.game_start(
+        system=system, emulator=emulator, core=core, rom="Application.rom"
+    )
+    progress = _FakeProgress()
+
+    @contextmanager
+    def unexpected_observation_scope():
+        raise AssertionError("ineligible gameStop entered SaveSync observation")
+        yield
+
+    monkeypatch.setattr(service, "observation_scope", unexpected_observation_scope)
+    monkeypatch.setattr(
+        service,
+        "quick_sync",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ineligible gameStop ran Quick Sync")
+        ),
+    )
+
+    assert coordinator.game_stop(
+        system=system,
+        emulator=emulator,
+        core=core,
+        rom="Application.rom",
+        progress=progress,
+    ) == ()
+    assert progress.calls == []
+    assert provider.reachability_checks == 0
+    assert not (tmp_path / "data/savesync-state.json").exists()
+    assert coordinator._sessions.has_active_session() is False
+
+
+def test_selected_supported_game_stop_remains_synchronous_and_eligible(
+    tmp_path: Path,
+):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = AutoSaveSyncCoordinator(
+        service,
+        data_root=tmp_path / "data",
+        enabled=True,
+        policy=DEFAULT_SAVE_SELECTION_POLICY,
+        quiet_seconds=0,
+        selected_systems=("snes",),
+    )
+    local = tmp_path / "local/snes/Super Metroid.srm"
+    remote = tmp_path / "remote/snes/Super Metroid.srm"
+    _write(local, b"baseline")
+    service.full_sync()
+    local.write_bytes(b"eligible-final-save")
+
+    coordinator.game_stop(
+        system="snes",
+        emulator="libretro",
+        core="snes9x",
+        rom="Super Metroid.sfc",
+    )
+
+    assert remote.read_bytes() == b"eligible-final-save"
 
 
 def test_game_exit_detects_first_save_and_uploads_only_that_registry_group(tmp_path: Path):
@@ -2404,6 +2562,7 @@ def test_game_stop_cli_schedules_drain_pending_follow_up_on_worker_busy(
         "Coordinator",
         (),
         {
+            "game_stop_eligible": lambda self, **_kwargs: True,
             "game_stop": lambda self, **_kwargs: (_ for _ in ()).throw(
                 SaveSyncWorkerBusyError("worker lock busy")
             )
@@ -3058,9 +3217,10 @@ def test_menu_loop_suppresses_gameplay_then_resumes_after_game_stop(
     with pytest.raises(StopLoop):
         coordinator.menu_loop()
 
-    # The initial and first interval ticks were suppressed during gameplay;
-    # gameStop reconciled immediately, then the forced-due test tick ran too.
-    assert quick_calls == 2
+    # The initial and first interval ticks were suppressed during gameplay.
+    # This unsupported application's gameStop only retires its session marker;
+    # the next forced-due menu tick is the sole Quick Sync.
+    assert quick_calls == 1
 
 
 def test_menu_tick_unchanged_journal_performs_no_save_layout_scan(

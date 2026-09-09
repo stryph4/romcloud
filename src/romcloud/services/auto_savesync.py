@@ -9,7 +9,7 @@ import time
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Optional, Protocol
+from typing import Callable, Collection, Optional, Protocol
 
 from romcloud.core.exceptions import (
     SaveSyncError,
@@ -225,6 +225,7 @@ class AutoSaveSyncCoordinator:
         stability_checks: int = _DEFAULT_STABILITY_CHECKS,
         staging_retries: int = _DEFAULT_STAGING_RETRIES,
         enabled_check: Optional[Callable[[], bool]] = None,
+        selected_systems: Optional[Collection[str]] = None,
     ) -> None:
         self._service = service
         self._data_root = Path(data_root)
@@ -238,6 +239,11 @@ class AutoSaveSyncCoordinator:
         self._staging_retries = max(0, staging_retries)
         self._enabled = enabled
         self._enabled_check = enabled_check
+        self._selected_systems = (
+            None
+            if selected_systems is None
+            else frozenset(value.strip().casefold() for value in selected_systems)
+        )
         self._menu_state_path = self._data_root / "savesync-menu-pull.json"
 
     @correlated_operation("gameStart", subsystem="savesync", source="Auto gameStart")
@@ -245,6 +251,14 @@ class AutoSaveSyncCoordinator:
         if not self._enabled:
             return
         self._sessions.start(system=system, emulator=emulator, core=core, rom=rom)
+
+    def game_stop_eligible(self, *, system: str, emulator: str, core: str) -> bool:
+        """Return whether a stop owns at least one selected automatic layout."""
+        layout_ids = layout_ids_for_session(self._policy, system, emulator, core)
+        selected = self._selected_systems
+        return bool(layout_ids) and (
+            selected is None or system.strip().casefold() in selected
+        )
 
     @correlated_operation(
         "Auto Quick Sync", subsystem="savesync", source="Auto gameStop"
@@ -260,6 +274,28 @@ class AutoSaveSyncCoordinator:
     ) -> tuple[str, ...]:
         if not self._enabled:
             log.info("gameStop conflict check skipped: Auto SaveSync disabled")
+            return ()
+        layout_ids = layout_ids_for_session(self._policy, system, emulator, core)
+        if not self.game_stop_eligible(
+            system=system, emulator=emulator, core=core
+        ):
+            # A lifecycle marker is bookkeeping rather than SaveSync work and
+            # must still be retired for every observed gameStop. Eligibility
+            # is decided before popup, observation, worker, provider, or state
+            # access so an unrelated application exit is a total sync no-op.
+            self._sessions.stop(system=system, rom=rom)
+            log.info(
+                "gameStop SaveSync skipped: system=%s emulator=%s core=%s "
+                "reason=%s",
+                system,
+                emulator,
+                core,
+                (
+                    "system-not-selected"
+                    if layout_ids and self._selected_systems is not None
+                    else "no-supported-layout"
+                ),
+            )
             return ()
         # The progress popup is purely observational: it never owns or gates
         # any SaveSync decision below, and its failures are never allowed to
@@ -287,6 +323,7 @@ class AutoSaveSyncCoordinator:
                     core=core,
                     rom=rom,
                     progress=progress,
+                    layout_ids=layout_ids,
                 )
         except Exception:
             progress.close(
@@ -303,13 +340,11 @@ class AutoSaveSyncCoordinator:
         core: str,
         rom: str,
         progress: SaveSyncProgressReporterLike,
+        layout_ids: frozenset[str],
     ) -> tuple[str, ...]:
         settled: Optional[_SettledObservation] = None
         with stage_timer("scope"):
             session = self._sessions.stop(system=system, rom=rom)
-            layout_ids = layout_ids_for_session(
-                self._policy, system, emulator, core
-            )
         log.info(
             "gameStop SaveSync scope: system=%s emulator=%s core=%s "
             "layout_count=%d layout_ids=%s session_record=%s",

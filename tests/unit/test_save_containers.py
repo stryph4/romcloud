@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import replace
 from pathlib import Path
 
@@ -33,8 +34,21 @@ from romcloud.infrastructure.ps1_memory_card import (
     Ps1RawMemoryCardAdapter,
 )
 from romcloud.core.storage import ProviderCapabilities, StorageProvider
-from romcloud.core.models.savesync import SaveSyncState
-from romcloud.infrastructure.savesync_state import save_state, state_from_dict, state_to_dict
+from romcloud.core.models.savesync import (
+    SaveArtifact,
+    SaveGroupSnapshot,
+    SaveSyncState,
+)
+from romcloud.core.save_selection import (
+    DEFAULT_SAVE_SELECTION_POLICY,
+    SaveSelectionPolicy,
+)
+from romcloud.infrastructure import savesync_state as durable_state
+from romcloud.infrastructure.savesync_state import (
+    save_state,
+    state_from_dict,
+    state_to_dict,
+)
 from romcloud.infrastructure import save_transaction
 from romcloud.core.exceptions import SaveSyncVerificationError
 from romcloud.services.saves import SaveSyncService
@@ -548,10 +562,10 @@ class _FilesystemTestProvider(StorageProvider):
 
 
 def _container_service(
-    tmp_path: Path, *, container_registry=None
+    tmp_path: Path, *, container_registry=None, policy=None
 ) -> SaveSyncService:
     local = tmp_path / "local"
-    local.mkdir()
+    local.mkdir(exist_ok=True)
     return SaveSyncService(
         provider=_FilesystemTestProvider(),
         connectivity_root=str(tmp_path / "remote-data"),
@@ -559,7 +573,58 @@ def _container_service(
         remote_root=str(tmp_path / "remote"),
         state_path=tmp_path / "data/state.json",
         **({"container_registry": container_registry} if container_registry else {}),
+        **({"policy": policy} if policy else {}),
     )
+
+
+def _whole_layout_policy(layout_id: str) -> SaveSelectionPolicy:
+    """Reproduce the pre-4781d09 ownership grouping for one layout."""
+    return SaveSelectionPolicy(
+        layouts=tuple(
+            replace(layout, group_by="layout")
+            if layout.layout_id == layout_id
+            else layout
+            for layout in DEFAULT_SAVE_SELECTION_POLICY.layouts
+        )
+    )
+
+
+def _create_legacy_ps2_conflict(
+    tmp_path: Path,
+    *,
+    two_cards: bool = False,
+    disjoint: bool = False,
+) -> tuple[SaveSyncService, str]:
+    legacy = _container_service(
+        tmp_path, policy=_whole_layout_policy("pcsx2-memory-cards")
+    )
+    local_one = tmp_path / "local/ps2/pcsx2/Mcd001.ps2"
+    local_one.parent.mkdir(parents=True, exist_ok=True)
+    local_one.write_bytes(b"card-one-base")
+    if two_cards:
+        (tmp_path / "local/ps2/pcsx2/Mcd002.ps2").write_bytes(b"card-two-base")
+    legacy.full_sync()
+    local_one.write_bytes(b"card-one-local")
+    if disjoint:
+        (tmp_path / "remote/ps2/pcsx2/Mcd002.ps2").write_bytes(
+            b"card-two-remote"
+        )
+    else:
+        (tmp_path / "remote/ps2/pcsx2/Mcd001.ps2").write_bytes(
+            b"card-one-remote"
+        )
+        if two_cards:
+            (tmp_path / "local/ps2/pcsx2/Mcd002.ps2").write_bytes(
+                b"card-two-local"
+            )
+            (tmp_path / "remote/ps2/pcsx2/Mcd002.ps2").write_bytes(
+                b"card-two-remote"
+            )
+    legacy.reconcile()
+    active = legacy.get_state().active_conflicts
+    assert len(active) == 1
+    assert active[0].group_id == "pcsx2-memory-cards/dataset"
+    return legacy, active[0].conflict_id
 
 
 def test_service_bootstrap_merges_disjoint_ps1_saves_and_preserves_overlap(
@@ -892,6 +957,196 @@ def test_pcsx2_memory_card_conflict_resolution_never_touches_unrelated_cards(
     assert local_only_remote.read_bytes() == b"metal-gear-solid-3-local-only"
     assert remote_only.read_bytes() == b"final-fantasy-x-remote-only"
     assert remote_only_local.read_bytes() == b"final-fantasy-x-remote-only"
+
+
+def test_quick_sync_migrates_unchanged_legacy_ps1_whole_layout_conflict(
+    tmp_path: Path,
+) -> None:
+    legacy = _container_service(
+        tmp_path, policy=_whole_layout_policy("duckstation-memory-cards")
+    )
+    local = tmp_path / "local/duckstation/memcards/card.mcd"
+    local.parent.mkdir(parents=True)
+    name = b"BASLUS-00001SAVE"
+    local.write_bytes(_ps1_card([(name, (1,), b"B")]))
+    legacy.full_sync()
+    local.write_bytes(_ps1_card([(name, (1,), b"L")]))
+    remote = tmp_path / "remote/duckstation/memcards/card.mcd"
+    remote.write_bytes(_ps1_card([(name, (1,), b"R")]))
+    legacy.reconcile()
+    old = legacy.get_state().active_conflicts[0]
+    assert old.group_id == "duckstation-memory-cards/dataset"
+
+    current = _container_service(tmp_path)
+    result = current.quick_sync()
+    state = current.get_state()
+
+    assert result.status == "reconciled"
+    archived = next(
+        item for item in state.conflicts if item.conflict_id == old.conflict_id
+    )
+    assert archived.resolved is True
+    assert archived.resolution_revision.startswith("ownership-migration:")
+    assert len(state.active_conflicts) == 1
+    assert state.active_conflicts[0].group_id == (
+        "duckstation-memory-cards/memcards/card"
+    )
+    assert local.read_bytes() != remote.read_bytes()
+
+
+def test_quick_sync_migrates_legacy_ps2_namespace_that_is_no_longer_conflicting(
+    tmp_path: Path,
+) -> None:
+    _legacy, old_id = _create_legacy_ps2_conflict(
+        tmp_path, two_cards=True, disjoint=True
+    )
+    current = _container_service(tmp_path)
+
+    migrated = current.quick_sync()
+    repeated = current.quick_sync()
+    state = current.get_state()
+
+    assert migrated.status == "reconciled"
+    assert migrated.report is not None
+    assert migrated.report.uploaded == 1
+    assert migrated.report.downloaded == 1
+    assert repeated.status == "unchanged"
+    assert not state.active_conflicts
+    archived = next(item for item in state.conflicts if item.conflict_id == old_id)
+    assert archived.resolved is True
+    assert archived.resolution_revision.startswith("ownership-migration:")
+    for card in ("Mcd001.ps2", "Mcd002.ps2"):
+        assert (tmp_path / "local/ps2/pcsx2" / card).read_bytes() == (
+            tmp_path / "remote/ps2/pcsx2" / card
+        ).read_bytes()
+
+
+@pytest.mark.parametrize(
+    "changed_side",
+    ("local", "remote", "both"),
+)
+def test_legacy_conflict_migration_reobserves_current_bytes(
+    tmp_path: Path, changed_side: str
+) -> None:
+    _legacy, old_id = _create_legacy_ps2_conflict(tmp_path)
+    local = tmp_path / "local/ps2/pcsx2/Mcd001.ps2"
+    remote = tmp_path / "remote/ps2/pcsx2/Mcd001.ps2"
+    if changed_side in {"local", "both"}:
+        local.write_bytes(b"card-one-local-after-conflict")
+    if changed_side in {"remote", "both"}:
+        remote.write_bytes(b"card-one-remote-after-conflict")
+    expected_local = local.read_bytes()
+    expected_remote = remote.read_bytes()
+
+    current = _container_service(tmp_path)
+    current.quick_sync()
+    state = current.get_state()
+
+    assert next(item for item in state.conflicts if item.conflict_id == old_id).resolved
+    assert len(state.active_conflicts) == 1
+    fresh = state.active_conflicts[0]
+    assert fresh.group_id == "pcsx2-memory-cards/pcsx2/mcd001"
+    assert fresh.local.artifacts[0].content_hash == hashlib.sha256(
+        expected_local
+    ).hexdigest()
+    assert fresh.remote.artifacts[0].content_hash == hashlib.sha256(
+        expected_remote
+    ).hexdigest()
+    assert local.read_bytes() == expected_local
+    assert remote.read_bytes() == expected_remote
+
+
+def test_legacy_namespace_migration_can_create_multiple_current_conflicts(
+    tmp_path: Path,
+) -> None:
+    _legacy, old_id = _create_legacy_ps2_conflict(tmp_path, two_cards=True)
+    current = _container_service(tmp_path)
+
+    current.quick_sync()
+    state = current.get_state()
+
+    assert next(item for item in state.conflicts if item.conflict_id == old_id).resolved
+    assert {item.group_id for item in state.active_conflicts} == {
+        "pcsx2-memory-cards/pcsx2/mcd001",
+        "pcsx2-memory-cards/pcsx2/mcd002",
+    }
+
+
+def test_legacy_conflict_migration_rolls_back_state_and_bytes_if_journal_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _legacy, old_id = _create_legacy_ps2_conflict(
+        tmp_path, two_cards=True, disjoint=True
+    )
+    current = _container_service(tmp_path)
+    local_before = {
+        card: (tmp_path / "local/ps2/pcsx2" / card).read_bytes()
+        for card in ("Mcd001.ps2", "Mcd002.ps2")
+    }
+    remote_before = {
+        card: (tmp_path / "remote/ps2/pcsx2" / card).read_bytes()
+        for card in ("Mcd001.ps2", "Mcd002.ps2")
+    }
+    real_append = current._append_remote_journal
+    monkeypatch.setattr(
+        current,
+        "_append_remote_journal",
+        lambda **_kwargs: (_ for _ in ()).throw(OSError("interrupted journal")),
+    )
+
+    with pytest.raises(OSError, match="interrupted journal"):
+        current.quick_sync()
+
+    failed = current.get_state()
+    assert [item.conflict_id for item in failed.active_conflicts] == [old_id]
+    for card, content in local_before.items():
+        assert (tmp_path / "local/ps2/pcsx2" / card).read_bytes() == content
+    for card, content in remote_before.items():
+        assert (tmp_path / "remote/ps2/pcsx2" / card).read_bytes() == content
+
+    monkeypatch.setattr(current, "_append_remote_journal", real_append)
+    current.quick_sync()
+    assert not current.get_state().active_conflicts
+
+
+def test_malformed_legacy_conflict_is_preserved_with_actionable_error(
+    tmp_path: Path,
+) -> None:
+    service = _container_service(tmp_path)
+    service.full_sync()
+    group_id = "duckstation-memory-cards/dataset"
+    layout_id = "duckstation-memory-cards"
+
+    def snapshot(content: bytes) -> SaveGroupSnapshot:
+        artifact = SaveArtifact(
+            "psx/Unexpected.srm",
+            len(content),
+            hashlib.sha256(content).hexdigest(),
+        )
+        return SaveGroupSnapshot(
+            group_id, layout_id, (artifact,), "2026-09-09T00:00:00Z"
+        )
+
+    state = durable_state.record_conflict(
+        service.get_state(),
+        group_id=group_id,
+        layout_id=layout_id,
+        baseline=snapshot(b"base"),
+        local=snapshot(b"local"),
+        remote=snapshot(b"remote"),
+        observed_at="2026-09-09T00:00:00Z",
+    )
+    save_state(service._state_path, state)
+    old_id = state.active_conflicts[0].conflict_id
+
+    with pytest.raises(
+        SaveSyncVerificationError, match="cannot be mapped unambiguously"
+    ):
+        service.quick_sync()
+
+    assert [item.conflict_id for item in service.get_state().active_conflicts] == [
+        old_id
+    ]
 
 
 def test_service_automatically_merges_ps2_folder_card_with_complete_versioned_grouping(

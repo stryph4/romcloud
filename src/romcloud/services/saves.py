@@ -328,6 +328,84 @@ class SaveSyncService:
         descriptor = self._policy.group_for_path(canonical_path)
         return descriptor is not None and self._layout_enabled(descriptor.layout_id)
 
+    def _obsolete_whole_layout_conflicts(
+        self,
+        state: SaveSyncState,
+        *,
+        excluded_layout_ids: frozenset[str] = frozenset(),
+        conflict_ids: Optional[frozenset[str]] = None,
+    ) -> tuple[SaveConflictRecord, ...]:
+        """Identify safely mappable conflicts from an older coarse grouping.
+
+        Historical ``group_by=layout`` records used ``<layout>/dataset`` as
+        their ownership identity.  A later registry may split that layout
+        into narrower current groups.  The stored snapshots remain recovery
+        evidence, but only a fresh layout scan may decide today's outcome.
+        """
+        obsolete: list[SaveConflictRecord] = []
+        for conflict in state.active_conflicts:
+            if conflict_ids is not None and conflict.conflict_id not in conflict_ids:
+                continue
+            legacy_group_id = f"{conflict.layout_id}/dataset"
+            if conflict.group_id != legacy_group_id:
+                continue
+            try:
+                layout = self._policy.layout(conflict.layout_id)
+            except KeyError as exc:
+                raise SaveSyncVerificationError(
+                    "A legacy whole-layout SaveSync conflict references a layout "
+                    f"that this version cannot map safely: {conflict.layout_id}. "
+                    "The conflict was preserved; export diagnostics and keep both "
+                    "save locations unchanged."
+                ) from exc
+            if layout.group_by == "layout":
+                continue
+            if (
+                conflict.layout_id in excluded_layout_ids
+                or not self._layout_enabled(conflict.layout_id)
+            ):
+                continue
+            evidence_paths = {
+                artifact.relative_path
+                for snapshot in (conflict.baseline, conflict.local, conflict.remote)
+                if snapshot is not None
+                for artifact in snapshot.artifacts
+            }
+            if not evidence_paths:
+                raise SaveSyncVerificationError(
+                    "A legacy whole-layout SaveSync conflict contains no mappable "
+                    "save evidence. The conflict was preserved; keep both save "
+                    "locations unchanged and export diagnostics."
+                )
+            descriptors = tuple(
+                self._policy.group_for_path(path) for path in sorted(evidence_paths)
+            )
+            if any(
+                descriptor is None
+                or descriptor.layout_id != conflict.layout_id
+                for descriptor in descriptors
+            ):
+                raise SaveSyncVerificationError(
+                    "A legacy whole-layout SaveSync conflict cannot be mapped "
+                    "unambiguously to the current ownership registry. The conflict "
+                    "was preserved; keep both save locations unchanged and export "
+                    "diagnostics."
+                )
+            current_group_ids = {
+                descriptor.group_id
+                for descriptor in descriptors
+                if descriptor is not None
+            }
+            if legacy_group_id in current_group_ids:
+                raise SaveSyncVerificationError(
+                    "A legacy whole-layout SaveSync conflict overlaps a current "
+                    "ownership identity and cannot be migrated safely. The conflict "
+                    "was preserved; keep both save locations unchanged and export "
+                    "diagnostics."
+                )
+            obsolete.append(conflict)
+        return tuple(obsolete)
+
     # ── state ─────────────────────────────────────────────────────────────
 
     def get_state(self) -> SaveSyncState:
@@ -1748,6 +1826,12 @@ class SaveSyncService:
         with self._locked_operation():
             state = self._get_state_unlocked()
             cursor = state.quick_sync_cursor_generation
+            obsolete_conflicts = self._obsolete_whole_layout_conflicts(
+                state, excluded_layout_ids=excluded_layouts
+            )
+            obsolete_layouts = frozenset(
+                conflict.layout_id for conflict in obsolete_conflicts
+            )
             known_groups = {group.group_id for group in state.groups}
             group_layouts = {
                 group.group_id: group.layout_id for group in state.groups
@@ -1826,7 +1910,7 @@ class SaveSyncService:
                 "current" if generation_unchanged else "advanced",
                 len(journal["history"]),
             )
-            if generation_unchanged and not pending_groups:
+            if generation_unchanged and not pending_groups and not obsolete_conflicts:
                 return SaveQuickSyncResult(
                     status="unchanged",
                     remote_generation=remote_generation,
@@ -1901,6 +1985,28 @@ class SaveSyncService:
                 )
                 selected_groups = None
 
+        if obsolete_layouts:
+            # A stale whole-layout conflict is not a dirty hint and therefore
+            # cannot safely be reconciled by its obsolete group ID. Promote
+            # every affected current layout to a fresh canonical scan, along
+            # with any already-selected groups that share this Quick Sync.
+            group_scope = frozenset(selected_groups or ()).union(pending_groups)
+            selected_layouts = frozenset(selected_layouts or ()).union(
+                obsolete_layouts,
+                (
+                    group_layouts[group_id]
+                    for group_id in group_scope
+                    if group_id in group_layouts
+                ),
+            )
+            selected_groups = None
+            log.info(
+                "Quick SaveSync ownership migration: obsolete_conflicts=%d "
+                "layout_ids=%s",
+                len(obsolete_conflicts),
+                ",".join(sorted(obsolete_layouts)),
+            )
+
         log.info(
             "Quick SaveSync scope: mode=%s selected_groups=%d "
             "selected_layouts=%d pending_groups=%d unseen_journal_entries=%d",
@@ -1958,6 +2064,9 @@ class SaveSyncService:
             upload_only=False,
             is_group_active=is_group_active,
             is_layout_active=is_layout_active,
+            obsolete_conflict_ids=frozenset(
+                conflict.conflict_id for conflict in obsolete_conflicts
+            ),
         )
         if report is None:
             return SaveQuickSyncResult(
@@ -2576,6 +2685,7 @@ class SaveSyncService:
         bootstrap: bool = False,
         is_group_active: Optional[Callable[[str], bool]] = None,
         is_layout_active: Optional[Callable[[str], bool]] = None,
+        obsolete_conflict_ids: frozenset[str] = frozenset(),
     ) -> Optional[SaveReconcileReport]:
         with self._locked_operation():
             if selected_group_ids is not None and selected_layout_ids is not None:
@@ -2612,6 +2722,20 @@ class SaveSyncService:
             )
             self._recover()
             state = self._get_state_unlocked()
+            obsolete_conflicts = self._obsolete_whole_layout_conflicts(
+                state, conflict_ids=obsolete_conflict_ids
+            )
+            if obsolete_conflicts and (
+                selected_layout_ids is None
+                or any(
+                    conflict.layout_id not in selected_layout_ids
+                    for conflict in obsolete_conflicts
+                )
+            ):
+                raise SaveSyncVerificationError(
+                    "Legacy SaveSync conflict migration requires a complete current "
+                    "layout scan; the conflict was preserved."
+                )
             diagnostic_event(
                 "savesync", "reconciliation.started",
                 "SaveSync authoritative reconciliation started",
@@ -3180,6 +3304,35 @@ class SaveSyncService:
                     )
                 ),
             )
+            if obsolete_conflicts:
+                obsolete_ids = {
+                    conflict.conflict_id for conflict in obsolete_conflicts
+                }
+                obsolete_group_ids = {
+                    conflict.group_id for conflict in obsolete_conflicts
+                }
+                next_state = replace(
+                    next_state,
+                    groups=tuple(
+                        group
+                        for group in next_state.groups
+                        if group.group_id not in obsolete_group_ids
+                    ),
+                    conflicts=tuple(
+                        replace(
+                            conflict,
+                            resolved_at=timestamp,
+                            resolution=SaveConflictResolution.MANUAL,
+                            resolution_revision=(
+                                f"ownership-migration:{report.revision}"
+                            ),
+                        )
+                        if conflict.conflict_id in obsolete_ids
+                        and not conflict.resolved
+                        else conflict
+                        for conflict in next_state.conflicts
+                    ),
+                )
             conflicted_group_ids = {
                 group.group_id
                 for group in refreshed_groups.values()
@@ -3258,6 +3411,21 @@ class SaveSyncService:
                             quick_sync_cursor_generation=generation,
                         )
                         _write_state(self._state_path, next_state)
+            if obsolete_conflicts:
+                log.info(
+                    "SaveSync ownership migration committed: revision=%s "
+                    "retired_conflicts=%d replacement_conflicts=%d",
+                    report.revision,
+                    len(obsolete_conflicts),
+                    len(
+                        {
+                            conflict.conflict_id
+                            for conflict in next_state.active_conflicts
+                            if conflict.layout_id
+                            in {item.layout_id for item in obsolete_conflicts}
+                        }
+                    ),
+                )
             log.info(
                 "SaveSync baseline committed: operation_id=%s revision=%s "
                 "baseline_artifacts=%d affected_groups=%d",

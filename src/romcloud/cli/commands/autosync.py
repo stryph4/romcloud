@@ -48,6 +48,7 @@ def _coordinator(ctx: click.Context) -> AutoSaveSyncCoordinator:
         data_root=Path(container.config.data_path),
         enabled=enabled,
         enabled_check=enabled_check,
+        selected_systems=container.config.source.selected_systems,
     )
 
 
@@ -237,6 +238,16 @@ def game_stop(
         except Exception:  # noqa: BLE001 - lifecycle hooks never block Batocera
             log.warning("Could not clear Batocera game session", exc_info=True)
         return
+    coordinator = _coordinator(ctx)
+    if not coordinator.game_stop_eligible(
+        system=system, emulator=emulator, core=core
+    ):
+        # Let the coordinator retire the lifecycle marker and emit its scoped
+        # skip diagnostic, but do so before creating any progress UI.
+        coordinator.game_stop(
+            system=system, emulator=emulator, core=core, rom=rom
+        )
+        return
     worker_pid = os.getpid()
     caller_pid = batocera_auto_savesync.lifecycle_caller_pid()
     log.info(
@@ -258,7 +269,7 @@ def game_stop(
         quick_sync_started = time.monotonic()
         log.info("gameStop Quick Sync started: worker_pid=%d", worker_pid)
         try:
-            conflict_ids = _coordinator(ctx).game_stop(
+            conflict_ids = coordinator.game_stop(
                 system=system, emulator=emulator, core=core, rom=rom,
                 progress=progress,
             )
