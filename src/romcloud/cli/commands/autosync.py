@@ -233,8 +233,27 @@ def game_stop(
 ) -> None:
     """Finish required Quick Sync work before the lifecycle command succeeds."""
     if not _auto_sync_enabled(ctx.obj["config"]):
+        config = ctx.obj["config"]
+        mode = operating_mode(config)
+        log.info(
+            "gameStop SaveSync skipped before eligibility: system=%s "
+            "emulator=%s core=%s rom=%s auto_sync_enabled=%s mode=%s "
+            "reason=%s operation_id=%s",
+            system,
+            emulator,
+            core,
+            rom,
+            bool(config.saves.auto_sync_enabled),
+            mode.value,
+            (
+                "offline-mode"
+                if mode is OperatingMode.OFFLINE
+                else "auto-sync-disabled"
+            ),
+            os.environ.get("ROMCLOUD_DIAGNOSTIC_OPERATION_ID", "none"),
+        )
         try:
-            _session_store(ctx.obj["config"]).stop(system=system, rom=rom)
+            _session_store(config).stop(system=system, rom=rom)
         except Exception:  # noqa: BLE001 - lifecycle hooks never block Batocera
             log.warning("Could not clear Batocera game session", exc_info=True)
         return

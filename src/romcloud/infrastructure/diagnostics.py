@@ -132,7 +132,7 @@ SAFE_METADATA_KEYS = frozenset(
         "current_hash", "desired_hash", "previous_hash", "size_bytes", "detail",
         "event",
         "raw_system", "normalized_system", "emulator", "core", "rom",
-        "selected_systems", "layout_ids", "matched_layout_ids",
+        "selected_systems", "layout_ids", "matched_layout_ids", "root_pattern",
         "canonical_systems", "ownership_groups", "files", "files_truncated", "content_hash",
         "mtime_ns", "monotonic_ns", "elapsed_ms", "matches_previous",
         "error_type", "observed_artifacts", "dirty_before", "dirty_after",

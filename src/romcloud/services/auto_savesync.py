@@ -493,6 +493,29 @@ class AutoSaveSyncCoordinator:
             },
         )
         if layout_ids:
+            scope = tuple(
+                {
+                    "layout_id": layout_id,
+                    "canonical_system": self._policy.layout(layout_id).system,
+                    "root_pattern": self._policy.layout(layout_id).root_pattern,
+                }
+                for layout_id in sorted(layout_ids)
+            )
+            log.info(
+                "gameStop targeted observation scope: layout_count=%d scope=%s",
+                len(scope),
+                json.dumps(scope, sort_keys=True, separators=(",", ":")),
+            )
+            diagnostic_event(
+                "savesync",
+                "local_observation.scope",
+                "gameStop targeted local observation scope resolved",
+                metadata={
+                    "scope": scope,
+                    "layout_ids": sorted(layout_ids),
+                    "count": len(scope),
+                },
+            )
             progress.stage("Waiting for save data to settle…")
             log.info(
                 "gameStop waiting for save stability: layout_ids=%s "

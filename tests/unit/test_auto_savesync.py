@@ -1890,7 +1890,7 @@ def test_gba_game_stop_uploads_and_periodic_quick_sync_repairs_materialization(
     assert service.quick_sync().status == "unchanged"
 
 
-def test_gba_game_stop_treats_new_group_as_change_against_full_sync_baseline(
+def test_local_gba_game_stop_without_session_scans_only_canonical_gba_scope(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -1948,7 +1948,7 @@ def test_gba_game_stop_treats_new_group_as_change_against_full_sync_baseline(
         system="gba",
         emulator="libretro",
         core="mgba",
-        rom="Pokemon Emerald.gba",
+        rom="/userdata/roms/gba/Pokemon Emerald.gba",
     )
 
     assert scanned_layouts
@@ -1963,6 +1963,47 @@ def test_gba_game_stop_treats_new_group_as_change_against_full_sync_baseline(
         "retroarch-root-gba/pokemon emerald",
     )
     assert remote.read_bytes() == b"new-save-with-preserved-mtime"
+
+
+@pytest.mark.parametrize(
+    ("system", "emulator", "core"),
+    (
+        ("", "libretro", "mgba"),
+        ("unknown", "", ""),
+    ),
+)
+def test_ambiguous_game_stop_identity_fails_closed_before_observation(
+    tmp_path: Path,
+    monkeypatch,
+    system: str,
+    emulator: str,
+    core: str,
+):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = AutoSaveSyncCoordinator(
+        service,
+        data_root=tmp_path / "data",
+        enabled=True,
+        policy=DEFAULT_SAVE_SELECTION_POLICY,
+        quiet_seconds=0,
+        selected_systems=("gba",),
+    )
+    monkeypatch.setattr(
+        service,
+        "observe_local_layouts",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ambiguous gameStop entered local observation")
+        ),
+    )
+
+    assert coordinator.game_stop(
+        system=system,
+        emulator=emulator,
+        core=core,
+        rom="/userdata/roms/gba/Pokemon Emerald.gba",
+    ) == ()
+    assert provider.reachability_checks == 0
 
 
 def test_gba_game_stop_observes_late_sram_flush_within_bounded_settle_window(
