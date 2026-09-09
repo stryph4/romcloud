@@ -13,6 +13,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Optional
 
+from romcloud.core.exceptions import ProviderError
 from romcloud.core.remote_data import (
     LooseObjectRemoteDataProvider,
     RemoteDataCapabilities,
@@ -91,6 +92,19 @@ class RemoteSaveStore(ABC):
     def filesystem_transaction_root(self) -> Optional[Path]:
         return None
 
+    def modified_epoch(
+        self,
+        relative_path: str,
+        *,
+        operation: Optional[RemoteOperationContext] = None,
+    ) -> Optional[float]:
+        """Provider modification time (UTC epoch seconds) for display evidence.
+
+        ``None`` means "this provider cannot report a trustworthy value" and
+        must be surfaced as Unknown.  Never used to choose a conflict winner.
+        """
+        return None
+
     @property
     def filesystem_journal_path(self) -> Optional[Path]:
         return None
@@ -145,6 +159,23 @@ class FilesystemRemoteSaveStore(RemoteSaveStore):
     @property
     def filesystem_transaction_root(self) -> Optional[Path]:
         return self._root
+
+    def modified_epoch(
+        self,
+        relative_path: str,
+        *,
+        operation: Optional[RemoteOperationContext] = None,
+    ) -> Optional[float]:
+        relative_path = validate_logical_key(relative_path)
+        if operation is not None:
+            operation.check()
+        path = self._root.joinpath(*relative_path.split("/"))
+        try:
+            if path.is_symlink() or not path.is_file():
+                return None
+            return path.stat().st_mtime
+        except OSError:
+            return None
 
     @property
     def filesystem_journal_path(self) -> Optional[Path]:
@@ -208,6 +239,23 @@ class ProviderRemoteSaveStore(RemoteSaveStore):
         if operation is not None:
             operation.check()
         return destination
+
+    def modified_epoch(
+        self,
+        relative_path: str,
+        *,
+        operation: Optional[RemoteOperationContext] = None,
+    ) -> Optional[float]:
+        relative_path = validate_logical_key(relative_path)
+        try:
+            entry = self._provider.metadata(
+                self._dataset_root, relative_path, operation=operation
+            )
+        except (NotImplementedError, OSError, ProviderError):
+            return None
+        if entry is None or entry.is_directory or entry.is_symlink:
+            return None
+        return entry.modified_epoch
 
 
 def build_remote_save_store(

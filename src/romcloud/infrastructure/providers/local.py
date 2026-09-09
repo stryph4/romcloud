@@ -246,6 +246,7 @@ class LocalFilesystemProvider(StorageProvider):
             is_symlink=is_symlink,
             object_id=str(path),
             revision=f"{stat.st_ino}:{stat.st_size}:{stat.st_mtime_ns}",
+            modified_epoch=None if is_symlink else stat.st_mtime,
         )
 
     def ensure_directory(

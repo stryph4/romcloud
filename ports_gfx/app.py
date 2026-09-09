@@ -1174,7 +1174,12 @@ def _run(  # noqa: ANN001
                         savesync_screen is not None
                         and savesync_screen.step == CONFLICTS
                     ):
-                        rects = conflict_action_rects(layout)
+                        rects = conflict_action_rects(
+                            layout,
+                            len(savesync_screen.resolver.detail_lines)
+                            if savesync_screen.resolver is not None
+                            else 0,
+                        )
                     else:
                         rects = (layout.safe_area,)
                 elif current_screen == "library_sync":
@@ -2927,7 +2932,9 @@ def _render_savesync(  # noqa: ANN001
             fonts,
             layout,
             savesync_screen.resolver,
-            conflict_action_rects(layout),
+            conflict_action_rects(
+                layout, len(savesync_screen.resolver.detail_lines)
+            ),
             colors={
                 "bg": _BG_COLOR,
                 "card": _CARD_BG,

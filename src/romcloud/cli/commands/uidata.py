@@ -1078,12 +1078,18 @@ def _record_dict(record) -> dict | None:
     }
 
 
-def _conflict_prompt_dict(conflict) -> dict:
+def _conflict_prompt_dict(conflict, saves=None) -> dict:  # noqa: ANN001
     artifacts = conflict.local.artifacts or conflict.remote.artifacts
     group_label = conflict.group_id
     if artifacts:
         artifact_path = Path(artifacts[0].relative_path)
         group_label = artifact_path.with_suffix("").as_posix()
+    evidence: dict = {}
+    if saves is not None:
+        try:
+            evidence = saves.conflict_modification_evidence(conflict)
+        except Exception:  # noqa: BLE001 - display evidence must never block a prompt
+            evidence = {}
     return {
         "conflict_id": conflict.conflict_id,
         "group_id": conflict.group_id,
@@ -1093,10 +1099,12 @@ def _conflict_prompt_dict(conflict) -> dict:
         "local": {
             "artifact_count": conflict.local.artifact_count,
             "total_bytes": conflict.local.total_bytes,
+            **evidence.get("local", {}),
         },
         "remote": {
             "artifact_count": conflict.remote.artifact_count,
             "total_bytes": conflict.remote.total_bytes,
+            **evidence.get("remote", {}),
         },
     }
 
@@ -1107,7 +1115,7 @@ def _conflicts_for_prompt(saves, data_root: Path, source: str) -> list[dict]:  #
         # Manual recovery deliberately includes conflicts whose one-time
         # automatic prompt was previously dismissed.
         return [
-            _conflict_prompt_dict(active[conflict_id])
+            _conflict_prompt_dict(active[conflict_id], saves)
             for conflict_id in sorted(active)
         ]
     if source != "automatic":
@@ -1117,7 +1125,7 @@ def _conflicts_for_prompt(saves, data_root: Path, source: str) -> list[dict]:  #
     for conflict_id in savesync_prompts.pending_ids(data_root):
         conflict = active.get(conflict_id)
         if conflict is not None:
-            result.append(_conflict_prompt_dict(conflict))
+            result.append(_conflict_prompt_dict(conflict, saves))
             continue
         # Manual resolution may race an automatic queued prompt. Remove only
         # the stale handoff; durable conflict history remains authoritative.

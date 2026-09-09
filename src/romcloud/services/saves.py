@@ -35,6 +35,7 @@ from romcloud.core.save_containers import (
     target_snapshot,
 )
 from romcloud.core.exceptions import (
+    ROMCloudError,
     SaveSyncConnectivityError,
     SaveSyncError,
     SaveSyncVerificationError,
@@ -90,6 +91,17 @@ from romcloud.infrastructure.save_container_registry import (
 log = get_logger("saves")
 _RPCS3_CANONICAL_PREFIX = f"ps3/{RPCS3_DEV_HDD0_PREFIX}"
 _QUICK_SYNC_HISTORY_REQUIRED = 1
+
+_FILE_TIMESTAMP_KIND = "file"
+_CONTAINER_TIMESTAMP_KIND = "container"
+
+
+def _unknown_modification_evidence(kind: str) -> dict[str, object]:
+    return {
+        "modified_epoch": None,
+        "timestamp_kind": kind,
+        "timestamp_source": "",
+    }
 
 
 class _ScratchDir:
@@ -572,6 +584,82 @@ class SaveSyncService:
         return durable_state.SaveSyncStateStore(
             self._state_path
         ).acknowledge_conflict(conflict_id)
+
+    def conflict_modification_evidence(
+        self, conflict: SaveConflictRecord
+    ) -> dict[str, dict[str, object]]:
+        """Read-only modification timestamps shown while a user resolves a conflict.
+
+        Purely presentational evidence: it never participates in conflict
+        classification, winner selection, or any transaction.  Timestamps come
+        only from the physical local files and from provider metadata — never
+        from scan, detection, journal, or wall-clock time.  Clocks may differ
+        between this device and the remote, so an unavailable or untrusted
+        value is reported as ``None`` rather than approximated.
+        """
+        kind = self._modification_timestamp_kind(conflict.layout_id)
+        return {
+            "local": self._local_modification_evidence(conflict.local, kind),
+            "remote": self._remote_modification_evidence(conflict.remote, kind),
+        }
+
+    def _modification_timestamp_kind(self, layout_id: str) -> str:
+        """``"container"`` when the physical file is a parsed save container.
+
+        No container adapter exposes a per-save logical timestamp, so container
+        layouts must never present their file mtime as a logical save time.
+        """
+        try:
+            layout = self._policy.layout(layout_id)
+        except KeyError:
+            return _FILE_TIMESTAMP_KIND
+        return (
+            _CONTAINER_TIMESTAMP_KIND
+            if layout.container_adapter_id
+            else _FILE_TIMESTAMP_KIND
+        )
+
+    def _local_modification_evidence(
+        self, snapshot: Optional[SaveGroupSnapshot], kind: str
+    ) -> dict[str, object]:
+        if snapshot is None or not snapshot.artifacts:
+            return _unknown_modification_evidence(kind)
+        newest: Optional[float] = None
+        for artifact in snapshot.artifacts:
+            try:
+                path = self._local_path(artifact.relative_path)
+                if path.is_symlink() or not path.is_file():
+                    return _unknown_modification_evidence(kind)
+                stamp = path.stat().st_mtime
+            except (SaveSyncVerificationError, OSError):
+                return _unknown_modification_evidence(kind)
+            newest = stamp if newest is None else max(newest, stamp)
+        return {
+            "modified_epoch": newest,
+            "timestamp_kind": kind,
+            "timestamp_source": "local-filesystem",
+        }
+
+    def _remote_modification_evidence(
+        self, snapshot: Optional[SaveGroupSnapshot], kind: str
+    ) -> dict[str, object]:
+        store = self._remote_store
+        if store is None or snapshot is None or not snapshot.artifacts:
+            return _unknown_modification_evidence(kind)
+        newest: Optional[float] = None
+        for artifact in snapshot.artifacts:
+            try:
+                stamp = store.modified_epoch(artifact.relative_path)
+            except (ROMCloudError, OSError, ValueError):
+                return _unknown_modification_evidence(kind)
+            if stamp is None:
+                return _unknown_modification_evidence(kind)
+            newest = stamp if newest is None else max(newest, stamp)
+        return {
+            "modified_epoch": newest,
+            "timestamp_kind": kind,
+            "timestamp_source": f"remote-provider:{store.provider_id}",
+        }
 
     @correlated_operation(
         "Conflict resolution", subsystem="savesync", source="conflict resolution"
