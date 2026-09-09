@@ -7,7 +7,7 @@ import json
 import os
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Optional, Protocol
 
@@ -19,7 +19,11 @@ from romcloud.core.exceptions import (
 from romcloud.core.models.savesync import SaveGroupCondition
 from romcloud.core.save_selection import SaveSelectionPolicy
 from romcloud.infrastructure.logging import get_logger
-from romcloud.infrastructure.diagnostics import correlated_operation, event as diagnostic_event
+from romcloud.infrastructure.diagnostics import (
+    correlated_operation,
+    event as diagnostic_event,
+    stage_timer,
+)
 from romcloud.infrastructure import savesync_prompts
 from romcloud.integrations.batocera import auto_savesync as batocera_auto_savesync
 from romcloud.services.saves import SaveSyncService
@@ -32,6 +36,25 @@ _DEFAULT_STAGING_RETRIES = 2
 # afford to wait much longer than an interactive trigger for a busy worker
 # lock to free up — still bounded, never indefinitely.
 _DRAIN_PENDING_LOCK_RETRY_ATTEMPTS = 300  # ~30s at the existing 0.1s poll interval
+
+
+@dataclass(frozen=True)
+class _SettledObservation:
+    """One completed bounded stability proof and the observation that made it.
+
+    ``manifest`` is the exact content observation the proof was concluded from,
+    ``observed_at`` the ``time.monotonic()`` reading when it was taken, and
+    ``window_started_at`` when the still-unbroken run of *equal* observations
+    began. A later stage can therefore reuse the bytes already read and can
+    account for how much of the required quiet window is already covered by
+    observation rather than sleeping through it a second time.
+    """
+
+    stable: bool
+    observations: int
+    manifest: dict
+    observed_at: float
+    window_started_at: float
 
 
 @dataclass(frozen=True)
@@ -257,90 +280,124 @@ class AutoSaveSyncCoordinator:
             core,
         )
         try:
-            session = self._sessions.stop(system=system, rom=rom)
-            layout_ids = layout_ids_for_session(self._policy, system, emulator, core)
-            log.info(
-                "gameStop SaveSync scope: system=%s emulator=%s core=%s "
-                "layout_count=%d layout_ids=%s session_record=%s",
-                system,
-                emulator,
-                core,
-                len(layout_ids),
-                ",".join(sorted(layout_ids)) or "none",
-                "present" if session is not None else "missing",
-            )
-            if layout_ids:
-                progress.stage("Waiting for save data to settle…")
-                log.info(
-                    "gameStop waiting for save stability: layout_ids=%s "
-                    "bounded_checks=%d interval=%.2fs",
-                    ",".join(sorted(layout_ids)),
-                    self._stability_checks,
-                    self._stability_interval,
+            with self._service.observation_scope():
+                return self._game_stop_locked(
+                    system=system,
+                    emulator=emulator,
+                    core=core,
+                    rom=rom,
+                    progress=progress,
                 )
-                if self._wait_for_pre_discovery_stability(layout_ids):
-                    log.info(
-                        "gameStop save stability achieved: layout_ids=%s",
-                        ",".join(sorted(layout_ids)),
-                    )
-                else:
-                    log.warning(
-                        "gameStop save stability timeout: layout_ids=%s "
-                        "bounded_checks=%d; local discovery skipped this pass to "
-                        "avoid classifying an in-flight write",
-                        ",".join(sorted(layout_ids)),
-                        self._stability_checks,
-                    )
-                    log.warning(
-                        "Auto SaveSync final result: trigger=game stop status=deferred "
-                        "reason=local-data-unstable-pre-discovery "
-                        "durable_dirty_state_retained=true"
-                    )
-                    raise SaveSyncError(
-                        "Auto SaveSync save data did not stabilize before discovery; "
-                        "pending local work was retained."
-                    )
-                changed_since = (
-                    session.started_at if session is not None else time.time() - 5.0
-                )
-                log.info(
-                    "gameStop local discovery started: layout_ids=%s",
-                    ",".join(sorted(layout_ids)),
-                )
-                self._service.detect_and_mark_local_changes(
-                    layout_ids, changed_since=changed_since
-                )
-            if self._sessions.has_active_session():
-                log.info(
-                    "Auto SaveSync final result: trigger=game stop status=deferred "
-                    "reason=another-session-active durable_dirty_state_retained=true"
-                )
-                progress.close(True, "Save sync deferred.")
-                return ()
-            progress.stage("Preparing save sync…")
-            conflict_ids = self._run_quick_sync(
-                trigger="game stop",
-                wait_for_handoff=True,
-                collect_new_conflicts=True,
-                require_completion=True,
-                progress=progress,
-            )
-            log.info(
-                "gameStop conflict check complete: new_conflicts=%d ids=%s",
-                len(conflict_ids),
-                ",".join(conflict_ids) if conflict_ids else "none",
-            )
-            # ``stage`` above already set the truthful final phrase ("No save
-            # changes detected."/"Save sync complete."); ``close`` here only
-            # starts the auto-dismiss countdown without overwriting it.
-            progress.close(True)
-            return conflict_ids
         except Exception:
             progress.close(
                 False,
                 "Save sync failed.\nYour local save has been preserved.",
             )
             raise
+
+    def _game_stop_locked(
+        self,
+        *,
+        system: str,
+        emulator: str,
+        core: str,
+        rom: str,
+        progress: SaveSyncProgressReporterLike,
+    ) -> tuple[str, ...]:
+        settled: Optional[_SettledObservation] = None
+        with stage_timer("scope"):
+            session = self._sessions.stop(system=system, rom=rom)
+            layout_ids = layout_ids_for_session(
+                self._policy, system, emulator, core
+            )
+        log.info(
+            "gameStop SaveSync scope: system=%s emulator=%s core=%s "
+            "layout_count=%d layout_ids=%s session_record=%s",
+            system,
+            emulator,
+            core,
+            len(layout_ids),
+            ",".join(sorted(layout_ids)) or "none",
+            "present" if session is not None else "missing",
+        )
+        if layout_ids:
+            progress.stage("Waiting for save data to settle…")
+            log.info(
+                "gameStop waiting for save stability: layout_ids=%s "
+                "bounded_checks=%d interval=%.2fs",
+                ",".join(sorted(layout_ids)),
+                self._stability_checks,
+                self._stability_interval,
+            )
+            with stage_timer("stability") as timing:
+                settled = self._settle(
+                    lambda: self._service.observe_local_layouts(layout_ids)
+                )
+                timing["observations"] = settled.observations
+                timing["result"] = "stable" if settled.stable else "unstable"
+            if settled.stable:
+                log.info(
+                    "gameStop save stability achieved: layout_ids=%s "
+                    "observations=%d",
+                    ",".join(sorted(layout_ids)),
+                    settled.observations,
+                )
+            else:
+                log.warning(
+                    "gameStop save stability timeout: layout_ids=%s "
+                    "bounded_checks=%d; local discovery skipped this pass to "
+                    "avoid classifying an in-flight write",
+                    ",".join(sorted(layout_ids)),
+                    self._stability_checks,
+                )
+                log.warning(
+                    "Auto SaveSync final result: trigger=game stop status=deferred "
+                    "reason=local-data-unstable-pre-discovery "
+                    "durable_dirty_state_retained=true"
+                )
+                raise SaveSyncError(
+                    "Auto SaveSync save data did not stabilize before discovery; "
+                    "pending local work was retained."
+                )
+            changed_since = (
+                session.started_at if session is not None else time.time() - 5.0
+            )
+            log.info(
+                "gameStop local discovery started: layout_ids=%s",
+                ",".join(sorted(layout_ids)),
+            )
+            with stage_timer("discovery"):
+                self._service.detect_and_mark_local_changes(
+                    layout_ids,
+                    changed_since=changed_since,
+                    observed=settled.manifest,
+                )
+        if self._sessions.has_active_session():
+            log.info(
+                "Auto SaveSync final result: trigger=game stop status=deferred "
+                "reason=another-session-active durable_dirty_state_retained=true"
+            )
+            progress.close(True, "Save sync deferred.")
+            return ()
+        progress.stage("Preparing save sync…")
+        conflict_ids = self._run_quick_sync(
+            trigger="game stop",
+            wait_for_handoff=True,
+            collect_new_conflicts=True,
+            require_completion=True,
+            progress=progress,
+            settled=settled,
+        )
+        log.info(
+            "gameStop conflict check complete: new_conflicts=%d ids=%s",
+            len(conflict_ids),
+            ",".join(conflict_ids) if conflict_ids else "none",
+        )
+        # ``stage`` above already set the truthful final phrase ("No save
+        # changes detected."/"Save sync complete."); ``close`` here only
+        # starts the auto-dismiss countdown without overwriting it.
+        progress.close(True)
+        return conflict_ids
 
     @correlated_operation(
         "Auto Quick Sync", subsystem="savesync", source="remote reconnect"
@@ -376,44 +433,59 @@ class AutoSaveSyncCoordinator:
         require_completion: bool = False,
         lock_retry_attempts: Optional[int] = None,
         progress: Optional[SaveSyncProgressReporterLike] = None,
+        settled: Optional[_SettledObservation] = None,
     ) -> tuple[str, ...]:
         """Serialize every automatic trigger through ``SaveSyncService.quick_sync``.
 
         Local-dirty groups receive the existing bounded settling observations
         before Quick Sync.  Quick Sync itself remains the sole authority for
         journal scoping and three-way upload/download/conflict decisions.
+
+        *settled* carries a stability proof a caller already completed for the
+        same local content (gameStop's pre-discovery settle). It only ever
+        seeds the first of the two observations still required here — never
+        replaces the proof.
         """
         lock = _AutoWorkerLock(self._data_root / ".savesync-auto.lock")
         new_conflict_ids: set[str] = set()
         attempts = lock_retry_attempts or (6 if wait_for_handoff else 1)
-        for attempt in range(attempts):
-            if lock.acquire():
-                break
-            if attempt == attempts - 1:
-                log.warning(
-                    "Auto SaveSync final result: trigger=%s status=deferred "
-                    "reason=worker-busy",
-                    trigger,
+        with stage_timer("worker-lock", metadata={"trigger": trigger}) as timing:
+            acquired = False
+            used = 0
+            for attempt in range(attempts):
+                used = attempt + 1
+                if lock.acquire():
+                    acquired = True
+                    break
+                if attempt == attempts - 1:
+                    break
+                # A just-finishing leader may have completed its final durable
+                # state read while gameStop was recording new work.
+                time.sleep(0.1)
+            timing["attempts"] = used
+            timing["result"] = "acquired" if acquired else "busy"
+        if not acquired:
+            log.warning(
+                "Auto SaveSync final result: trigger=%s status=deferred "
+                "reason=worker-busy",
+                trigger,
+            )
+            diagnostic_event(
+                "savesync", "worker.busy", "Auto SaveSync worker is busy",
+                level="WARNING",
+                metadata={
+                    "trigger": trigger, "status": "deferred",
+                    "reason": "worker-busy", "worker_state": "busy",
+                },
+            )
+            if require_completion:
+                raise SaveSyncWorkerBusyError(
+                    "Auto SaveSync could not acquire its worker lock "
+                    "because another Quick Sync was still running; "
+                    "pending local work was retained and a follow-up "
+                    "sync will be scheduled."
                 )
-                diagnostic_event(
-                    "savesync", "worker.busy", "Auto SaveSync worker is busy",
-                    level="WARNING",
-                    metadata={
-                        "trigger": trigger, "status": "deferred",
-                        "reason": "worker-busy", "worker_state": "busy",
-                    },
-                )
-                if require_completion:
-                    raise SaveSyncWorkerBusyError(
-                        "Auto SaveSync could not acquire its worker lock "
-                        "because another Quick Sync was still running; "
-                        "pending local work was retained and a follow-up "
-                        "sync will be scheduled."
-                    )
-                return ()
-            # A just-finishing leader may have completed its final durable
-            # state read while gameStop was recording new work.
-            time.sleep(0.1)
+            return ()
         log.info("Auto SaveSync worker lock acquired: trigger=%s", trigger)
         try:
             if self._sessions.has_active_session():
@@ -455,7 +527,7 @@ class AutoSaveSyncCoordinator:
                     len(state.groups),
                     len(pending),
                 )
-                if pending and not self._wait_until_stable(pending):
+                if pending and not self._wait_until_stable(pending, seed=settled):
                     log.warning(
                         "Auto SaveSync deferred: local save data did not "
                         "stabilize after %d bounded checks; durable dirty "
@@ -504,13 +576,14 @@ class AutoSaveSyncCoordinator:
                 try:
                     for staging_attempt in range(self._staging_retries + 1):
                         try:
-                            result = self._service.quick_sync(
-                                is_group_active=is_group_active,
-                                is_layout_active=is_layout_active,
-                                exclude_layout_ids=(
-                                    self._policy.lifecycle_disabled_layout_ids()
-                                ),
-                            )
+                            with stage_timer("quick-sync"):
+                                result = self._service.quick_sync(
+                                    is_group_active=is_group_active,
+                                    is_layout_active=is_layout_active,
+                                    exclude_layout_ids=(
+                                        self._policy.lifecycle_disabled_layout_ids()
+                                    ),
+                                )
                             break
                         except SaveSyncVerificationError:
                             if staging_attempt >= self._staging_retries:
@@ -797,49 +870,94 @@ class AutoSaveSyncCoordinator:
             )
         )
 
-    def _wait_for_pre_discovery_stability(self, layout_ids: frozenset[str]) -> bool:
-        """Require two equal raw layout observations before dirty classification.
+    def _wait_until_stable(
+        self,
+        group_ids: frozenset[str],
+        *,
+        seed: Optional[_SettledObservation] = None,
+    ) -> bool:
+        """Require two equal local hash/size observations within a bound.
 
-        This runs *before* :meth:`SaveSyncService.detect_and_mark_local_changes`
-        ever compares content against a baseline. Without it, a single upfront
-        scan racing an emulator/core's still-in-flight save write can observe
-        stale, baseline-matching bytes and permanently classify a real change
-        as unchanged: nothing downstream re-scans a group that was never
-        marked dirty, so the change would silently never sync.
+        When *seed* is a proof taken over a wider local scope moments ago, its
+        manifest is narrowed to *group_ids* and used as the first of the two
+        required observations. A seed that does not cover these exact groups
+        simply fails the equality comparison, which costs one extra
+        observation and can never report stability that was not observed.
+        """
+        seeded: Optional[_SettledObservation] = None
+        if seed is not None and seed.stable:
+            seeded = replace(
+                seed,
+                manifest=self._service.groups_within(seed.manifest, group_ids),
+            )
+        with stage_timer("stability-preflight") as timing:
+            result = self._settle(
+                lambda: self._service.observe_local_groups(group_ids), seed=seeded
+            )
+            timing["observations"] = result.observations
+            timing["result"] = "stable" if result.stable else "unstable"
+        return result.stable
+
+    def _settle(
+        self,
+        observe: Callable[[], dict],
+        *,
+        seed: Optional["_SettledObservation"] = None,
+    ) -> "_SettledObservation":
+        """Bounded proof that local save content has stopped changing.
+
+        Stability is proven exactly as before: local content must be observed
+        *unchanged* across a quiet window of at least
+        ``self._stability_interval``. Without that proof a single upfront scan
+        racing an emulator/core's still-in-flight save write can observe stale,
+        baseline-matching bytes and permanently classify a real change as
+        unchanged — nothing downstream re-scans a group that was never marked
+        dirty, so the change would silently never sync.
+
+        What changed is only the bookkeeping of that window. It is measured
+        from the first observation of the current unbroken run of equal
+        observations, so time already spent *reading* the tree counts towards
+        it instead of being slept through again — a multi-second scan of a
+        large PS2 save tree covers the whole window on its own. For the same
+        reason a caller may hand over a proof it just completed as *seed*: its
+        observation and window are real measurements, so one fresh matching
+        observation extends that same unbroken quiet run rather than starting
+        a new one. Any mismatch immediately restarts the window.
         """
         unavailable = object()
-        previous: object = unavailable
-        for observation in range(self._stability_checks + 1):
+        previous: object = seed.manifest if seed is not None else unavailable
+        window_started_at = seed.window_started_at if seed is not None else 0.0
+        latest_at = seed.observed_at if seed is not None else 0.0
+        observations = 0
+        for _ in range(self._stability_checks + 1):
+            if previous is not unavailable and self._stability_interval:
+                remaining = self._stability_interval - (
+                    time.monotonic() - window_started_at
+                )
+                if remaining > 0:
+                    time.sleep(remaining)
             try:
-                current = self._service.observe_local_layouts(layout_ids)
-            except OSError:
-                previous = unavailable
-            else:
-                if previous is not unavailable and current == previous:
-                    return True
-                previous = current
-            if observation < self._stability_checks and self._stability_interval:
-                time.sleep(self._stability_interval)
-        return False
-
-    def _wait_until_stable(self, group_ids: frozenset[str]) -> bool:
-        """Require two equal local hash/size observations within a bound."""
-        unavailable = object()
-        previous: object = unavailable
-        for observation in range(self._stability_checks + 1):
-            try:
-                current = self._service.observe_local_groups(group_ids)
+                current = observe()
             except OSError:
                 # An emulator may atomically replace a save between discovery
                 # and hashing. Treat that bounded observation as unstable.
                 previous = unavailable
-            else:
-                if previous is not unavailable and current == previous:
-                    return True
-                previous = current
-            if observation < self._stability_checks and self._stability_interval:
-                time.sleep(self._stability_interval)
-        return False
+                continue
+            observations += 1
+            latest_at = time.monotonic()
+            if previous is not unavailable and current == previous:
+                return _SettledObservation(
+                    True, observations, current, latest_at, window_started_at
+                )
+            previous = current
+            window_started_at = latest_at
+        return _SettledObservation(
+            False,
+            observations,
+            {} if previous is unavailable else previous,  # type: ignore[arg-type]
+            latest_at,
+            window_started_at,
+        )
 
 
 class _AutoWorkerLock:

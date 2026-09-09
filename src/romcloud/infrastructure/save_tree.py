@@ -61,6 +61,49 @@ def hash_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+class ContentObservationCache:
+    """Operation-scoped memo of files already hashed during one operation.
+
+    A single Auto SaveSync operation scans the same physical trees several
+    times (bounded stability observations, the authoritative plan scan, the
+    pre-apply staging check). Re-reading every byte each time is what makes a
+    CIFS-mounted remote dataset dominate gameStop latency.
+
+    A file is only served from this memo when its device, inode, size *and*
+    nanosecond mtime are all still exactly what they were when the digest was
+    computed earlier in this same operation — the filesystem itself reporting
+    that no write happened since that observation. Any difference re-reads.
+
+    Deliberately narrow: never shared between operations (so it can never hide
+    a change made between two syncs) and never consulted by the post-mutation
+    verification scan, which always re-reads real bytes.
+    """
+
+    __slots__ = ("_entries", "hits", "misses")
+
+    def __init__(self) -> None:
+        self._entries: dict[tuple[str, int, int, int, int], str] = {}
+        self.hits = 0
+        self.misses = 0
+
+    def hash_observed(self, path: Path, status: os.stat_result) -> str:
+        key = (
+            str(path),
+            status.st_dev,
+            status.st_ino,
+            status.st_size,
+            status.st_mtime_ns,
+        )
+        cached = self._entries.get(key)
+        if cached is not None:
+            self.hits += 1
+            return cached
+        digest = hash_file(path)
+        self.misses += 1
+        self._entries[key] = digest
+        return digest
+
+
 def scan_tree(
     root: Path,
     policy: SaveSelectionPolicy,
@@ -89,12 +132,19 @@ def scan_tree_report(
     *,
     enabled_optional_systems: frozenset[str] = frozenset(),
     enabled_optional_groups: frozenset[str] = frozenset(),
+    cache: Optional[ContentObservationCache] = None,
+    only_relative_paths: Optional[frozenset[str]] = None,
 ) -> ScanReport:
     """Scan only roots positively resolved from the supported-layout registry.
 
     Unknown systems and unsupported subtrees are neither entered nor counted as
     exclusions.  This distinction is important: an empty result must not hide a
     costly recursive classification walk through arbitrary user data.
+
+    *only_relative_paths* narrows the result to named files relative to *root*.
+    Classification is unchanged for the files that are kept; the rest are never
+    opened, which is what keeps a transaction's own selected-path verification
+    from reading every unrelated save in the destination tree.
     """
     roots = policy.watch_roots(
         root,
@@ -104,6 +154,18 @@ def scan_tree_report(
         roots,
         policy,
         enabled_optional_groups=enabled_optional_groups,
+        cache=cache,
+        include=_include_set(root, only_relative_paths),
+    )
+
+
+def _include_set(
+    root: Path, only_relative_paths: Optional[frozenset[str]]
+) -> Optional[frozenset[Path]]:
+    if only_relative_paths is None:
+        return None
+    return frozenset(
+        Path(root).joinpath(*relative.split("/")) for relative in only_relative_paths
     )
 
 
@@ -114,6 +176,8 @@ def scan_mapped_tree_report(
     system: str,
     relative_prefix: str,
     enabled_optional_groups: frozenset[str] = frozenset(),
+    cache: Optional[ContentObservationCache] = None,
+    only_relative_paths: Optional[frozenset[str]] = None,
 ) -> ScanReport:
     """Scan an emulator tree stored outside the main saves root.
 
@@ -129,6 +193,8 @@ def scan_mapped_tree_report(
         roots,
         policy,
         enabled_optional_groups=enabled_optional_groups,
+        cache=cache,
+        include=_include_set(root, only_relative_paths),
     )
 
 
@@ -160,10 +226,14 @@ def _scan_watch_roots(
     policy: SaveSelectionPolicy,
     *,
     enabled_optional_groups: frozenset[str],
+    cache: Optional[ContentObservationCache] = None,
+    include: Optional[frozenset[Path]] = None,
 ) -> ScanReport:
     artifacts: dict[str, SaveArtifact] = {}
     for watch in roots:
         for file_path in _iter_approved_files(watch.path, recursive=watch.recursive):
+            if include is not None and file_path not in include:
+                continue
             relative = file_path.relative_to(watch.path).as_posix()
             canonical = f"{watch.canonical_root}/{relative}".strip("/")
             system, separator, policy_relative = canonical.partition("/")
@@ -179,8 +249,13 @@ def _scan_watch_roots(
                 continue
             if canonical in artifacts:
                 raise SaveSyncError(f"SaveSync found duplicate canonical path: {canonical}")
-            size_bytes = file_path.stat().st_size
-            artifacts[canonical] = SaveArtifact(canonical, size_bytes, hash_file(file_path))
+            status = file_path.stat()
+            digest = (
+                hash_file(file_path)
+                if cache is None
+                else cache.hash_observed(file_path, status)
+            )
+            artifacts[canonical] = SaveArtifact(canonical, status.st_size, digest)
     return ScanReport(artifacts)
 
 

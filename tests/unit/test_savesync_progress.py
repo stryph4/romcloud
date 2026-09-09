@@ -105,6 +105,22 @@ class TestSaveSyncProgressReporter:
             {"event": "done", "ok": True, "message": "Save sync complete."}
         ]
         assert proc.stdin.closed
+
+    def test_successful_close_does_not_block_on_the_cosmetic_dismiss_fade(self):
+        """The SaveSync transaction is durably committed before a successful
+        close is reported, so the lifecycle hook (and therefore
+        EmulationStation) must not additionally wait out the popup's
+        purely cosmetic success fade on every single game exit."""
+        proc = _FakeProcess()
+        reporter = SaveSyncProgressReporter(proc)
+        reporter.close(True, "Save sync complete.")
+        assert proc.wait_calls == []
+        assert proc.stdin.closed
+
+    def test_failed_close_still_waits_so_the_message_is_readable(self):
+        proc = _FakeProcess()
+        reporter = SaveSyncProgressReporter(proc)
+        reporter.close(False, "Save sync failed.")
         assert proc.wait_calls
 
     def test_close_without_message_omits_the_field(self):
@@ -116,8 +132,8 @@ class TestSaveSyncProgressReporter:
     def test_close_is_idempotent(self):
         proc = _FakeProcess()
         reporter = SaveSyncProgressReporter(proc)
-        reporter.close(True, "Save sync complete.")
         reporter.close(False, "Save sync failed.")
+        reporter.close(True, "Save sync complete.")
         assert len(proc.stdin.events) == 1
         assert len(proc.wait_calls) == 1
 

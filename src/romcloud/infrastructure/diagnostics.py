@@ -127,6 +127,8 @@ SAFE_METADATA_KEYS = frozenset(
         "transaction_root", "transaction_view", "trigger", "unchanged",
         "uploaded", "worker_state", "quick_ready", "duration_ms", "count",
         "examined",
+        "attempts", "cache_hits", "hashed_files", "observations", "scanned_files",
+        "sleep_ms", "stage_scope",
         "current_hash", "desired_hash", "previous_hash", "size_bytes", "detail",
         "event",
         "arguments", "browser_pid", "browser_view", "display", "exit_code",
@@ -774,6 +776,74 @@ def operation(
 
 def current_operation_id() -> Optional[str]:
     return _operation_id.get()
+
+
+@contextlib.contextmanager
+def stage_timer(
+    stage: str,
+    *,
+    subsystem: str = "savesync",
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Iterator[dict[str, Any]]:
+    """Time one named stage of the enclosing correlated operation.
+
+    Emits a single ``stage.timing`` event carrying ``duration_ms`` so a whole
+    workflow can be replayed as a timeline (see :func:`operation_timeline`).
+    Deliberately fail-open and allocation-light: when no diagnostics store is
+    configured :func:`event` returns immediately, and any bookkeeping failure
+    is swallowed rather than propagated into the timed code path.
+
+    The yielded dict is a mutable metadata bag — a caller may add allowlisted
+    counters (``count``, ``bytes``, …) that are only known once the stage ran.
+    """
+    fields: dict[str, Any] = dict(metadata or {})
+    started = time.monotonic_ns()
+    try:
+        yield fields
+    finally:
+        with contextlib.suppress(Exception):
+            event(
+                subsystem,
+                "stage.timing",
+                f"{stage} stage completed",
+                metadata={
+                    **fields,
+                    "stage": stage,
+                    "duration_ms": (time.monotonic_ns() - started) // 1_000_000,
+                },
+            )
+
+
+def operation_timeline(operation_id: str) -> list[dict[str, Any]]:
+    """Return ``stage.timing`` rows for *operation_id* with % of total time.
+
+    Read-only reporting helper for ``romcloud diagnostics``/support bundles;
+    returns ``[]`` when diagnostics are disabled or the operation is unknown.
+    """
+    store = active_store()
+    if store is None:
+        return []
+    stages: dict[str, dict[str, Any]] = {}
+    for row in store.operation_chain(operation_id, page_size=200):
+        if row.get("event_code") != "stage.timing":
+            continue
+        metadata = row.get("metadata") or {}
+        name = str(metadata.get("stage") or "")
+        duration = metadata.get("duration_ms")
+        if not name or not isinstance(duration, (int, float)):
+            continue
+        entry = stages.setdefault(name, {"stage": name, "duration_ms": 0, "count": 0})
+        entry["duration_ms"] += int(duration)
+        entry["count"] += 1
+    total = sum(entry["duration_ms"] for entry in stages.values()) or 1
+    return sorted(
+        (
+            {**entry, "percent": round(entry["duration_ms"] * 100.0 / total, 1)}
+            for entry in stages.values()
+        ),
+        key=lambda entry: entry["duration_ms"],
+        reverse=True,
+    )
 
 
 def correlated_operation(

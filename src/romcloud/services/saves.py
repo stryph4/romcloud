@@ -79,6 +79,7 @@ from romcloud.infrastructure.diagnostics import (
     correlated_operation,
     current_operation_id,
     event as diagnostic_event,
+    stage_timer,
 )
 from romcloud.infrastructure import savesync_state as durable_state
 from romcloud.infrastructure import savesync_journal
@@ -256,6 +257,7 @@ class SaveSyncService:
         self._policy = policy
         self._capabilities = capability_policy or CapabilityPolicy("smart_cache")
         self._active_read_scratch: Optional[_ScratchDir] = None
+        self._observation_cache: Optional[save_tree.ContentObservationCache] = None
         self._container_registry = container_registry
 
     # ── connectivity and settings ────────────────────────────────────────
@@ -380,6 +382,7 @@ class SaveSyncService:
         layout_ids: frozenset[str],
         *,
         changed_since: float,
+        observed: Optional[dict[str, SaveArtifact]] = None,
     ) -> SaveSyncState:
         """Hash audited local layouts and persist changed group hints.
 
@@ -387,6 +390,13 @@ class SaveSyncService:
         are authoritative. For a group never observed before, file mtimes are
         used only to nominate a candidate; reconciliation always rescans and
         hashes both sides before making a decision.
+
+        *observed* lets a caller hand over a manifest it just produced for the
+        exact same layout scope — the settled observation from
+        :meth:`observe_local_layouts` that proved stability moments ago. Doing
+        so avoids re-reading every byte of the same tree a third time; it is
+        never weaker, because that manifest is the newest content observation
+        available and is what the stability proof was made from.
         """
         allowed_layouts = frozenset(
             layout_id
@@ -398,7 +408,11 @@ class SaveSyncService:
             return self.get_state()
         with self._operation_lock():
             state = self._get_state_unlocked()
-            current = self._scan_local_layouts(allowed_layouts).artifacts
+            current = (
+                self._scan_local_layouts(allowed_layouts).artifacts
+                if observed is None
+                else dict(observed)
+            )
             baseline = self._automatic_baseline(state)
             known_groups = {group.group_id for group in state.groups}
             paths_by_group: dict[str, set[str]] = {}
@@ -557,6 +571,16 @@ class SaveSyncService:
             return {}
         report = self._scan_local_layouts(layout_ids)
         return _manifest_for_groups(report.artifacts, group_ids, self._policy)
+
+    def groups_within(
+        self, observed: dict[str, SaveArtifact], group_ids: frozenset[str]
+    ) -> dict[str, SaveArtifact]:
+        """Narrow an already-taken local observation to specific logical groups.
+
+        Pure filtering of a manifest the caller already holds — no filesystem,
+        provider or durable-state access.
+        """
+        return _manifest_for_groups(observed, group_ids, self._policy)
 
     def observe_local_layouts(
         self, layout_ids: frozenset[str]
@@ -1010,10 +1034,45 @@ class SaveSyncService:
                 scratch.cleanup()
                 self._active_read_scratch = previous
 
+    @contextlib.contextmanager
+    def observation_scope(self):  # noqa: ANN202
+        """Reuse content observations for the duration of one operation.
+
+        Inside this scope a file that the filesystem still reports as
+        untouched (same device/inode/size/mtime_ns) since it was hashed
+        earlier in the *same* operation is not re-read. Nested scopes reuse
+        the outermost cache so a caller-established scope survives the
+        service's own internal operations; the cache is always discarded when
+        the outermost scope exits, so nothing is ever carried between
+        operations.
+        """
+        if self._observation_cache is not None:
+            yield self._observation_cache
+            return
+        cache = save_tree.ContentObservationCache()
+        self._observation_cache = cache
+        try:
+            yield cache
+        finally:
+            self._observation_cache = None
+
+    @contextlib.contextmanager
+    def _fresh_observations(self):  # noqa: ANN202
+        """Suspend observation reuse so a scan re-reads every real byte.
+
+        Used for the post-mutation verification scan, which must prove what is
+        actually on disk now rather than what was true before the transaction.
+        """
+        previous = self._observation_cache
+        self._observation_cache = None
+        try:
+            yield
+        finally:
+            self._observation_cache = previous
+
     @property
     def selection_policy(self) -> SaveSelectionPolicy:
         return self._policy
-
     def with_local_root(self, local_root: Path) -> "SaveSyncService":
         """Create a transition view over an owned canonical local shadow tree."""
         return SaveSyncService(
@@ -1043,12 +1102,16 @@ class SaveSyncService:
         self,
         root: Path,
         policy: Optional[SaveSelectionPolicy] = None,
+        *,
+        only_relative_paths: Optional[frozenset[str]] = None,
     ) -> save_tree.ScanReport:
         return save_tree.scan_tree_report(
             root,
             policy or self._policy,
             enabled_optional_systems=self._enabled_optional_systems(),
             enabled_optional_groups=self._enabled_optional_groups(),
+            cache=self._observation_cache,
+            only_relative_paths=only_relative_paths,
         )
 
     def _primary_local_policy(
@@ -1102,6 +1165,7 @@ class SaveSyncService:
         policy: SaveSelectionPolicy,
         *,
         root: Optional[Path] = None,
+        only_relative_paths: Optional[frozenset[str]] = None,
     ) -> save_tree.ScanReport:
         system, _, relative_prefix = view.canonical_prefix.partition("/")
         return save_tree.scan_mapped_tree_report(
@@ -1110,6 +1174,8 @@ class SaveSyncService:
             system=system,
             relative_prefix=relative_prefix,
             enabled_optional_groups=self._enabled_optional_groups(),
+            cache=self._observation_cache,
+            only_relative_paths=only_relative_paths,
         )
 
     def _scan_local(self) -> save_tree.ScanReport:
@@ -1186,6 +1252,7 @@ class SaveSyncService:
             self._policy,
             enabled_optional_systems=self._enabled_optional_systems(),
             enabled_optional_groups=self._enabled_optional_groups(),
+            cache=self._observation_cache,
         )
 
     def _scan_remote_layouts(
@@ -1204,6 +1271,7 @@ class SaveSyncService:
             selected_policy,
             enabled_optional_systems=self._enabled_optional_systems(),
             enabled_optional_groups=self._enabled_optional_groups(),
+            cache=self._observation_cache,
         )
 
     def _automatic_report(self, report: save_tree.ScanReport) -> save_tree.ScanReport:
@@ -1507,6 +1575,28 @@ class SaveSyncService:
         authoritative_side: Optional[str] = None,
     ) -> SaveQuickSyncResult:
         """Journal-driven discovery optimization for authoritative reconciliation."""
+        with self.observation_scope():
+            return self._quick_sync(
+                progress=progress,
+                is_group_active=is_group_active,
+                is_layout_active=is_layout_active,
+                exclude_layout_ids=exclude_layout_ids,
+                force_current_state=force_current_state,
+                include_layout_ids=include_layout_ids,
+                authoritative_side=authoritative_side,
+            )
+
+    def _quick_sync(
+        self,
+        *,
+        progress: ProgressSink,
+        is_group_active: Optional[Callable[[str], bool]],
+        is_layout_active: Optional[Callable[[str], bool]],
+        exclude_layout_ids: Optional[frozenset[str]],
+        force_current_state: bool,
+        include_layout_ids: Optional[frozenset[str]],
+        authoritative_side: Optional[str],
+    ) -> SaveQuickSyncResult:
         self._capabilities.require(Capability.SAVE_SYNC, "Quick SaveSync")
         self._require_remote()
         self._require_filesystem_remote("Quick SaveSync")
@@ -1899,7 +1989,7 @@ class SaveSyncService:
         path = self._remote_journal_path
         if path is None:
             raise SaveSyncConnectivityError("SaveSync remote location is not configured")
-        with savesync_journal.journal_lock(path):
+        with stage_timer("journal-load"), savesync_journal.journal_lock(path):
             if not reset_on_error:
                 try:
                     return savesync_journal.load(path)
@@ -2530,8 +2620,10 @@ class SaveSyncService:
                 # scoped snapshot with a later all-layout scan makes unrelated
                 # local-only layouts look like concurrent mutations.
                 verification_layout_ids = selected_layout_ids
-                local_report = self._scan_local_layouts(selected_layout_ids)
-                remote_report = self._scan_remote_layouts(selected_layout_ids)
+                with stage_timer("scan-local"):
+                    local_report = self._scan_local_layouts(selected_layout_ids)
+                with stage_timer("scan-remote"):
+                    remote_report = self._scan_remote_layouts(selected_layout_ids)
                 local_report = self._automatic_report(local_report)
                 remote_report = self._automatic_report(remote_report)
             elif selected_group_ids is not None:
@@ -2546,18 +2638,22 @@ class SaveSyncService:
                 )
                 verification_layout_ids = scoped_layouts
                 if scoped_layouts:
-                    local_report = self._automatic_report(
-                        self._scan_local_layouts(scoped_layouts)
-                    )
-                    remote_report = self._automatic_report(
-                        self._scan_remote_layouts(scoped_layouts)
-                    )
+                    with stage_timer("scan-local"):
+                        local_report = self._automatic_report(
+                            self._scan_local_layouts(scoped_layouts)
+                        )
+                    with stage_timer("scan-remote"):
+                        remote_report = self._automatic_report(
+                            self._scan_remote_layouts(scoped_layouts)
+                        )
                 else:
                     local_report = save_tree.ScanReport({})
                     remote_report = save_tree.ScanReport({})
             else:
-                local_report = self._scan_automatic_local()
-                remote_report = self._scan_automatic_remote()
+                with stage_timer("scan-local"):
+                    local_report = self._scan_automatic_local()
+                with stage_timer("scan-remote"):
+                    remote_report = self._scan_automatic_remote()
             complete_local = dict(local_report.artifacts)
             complete_remote = dict(remote_report.artifacts)
             baseline = self._automatic_baseline(state)
@@ -2743,15 +2839,17 @@ class SaveSyncService:
                     ),
                 )
                 if verification_layout_ids is None:
-                    current_local = self._scan_automatic_local()
-                    current_remote = self._scan_automatic_remote()
+                    with stage_timer("staging-verify"):
+                        current_local = self._scan_automatic_local()
+                        current_remote = self._scan_automatic_remote()
                 else:
-                    current_local = self._automatic_report(
-                        self._scan_local_layouts(verification_layout_ids)
-                    )
-                    current_remote = self._automatic_report(
-                        self._scan_remote_layouts(verification_layout_ids)
-                    )
+                    with stage_timer("staging-verify"):
+                        current_local = self._automatic_report(
+                            self._scan_local_layouts(verification_layout_ids)
+                        )
+                        current_remote = self._automatic_report(
+                            self._scan_remote_layouts(verification_layout_ids)
+                        )
                 if (
                     current_local.artifacts != complete_local
                     or current_remote.artifacts != complete_remote
@@ -2782,20 +2880,24 @@ class SaveSyncService:
                         transaction.rollback()
                     return None
                 if transaction is not None:
-                    self._apply_selected_transaction(
-                        transaction, tuple(destination_views)
-                    )
+                    with stage_timer("transaction-apply"):
+                        self._apply_selected_transaction(
+                            transaction, tuple(destination_views)
+                        )
                 self._verify_container_targets(container_work)
-                if verification_layout_ids is None:
-                    final_local_report = self._scan_automatic_local()
-                    final_remote_report = self._scan_automatic_remote()
-                else:
-                    final_local_report = self._automatic_report(
-                        self._scan_local_layouts(verification_layout_ids)
-                    )
-                    final_remote_report = self._automatic_report(
-                        self._scan_remote_layouts(verification_layout_ids)
-                    )
+                # Post-mutation proof must read the real bytes now on disk, so
+                # this scan deliberately bypasses observation reuse entirely.
+                with self._fresh_observations(), stage_timer("final-verify"):
+                    if verification_layout_ids is None:
+                        final_local_report = self._scan_automatic_local()
+                        final_remote_report = self._scan_automatic_remote()
+                    else:
+                        final_local_report = self._automatic_report(
+                            self._scan_local_layouts(verification_layout_ids)
+                        )
+                        final_remote_report = self._automatic_report(
+                            self._scan_remote_layouts(verification_layout_ids)
+                        )
                 if (
                     final_local_report.artifacts
                     != (
@@ -3561,17 +3663,40 @@ class SaveSyncService:
                 )
             roots.append(root)
 
-    def _scan_view(self, root: Path, view: _DestinationView) -> dict[str, SaveArtifact]:
+    def _scan_view(
+        self,
+        root: Path,
+        view: _DestinationView,
+        *,
+        only_relative_paths: Optional[frozenset[str]] = None,
+    ) -> dict[str, SaveArtifact]:
+        """Observe one physical destination view.
+
+        *only_relative_paths* restricts the observation to the exact physical
+        paths a caller is going to compare, so a selected-path transaction
+        check never opens (or reads a single byte of) any unrelated save that
+        merely happens to live under the same destination root. Classification
+        of the observed paths is unchanged.
+        """
         if view.canonical_prefix:
-            report = self._scan_mapped_view(view, self._policy, root=root)
+            report = self._scan_mapped_view(
+                view,
+                self._policy,
+                root=root,
+                only_relative_paths=only_relative_paths,
+            )
         else:
             if view.root == self._local_root:
                 report = self._scan_primary(
-                    root, self._primary_local_policy(self._policy)
+                    root,
+                    self._primary_local_policy(self._policy),
+                    only_relative_paths=only_relative_paths,
                 )
                 report = self._without_mapped_local_prefixes(report)
             else:
-                report = self._scan_primary(root)
+                report = self._scan_primary(
+                    root, only_relative_paths=only_relative_paths
+                )
         physical, _ = self._physical_manifest(view, report.artifacts)
         return physical
 
@@ -3706,12 +3831,8 @@ class SaveSyncService:
                 raise SaveSyncVerificationError(
                     f"Unexpected SaveSync transaction destination: {root}"
                 )
-            observed = self._scan_view(root, view)
-            observed = {
-                path: artifact
-                for path, artifact in observed.items()
-                if path in selected_paths.get(normalized_root, frozenset())
-            }
+            selected = selected_paths.get(normalized_root, frozenset())
+            observed = self._scan_view(root, view, only_relative_paths=selected)
             if observed != expected:
                 raise SaveSyncVerificationError(
                     f"Selected save/state tree verification failed for {root}"
@@ -3918,13 +4039,14 @@ class SaveSyncService:
         if path is None:
             return 0
         state = self._get_state_unlocked()
-        generation = savesync_journal.append_mutations(
-            path,
-            device_id=state.device_id,
-            revision=revision,
-            timestamp=timestamp,
-            mutations=mutations,
-        )
+        with stage_timer("journal-commit"):
+            generation = savesync_journal.append_mutations(
+                path,
+                device_id=state.device_id,
+                revision=revision,
+                timestamp=timestamp,
+                mutations=mutations,
+            )
         log.info(
             "SaveSync remote journal committed: revision=%s generation=%d "
             "mutation_count=%d",

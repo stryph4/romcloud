@@ -75,8 +75,14 @@ class RemoteSaveStore(ABC):
         enabled_optional_systems: frozenset[str],
         enabled_optional_groups: frozenset[str],
         operation: Optional[RemoteOperationContext] = None,
+        cache: Optional[save_tree.ContentObservationCache] = None,
     ) -> save_tree.ScanReport:
-        """Return the provider's current logical save-artifact manifest."""
+        """Return the provider's current logical save-artifact manifest.
+
+        *cache* is an optional operation-scoped observation memo; stores whose
+        backing protocol cannot report a trustworthy per-file identity simply
+        ignore it and always re-read.
+        """
 
     @abstractmethod
     def materialize(
@@ -132,6 +138,7 @@ class FilesystemRemoteSaveStore(RemoteSaveStore):
         enabled_optional_systems: frozenset[str],
         enabled_optional_groups: frozenset[str],
         operation: Optional[RemoteOperationContext] = None,
+        cache: Optional[save_tree.ContentObservationCache] = None,
     ) -> save_tree.ScanReport:
         if operation is not None:
             operation.check()
@@ -140,6 +147,7 @@ class FilesystemRemoteSaveStore(RemoteSaveStore):
             policy,
             enabled_optional_systems=enabled_optional_systems,
             enabled_optional_groups=enabled_optional_groups,
+            cache=cache,
         )
 
     def materialize(
@@ -209,7 +217,10 @@ class ProviderRemoteSaveStore(RemoteSaveStore):
         enabled_optional_systems: frozenset[str],
         enabled_optional_groups: frozenset[str],
         operation: Optional[RemoteOperationContext] = None,
+        cache: Optional[save_tree.ContentObservationCache] = None,
     ) -> save_tree.ScanReport:
+        # A protocol-only provider exposes no device/inode identity, so there
+        # is nothing this store may safely reuse: it always re-reads.
         return save_tree.scan_provider_tree_report(
             self._provider,
             self._dataset_root,

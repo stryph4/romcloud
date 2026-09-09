@@ -4,6 +4,7 @@ import logging
 import multiprocessing
 import sqlite3
 import hashlib
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -65,6 +66,52 @@ def test_operation_id_propagates_and_chain_is_chronological(tmp_path: Path) -> N
     assert summary["operation_id"] == op_id
     assert summary["status"] == "unchanged"
     assert summary["unchanged"] == 1
+
+
+def test_stage_timings_form_an_inspectable_operation_timeline(tmp_path: Path) -> None:
+    store = diagnostics.configure_diagnostics(tmp_path / "diagnostics.db")
+    assert store is not None
+    with operation("Auto Quick Sync", subsystem="savesync", source="Auto gameStop") as op_id:
+        for stage in ("stability", "discovery", "scan-remote", "stability"):
+            with diagnostics.stage_timer(stage) as timing:
+                timing["observations"] = 2
+                if stage == "scan-remote":
+                    time.sleep(0.02)
+
+    timeline = diagnostics.operation_timeline(op_id)
+    assert {entry["stage"] for entry in timeline} == {
+        "stability", "discovery", "scan-remote",
+    }
+    repeated = next(entry for entry in timeline if entry["stage"] == "stability")
+    assert repeated["count"] == 2
+    assert all("duration_ms" in entry for entry in timeline)
+    assert timeline[0]["stage"] == "scan-remote"
+    assert timeline[0]["percent"] > 50
+    assert round(sum(entry["percent"] for entry in timeline)) == 100
+
+
+def test_stage_timer_is_fail_open_without_a_configured_store(monkeypatch) -> None:
+    """Timing instrumentation must never be able to break the timed work."""
+    monkeypatch.setattr(diagnostics, "_active_store", None)
+    with diagnostics.stage_timer("stability") as timing:
+        timing["observations"] = 1
+    assert diagnostics.operation_timeline("does-not-exist") == []
+
+
+def test_stage_timer_records_the_stage_even_when_the_stage_raises(
+    tmp_path: Path,
+) -> None:
+    store = diagnostics.configure_diagnostics(tmp_path / "diagnostics.db")
+    assert store is not None
+    with operation("Auto Quick Sync", subsystem="savesync") as op_id:
+        try:
+            with diagnostics.stage_timer("transaction-apply"):
+                raise RuntimeError("staging failed")
+        except RuntimeError:
+            pass
+    assert [entry["stage"] for entry in diagnostics.operation_timeline(op_id)] == [
+        "transaction-apply"
+    ]
 
 
 def test_metadata_allowlist_and_secret_fields_are_redacted(tmp_path: Path) -> None:

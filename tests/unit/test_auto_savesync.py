@@ -16,6 +16,7 @@ from romcloud.core.models.savesync import SaveGroupCondition, SaveQuickSyncResul
 from romcloud.core.save_selection import DEFAULT_SAVE_SELECTION_POLICY
 from romcloud.core.storage import StorageProvider
 from romcloud.infrastructure import save_transaction
+from romcloud.infrastructure import save_tree
 from romcloud.infrastructure import savesync_prompts
 from romcloud.infrastructure.config import (
     AppConfig,
@@ -1221,6 +1222,290 @@ def test_game_stop_never_stabilizing_save_is_conservatively_deferred(
         system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
     )
     assert remote.read_bytes() == b"finally-settled"
+
+
+class TestGameStopObservationCost:
+    """Latency-focused regression tests for the synchronous gameStop path.
+
+    These assert *operation counts* (how many times a byte of a save is read,
+    how many settle windows are slept through, which roots are entered) rather
+    than wall-clock thresholds, so they stay meaningful on any hardware.
+    """
+
+    @staticmethod
+    def _counting_hash(monkeypatch) -> list[Path]:
+        reads: list[Path] = []
+        original = save_tree.hash_file
+
+        def counted(path: Path) -> str:
+            reads.append(Path(path))
+            return original(path)
+
+        monkeypatch.setattr(save_tree, "hash_file", counted)
+        return reads
+
+    @staticmethod
+    def _counting_sleep(monkeypatch) -> list[float]:
+        """Count settle windows without shortening them — the window is real
+        elapsed time, so shortcutting it here would make the reuse under test
+        look free when it is not."""
+        slept: list[float] = []
+        original = time.sleep
+
+        def counted(seconds: float) -> None:
+            slept.append(seconds)
+            original(seconds)
+
+        monkeypatch.setattr(
+            "romcloud.services.auto_savesync.time.sleep", counted
+        )
+        return slept
+
+    def _prepared(self, tmp_path: Path):
+        provider = _Provider()
+        service = _service(tmp_path, provider)
+        coordinator = AutoSaveSyncCoordinator(
+            service,
+            data_root=tmp_path / "data",
+            enabled=True,
+            policy=DEFAULT_SAVE_SELECTION_POLICY,
+            quiet_seconds=0.2,
+        )
+        return service, coordinator
+
+    def test_no_change_game_stop_reads_each_local_save_exactly_once(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """The overwhelmingly common case — nothing changed — must not read
+        the same save tree over and over. One content observation is reused by
+        the second (stat-confirmed) stability observation and by discovery."""
+        service, coordinator = self._prepared(tmp_path)
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        _write(local, b"baseline")
+        service.full_sync()
+        coordinator.game_start(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+
+        reads = self._counting_hash(monkeypatch)
+        self._counting_sleep(monkeypatch)
+        assert (
+            coordinator.game_stop(
+                system="snes",
+                emulator="libretro",
+                core="snes9x",
+                rom="Super Metroid.sfc",
+            )
+            == ()
+        )
+
+        assert reads == [local]
+
+    def test_no_change_game_stop_sleeps_through_one_settle_window(
+        self, tmp_path: Path, monkeypatch
+    ):
+        service, coordinator = self._prepared(tmp_path)
+        _write(tmp_path / "local/snes/Super Metroid.srm", b"baseline")
+        service.full_sync()
+        coordinator.game_start(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+
+        slept = self._counting_sleep(monkeypatch)
+        coordinator.game_stop(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+
+        assert len(slept) == 1
+        assert slept[0] <= 0.2
+
+    def test_changed_save_game_stop_does_not_sleep_a_second_settle_window(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """The pre-discovery settle already proved stability for this exact
+        content; Quick Sync's own preflight must extend that proven quiet run
+        with one fresh observation instead of restarting the whole window."""
+        service, coordinator = self._prepared(tmp_path)
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        remote = tmp_path / "remote/snes/Super Metroid.srm"
+        _write(local, b"baseline")
+        service.full_sync()
+        coordinator.game_start(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+        local.write_bytes(b"final-save-bytes")
+
+        slept = self._counting_sleep(monkeypatch)
+        coordinator.game_stop(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+
+        assert len(slept) == 1
+        assert remote.read_bytes() == b"final-save-bytes"
+
+    def test_changed_save_game_stop_re_reads_only_what_correctness_requires(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """One tiny changed save: the local file is read once for the settle
+        proof and once more by the post-mutation verification that must see
+        real bytes on disk — never once per scan phase."""
+        service, coordinator = self._prepared(tmp_path)
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        remote = tmp_path / "remote/snes/Super Metroid.srm"
+        _write(local, b"baseline")
+        service.full_sync()
+        coordinator.game_start(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+        local.write_bytes(b"final-save-bytes")
+
+        reads = self._counting_hash(monkeypatch)
+        self._counting_sleep(monkeypatch)
+        coordinator.game_stop(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+
+        assert remote.read_bytes() == b"final-save-bytes"
+        assert reads.count(local) == 2
+        # Remote reads are the verification floor: the authoritative plan
+        # scan, the transaction's own pre/post artifact check, and the
+        # post-mutation scan that must see real bytes.
+        assert reads.count(remote) <= 3
+
+    def test_multiple_changed_files_in_one_group_are_each_read_once_per_phase(
+        self, tmp_path: Path, monkeypatch
+    ):
+        service, coordinator = self._prepared(tmp_path)
+        first = tmp_path / "local/psx/duckstation/memcards/shared_card_1.mcd"
+        second = tmp_path / "local/psx/duckstation/memcards/shared_card_2.mcd"
+        _write(first, b"card-one-baseline")
+        _write(second, b"card-two-baseline")
+        service.full_sync()
+        coordinator.game_start(
+            system="psx", emulator="libretro", core="swanstation", rom="FF7.chd"
+        )
+        first.write_bytes(b"card-one-final")
+        second.write_bytes(b"card-two-final")
+
+        reads = self._counting_hash(monkeypatch)
+        self._counting_sleep(monkeypatch)
+        coordinator.game_stop(
+            system="psx", emulator="libretro", core="swanstation", rom="FF7.chd"
+        )
+
+        assert (
+            tmp_path / "remote/psx/duckstation/memcards/shared_card_1.mcd"
+        ).read_bytes() == b"card-one-final"
+        assert (
+            tmp_path / "remote/psx/duckstation/memcards/shared_card_2.mcd"
+        ).read_bytes() == b"card-two-final"
+        assert reads.count(first) == 2
+        assert reads.count(second) == 2
+
+    def test_narrow_game_stop_never_enters_unrelated_save_roots(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """One SNES game closing must not read a single byte of any other
+        system's saves, however large that data is."""
+        service, coordinator = self._prepared(tmp_path)
+        snes = tmp_path / "local/snes/Super Metroid.srm"
+        unrelated = tmp_path / "local/psx/duckstation/memcards/shared_card_1.mcd"
+        _write(snes, b"baseline")
+        _write(unrelated, b"unrelated-psx-memory-card")
+        service.full_sync()
+        coordinator.game_start(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+        snes.write_bytes(b"final-save-bytes")
+
+        reads = self._counting_hash(monkeypatch)
+        self._counting_sleep(monkeypatch)
+        coordinator.game_stop(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+
+        assert unrelated not in reads
+        assert not any("duckstation" in read.parts for read in reads), reads
+        assert unrelated.read_bytes() == b"unrelated-psx-memory-card"
+
+    def test_a_save_still_being_written_is_re_read_until_it_settles(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """Observation reuse must never short-circuit the settle proof: an
+        actively changing file has to be re-read on every observation and the
+        published bytes must be the final ones."""
+        service, coordinator = self._prepared(tmp_path)
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        remote = tmp_path / "remote/snes/Super Metroid.srm"
+        _write(local, b"baseline")
+        service.full_sync()
+        coordinator.game_start(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+
+        reads = self._counting_hash(monkeypatch)
+        observations = {"count": 0}
+        original_observe = service.observe_local_layouts
+
+        def flushing_observe(layout_ids):
+            observations["count"] += 1
+            if observations["count"] <= 2:
+                local.write_bytes(
+                    f"torn-in-flight-{observations['count']}".encode()
+                )
+            elif observations["count"] == 3:
+                local.write_bytes(b"true-final-save-bytes")
+            return original_observe(layout_ids)
+
+        monkeypatch.setattr(service, "observe_local_layouts", flushing_observe)
+        self._counting_sleep(monkeypatch)
+        coordinator.game_stop(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+
+        assert observations["count"] >= 4
+        assert reads.count(local) >= observations["count"]
+        assert remote.read_bytes() == b"true-final-save-bytes"
+        assert local.read_bytes() == b"true-final-save-bytes"
+
+    def test_post_mutation_verification_always_re_reads_real_bytes(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """The final proof must come from disk, never from an earlier
+        observation: corrupting the committed remote file behind ROMCloud's
+        back has to be detected and the transaction rolled back."""
+        service, coordinator = self._prepared(tmp_path)
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        remote = tmp_path / "remote/snes/Super Metroid.srm"
+        _write(local, b"baseline")
+        service.full_sync()
+        coordinator.game_start(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+        local.write_bytes(b"final-save-bytes")
+
+        original_apply = save_transaction.apply_transaction
+
+        def corrupting_apply(*args, **kwargs):
+            result = original_apply(*args, **kwargs)
+            remote.write_bytes(b"corrupted-by-something-else")
+            return result
+
+        monkeypatch.setattr(
+            "romcloud.services.saves.save_transaction.apply_transaction",
+            corrupting_apply,
+        )
+        self._counting_sleep(monkeypatch)
+
+        with pytest.raises(SaveSyncError):
+            coordinator.game_stop(
+                system="snes",
+                emulator="libretro",
+                core="snes9x",
+                rom="Super Metroid.sfc",
+            )
+
+        assert local.read_bytes() == b"final-save-bytes"
 
 
 def test_snes_game_stop_never_invokes_container_reconciliation(tmp_path: Path):

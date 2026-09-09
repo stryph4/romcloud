@@ -387,6 +387,142 @@ class TestScanTree:
         assert all("/game" not in item.canonical_root for item in roots)
 
 
+class TestContentObservationCache:
+    """The operation-scoped memo must be a pure cost optimisation: it may only
+    ever return a digest for a file the filesystem still reports as untouched
+    since that digest was computed, and must re-read on any difference."""
+
+    def _scan(self, root: Path, policy, cache):
+        return save_tree.scan_tree_report(root, policy, cache=cache).artifacts
+
+    def test_repeated_scan_of_untouched_files_reads_bytes_only_once(
+        self, tmp_path: Path, policy, monkeypatch
+    ):
+        save = tmp_path / "psx" / "Game.srm"
+        save.parent.mkdir(parents=True)
+        save.write_bytes(b"content" * 500)
+        reads: list[Path] = []
+        original = save_tree.hash_file
+        monkeypatch.setattr(
+            save_tree,
+            "hash_file",
+            lambda path: (reads.append(path), original(path))[1],
+        )
+        cache = save_tree.ContentObservationCache()
+
+        first = self._scan(tmp_path, policy, cache)
+        second = self._scan(tmp_path, policy, cache)
+
+        assert first == second
+        assert len(reads) == 1
+        assert (cache.hits, cache.misses) == (1, 1)
+
+    def test_rewritten_content_is_re_read_and_reported(
+        self, tmp_path: Path, policy, monkeypatch
+    ):
+        save = tmp_path / "psx" / "Game.srm"
+        save.parent.mkdir(parents=True)
+        save.write_bytes(b"before")
+        reads: list[Path] = []
+        original = save_tree.hash_file
+        monkeypatch.setattr(
+            save_tree,
+            "hash_file",
+            lambda path: (reads.append(path), original(path))[1],
+        )
+        cache = save_tree.ContentObservationCache()
+
+        first = self._scan(tmp_path, policy, cache)
+        save.write_bytes(b"after-a-real-emulator-write")
+        second = self._scan(tmp_path, policy, cache)
+
+        assert len(reads) == 2
+        assert first != second
+        assert second["psx/Game.srm"].content_hash == save_tree.hash_file(save)
+
+    def test_same_size_rewrite_is_re_read(
+        self, tmp_path: Path, policy, monkeypatch
+    ):
+        save = tmp_path / "psx" / "Game.srm"
+        save.parent.mkdir(parents=True)
+        save.write_bytes(b"aaaa")
+        reads: list[Path] = []
+        original = save_tree.hash_file
+        monkeypatch.setattr(
+            save_tree,
+            "hash_file",
+            lambda path: (reads.append(path), original(path))[1],
+        )
+        cache = save_tree.ContentObservationCache()
+
+        first = self._scan(tmp_path, policy, cache)
+        save.write_bytes(b"bbbb")
+        second = self._scan(tmp_path, policy, cache)
+
+        assert len(reads) == 2
+        assert first["psx/Game.srm"].content_hash != second["psx/Game.srm"].content_hash
+
+    def test_replacement_by_a_new_inode_is_re_read(
+        self, tmp_path: Path, policy, monkeypatch
+    ):
+        """An emulator that atomically renames a temporary file over the save
+        produces a new inode; the memo must never serve the old digest."""
+        save = tmp_path / "psx" / "Game.srm"
+        save.parent.mkdir(parents=True)
+        save.write_bytes(b"original")
+        cache = save_tree.ContentObservationCache()
+        first = self._scan(tmp_path, policy, cache)
+
+        replacement = tmp_path / "psx" / "Game.srm.tmp"
+        replacement.write_bytes(b"replaced")
+        import os
+
+        os.utime(replacement, ns=(save.stat().st_atime_ns, save.stat().st_mtime_ns))
+        replacement.replace(save)
+
+        second = self._scan(tmp_path, policy, cache)
+        assert first["psx/Game.srm"].content_hash != second["psx/Game.srm"].content_hash
+
+    def test_scans_without_a_cache_always_re_read(
+        self, tmp_path: Path, policy, monkeypatch
+    ):
+        save = tmp_path / "psx" / "Game.srm"
+        save.parent.mkdir(parents=True)
+        save.write_bytes(b"content")
+        reads: list[Path] = []
+        original = save_tree.hash_file
+        monkeypatch.setattr(
+            save_tree,
+            "hash_file",
+            lambda path: (reads.append(path), original(path))[1],
+        )
+
+        self._scan(tmp_path, policy, None)
+        self._scan(tmp_path, policy, None)
+
+        assert len(reads) == 2
+
+    def test_separate_caches_never_share_observations(
+        self, tmp_path: Path, policy, monkeypatch
+    ):
+        """Two operations must never reuse each other's observations."""
+        save = tmp_path / "psx" / "Game.srm"
+        save.parent.mkdir(parents=True)
+        save.write_bytes(b"content")
+        reads: list[Path] = []
+        original = save_tree.hash_file
+        monkeypatch.setattr(
+            save_tree,
+            "hash_file",
+            lambda path: (reads.append(path), original(path))[1],
+        )
+
+        self._scan(tmp_path, policy, save_tree.ContentObservationCache())
+        self._scan(tmp_path, policy, save_tree.ContentObservationCache())
+
+        assert len(reads) == 2
+
+
 class TestMaterialize:
     def test_copies_from_fresh_source_when_no_unchanged_source(self, tmp_path: Path):
         src = tmp_path / "src.bin"

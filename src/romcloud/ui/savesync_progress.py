@@ -74,7 +74,7 @@ class SaveSyncProgressReporter:
         if message:
             event["message"] = message
         self._send(event)
-        self._close_subprocess()
+        self._close_subprocess(ok=bool(ok))
 
     def _send(self, event: dict) -> None:
         try:
@@ -85,12 +85,22 @@ class SaveSyncProgressReporter:
         except (BrokenPipeError, ValueError, OSError):
             pass  # UI process gone — SaveSync itself must still proceed
 
-    def _close_subprocess(self) -> None:
+    def _close_subprocess(self, *, ok: bool) -> None:
         try:
             if self._proc.stdin:
                 self._proc.stdin.close()
         except Exception:  # noqa: BLE001
             pass
+        if ok:
+            # The SaveSync transaction is already durably committed by the
+            # time a successful close is reported. Blocking the lifecycle hook
+            # (and therefore EmulationStation) for the popup's purely cosmetic
+            # success fade would add that delay to every single game exit, so
+            # the popup is left to dismiss itself: it exits on its own success
+            # timer, and on its stream-closed grace timer if anything goes
+            # wrong. Nothing about the sync itself is deferred here.
+            return
+        # A failure message must actually be readable before control returns.
         try:
             self._proc.wait(timeout=_SUBPROCESS_EXIT_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
