@@ -40,6 +40,7 @@ def test_offline_policy_has_narrow_explicit_capabilities(offline_policy) -> None
         Capability.GAME_DOWNLOAD,
         Capability.CATALOG_REFRESH,
         Capability.LIBRARY_SYNC,
+        Capability.SAVE_SYNC,
         Capability.UPDATE_NETWORK,
         Capability.REMOTE_VALIDATION,
     ):
@@ -51,14 +52,13 @@ def test_offline_policy_has_narrow_explicit_capabilities(offline_policy) -> None
         Capability.LOCAL_SETTINGS,
         Capability.LOCAL_DIAGNOSTICS,
         Capability.CONNECTION_RECOVERY,
-        Capability.SAVE_SYNC,
     ):
         assert offline_policy.allows(capability)
 
     serialized = offline_policy.serialize()
     assert serialized["presentation_intent"] == "offline"
-    assert serialized["capabilities"]["save_sync"] is True
-    assert "save_sync" not in serialized["blocked_reasons"]
+    assert serialized["capabilities"]["save_sync"] is False
+    assert "save_sync" in serialized["blocked_reasons"]
 
 
 def test_configured_strategy_does_not_override_authoritative_offline_state() -> None:
@@ -163,7 +163,7 @@ def test_cached_game_and_local_cache_management_work_but_cache_miss_is_blocked(
         offline_cache.cache_game(game_with_file.id)
 
 
-def test_savesync_is_independent_from_offline_game_mode(
+def test_offline_mode_blocks_manual_savesync_before_remote_access(
     tmp_path: Path, offline_policy
 ) -> None:
     local = tmp_path / "saves"
@@ -184,7 +184,8 @@ def test_savesync_is_independent_from_offline_game_mode(
         capability_policy=offline_policy,
     )
 
-    assert service.preview_upload().direction == "upload"
+    with pytest.raises(CapabilityUnavailableError, match="Offline"):
+        service.preview_upload()
     assert save.read_bytes() == b"local-save"
 
 

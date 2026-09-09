@@ -52,10 +52,10 @@ def _coordinator(ctx: click.Context) -> AutoSaveSyncCoordinator:
 
 
 def _auto_sync_enabled(config) -> bool:  # noqa: ANN001
-    """Automatic network SaveSync runs only with local Cached ownership."""
+    """Automatic SaveSync runs whenever gameplay is online and locally owned."""
     return (
         bool(config.saves.auto_sync_enabled)
-        and operating_mode(config) is OperatingMode.CACHE
+        and operating_mode(config) is not OperatingMode.OFFLINE
     )
 
 

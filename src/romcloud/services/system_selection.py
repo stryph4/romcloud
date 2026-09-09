@@ -71,8 +71,8 @@ def update_selection(
         and config.source.selected_systems != selected
     ):
         raise ValueError(
-            "Direct save routing is active. Switch to Cached Storage before "
-            "changing selected systems so save authority can be handed off safely."
+            "Legacy Direct Save migration is pending. Run startup repair before "
+            "changing selected systems so its paths remain safely attributable."
         )
     updated = replace(
         config,

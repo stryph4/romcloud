@@ -602,32 +602,6 @@ class TestPositiveLayoutRegistry:
             for layout in layouts
         )
 
-    def test_direct_layout_requires_explicit_complete_matching_route_root(self):
-        base = dict(
-            layout_id="unsafe-direct",
-            system="nes",
-            root_pattern="",
-            recursive=True,
-            eligible_files=("*",),
-            direct_save_capable=True,
-        )
-        with pytest.raises(ValueError, match="static, complete"):
-            SaveSelectionPolicy(
-                layouts=(SaveLayout(**base, direct_save_root="other-system"),)
-            )
-        with pytest.raises(ValueError, match="static, complete"):
-            SaveSelectionPolicy(
-                layouts=(
-                    SaveLayout(
-                        **{
-                            **base,
-                            "eligible_files": ("*.srm",),
-                            "direct_save_root": "nes",
-                        }
-                    ),
-                )
-            )
-
     def test_lifecycle_identity_resolution_is_declarative_and_fail_closed(self):
         policy = DEFAULT_SAVE_SELECTION_POLICY
 

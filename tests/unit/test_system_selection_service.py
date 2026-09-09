@@ -65,7 +65,7 @@ def test_post_setup_action_updates_config_and_triggers_reconciliation(
     assert result["newly_deselected"] == ["nes"]
 
 
-def test_active_direct_routes_block_selected_system_changes(
+def test_pending_legacy_routes_block_selected_system_changes(
     tmp_path: Path, monkeypatch
 ) -> None:
     config_path = tmp_path / "romcloud.toml"
@@ -92,7 +92,7 @@ def test_active_direct_routes_block_selected_system_changes(
         },
     )
 
-    with pytest.raises(ValueError, match="Switch to Cached Storage"):
+    with pytest.raises(ValueError, match="Legacy Direct Save migration"):
         system_selection.update_selection(
             config_path, {"selected_systems": ["nes"]}
         )

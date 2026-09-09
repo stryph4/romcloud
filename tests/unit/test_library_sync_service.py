@@ -146,11 +146,10 @@ def _stub_mode_frontend(monkeypatch) -> None:  # noqa: ANN001
         "romcloud.integrations.batocera.game_access._reload_emulationstation",
         lambda: True,
     )
-    # These tests isolate library-media behavior. Direct save routing has its
-    # own injected mount-boundary coverage and must not call the host's mount.
+    # These tests isolate library-media behavior from legacy save migration.
     monkeypatch.setattr(
-        "romcloud.integrations.batocera.game_access._prepare_save_authority_transition",
-        lambda *_args, **_kwargs: (None, False, None),
+        "romcloud.integrations.batocera.game_access._migrate_legacy_direct_saves",
+        lambda *_args, **_kwargs: None,
     )
 
 

@@ -822,13 +822,10 @@ def apply_setup(
     config = _build_config(
         config_path, request, existing, selected_systems=selected_systems
     )
-    _guard_active_direct_save_provider_change(existing, config)
+    _guard_pending_legacy_save_provider_change(existing, config)
     mounted_during_setup: list[str] = []
-    direct_save_routing = None
     save_sync_report = None
     save_conflict_ids: tuple[str, ...] = ()
-    direct_conflict_ids: tuple[str, ...] = ()
-    direct_mode_pending = False
 
     step = "write configuration"
     emit_progress(progress, "configure", "save", "running", "Saving configuration…")
@@ -1043,53 +1040,7 @@ def apply_setup(
                     "success",
                     "SaveSync already initialized — Initial Full Sync skipped",
                 )
-        # SaveSync must establish its baseline before Direct routing hides the
-        # local directories behind emulator-visible remote bind mounts.
         if config.source.enabled:
-            from romcloud.core.capabilities import OperatingMode
-            from romcloud.infrastructure.library_view import operating_mode
-
-            if operating_mode(config) is OperatingMode.CONNECTED:
-                from romcloud.integrations.batocera.direct_saves import (
-                    DirectSaveRouting,
-                )
-                from romcloud.infrastructure.library_view import write_operating_mode
-
-                direct_save_routing = DirectSaveRouting(
-                    config,
-                    container.saves.selection_policy,
-                    container.saves.filesystem_remote_root,
-                )
-                direct_conflicts = tuple(
-                    conflict
-                    for conflict in container.saves.get_state().active_conflicts
-                    if conflict.layout_id in direct_save_routing.layout_ids
-                )
-                if direct_conflicts:
-                    # Bootstrap succeeded. Keep the installation usable with
-                    # local ownership and return a pending Direct decision as
-                    # data; preserved conflicts are not setup failures.
-                    write_operating_mode(config, OperatingMode.CACHE)
-                    reconcile_game_access(config, render_library_metadata=False)
-                    direct_mode_pending = True
-                    direct_conflict_ids = tuple(
-                        conflict.conflict_id for conflict in direct_conflicts
-                    )
-                    emit_progress(
-                        progress,
-                        "configure",
-                        "direct_save_conflicts",
-                        "warning",
-                        "Direct Mode is pending a save-conflict decision",
-                        metadata={
-                            "conflict_ids": [
-                                conflict.conflict_id
-                                for conflict in direct_conflicts
-                            ]
-                        },
-                    )
-                else:
-                    direct_save_routing.activate()
             # Optional metadata/media enrichment remains a post-setup action.
             reconcile_game_access(config, render_library_metadata=False)
         emit_progress(
@@ -1101,35 +1052,9 @@ def apply_setup(
         )
         emit_progress(progress, "configure", "complete", "success", "ROMCloud setup complete")
     except Exception as exc:
-        from romcloud.core.exceptions import SaveAuthorityConflictError
-
-        if isinstance(exc, SaveAuthorityConflictError):
-            log.info(
-                "Setup step %r ended in a save-authority conflict (non-fatal): "
-                "exception_type=%s conflict_ids=%d — configured in Cached Storage "
-                "pending resolution",
-                step,
-                type(exc).__name__,
-                len(getattr(exc, "conflict_ids", ()) or ()),
-            )
-            state_path.unlink(missing_ok=True)
-            emit_progress(
-                progress,
-                "configure",
-                step,
-                "warning",
-                "Setup is configured in Cached Storage pending a save-conflict decision.",
-                detail=str(exc),
-            )
-            raise
         from romcloud.infrastructure.mount import unmount_cifs_source
 
         cleanup_errors: list[str] = []
-        if direct_save_routing is not None and direct_save_routing.active:
-            try:
-                direct_save_routing.deactivate()
-            except Exception as cleanup_exc:  # noqa: BLE001
-                cleanup_errors.append(f"Direct save routing: {cleanup_exc}")
         for mount_point in reversed(mounted_during_setup):
             try:
                 unmount_cifs_source(mount_point)
@@ -1176,11 +1101,9 @@ def apply_setup(
 
     state_path.unlink(missing_ok=True)
     log.info(
-        "Setup outcome: complete — save_sync_initialized=%s unresolved_conflict_count=%d "
-        "direct_mode_pending=%s",
+        "Setup outcome: complete — save_sync_initialized=%s unresolved_conflict_count=%d",
         save_sync_state is not None,
         len(save_conflict_ids),
-        direct_mode_pending,
     )
     return {
         "source_type": request.source_type,
@@ -1216,9 +1139,7 @@ def apply_setup(
         ),
         "save_conflicts": len(save_conflict_ids),
         "conflict_ids": list(save_conflict_ids),
-        "direct_conflict_ids": list(direct_conflict_ids),
         "auto_savesync_pending_conflicts": bool(save_conflict_ids),
-        "direct_mode_pending": direct_mode_pending,
     }
 
 
@@ -1229,10 +1150,10 @@ def _existing_config(config_path: Path) -> AppConfig | None:
         return None
 
 
-def _guard_active_direct_save_provider_change(
+def _guard_pending_legacy_save_provider_change(
     existing: AppConfig | None, requested: AppConfig
 ) -> None:
-    """Never strand owned bind mounts by rewriting their path/provider identity."""
+    """Preserve path identity until a legacy Direct Save manifest is migrated."""
     if existing is None:
         return
     from romcloud.integrations.batocera.direct_saves import MANIFEST_FILENAME
@@ -1246,9 +1167,9 @@ def _guard_active_direct_save_provider_change(
     )
     if os.path.lexists(manifest) and identity_changed:
         raise ValueError(
-            "Direct save routing is active. Switch to Cached Storage first so "
-            "remote saves are materialized locally before changing the remote-data "
-            "provider, save paths, or selected systems."
+            "Legacy Direct Save migration is still pending. Run startup repair "
+            "with the existing provider and paths before changing remote-data, "
+            "save paths, or selected systems."
         )
 
 

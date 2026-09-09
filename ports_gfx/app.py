@@ -90,9 +90,9 @@ from ports_gfx.menu import (
     MenuState,
     NavigationState,
 )
-from ports_gfx.mode_save_conflict import (
+from ports_gfx.setup_save_conflict import (
     ACTION_LABELS as MODE_CONFLICT_ACTIONS,
-    ModeSaveConflictState,
+    SetupSaveConflictState,
 )
 from ports_gfx.operation import OperationRunner, OperationState
 from ports_gfx.operation_screen import (
@@ -228,16 +228,6 @@ def root_menu_items_for_state(state: dict[str, object]) -> tuple[MenuItem, ...]:
     )
     active_mode = str(state.get("operating_mode", "cache"))
     if game_management_enabled:
-        if state.get("direct_save_storage_capable"):
-            direct_save_detail = (
-                "Audited save directories use remote storage directly; unsupported "
-                "save layouts remain local with manual SaveSync available."
-            )
-        else:
-            direct_save_detail = (
-                "This data provider cannot host live emulator saves, so saves remain "
-                "local with manual SaveSync available."
-            )
         items.append(
             MenuItem(
                 "Direct",
@@ -245,7 +235,7 @@ def root_menu_items_for_state(state: dict[str, object]) -> tuple[MenuItem, ...]:
                 (
                     ("Active. " if active_mode == "connected" else "")
                     + "Games run from the configured ROM source. "
-                    + direct_save_detail
+                    + "Gameplay saves stay local and use SaveSync for portability."
                 ),
                 active=active_mode == "connected",
             )
@@ -585,21 +575,6 @@ def _start_local_browser_screen(
     else:
         screen.start_or_refresh()
     return screen
-
-
-def start_remote_wins_operation(
-    romcloud_bin: str, *, popen=None  # noqa: ANN001
-) -> OperationScreenState:
-    """Launch the destructive continuation only from the warning screen."""
-    runner_kwargs = {"popen": popen} if popen is not None else {}
-    runner = OperationRunner(
-        [romcloud_bin, "uidata", "library-connected-remote-wins"],
-        **runner_kwargs,
-    )
-    runner.start()
-    return OperationScreenState(
-        title="Direct", runner=runner, exits_after_mode_change=True
-    )
 
 
 def operation_summary_message(operation: OperationScreenState) -> tuple[str, str]:
@@ -1053,7 +1028,7 @@ def _run(  # noqa: ANN001
     library_manager_screen: Optional[LibraryManagerScreenState] = None
     system_selection_screen: Optional[SystemSelectionScreenState] = None
     startup_restart: StartupRestartPromptState | None = None
-    mode_save_conflict: ModeSaveConflictState | None = None
+    mode_save_conflict: SetupSaveConflictState | None = None
     update_check: UpdateCheckState | None = None
 
     try:
@@ -1334,10 +1309,6 @@ def _run(  # noqa: ANN001
                         savesync_screen.start_conflict_resolution()
                         current_screen = "savesync"
                         mode_save_conflict = None
-                    elif decision == "remote-wins":
-                        operation_screen = start_remote_wins_operation(romcloud_bin)
-                        current_screen = OPERATION_SCREEN
-                        mode_save_conflict = None
                     elif decision in {"cancel", "finish"}:
                         current_screen = "menu"
                         mode_save_conflict = None
@@ -1421,12 +1392,6 @@ def _run(  # noqa: ANN001
                         # the updater's replacement-launch coordinator.
                         current_screen = "mode-transition-exit"
                         running = False
-                    elif mode_save_conflict_from_operation(operation_screen) is not None:
-                        mode_save_conflict = mode_save_conflict_from_operation(
-                            operation_screen
-                        )
-                        operation_screen = None
-                        current_screen = MODE_SAVE_CONFLICT_SCREEN
                     elif operation_screen.title == "Refresh Catalog":
                         if ievent.action == Action.UP:
                             catalog_progress.scroll(-1, 6)
@@ -1494,14 +1459,6 @@ def _run(  # noqa: ANN001
                     if render_completed_mode_transition_exit(operation_screen, splash):
                         current_screen = "mode-transition-exit"
                         running = False
-                    else:
-                        conflict_state = mode_save_conflict_from_operation(
-                            operation_screen
-                        )
-                        if conflict_state is not None:
-                            mode_save_conflict = conflict_state
-                            operation_screen = None
-                            current_screen = MODE_SAVE_CONFLICT_SCREEN
             elif current_screen == "savesync" and savesync_screen is not None:
                 for line in savesync_screen.poll():
                     activity.ingest(line.text)
@@ -1525,14 +1482,9 @@ def _run(  # noqa: ANN001
             elif current_screen == "wizard" and wizard is not None:
                 for line in wizard.poll():
                     activity.ingest(line.text)
-                if wizard.save_authority_conflict_ids:
-                    mode_save_conflict = ModeSaveConflictState(
-                        wizard.save_authority_conflict_ids,
-                        purpose=(
-                            "setup-direct"
-                            if wizard.applied_summary.get("direct_mode_pending")
-                            else "setup"
-                        ),
+                if wizard.savesync_conflict_ids:
+                    mode_save_conflict = SetupSaveConflictState(
+                        wizard.savesync_conflict_ids
                     )
                     wizard = None
                     current_screen = MODE_SAVE_CONFLICT_SCREEN
@@ -1558,15 +1510,6 @@ def _run(  # noqa: ANN001
                         )
                         message = str(startup_failure or "Setup complete")
                         message_kind = "error" if startup_failure else "success"
-            elif (
-                current_screen == MODE_SAVE_CONFLICT_SCREEN
-                and mode_save_conflict is not None
-            ):
-                if mode_save_conflict.update(dt) == "remote-wins":
-                    operation_screen = start_remote_wins_operation(romcloud_bin)
-                    mode_save_conflict = None
-                    current_screen = OPERATION_SCREEN
-
             should_capture_text = bool(
                 current_screen == "wizard"
                 and wizard is not None
@@ -1970,20 +1913,6 @@ def _system_selection_body_lines(
             for index, label in enumerate(visible)
         ],
     ]
-
-
-def mode_save_conflict_from_operation(
-    operation: OperationScreenState,
-) -> ModeSaveConflictState | None:
-    if not operation.is_finished or operation.succeeded:
-        return None
-    result = operation_result(operation.runner)
-    if not result.data.get("save_authority_conflict"):
-        return None
-    ids = result.data.get("conflict_ids", [])
-    if not isinstance(ids, list) or not all(isinstance(value, str) for value in ids):
-        return None
-    return ModeSaveConflictState(tuple(ids))
 
 
 def _library_manager_body_lines(screen: LibraryManagerScreenState) -> list[str]:
@@ -2591,29 +2520,19 @@ def _save_size(num_bytes: int) -> str:
 
 
 def _render_mode_save_conflict(  # noqa: ANN001
-    pygame, screen, fonts: dict, layout: Layout, state: ModeSaveConflictState
+    pygame, screen, fonts: dict, layout: Layout, state: SetupSaveConflictState
 ) -> None:
     screen.fill(_BG_COLOR)
-    title_text = (
-        "SaveSync Initialized — Conflicts Need Attention"
-        if state.purpose.startswith("setup")
-        else "Unresolved Save Conflicts"
-    )
+    title_text = "SaveSync Initialized — Conflicts Need Attention"
     title = fonts["title"].render(title_text, True, _WARNING_COLOR)
     screen.blit(title, (layout.header_rect.x, layout.header_rect.y))
     lines = (
         (
             "SaveSync merged every unambiguous local and remote save."
-            if state.purpose.startswith("setup")
-            else "Direct Mode uses the remote save location directly."
         ),
         "Local save changes conflict with the remote versions.",
         (
             "Resolve them now or finish setup with the conflicts preserved."
-            if state.purpose == "setup"
-            else "Resolve them, accept remote saves, or keep Cached Storage."
-            if state.purpose == "setup-direct"
-            else "Resolve them first, accept remote saves, or cancel the mode change."
         ),
         f"Conflicting save groups: {len(state.conflict_ids)}",
     )

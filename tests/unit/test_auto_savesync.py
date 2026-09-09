@@ -138,7 +138,7 @@ def test_disabled_coordinator_is_an_immediate_filesystem_and_service_noop(
     assert not (tmp_path / "data").exists()
 
 
-def test_automatic_savesync_is_enabled_only_in_cached_mode(tmp_path: Path):
+def test_automatic_savesync_is_enabled_in_cached_and_direct_modes(tmp_path: Path):
     from romcloud.cli.commands.autosync import _auto_sync_enabled
     from romcloud.infrastructure.library_view import write_operating_mode
 
@@ -151,7 +151,7 @@ def test_automatic_savesync_is_enabled_only_in_cached_mode(tmp_path: Path):
     )
     for mode, expected in (
         (OperatingMode.CACHE, True),
-        (OperatingMode.CONNECTED, False),
+        (OperatingMode.CONNECTED, True),
         (OperatingMode.OFFLINE, False),
     ):
         write_operating_mode(config, mode)
@@ -162,7 +162,6 @@ def test_automatic_savesync_is_enabled_only_in_cached_mode(tmp_path: Path):
     ("auto_enabled", "mode"),
     (
         (False, OperatingMode.CACHE),
-        (True, OperatingMode.CONNECTED),
         (True, OperatingMode.OFFLINE),
     ),
 )
@@ -216,15 +215,15 @@ def test_inactive_lifecycle_cli_does_not_construct_coordinator(
     assert coordinator_calls == []
 
 
-def test_game_stop_worker_skips_popup_when_quick_sync_finds_no_new_conflict(
-    tmp_path: Path, monkeypatch
+@pytest.mark.parametrize("mode", [OperatingMode.CACHE, OperatingMode.CONNECTED])
+def test_game_stop_worker_runs_quick_sync_in_cached_and_direct_modes(
+    tmp_path: Path, monkeypatch, mode: OperatingMode
 ):
     from romcloud.cli.commands import autosync as autosync_commands
     from romcloud.cli.main import cli
 
     config_path = tmp_path / "romcloud.toml"
-    write_config(
-        AppConfig(
+    config = AppConfig(
             source=SourceConfig("local", (tmp_path / "roms").as_posix()),
             cache=CacheConfig((tmp_path / "cache").as_posix()),
             local_roms_path=(tmp_path / "local-roms").as_posix(),
@@ -233,10 +232,15 @@ def test_game_stop_worker_skips_popup_when_quick_sync_finds_no_new_conflict(
                 local_path=(tmp_path / "saves").as_posix(),
                 auto_sync_enabled=True,
             ),
-        ),
-        str(config_path),
     )
-    coordinator = type("Coordinator", (), {"game_stop": lambda self, **_kwargs: ()})()
+    write_config(config, str(config_path))
+    from romcloud.infrastructure.library_view import write_operating_mode
+    write_operating_mode(config, mode)
+    calls = []
+    coordinator = type(
+        "Coordinator", (),
+        {"game_stop": lambda self, **kwargs: calls.append(kwargs) or ()},
+    )()
     monkeypatch.setattr(autosync_commands, "_coordinator", lambda _ctx: coordinator)
     monkeypatch.setattr(
         autosync_commands,
@@ -261,6 +265,7 @@ def test_game_stop_worker_skips_popup_when_quick_sync_finds_no_new_conflict(
     )
 
     assert result.exit_code == 0, result.output
+    assert len(calls) == 1
 
 
 def test_conflict_popup_worker_passes_exact_lifecycle_caller(
@@ -2566,20 +2571,28 @@ def test_final_game_stop_cannot_succeed_with_unchanged_dirty_work(
     assert (tmp_path / "remote/snes/Super Metroid.srm").read_bytes() == b"baseline"
 
 
-def test_offline_game_mode_still_allows_independent_savesync(tmp_path: Path):
+def test_offline_game_mode_retains_local_dirty_work_without_network(tmp_path: Path):
     provider = _Provider()
-    offline = CapabilityPolicy("smart_cache", OperatingMode.OFFLINE)
-    service = _service(tmp_path, provider, capability_policy=offline)
+    service = _service(tmp_path, provider)
     path = tmp_path / "local" / "psx" / "Game.srm"
     _write(path, b"base")
     service.full_sync()
     _write(path, b"local")
     service.mark_local_dirty("psx/Game.srm")
+    checks_before = provider.reachability_checks
 
-    _coordinator(tmp_path, service).drain_pending()
+    coordinator = AutoSaveSyncCoordinator(
+        service,
+        data_root=tmp_path / "data",
+        enabled=False,
+        policy=DEFAULT_SAVE_SELECTION_POLICY,
+        quiet_seconds=0,
+    )
+    coordinator.drain_pending()
 
-    assert provider.reachability_checks > 0
-    assert (tmp_path / "remote" / "psx" / "Game.srm").read_bytes() == b"local"
+    assert provider.reachability_checks == checks_before
+    assert (tmp_path / "remote" / "psx" / "Game.srm").read_bytes() == b"base"
+    assert service.get_state().groups[0].condition is SaveGroupCondition.LOCAL_DIRTY
 
 
 def test_verified_unchanged_hint_clears_without_transaction(

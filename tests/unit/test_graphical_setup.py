@@ -196,7 +196,7 @@ class _Container:
             get_state=lambda: save_sync_state,
             _remote_supports_durable_transactions=lambda: remote_durable,
             selection_policy=SimpleNamespace(),
-            filesystem_remote_root=Path(config.data_path) / "remote-saves",
+            legacy_filesystem_remote_root=Path(config.data_path) / "remote-saves",
         )
 
 
@@ -252,7 +252,7 @@ def _patch_apply_dependencies(
     )
 
 
-def test_active_direct_routes_block_provider_identity_rewrite(tmp_path: Path) -> None:
+def test_pending_legacy_routes_block_provider_identity_rewrite(tmp_path: Path) -> None:
     old_data = tmp_path / "old-data"
     old_data.mkdir()
     common = {
@@ -270,8 +270,8 @@ def test_active_direct_routes_block_provider_identity_rewrite(tmp_path: Path) ->
     )
     (old_data / "direct-save-routes.json").write_text("{}", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="Switch to Cached Storage first"):
-        graphical_setup._guard_active_direct_save_provider_change(  # noqa: SLF001
+    with pytest.raises(ValueError, match="Legacy Direct Save migration"):
+        graphical_setup._guard_pending_legacy_save_provider_change(  # noqa: SLF001
             existing, requested
         )
 
@@ -1483,12 +1483,12 @@ class TestApply:
             for message in messages
         )
 
-    def test_direct_setup_conflict_finishes_in_cache_with_pending_decision(
+    def test_direct_setup_keeps_normal_savesync_conflicts_without_save_routing(
         self, tmp_path, monkeypatch
     ):
         from romcloud.core.capabilities import OperatingMode
         from romcloud.infrastructure.library_view import operating_mode
-        from romcloud.integrations.batocera import direct_saves, game_access
+        from romcloud.integrations.batocera import game_access
 
         config_path = tmp_path / "config" / "romcloud.toml"
         remote_root = tmp_path / "remote-data"
@@ -1497,17 +1497,6 @@ class TestApply:
         )
         _patch_apply_dependencies(monkeypatch, save_conflicts=(conflict,))
 
-        class Routing:
-            active = False
-            layout_ids = frozenset({"retroarch-root-psx"})
-
-            def __init__(self, *_args, **_kwargs):
-                pass
-
-            def activate(self):
-                raise AssertionError("routing must not activate before conflict resolution")
-
-        monkeypatch.setattr(direct_saves, "DirectSaveRouting", Routing)
         monkeypatch.setattr(
             game_access, "reconcile_game_access", lambda *_args, **_kwargs: None
         )
@@ -1522,10 +1511,10 @@ class TestApply:
         )
 
         config = graphical_setup.load_config(str(config_path))
-        assert result["direct_mode_pending"] is True
         assert result["conflict_ids"] == ["direct-conflict"]
-        assert result["direct_conflict_ids"] == ["direct-conflict"]
-        assert operating_mode(config) is OperatingMode.CACHE
+        assert "direct_mode_pending" not in result
+        assert "direct_conflict_ids" not in result
+        assert operating_mode(config) is OperatingMode.CONNECTED
 
     def test_unwritable_remote_data_fails_without_exposing_password(
         self, tmp_path, monkeypatch
@@ -1683,7 +1672,7 @@ class TestSaveSyncBootstrapSkipping:
                     get_state=get_state,
                     _remote_supports_durable_transactions=lambda: True,
                     selection_policy=SimpleNamespace(),
-                    filesystem_remote_root=Path(config.data_path) / "remote-saves",
+                    legacy_filesystem_remote_root=Path(config.data_path) / "remote-saves",
                 ),
             )
 

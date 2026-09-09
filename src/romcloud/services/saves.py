@@ -282,8 +282,8 @@ class SaveSyncService:
         return self._remote_store is not None
 
     @property
-    def filesystem_remote_root(self) -> Optional[Path]:
-        """Safe Direct-save root, derived from provider guarantees, not identity."""
+    def legacy_filesystem_remote_root(self) -> Optional[Path]:
+        """Filesystem root needed only to validate legacy Direct Save manifests."""
         if (
             self._remote_store is None
             or not self._remote_store.capabilities.filesystem_transactions

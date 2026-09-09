@@ -85,7 +85,8 @@ connectivity does **not** silently change the selected mode.
 
 Use this when the NAS, PC, or external source is available and you want
 to launch games directly from it. Existing cache files and pins are
-preserved but are not the normal launch path.
+preserved but are not the normal launch path. Emulator saves still use
+Batocera's local save paths; Direct applies only to ROM access.
 
 ### Cached Storage
 
@@ -550,13 +551,15 @@ The SaveSync dashboard renders local/configured state immediately. Writable
 `[remote_data]` availability is checked separately with a bounded background
 probe, so Back and application Exit stay responsive when storage is missing.
 
-When Auto SaveSync is enabled, ROMCloud's Batocera lifecycle hook records
-game start and hands game stop to a detached worker. The worker hashes only
-the audited layouts associated with that system/emulator, waits for concrete
-save-file stability, and runs ordinary Quick Sync. While EmulationStation is
-idle, the same Quick Sync path performs bounded periodic pulls and repairs a
-missing local materialization. It does not use Download All as the normal
-cross-device path.
+When Auto SaveSync is enabled in Direct or Cached Storage, ROMCloud's
+Batocera lifecycle hook records game start and completes game-stop Quick Sync
+synchronously. It hashes only the audited layouts associated with that
+system/emulator, waits for concrete save-file stability, and runs ordinary
+Quick Sync. While EmulationStation is idle, the same Quick Sync path performs
+bounded periodic pulls and repairs a missing local materialization. Offline
+keeps dirty work local until an online mode is restored. Periodic/reconnect
+pulls provide receive-side discovery, but there is not yet a hard Quick Sync
+barrier immediately before every game launch.
 
 The audited registry covers common root-level RetroArch save/state formats and
 structured emulator layouts including Azahar title saves, Dolphin GameCube/Wii

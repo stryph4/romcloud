@@ -23,9 +23,7 @@ from romcloud.core.exceptions import (
     ModeTransitionError,
     ProviderNotReachableError,
     ROMCloudError,
-    SaveAuthorityConflictError,
 )
-from romcloud.core.models.savesync import SaveConflictResolution
 from romcloud.core.progress import ProgressSink, emit_progress
 from romcloud.infrastructure.atomic_file import atomic_write_text
 from romcloud.infrastructure.config import AppConfig, paths_overlap
@@ -320,22 +318,17 @@ def reconcile_game_access(
         config,
         operating_policy=CapabilityPolicy(config.game_access_mode, mode),
     )
+    _migrate_legacy_direct_saves(
+        config,
+        container=container,
+        allow_remote=mode is not OperatingMode.OFFLINE,
+    )
     selected_games = _selected_catalog_games(config, container)
     systems = sorted(
         {game.system for game in selected_games if game.system in BATOCERA_SYSTEMS}
     )
     selected_game_ids = {game.id for game in selected_games}
     if mode is OperatingMode.CONNECTED:
-        if _direct_save_manifest_exists(config):
-            save_routing = _direct_save_routing(config, container)
-            access = container.saves.validate_remote_storage()
-            if not access.readable or not container.saves.is_remote_writable(access):
-                raise ModeTransitionError(
-                    "Active Direct save storage is not readable and writable; "
-                    "refusing to recreate emulator save routing. "
-                    + access.detail
-                )
-            save_routing.recover_for_mode(direct=True)
         report = reconcile_direct_links(config, systems)
         remove_owned_proxies(config)
         if (
@@ -346,8 +339,6 @@ def reconcile_game_access(
         if refresh_es:
             _refresh_emulationstation(config, systems, mode=mode)
         return GameAccessReport(created=report.created, removed=report.removed)
-    if _direct_save_manifest_exists(config):
-        _direct_save_routing(config, container).recover_for_mode(direct=False)
     report = remove_direct_links(config)
     if mode is OperatingMode.OFFLINE:
         reconcile_library_presentation(config, offline=True)
@@ -546,121 +537,34 @@ def _render_library_metadata(config: AppConfig, container: Container) -> None:
         container.library_sync.render_local()
 
 
-def _direct_save_routing(config: AppConfig, container: Container):  # noqa: ANN202
-    from romcloud.integrations.batocera.direct_saves import DirectSaveRouting
-
-    saves = container.saves
-    return DirectSaveRouting(
-        config,
-        saves.selection_policy,
-        saves.filesystem_remote_root,
-    )
-
-
 def _direct_save_manifest_exists(config: AppConfig) -> bool:
     from romcloud.integrations.batocera.direct_saves import MANIFEST_FILENAME
 
     return os.path.lexists(Path(config.data_path) / MANIFEST_FILENAME)
 
 
-def _require_transition_sync(result, destination: OperatingMode) -> None:  # noqa: ANN001
-    if result.status == "requires-full-sync":
-        raise ModeTransitionError(
-            "Direct save authority cannot change until SaveSync has a trusted "
-            f"baseline ({result.reason}). Run Full Sync and retry."
-        )
-    if result.status == "deferred":
-        raise ModeTransitionError(
-            f"Direct save authority cannot change while save data is active; "
-            f"{destination.value.title()} Mode was not entered."
-        )
-
-
-def _prepare_save_authority_transition(
+def _migrate_legacy_direct_saves(
     config: AppConfig,
-    previous: OperatingMode,
-    requested: OperatingMode,
-    progress: ProgressSink,
     *,
-    conflict_action: str,
-):
-    """Run the scoped current-state handoff before presentation/state commit."""
-    transition_container = Container(
+    container: Container | None = None,
+    progress: ProgressSink = None,
+    allow_remote: bool = True,
+):  # noqa: ANN202
+    """Run the minimum compatibility path for a released legacy manifest."""
+    if not _direct_save_manifest_exists(config):
+        return None
+    from romcloud.integrations.batocera.direct_saves import LegacyDirectSaveMigration
+
+    migration_container = container or Container(
         config,
-        # Manual and transition SaveSync remain available in every ROM mode.
-        operating_policy=CapabilityPolicy(
-            config.game_access_mode, OperatingMode.CACHE
-        ),
+        operating_policy=CapabilityPolicy(config.game_access_mode, OperatingMode.CACHE),
     )
-    routing = _direct_save_routing(config, transition_container)
-    if not routing.available and not routing.active:
-        return routing, False, None
-    layout_ids = routing.layout_ids
-    from romcloud.services.auto_savesync import ActiveSessionStore
-
-    active_layout_ids = ActiveSessionStore(
-        Path(config.data_path)
-    ).active_layout_ids(transition_container.saves.selection_policy)
-    active_authority_layouts = layout_ids.intersection(active_layout_ids)
-    if active_authority_layouts:
-        raise ModeTransitionError(
-            "Direct save authority cannot change while a game is using: "
-            + ", ".join(sorted(active_authority_layouts))
-        )
-    if requested is OperatingMode.CONNECTED:
-        result = transition_container.saves.quick_sync(
-            progress=progress,
-            force_current_state=True,
-            include_layout_ids=layout_ids,
-        )
-        _require_transition_sync(result, requested)
-        conflicts = tuple(
-            conflict
-            for conflict in transition_container.saves.get_state().active_conflicts
-            if conflict.layout_id in layout_ids
-        )
-        if conflicts and conflict_action == "remote-wins":
-            for conflict in conflicts:
-                transition_container.saves.resolve_conflict(
-                    conflict.conflict_id,
-                    SaveConflictResolution.KEEP_REMOTE,
-                    progress=progress,
-                )
-            result = transition_container.saves.quick_sync(
-                progress=progress,
-                force_current_state=True,
-                include_layout_ids=layout_ids,
-            )
-            _require_transition_sync(result, requested)
-            conflicts = tuple(
-                conflict
-                for conflict in transition_container.saves.get_state().active_conflicts
-                if conflict.layout_id in layout_ids
-            )
-        if conflicts:
-            raise SaveAuthorityConflictError(
-                "Unresolved Save Conflicts: Direct Mode would use these remote "
-                "saves directly. Resolve them, explicitly use remote saves, or cancel.",
-                conflict_ids=tuple(conflict.conflict_id for conflict in conflicts),
-            )
-        routing.activate()
-        return routing, True, result
-
-    if previous is OperatingMode.CONNECTED and routing.active:
-        routing.recover_for_mode(direct=True)
-        shadow_service = transition_container.saves.with_local_root(routing.shadow_root)
-        result = shadow_service.quick_sync(
-            progress=progress,
-            force_current_state=True,
-            include_layout_ids=layout_ids,
-            authoritative_side="remote",
-        )
-        _require_transition_sync(result, requested)
-        # The owned local shadow is fully materialized and verified while the
-        # emulator-visible remote bind mounts are still active.
-        routing.deactivate()
-        return routing, True, result
-    return routing, False, None
+    saves = migration_container.saves
+    return LegacyDirectSaveMigration(
+        config,
+        saves.selection_policy,
+        saves.legacy_filesystem_remote_root,
+    ).migrate(saves, progress=progress, allow_remote=allow_remote)
 
 
 def _prepare_connected_source(config: AppConfig, progress: ProgressSink) -> Container:
@@ -837,17 +741,19 @@ def set_operating_mode(
     mode: OperatingMode | str,
     *,
     progress: ProgressSink = None,
-    conflict_action: str = "stop",
 ) -> LibraryPresentationReport:
     """Transactionally select Connected, Cache, or Offline Mode."""
     from romcloud.infrastructure.library_view import operating_mode, write_operating_mode
 
     requested = OperatingMode(mode)
-    if conflict_action not in {"stop", "remote-wins"}:
-        raise ValueError("Mode transition conflict action must be stop or remote-wins")
     with _operating_mode_lock(config):
         previous = operating_mode(config)
         if requested is previous:
+            _migrate_legacy_direct_saves(
+                config,
+                progress=progress,
+                allow_remote=requested is not OperatingMode.OFFLINE,
+            )
             emit_progress(
                 progress,
                 "operating_mode",
@@ -872,30 +778,25 @@ def set_operating_mode(
         )
         presentation_attempted = False
         state_committed = False
-        save_routing = None
-        save_routing_changed = False
         save_reconcile = None
         transition_stage = "prepare the mode transition"
         try:
             if requested is OperatingMode.CONNECTED:
                 transition_stage = "connect to the configured ROM source"
                 _prepare_connected_source(config, progress)
-            transition_stage = "reconcile save authority and prepare Direct Save Storage"
-            save_routing, save_routing_changed, save_result = (
-                _prepare_save_authority_transition(
-                    config,
-                    previous,
-                    requested,
-                    progress,
-                    conflict_action=conflict_action,
-                )
+            transition_stage = "migrate legacy Direct Save Storage"
+            migration = _migrate_legacy_direct_saves(
+                config,
+                progress=progress,
+                allow_remote=requested is not OperatingMode.OFFLINE,
             )
-            if save_result is not None:
-                save_reconcile = (
-                    save_result.report.to_dict()
-                    if save_result.report is not None
-                    else {"status": save_result.status, "reason": save_result.reason}
-                )
+            if migration is not None:
+                save_reconcile = {
+                    "status": migration.status,
+                    "legacy_direct_save_routes": migration.routes,
+                    "localized": migration.localized,
+                    "conflict_ids": list(migration.conflict_ids),
+                }
             transition_stage = "prepare the game-library presentation"
             presentation_attempted = True
             report, container = _apply_mode_presentation(
@@ -938,30 +839,13 @@ def set_operating_mode(
             )
             return report
         except Exception as exc:
-            if isinstance(exc, SaveAuthorityConflictError):
-                log.info(
-                    "Operating-mode transition needs a save decision: "
-                    "previous=%s requested=%s conflicts=%d",
-                    previous.value,
-                    requested.value,
-                    len(exc.conflict_ids),
-                )
-            else:
-                log.exception(
-                    "Operating-mode transition failed: previous=%s requested=%s stage=%s",
-                    previous.value,
-                    requested.value,
-                    transition_stage,
-                )
+            log.exception(
+                "Operating-mode transition failed: previous=%s requested=%s stage=%s",
+                previous.value,
+                requested.value,
+                transition_stage,
+            )
             rollback_errors: list[Exception] = []
-            if save_routing_changed and save_routing is not None:
-                try:
-                    if previous is OperatingMode.CONNECTED:
-                        save_routing.activate()
-                    else:
-                        save_routing.deactivate()
-                except Exception as rollback_exc:
-                    rollback_errors.append(rollback_exc)
             if state_committed:
                 try:
                     write_operating_mode(config, previous)
@@ -1006,15 +890,6 @@ def set_operating_mode(
                     detail="; ".join(str(error) for error in rollback_errors),
                 )
                 raise failure from exc
-            if isinstance(exc, SaveAuthorityConflictError):
-                emit_progress(
-                    progress,
-                    "operating_mode",
-                    "save_conflicts",
-                    "warning",
-                    str(exc),
-                )
-                raise
             if isinstance(exc, ROMCloudError):
                 failure = exc
             else:

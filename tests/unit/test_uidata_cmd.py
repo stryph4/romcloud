@@ -135,6 +135,42 @@ class TestManagerBridge:
         assert json.loads(result.output)["running"] is True
         assert events == ["attempt", "activated"]
 
+    def test_manager_boot_start_runs_pending_legacy_save_migration(
+        self, tmp_path, monkeypatch
+    ):
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "direct-save-routes.json").write_text("{}", encoding="utf-8")
+        config = type("Config", (), {"data_path": str(data_path)})()
+        calls = []
+        monkeypatch.setattr(
+            "romcloud.cli.commands.uidata.load_config", lambda _path: config
+        )
+        monkeypatch.setattr(
+            "romcloud.integrations.batocera.game_access.reconcile_game_access",
+            lambda value, **kwargs: calls.append((value, kwargs)),
+        )
+        monkeypatch.setattr(
+            "romcloud.web.lifecycle.start_manager",
+            lambda *args: {"running": True, "started": True},
+        )
+        monkeypatch.setattr(
+            "romcloud.cli.commands.uidata.startup_activation.record_startup_attempt",
+            lambda _path: None,
+        )
+        monkeypatch.setattr(
+            "romcloud.cli.commands.uidata.startup_activation.mark_activated",
+            lambda _path: True,
+        )
+
+        result = CliRunner().invoke(
+            cli,
+            ["--config", str(tmp_path / "config.toml"), "uidata", "manager-boot-start"],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert calls == [(config, {"refresh_es": False, "render_library_metadata": False})]
+
     def test_manager_boot_start_failure_is_recorded_and_surfaced(
         self, tmp_path, monkeypatch
     ):
@@ -458,19 +494,7 @@ class TestStatus:
         assert payload["source_type"] == "Local filesystem"
         assert payload["source_internal_provider"] == "local"
         assert payload["source_description"] == str(tmp_path / "roms")
-        assert payload["operating_state"]["direct_save_storage_capable"] is False
-        assert "ppsspp-savedata" in payload["operating_state"][
-            "direct_save_capable_layouts"
-        ]
-        psx = next(
-            item
-            for item in payload["operating_state"]["direct_save_layout_details"]
-            if item["layout_id"] == "retroarch-root-psx"
-        )
-        assert psx["relative_root"] == "psx"
-        assert psx["emulators"] == ["libretro"]
-        assert psx["cores"] == ["pcsx_rearmed", "swanstation", "mednafen_psx"]
-        assert psx["requires_configuration_override"] is False
+        assert "direct_save_storage_capable" not in payload["operating_state"]
 
     def test_emits_smb_source_summary_when_smb_configured(self, tmp_path):
         config = _build_config(tmp_path, smb=SMBConfig(server="nas.local", share="ROMs", username="alice"))
@@ -554,30 +578,6 @@ class TestLibraryModeAction:
         assert payload["ok"] is True
         assert payload["mode_changed"] is False
         assert payload["es_restart_requested"] is False
-
-    def test_direct_conflict_is_a_structured_decision_not_generic_failure(
-        self, tmp_path, monkeypatch
-    ):
-        from romcloud.core.exceptions import SaveAuthorityConflictError
-
-        def conflict(*_args, **_kwargs):
-            raise SaveAuthorityConflictError(
-                "Unresolved Save Conflicts",
-                conflict_ids=("one", "two"),
-            )
-
-        monkeypatch.setattr(
-            "romcloud.integrations.batocera.game_access.set_operating_mode",
-            conflict,
-        )
-
-        result = _write_and_invoke(tmp_path, ["library-connected"])
-
-        assert result.exit_code == 1
-        payload = json.loads(result.output.strip().splitlines()[-1])
-        assert payload["save_authority_conflict"] is True
-        assert payload["conflict_ids"] == ["one", "two"]
-        assert payload["error_type"] == "SaveAuthorityConflictError"
 
     def test_provider_failure_keeps_actionable_detail_and_type(
         self, tmp_path, monkeypatch
