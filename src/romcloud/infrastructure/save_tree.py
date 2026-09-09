@@ -69,10 +69,23 @@ class ContentObservationCache:
     pre-apply staging check). Re-reading every byte each time is what makes a
     CIFS-mounted remote dataset dominate gameStop latency.
 
-    A file is only served from this memo when its device, inode, size *and*
-    nanosecond mtime are all still exactly what they were when the digest was
-    computed earlier in this same operation — the filesystem itself reporting
-    that no write happened since that observation. Any difference re-reads.
+    A file is only served from this memo when its device, inode, size,
+    nanosecond mtime *and* nanosecond ctime are all still exactly what they
+    were when the digest was computed earlier in this same operation — the
+    filesystem itself reporting that no write happened since that
+    observation. Any difference re-reads. ``ctime`` is defense-in-depth only
+    (it also changes on a metadata-only change, which just costs one harmless
+    extra re-read); it does not, and cannot, fix the underlying trust problem
+    below.
+
+    This is only ever safe for a physical location ROMCloud trusts to report
+    accurate, high-resolution, uncached stat metadata — i.e. a genuine local
+    filesystem. A network-backed mount (CIFS/SMB) can report coarse or
+    client-cached metadata that makes two genuinely different writes from
+    another client look identical to this tuple, so callers must never pass
+    this cache in in for a remote/network-backed scan; see
+    :class:`~romcloud.infrastructure.remote_saves.FilesystemRemoteSaveStore`,
+    which always re-reads regardless of what a caller supplies.
 
     Deliberately narrow: never shared between operations (so it can never hide
     a change made between two syncs) and never consulted by the post-mutation
@@ -82,7 +95,7 @@ class ContentObservationCache:
     __slots__ = ("_entries", "hits", "misses")
 
     def __init__(self) -> None:
-        self._entries: dict[tuple[str, int, int, int, int], str] = {}
+        self._entries: dict[tuple[str, int, int, int, int, int], str] = {}
         self.hits = 0
         self.misses = 0
 
@@ -93,6 +106,7 @@ class ContentObservationCache:
             status.st_ino,
             status.st_size,
             status.st_mtime_ns,
+            status.st_ctime_ns,
         )
         cached = self._entries.get(key)
         if cached is not None:

@@ -1104,14 +1104,33 @@ class SaveSyncService:
         policy: Optional[SaveSelectionPolicy] = None,
         *,
         only_relative_paths: Optional[frozenset[str]] = None,
+        trusted: bool = True,
     ) -> save_tree.ScanReport:
+        """*trusted* gates whether the operation-scoped observation cache may
+        be consulted. It must be ``False`` for any root that is not one of
+        this service's own known local destinations (see
+        :meth:`_is_local_physical_root`) — a network-backed remote root's
+        metadata is never trustworthy enough to skip a re-read.
+        """
         return save_tree.scan_tree_report(
             root,
             policy or self._policy,
             enabled_optional_systems=self._enabled_optional_systems(),
             enabled_optional_groups=self._enabled_optional_groups(),
-            cache=self._observation_cache,
+            cache=self._observation_cache if trusted else None,
             only_relative_paths=only_relative_paths,
+        )
+
+    def _is_local_physical_root(self, root: Path) -> bool:
+        """True only for a root this service itself owns as local storage.
+
+        The sole basis for ever trusting a cached content observation — see
+        :class:`~romcloud.infrastructure.save_tree.ContentObservationCache`.
+        """
+        absolute = self._absolute_root(root)
+        return any(
+            absolute == self._absolute_root(view.root)
+            for view in self._local_views()
         )
 
     def _primary_local_policy(
@@ -1248,11 +1267,15 @@ class SaveSyncService:
 
     def _scan_remote(self) -> save_tree.ScanReport:
         assert self._remote_store is not None
+        # Never pass the local observation cache: the remote dataset may be a
+        # network-backed mount (CIFS/SMB) whose metadata cannot prove another
+        # client did not rewrite a file since an earlier observation in this
+        # same operation. Scope narrowing (see callers) keeps this cheap
+        # without reusing potentially-stale hashes.
         return self._remote_store.scan(
             self._policy,
             enabled_optional_systems=self._enabled_optional_systems(),
             enabled_optional_groups=self._enabled_optional_groups(),
-            cache=self._observation_cache,
         )
 
     def _scan_remote_layouts(
@@ -1267,11 +1290,11 @@ class SaveSyncService:
         if not layouts:
             return save_tree.ScanReport({})
         selected_policy = SaveSelectionPolicy(layouts=layouts)
+        # See _scan_remote: remote metadata is never trusted across calls.
         return self._remote_store.scan(
             selected_policy,
             enabled_optional_systems=self._enabled_optional_systems(),
             enabled_optional_groups=self._enabled_optional_groups(),
-            cache=self._observation_cache,
         )
 
     def _automatic_report(self, report: save_tree.ScanReport) -> save_tree.ScanReport:
@@ -3694,8 +3717,18 @@ class SaveSyncService:
                 )
                 report = self._without_mapped_local_prefixes(report)
             else:
+                # Any other physical root reaching here is the remote
+                # transaction root (a real Path only because
+                # FilesystemRemoteSaveStore keeps ROMCloud's existing
+                # Path-based transaction machinery) — possibly a
+                # network-backed CIFS/SMB mount. Its own store already
+                # refuses a cache (see FilesystemRemoteSaveStore.scan), but
+                # this call reaches the filesystem directly, so the trust
+                # gate must be enforced here too.
                 report = self._scan_primary(
-                    root, only_relative_paths=only_relative_paths
+                    root,
+                    only_relative_paths=only_relative_paths,
+                    trusted=self._is_local_physical_root(root),
                 )
         physical, _ = self._physical_manifest(view, report.artifacts)
         return physical

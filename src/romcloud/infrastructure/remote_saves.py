@@ -79,9 +79,15 @@ class RemoteSaveStore(ABC):
     ) -> save_tree.ScanReport:
         """Return the provider's current logical save-artifact manifest.
 
-        *cache* is an optional operation-scoped observation memo; stores whose
-        backing protocol cannot report a trustworthy per-file identity simply
-        ignore it and always re-read.
+        *cache* is an optional operation-scoped observation memo reserved for
+        a future store backed by a provider-native strong identity (an
+        immutable generation/version/ETag that genuinely proves object
+        content, not a weak mtime). No current store implementation honors
+        it: :class:`FilesystemRemoteSaveStore` may be a network-backed mount
+        (CIFS/SMB) whose metadata cannot be trusted to prove nothing changed
+        since an earlier observation, so it always re-reads regardless of
+        what is passed here; protocol-only stores have no local stat to
+        memoize against in the first place.
         """
 
     @abstractmethod
@@ -142,12 +148,12 @@ class FilesystemRemoteSaveStore(RemoteSaveStore):
     ) -> save_tree.ScanReport:
         if operation is not None:
             operation.check()
+        del cache  # never trusted: this root may be a network-backed mount
         return save_tree.scan_tree_report(
             self._root,
             policy,
             enabled_optional_systems=enabled_optional_systems,
             enabled_optional_groups=enabled_optional_groups,
-            cache=cache,
         )
 
     def materialize(

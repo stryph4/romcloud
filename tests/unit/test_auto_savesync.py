@@ -1367,10 +1367,15 @@ class TestGameStopObservationCost:
 
         assert remote.read_bytes() == b"final-save-bytes"
         assert reads.count(local) == 2
-        # Remote reads are the verification floor: the authoritative plan
-        # scan, the transaction's own pre/post artifact check, and the
-        # post-mutation scan that must see real bytes.
-        assert reads.count(remote) <= 3
+        # Local content may be reused within one operation once its content
+        # is proven stable; remote content is never reused at all — the
+        # remote dataset may be a network-backed CIFS/SMB mount whose
+        # metadata cannot prove another client did not rewrite a file since
+        # an earlier observation. Every remote-touching phase (plan scan,
+        # staging verification, transaction pre/post check, final
+        # verification) therefore re-reads real bytes: this is the safety
+        # floor, not a regression to hashing the whole remote tree.
+        assert reads.count(remote) == 5
 
     def test_multiple_changed_files_in_one_group_are_each_read_once_per_phase(
         self, tmp_path: Path, monkeypatch
@@ -1506,6 +1511,85 @@ class TestGameStopObservationCost:
             )
 
         assert local.read_bytes() == b"final-save-bytes"
+
+    def test_remote_change_mid_operation_is_never_hidden_by_reused_metadata(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """The critical reconciliation boundary: if the remote content
+        actually changes partway through one gameStop operation (another
+        client on the network wrote a same-size save between this
+        operation's plan scan and its staging check), that must be detected
+        rather than silently confirmed as unchanged from an earlier, reused
+        observation and must never be silently overwritten by either side.
+        Remote content is never cached, so every remote-touching phase
+        re-reads real bytes and a genuine divergence is always seen — here,
+        surfaced as a conflict between two independent changes."""
+        service, coordinator = self._prepared(tmp_path)
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        remote = tmp_path / "remote/snes/Super Metroid.srm"
+        _write(local, b"baseline")
+        service.full_sync()
+        coordinator.game_start(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+        local.write_bytes(b"our-final-save-bytes")
+
+        remote_scans = {"count": 0}
+        original_scan_remote_layouts = service._scan_remote_layouts
+
+        def injecting_scan_remote_layouts(layout_ids):
+            remote_scans["count"] += 1
+            if remote_scans["count"] == 2:
+                # Simulate another client's write landing mid-operation, after
+                # this operation's own plan scan already observed the old
+                # remote bytes.
+                remote.write_bytes(b"same-size-bytes-from-elsewhere")
+            return original_scan_remote_layouts(layout_ids)
+
+        monkeypatch.setattr(
+            service, "_scan_remote_layouts", injecting_scan_remote_layouts
+        )
+        self._counting_sleep(monkeypatch)
+
+        conflict_ids = coordinator.game_stop(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+
+        assert remote_scans["count"] >= 2
+        assert conflict_ids != ()
+        assert service.get_state().active_conflicts
+        # Detecting the mid-operation change must never let either side's
+        # write be silently overwritten by the other.
+        assert local.read_bytes() == b"our-final-save-bytes"
+        assert remote.read_bytes() == b"same-size-bytes-from-elsewhere"
+
+    def test_narrowly_scoped_remote_observation_never_hashes_other_systems(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """Freshness (never caching remote content) must not regress into
+        scanning the whole remote dataset: a narrow gameStop scope still
+        never opens an unrelated system's remote save, however large."""
+        service, coordinator = self._prepared(tmp_path)
+        snes_local = tmp_path / "local/snes/Super Metroid.srm"
+        psx_local = tmp_path / "local/psx/duckstation/memcards/shared_card_1.mcd"
+        _write(snes_local, b"snes-baseline")
+        _write(psx_local, b"unrelated-psx-memory-card")
+        service.full_sync()
+        coordinator.game_start(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+        snes_local.write_bytes(b"snes-final-save-bytes")
+
+        reads = self._counting_hash(monkeypatch)
+        self._counting_sleep(monkeypatch)
+        coordinator.game_stop(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+
+        remote_psx = tmp_path / "remote/psx/duckstation/memcards/shared_card_1.mcd"
+        assert remote_psx not in reads
+        assert not any("duckstation" in read.parts for read in reads), reads
+        assert remote_psx.read_bytes() == b"unrelated-psx-memory-card"
 
 
 def test_snes_game_stop_never_invokes_container_reconciliation(tmp_path: Path):
