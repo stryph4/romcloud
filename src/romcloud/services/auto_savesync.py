@@ -81,6 +81,22 @@ def layout_ids_for_session(
     )
 
 
+def selected_layout_ids_for_session(
+    policy: SaveSelectionPolicy,
+    system: str,
+    emulator: str = "",
+    core: str = "",
+    selected_systems: Optional[frozenset[str]] = None,
+) -> frozenset[str]:
+    """Resolve selected lifecycle scope through canonical SaveLayout metadata."""
+    return policy.selected_layout_ids_for_lifecycle(
+        system=system,
+        emulator=emulator,
+        core=core,
+        selected_systems=selected_systems,
+    )
+
+
 class ActiveSessionStore:
     """Crash-safe per-game marker files; no shared lock can delay game launch."""
 
@@ -254,10 +270,14 @@ class AutoSaveSyncCoordinator:
 
     def game_stop_eligible(self, *, system: str, emulator: str, core: str) -> bool:
         """Return whether a stop owns at least one selected automatic layout."""
-        layout_ids = layout_ids_for_session(self._policy, system, emulator, core)
-        selected = self._selected_systems
-        return bool(layout_ids) and (
-            selected is None or system.strip().casefold() in selected
+        return bool(
+            selected_layout_ids_for_session(
+                self._policy,
+                system,
+                emulator,
+                core,
+                self._selected_systems,
+            )
         )
 
     @correlated_operation(
@@ -275,7 +295,16 @@ class AutoSaveSyncCoordinator:
         if not self._enabled:
             log.info("gameStop conflict check skipped: Auto SaveSync disabled")
             return ()
-        layout_ids = layout_ids_for_session(self._policy, system, emulator, core)
+        resolved_layout_ids = layout_ids_for_session(
+            self._policy, system, emulator, core
+        )
+        layout_ids = selected_layout_ids_for_session(
+            self._policy,
+            system,
+            emulator,
+            core,
+            self._selected_systems,
+        )
         if not self.game_stop_eligible(
             system=system, emulator=emulator, core=core
         ):
@@ -285,14 +314,31 @@ class AutoSaveSyncCoordinator:
             # access so an unrelated application exit is a total sync no-op.
             self._sessions.stop(system=system, rom=rom)
             log.info(
-                "gameStop SaveSync skipped: system=%s emulator=%s core=%s "
-                "reason=%s",
+                "gameStop SaveSync skipped: system=%s normalized_system=%s "
+                "emulator=%s core=%s resolved_layout_ids=%s "
+                "canonical_systems=%s selected_systems=%s reason=%s",
                 system,
+                system.strip().casefold() or "none",
                 emulator,
                 core,
+                ",".join(sorted(resolved_layout_ids)) or "none",
+                ",".join(
+                    sorted(
+                        {
+                            self._policy.layout(value).system
+                            for value in resolved_layout_ids
+                        }
+                    )
+                )
+                or "none",
+                (
+                    ",".join(sorted(self._selected_systems))
+                    if self._selected_systems is not None
+                    else "all"
+                ),
                 (
                     "system-not-selected"
-                    if layout_ids and self._selected_systems is not None
+                    if resolved_layout_ids and self._selected_systems is not None
                     else "no-supported-layout"
                 ),
             )
@@ -308,6 +354,21 @@ class AutoSaveSyncCoordinator:
             emulator,
             core,
             rom,
+        )
+        log.info(
+            "gameStop SaveSync resolution: raw_system=%s normalized_system=%s "
+            "selected_systems=%s matched_layout_ids=%s canonical_systems=%s",
+            system,
+            system.strip().casefold() or "none",
+            (
+                ",".join(sorted(self._selected_systems))
+                if self._selected_systems is not None
+                else "all"
+            ),
+            ",".join(sorted(layout_ids)),
+            ",".join(
+                sorted({self._policy.layout(value).system for value in layout_ids})
+            ),
         )
         log.info(
             "gameStop conflict check started: system=%s emulator=%s core=%s",

@@ -1874,7 +1874,7 @@ class SaveSyncService:
             log.info(
                 "Quick SaveSync preflight: quick_ready=%s cursor=%s "
                 "baseline_artifacts=%d tracked_groups=%d pending_groups=%d "
-                "materialization_groups=%d excluded_layouts=%d",
+                "materialization_groups=%d excluded_layouts=%d pending_group_ids=%s",
                 state.quick_sync_ready,
                 cursor if cursor is not None else "none",
                 len(self._automatic_baseline(state)),
@@ -1882,6 +1882,7 @@ class SaveSyncService:
                 len(pending_groups),
                 len(materialization_groups),
                 len(excluded_layouts),
+                ",".join(sorted(pending_groups)) or "none",
             )
             if not state.quick_sync_ready or cursor is None:
                 return SaveQuickSyncResult(
@@ -1911,6 +1912,12 @@ class SaveSyncService:
                 len(journal["history"]),
             )
             if generation_unchanged and not pending_groups and not obsolete_conflicts:
+                log.info(
+                    "Quick SaveSync early return: reason=%s cursor=%d "
+                    "pending_group_ids=none",
+                    "journal-current-local-materialized",
+                    cursor,
+                )
                 return SaveQuickSyncResult(
                     status="unchanged",
                     remote_generation=remote_generation,

@@ -30,6 +30,7 @@ from romcloud.integrations.batocera.auto_savesync import hook_content, install_h
 from romcloud.services.auto_savesync import (
     AutoSaveSyncCoordinator,
     layout_ids_for_session,
+    selected_layout_ids_for_session,
 )
 from romcloud.services.saves import SaveSyncService
 
@@ -1028,6 +1029,64 @@ def test_lifecycle_mapping_is_registry_bounded_and_xemu_is_never_automatic():
     assert layout_ids_for_session(policy, "unknown-system") == frozenset()
 
 
+def test_every_automatic_layout_round_trips_through_lifecycle_and_selection():
+    """Registry additions fail if lifecycle cannot recover canonical ownership."""
+    policy = DEFAULT_SAVE_SELECTION_POLICY
+    for layout in policy.layouts:
+        if not layout.lifecycle_enabled:
+            continue
+        lifecycle_system = (layout.lifecycle_systems or (layout.system,))[0]
+        emulator = layout.lifecycle_emulators[0] if layout.lifecycle_emulators else ""
+        core = layout.lifecycle_cores[0] if layout.lifecycle_cores else ""
+        resolved = selected_layout_ids_for_session(
+            policy,
+            lifecycle_system,
+            emulator,
+            core,
+            frozenset({lifecycle_system}),
+        )
+        assert layout.layout_id in resolved, (
+            layout.layout_id,
+            lifecycle_system,
+            emulator,
+            core,
+        )
+        assert policy.layout(layout.layout_id).system == layout.system
+
+
+@pytest.mark.parametrize(
+    ("event_system", "selected_system", "layout_id", "canonical_system"),
+    (
+        ("gba", "gba", "retroarch-root-gba", "gba"),
+        ("genesis", "genesis", "retroarch-root-megadrive", "megadrive"),
+        ("genesis", "megadrive", "retroarch-root-megadrive", "megadrive"),
+        ("segacd", "segacd", "retroarch-root-megacd", "megacd"),
+        ("vita", "psvita", "vita3k-title-saves", "psvita"),
+    ),
+)
+def test_lifecycle_aliases_select_one_canonical_ownership_domain(
+    event_system: str,
+    selected_system: str,
+    layout_id: str,
+    canonical_system: str,
+):
+    policy = DEFAULT_SAVE_SELECTION_POLICY
+    layout = policy.layout(layout_id)
+    emulator = layout.lifecycle_emulators[0] if layout.lifecycle_emulators else ""
+    core = layout.lifecycle_cores[0] if layout.lifecycle_cores else ""
+
+    resolved = selected_layout_ids_for_session(
+        policy,
+        event_system,
+        emulator,
+        core,
+        frozenset({selected_system}),
+    )
+
+    assert layout_id in resolved
+    assert {policy.layout(value).system for value in resolved} == {canonical_system}
+
+
 @pytest.mark.parametrize(
     ("selected_systems", "system", "emulator", "core"),
     (
@@ -1800,7 +1859,14 @@ def test_gba_game_stop_uploads_and_periodic_quick_sync_repairs_materialization(
 ):
     provider = _Provider()
     service = _service(tmp_path, provider)
-    coordinator = _coordinator(tmp_path, service)
+    coordinator = AutoSaveSyncCoordinator(
+        service,
+        data_root=tmp_path / "data",
+        enabled=True,
+        policy=DEFAULT_SAVE_SELECTION_POLICY,
+        quiet_seconds=0,
+        selected_systems=("gba",),
+    )
     local = tmp_path / "local" / "gba" / "Game.srm"
     remote = tmp_path / "remote" / "gba" / "Game.srm"
     service.full_sync()
@@ -1822,6 +1888,85 @@ def test_gba_game_stop_uploads_and_periodic_quick_sync_repairs_materialization(
     assert local.read_bytes() == b"gba-progress"
     assert remote.read_bytes() == b"gba-progress"
     assert service.quick_sync().status == "unchanged"
+
+
+def test_manual_quick_sync_is_hint_driven_for_unmarked_gba_change(tmp_path: Path):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    local = tmp_path / "local/gba/Pokemon Emerald.srm"
+    remote = tmp_path / "remote/gba/Pokemon Emerald.srm"
+    _write(local, b"baseline")
+    service.full_sync()
+    local.write_bytes(b"changed-without-game-stop-marker")
+
+    result = service.quick_sync()
+
+    assert result.status == "unchanged"
+    assert result.reason == "journal-current-local-materialized"
+    assert remote.read_bytes() == b"baseline"
+
+    full = service.full_sync()
+    assert full.uploaded == 1
+    assert remote.read_bytes() == b"changed-without-game-stop-marker"
+
+
+def test_selected_gba_game_stop_persists_canonical_dirty_domain_for_restart_quick_sync(
+    tmp_path: Path,
+    monkeypatch,
+):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = AutoSaveSyncCoordinator(
+        service,
+        data_root=tmp_path / "data",
+        enabled=True,
+        policy=DEFAULT_SAVE_SELECTION_POLICY,
+        quiet_seconds=0,
+        selected_systems=("gba",),
+    )
+    local = tmp_path / "local/gba/Pokemon Emerald.srm"
+    remote = tmp_path / "remote/gba/Pokemon Emerald.srm"
+    _write(local, b"baseline")
+    service.full_sync()
+    coordinator.game_start(
+        system="gba", emulator="libretro", core="mgba", rom="Pokemon Emerald.gba"
+    )
+    local.write_bytes(b"changed")
+
+    def stop_after_mark(*_args, **_kwargs):
+        raise SaveSyncConnectivityError("simulate process exit after durable mark")
+
+    monkeypatch.setattr(service, "quick_sync", stop_after_mark)
+    with pytest.raises(SaveSyncConnectivityError):
+        coordinator.game_stop(
+            system="gba",
+            emulator="libretro",
+            core="mgba",
+            rom="Pokemon Emerald.gba",
+        )
+
+    persisted = service.get_state()
+    dirty = [group for group in persisted.groups if group.dirty_path_hints]
+    assert [(group.group_id, group.layout_id, group.dirty_path_hints) for group in dirty] == [
+        (
+            "retroarch-root-gba/pokemon emerald",
+            "retroarch-root-gba",
+            ("gba/Pokemon Emerald.srm",),
+        )
+    ]
+
+    restarted = SaveSyncService(
+        provider=provider,
+        connectivity_root=str(tmp_path / "remote-data"),
+        local_root=str(tmp_path / "local"),
+        remote_root=str(tmp_path / "remote"),
+        state_path=tmp_path / "data/savesync-state.json",
+    )
+    result = restarted.quick_sync()
+
+    assert result.status == "reconciled"
+    assert "retroarch-root-gba/pokemon emerald" in result.processed_groups
+    assert remote.read_bytes() == b"changed"
 
 
 def test_eden_metroid_game_stop_and_peer_quick_sync_use_physical_nand_roots(
