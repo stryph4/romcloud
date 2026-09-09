@@ -43,12 +43,13 @@ def _coordinator(ctx: click.Context) -> AutoSaveSyncCoordinator:
         current = load_config(ctx.obj["config_path"])
         return _auto_sync_enabled(current)
 
+    # source.selected_systems is the ROM import/catalog allowlist. SaveSync's
+    # independent positive boundary is the canonical SaveLayout registry.
     return AutoSaveSyncCoordinator(
         container.saves,
         data_root=Path(container.config.data_path),
         enabled=enabled,
         enabled_check=enabled_check,
-        selected_systems=container.config.source.selected_systems,
     )
 
 

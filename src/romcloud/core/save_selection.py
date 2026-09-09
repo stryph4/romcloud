@@ -275,8 +275,8 @@ _COMPLETE_RETROARCH_CLASSIC_SYSTEMS = frozenset(
 
 # Batocera exposes a few equivalent frontend system names while its emulator
 # generators keep save data in one canonical namespace.  Keep those identities
-# on the SaveLayout registry itself so lifecycle eligibility, selected-system
-# filtering, dirty ownership, and Full Sync all converge on ``layout.system``.
+# on the SaveLayout registry itself so lifecycle eligibility, dirty ownership,
+# Quick Sync, and Full Sync all converge on ``layout.system``.
 # These are names already present in ROMCloud's audited Batocera system catalog;
 # they are not an Auto SaveSync-specific allowlist.
 _LIFECYCLE_SYSTEM_ALIASES: dict[str, tuple[str, ...]] = {
@@ -900,44 +900,6 @@ class SaveSelectionPolicy:
                 value.casefold()
                 for value in (layout.lifecycle_systems or (layout.system,))
             }
-        )
-
-    def selected_layout_ids_for_lifecycle(
-        self,
-        *,
-        system: str,
-        emulator: str = "",
-        core: str = "",
-        selected_systems: Optional[frozenset[str]] = None,
-    ) -> frozenset[str]:
-        """Resolve a lifecycle event through canonical layout ownership.
-
-        ``selected_systems`` contains Batocera/frontend identities.  A layout
-        is selected when any of its registered lifecycle identities or its
-        canonical SaveSync system is selected.  This deliberately avoids
-        comparing only the raw gameStop system string: aliases such as
-        ``genesis`` and canonical roots such as ``megadrive`` own one domain.
-        """
-        resolved = self.layout_ids_for_lifecycle(
-            system=system,
-            emulator=emulator,
-            core=core,
-        )
-        if selected_systems is None:
-            return resolved
-        normalized_selected = frozenset(
-            value.strip().casefold() for value in selected_systems
-        )
-        return frozenset(
-            layout_id
-            for layout_id in resolved
-            if normalized_selected.intersection(
-                value.casefold()
-                for value in (
-                    self._by_id[layout_id].system,
-                    *(self._by_id[layout_id].lifecycle_systems or ()),
-                )
-            )
         )
 
     def is_lifecycle_enabled(self, layout_id: str) -> bool:

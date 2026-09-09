@@ -6,10 +6,12 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from click.testing import CliRunner
 
+from romcloud.bootstrap.container import Container
 from romcloud.core.capabilities import CapabilityPolicy, OperatingMode
 from romcloud.core.exceptions import SaveSyncConnectivityError, SaveSyncError
 from romcloud.core.models.savesync import SaveGroupCondition, SaveQuickSyncResult
@@ -21,6 +23,7 @@ from romcloud.infrastructure import savesync_prompts
 from romcloud.infrastructure.config import (
     AppConfig,
     CacheConfig,
+    RemoteDataConfig,
     SavesConfig,
     SourceConfig,
     write_config,
@@ -30,7 +33,6 @@ from romcloud.integrations.batocera.auto_savesync import hook_content, install_h
 from romcloud.services.auto_savesync import (
     AutoSaveSyncCoordinator,
     layout_ids_for_session,
-    selected_layout_ids_for_session,
 )
 from romcloud.services.saves import SaveSyncService
 
@@ -109,6 +111,30 @@ def _coordinator(tmp_path: Path, service: SaveSyncService) -> AutoSaveSyncCoordi
         policy=DEFAULT_SAVE_SELECTION_POLICY,
         quiet_seconds=0,
     )
+
+
+def _container_with_rom_selection(
+    tmp_path: Path, *, selected_systems: tuple[str, ...]
+) -> tuple[Container, Path]:
+    source = tmp_path / "rom-source"
+    source.mkdir()
+    local_saves = tmp_path / "selected-local-saves"
+    local_saves.mkdir()
+    remote_data = tmp_path / "selected-remote-data"
+    remote_data.mkdir()
+    config = AppConfig(
+        source=SourceConfig(
+            "local", str(source), selected_systems=selected_systems
+        ),
+        cache=CacheConfig(str(tmp_path / "selected-cache")),
+        local_roms_path=str(tmp_path / "selected-local-roms"),
+        data_path=str(tmp_path / "selected-data"),
+        remote_data=RemoteDataConfig("local", str(remote_data)),
+        saves=SavesConfig(local_path=str(local_saves), auto_sync_enabled=True),
+    )
+    config_path = tmp_path / "selected-romcloud.toml"
+    write_config(config, str(config_path))
+    return Container(config), config_path
 
 
 def test_disabled_coordinator_is_an_immediate_filesystem_and_service_noop(
@@ -1029,7 +1055,7 @@ def test_lifecycle_mapping_is_registry_bounded_and_xemu_is_never_automatic():
     assert layout_ids_for_session(policy, "unknown-system") == frozenset()
 
 
-def test_every_automatic_layout_round_trips_through_lifecycle_and_selection():
+def test_every_automatic_layout_round_trips_through_lifecycle_registry():
     """Registry additions fail if lifecycle cannot recover canonical ownership."""
     policy = DEFAULT_SAVE_SELECTION_POLICY
     for layout in policy.layouts:
@@ -1038,12 +1064,8 @@ def test_every_automatic_layout_round_trips_through_lifecycle_and_selection():
         lifecycle_system = (layout.lifecycle_systems or (layout.system,))[0]
         emulator = layout.lifecycle_emulators[0] if layout.lifecycle_emulators else ""
         core = layout.lifecycle_cores[0] if layout.lifecycle_cores else ""
-        resolved = selected_layout_ids_for_session(
-            policy,
-            lifecycle_system,
-            emulator,
-            core,
-            frozenset({lifecycle_system}),
+        resolved = layout_ids_for_session(
+            policy, lifecycle_system, emulator, core
         )
         assert layout.layout_id in resolved, (
             layout.layout_id,
@@ -1055,18 +1077,16 @@ def test_every_automatic_layout_round_trips_through_lifecycle_and_selection():
 
 
 @pytest.mark.parametrize(
-    ("event_system", "selected_system", "layout_id", "canonical_system"),
+    ("event_system", "layout_id", "canonical_system"),
     (
-        ("gba", "gba", "retroarch-root-gba", "gba"),
-        ("genesis", "genesis", "retroarch-root-megadrive", "megadrive"),
-        ("genesis", "megadrive", "retroarch-root-megadrive", "megadrive"),
-        ("segacd", "segacd", "retroarch-root-megacd", "megacd"),
-        ("vita", "psvita", "vita3k-title-saves", "psvita"),
+        ("gba", "retroarch-root-gba", "gba"),
+        ("genesis", "retroarch-root-megadrive", "megadrive"),
+        ("segacd", "retroarch-root-megacd", "megacd"),
+        ("vita", "vita3k-title-saves", "psvita"),
     ),
 )
-def test_lifecycle_aliases_select_one_canonical_ownership_domain(
+def test_lifecycle_aliases_resolve_one_canonical_ownership_domain(
     event_system: str,
-    selected_system: str,
     layout_id: str,
     canonical_system: str,
 ):
@@ -1075,35 +1095,26 @@ def test_lifecycle_aliases_select_one_canonical_ownership_domain(
     emulator = layout.lifecycle_emulators[0] if layout.lifecycle_emulators else ""
     core = layout.lifecycle_cores[0] if layout.lifecycle_cores else ""
 
-    resolved = selected_layout_ids_for_session(
-        policy,
-        event_system,
-        emulator,
-        core,
-        frozenset({selected_system}),
-    )
+    resolved = layout_ids_for_session(policy, event_system, emulator, core)
 
     assert layout_id in resolved
     assert {policy.layout(value).system for value in resolved} == {canonical_system}
 
 
 @pytest.mark.parametrize(
-    ("selected_systems", "system", "emulator", "core"),
+    ("system", "emulator", "core"),
     (
-        (None, "ports", "pygame", "pygame"),
-        (("gba",), "snes", "libretro", "snes9x"),
-        (("switch",), "switch", "ryujinx", "ryujinx"),
+        ("ports", "pygame", "pygame"),
+        ("switch", "ryujinx", "ryujinx"),
     ),
     ids=(
         "unsupported-application",
-        "supported-system-not-selected",
         "unsupported-layout",
     ),
 )
 def test_ineligible_game_stop_is_total_savesync_noop_before_popup_or_service_access(
     tmp_path: Path,
     monkeypatch,
-    selected_systems,
     system: str,
     emulator: str,
     core: str,
@@ -1116,7 +1127,6 @@ def test_ineligible_game_stop_is_total_savesync_noop_before_popup_or_service_acc
         enabled=True,
         policy=DEFAULT_SAVE_SELECTION_POLICY,
         quiet_seconds=0,
-        selected_systems=selected_systems,
     )
     coordinator.game_start(
         system=system, emulator=emulator, core=core, rom="Application.rom"
@@ -1150,7 +1160,7 @@ def test_ineligible_game_stop_is_total_savesync_noop_before_popup_or_service_acc
     assert coordinator._sessions.has_active_session() is False
 
 
-def test_selected_supported_game_stop_remains_synchronous_and_eligible(
+def test_supported_game_stop_remains_synchronous_and_eligible(
     tmp_path: Path,
 ):
     provider = _Provider()
@@ -1161,7 +1171,6 @@ def test_selected_supported_game_stop_remains_synchronous_and_eligible(
         enabled=True,
         policy=DEFAULT_SAVE_SELECTION_POLICY,
         quiet_seconds=0,
-        selected_systems=("snes",),
     )
     local = tmp_path / "local/snes/Super Metroid.srm"
     remote = tmp_path / "remote/snes/Super Metroid.srm"
@@ -1177,6 +1186,72 @@ def test_selected_supported_game_stop_remains_synchronous_and_eligible(
     )
 
     assert remote.read_bytes() == b"eligible-final-save"
+
+
+def test_local_gba_auto_sync_ignores_rom_import_selection(
+    tmp_path: Path, monkeypatch
+):
+    """ROM source selection must never gate a supported local save layout."""
+    from romcloud.cli.commands import autosync as autosync_commands
+
+    container, config_path = _container_with_rom_selection(
+        tmp_path, selected_systems=("psx",)
+    )
+    service = container.saves
+    service.full_sync()
+    local = Path(container.config.saves.local_path) / "gba/Pokemon Emerald.srm"
+    _write(local, b"local-gba-save")
+
+    monkeypatch.setattr(
+        autosync_commands, "get_container", lambda _ctx: container
+    )
+    coordinator = autosync_commands._coordinator(
+        SimpleNamespace(obj={"config_path": str(config_path)})
+    )
+    coordinator._stability_interval = 0
+
+    coordinator.game_stop(
+        system="gba",
+        emulator="libretro",
+        core="mgba",
+        rom="/userdata/roms/gba/Pokemon Emerald.gba",
+    )
+
+    assert container.config.source.selected_systems == ("psx",)
+    assert (
+        Path(container.config.remote_data.root)
+        / "saves/gba/Pokemon Emerald.srm"
+    ).read_bytes() == b"local-gba-save"
+
+
+def test_full_and_quick_sync_share_code_defined_supported_layout_boundary(
+    tmp_path: Path,
+):
+    container, _config_path = _container_with_rom_selection(
+        tmp_path, selected_systems=("psx",)
+    )
+    service = container.saves
+    local_root = Path(container.config.saves.local_path)
+    remote_root = Path(container.config.remote_data.root) / "saves"
+    gba = local_root / "gba/Pokemon Emerald.srm"
+    unsupported = local_root / "unsupported/Pokemon Emerald.sav"
+    _write(gba, b"gba-baseline")
+    _write(unsupported, b"must-not-sync")
+
+    full = service.full_sync()
+
+    assert full.uploaded == 1
+    assert (remote_root / "gba/Pokemon Emerald.srm").read_bytes() == b"gba-baseline"
+    assert not (remote_root / "unsupported/Pokemon Emerald.sav").exists()
+
+    gba.write_bytes(b"gba-dirty")
+    service.mark_local_dirty("gba/Pokemon Emerald.srm")
+    quick = service.quick_sync()
+
+    assert quick.status == "reconciled"
+    assert quick.processed_groups == ("retroarch-root-gba/pokemon emerald",)
+    assert (remote_root / "gba/Pokemon Emerald.srm").read_bytes() == b"gba-dirty"
+    assert not (remote_root / "unsupported/Pokemon Emerald.sav").exists()
 
 
 def test_game_exit_detects_first_save_and_uploads_only_that_registry_group(tmp_path: Path):
@@ -1865,7 +1940,6 @@ def test_gba_game_stop_uploads_and_periodic_quick_sync_repairs_materialization(
         enabled=True,
         policy=DEFAULT_SAVE_SELECTION_POLICY,
         quiet_seconds=0,
-        selected_systems=("gba",),
     )
     local = tmp_path / "local" / "gba" / "Game.srm"
     remote = tmp_path / "remote" / "gba" / "Game.srm"
@@ -1904,7 +1978,6 @@ def test_local_gba_game_stop_without_session_scans_only_canonical_gba_scope(
         enabled=True,
         policy=DEFAULT_SAVE_SELECTION_POLICY,
         quiet_seconds=0,
-        selected_systems=("gba",),
     )
     service.full_sync()
     local = tmp_path / "local/gba/Pokemon Emerald.srm"
@@ -1987,7 +2060,6 @@ def test_ambiguous_game_stop_identity_fails_closed_before_observation(
         enabled=True,
         policy=DEFAULT_SAVE_SELECTION_POLICY,
         quiet_seconds=0,
-        selected_systems=("gba",),
     )
     monkeypatch.setattr(
         service,
@@ -2019,7 +2091,6 @@ def test_gba_game_stop_observes_late_sram_flush_within_bounded_settle_window(
         policy=DEFAULT_SAVE_SELECTION_POLICY,
         quiet_seconds=0.05,
         stability_checks=4,
-        selected_systems=("gba",),
     )
     local = tmp_path / "local/gba/Pokemon Emerald.srm"
     remote = tmp_path / "remote/gba/Pokemon Emerald.srm"
@@ -2084,7 +2155,7 @@ def test_manual_quick_sync_is_hint_driven_for_unmarked_gba_change(tmp_path: Path
     assert remote.read_bytes() == b"changed-without-game-stop-marker"
 
 
-def test_selected_gba_game_stop_persists_canonical_dirty_domain_for_restart_quick_sync(
+def test_gba_game_stop_persists_canonical_dirty_domain_for_restart_quick_sync(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -2096,7 +2167,6 @@ def test_selected_gba_game_stop_persists_canonical_dirty_domain_for_restart_quic
         enabled=True,
         policy=DEFAULT_SAVE_SELECTION_POLICY,
         quiet_seconds=0,
-        selected_systems=("gba",),
     )
     local = tmp_path / "local/gba/Pokemon Emerald.srm"
     remote = tmp_path / "remote/gba/Pokemon Emerald.srm"

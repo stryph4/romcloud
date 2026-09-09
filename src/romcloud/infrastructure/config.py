@@ -151,6 +151,8 @@ class SourceConfig:
 
     ``None`` preserves the legacy behaviour of managing every detected
     system. An empty tuple explicitly selects no systems.
+    This ROM import/catalog selection does not filter SaveSync; save
+    eligibility is defined independently by the canonical SaveLayout registry.
     """
 
     @property

@@ -9,7 +9,7 @@ import time
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Collection, Optional, Protocol
+from typing import Callable, Optional, Protocol
 
 from romcloud.core.exceptions import (
     SaveSyncError,
@@ -78,22 +78,6 @@ def layout_ids_for_session(
         system=system,
         emulator=emulator,
         core=core,
-    )
-
-
-def selected_layout_ids_for_session(
-    policy: SaveSelectionPolicy,
-    system: str,
-    emulator: str = "",
-    core: str = "",
-    selected_systems: Optional[frozenset[str]] = None,
-) -> frozenset[str]:
-    """Resolve selected lifecycle scope through canonical SaveLayout metadata."""
-    return policy.selected_layout_ids_for_lifecycle(
-        system=system,
-        emulator=emulator,
-        core=core,
-        selected_systems=selected_systems,
     )
 
 
@@ -241,7 +225,6 @@ class AutoSaveSyncCoordinator:
         stability_checks: int = _DEFAULT_STABILITY_CHECKS,
         staging_retries: int = _DEFAULT_STAGING_RETRIES,
         enabled_check: Optional[Callable[[], bool]] = None,
-        selected_systems: Optional[Collection[str]] = None,
     ) -> None:
         self._service = service
         self._data_root = Path(data_root)
@@ -255,11 +238,6 @@ class AutoSaveSyncCoordinator:
         self._staging_retries = max(0, staging_retries)
         self._enabled = enabled
         self._enabled_check = enabled_check
-        self._selected_systems = (
-            None
-            if selected_systems is None
-            else frozenset(value.strip().casefold() for value in selected_systems)
-        )
         self._menu_state_path = self._data_root / "savesync-menu-pull.json"
 
     @correlated_operation("gameStart", subsystem="savesync", source="Auto gameStart")
@@ -299,16 +277,8 @@ class AutoSaveSyncCoordinator:
         )
 
     def game_stop_eligible(self, *, system: str, emulator: str, core: str) -> bool:
-        """Return whether a stop owns at least one selected automatic layout."""
-        return bool(
-            selected_layout_ids_for_session(
-                self._policy,
-                system,
-                emulator,
-                core,
-                self._selected_systems,
-            )
-        )
+        """Return whether a stop owns a code-supported automatic layout."""
+        return bool(layout_ids_for_session(self._policy, system, emulator, core))
 
     @correlated_operation(
         "Auto Quick Sync", subsystem="savesync", source="Auto gameStop"
@@ -325,16 +295,7 @@ class AutoSaveSyncCoordinator:
         if not self._enabled:
             log.info("gameStop conflict check skipped: Auto SaveSync disabled")
             return ()
-        resolved_layout_ids = layout_ids_for_session(
-            self._policy, system, emulator, core
-        )
-        layout_ids = selected_layout_ids_for_session(
-            self._policy,
-            system,
-            emulator,
-            core,
-            self._selected_systems,
-        )
+        layout_ids = layout_ids_for_session(self._policy, system, emulator, core)
         canonical_systems = tuple(
             sorted({self._policy.layout(value).system for value in layout_ids})
         )
@@ -348,11 +309,6 @@ class AutoSaveSyncCoordinator:
                 "emulator": emulator,
                 "core": core,
                 "rom": rom,
-                "selected_systems": (
-                    sorted(self._selected_systems)
-                    if self._selected_systems is not None
-                    else "all"
-                ),
                 "matched_layout_ids": sorted(layout_ids),
                 "canonical_systems": canonical_systems,
                 "reason": "eligible" if layout_ids else "ineligible",
@@ -369,31 +325,21 @@ class AutoSaveSyncCoordinator:
             log.info(
                 "gameStop SaveSync skipped: system=%s normalized_system=%s "
                 "emulator=%s core=%s resolved_layout_ids=%s "
-                "canonical_systems=%s selected_systems=%s reason=%s",
+                "canonical_systems=%s reason=no-supported-layout",
                 system,
                 system.strip().casefold() or "none",
                 emulator,
                 core,
-                ",".join(sorted(resolved_layout_ids)) or "none",
+                ",".join(sorted(layout_ids)) or "none",
                 ",".join(
                     sorted(
                         {
                             self._policy.layout(value).system
-                            for value in resolved_layout_ids
+                            for value in layout_ids
                         }
                     )
                 )
                 or "none",
-                (
-                    ",".join(sorted(self._selected_systems))
-                    if self._selected_systems is not None
-                    else "all"
-                ),
-                (
-                    "system-not-selected"
-                    if resolved_layout_ids and self._selected_systems is not None
-                    else "no-supported-layout"
-                ),
             )
             return ()
         # The progress popup is purely observational: it never owns or gates
@@ -410,14 +356,9 @@ class AutoSaveSyncCoordinator:
         )
         log.info(
             "gameStop SaveSync resolution: raw_system=%s normalized_system=%s "
-            "selected_systems=%s matched_layout_ids=%s canonical_systems=%s",
+            "matched_layout_ids=%s canonical_systems=%s",
             system,
             system.strip().casefold() or "none",
-            (
-                ",".join(sorted(self._selected_systems))
-                if self._selected_systems is not None
-                else "all"
-            ),
             ",".join(sorted(layout_ids)),
             ",".join(canonical_systems),
         )
