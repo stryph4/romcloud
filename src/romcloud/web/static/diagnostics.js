@@ -59,6 +59,14 @@
       return this.loadList();
     }
 
+    close() {
+      this.active = false;
+      $("diagnostics-main").classList.add("hidden");
+      $("library-main").classList.remove("hidden");
+      $("app-section-title").textContent = "Library Manager";
+      this.contentUpdated();
+    }
+
     showList() {
       $("diagnostics-list-view").classList.remove("hidden");
       $("diagnostics-detail-view").classList.add("hidden");
@@ -350,7 +358,10 @@
     back() {
       if (!$("diagnostics-group-view").classList.contains("hidden")) { this.closeGroup(); return true; }
       if (!$("diagnostics-detail-view").classList.contains("hidden")) { this.closeOperation(); return true; }
-      this.exitLocal();
+      // Remote paired browsers have no Open Here exit request; Back at the
+      // diagnostics top level simply returns to the Library view instead.
+      if (typeof this.exitLocal === "function") this.exitLocal();
+      else this.close();
       return true;
     }
 

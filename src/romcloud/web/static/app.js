@@ -155,6 +155,32 @@ function renderGames(games) {
 
 function actionButton(text, action, ids) { const button = el("button", "", text); button.addEventListener("click", () => runAction(action, ids, button)); return button; }
 
+function ensureDiagnosticsBrowser() {
+  if (diagnosticsBrowser) return diagnosticsBrowser;
+  diagnosticsBrowser = new window.ROMCloudDiagnostics.DiagnosticsBrowser({
+    api,
+    contentUpdated,
+    exitLocal: state.controllerFirst ? requestLocalExit : null,
+  });
+  return diagnosticsBrowser;
+}
+
+function setViewNav(diagnosticsActive) {
+  $("nav-library").classList.toggle("active", !diagnosticsActive);
+  $("nav-diagnostics").classList.toggle("active", diagnosticsActive);
+}
+
+async function openDiagnostics() {
+  if (diagnosticsBrowser && diagnosticsBrowser.active) return;
+  setViewNav(true);
+  await ensureDiagnosticsBrowser().open();
+}
+
+function showLibrary() {
+  if (diagnosticsBrowser && diagnosticsBrowser.active) diagnosticsBrowser.close();
+  setViewNav(false);
+}
+
 async function runAction(action, ids, button = null) {
   if (button) button.disabled = true;
   showNotice(`${title(action)} in progress…`);
@@ -353,14 +379,13 @@ window.addEventListener("romcloud:controller-status", (event) => {
   $("controller-menu-button").classList.toggle("hidden", !state.controllerFirst);
   buildOsk();
   state.token = tokenFromStorage();
+  $("nav-library").addEventListener("click", showLibrary);
+  $("nav-diagnostics").addEventListener("click", openDiagnostics);
   await connect(state.token || "");
-  if (state.controllerFirst && new URLSearchParams(location.search).get("view") === "diagnostics") {
-    diagnosticsBrowser = new window.ROMCloudDiagnostics.DiagnosticsBrowser({
-      api,
-      contentUpdated,
-      exitLocal: requestLocalExit,
-    });
-    await diagnosticsBrowser.open();
+  if (new URLSearchParams(location.search).get("view") === "diagnostics") {
+    await openDiagnostics();
+  } else {
+    setViewNav(false);
   }
 })();
 window.romcloudGamepad = window.ROMCloudController.startBrowserController(

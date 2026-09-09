@@ -53,6 +53,15 @@ def test_controller_assets_wire_all_required_inputs_and_focus_scopes() -> None:
     assert "romcloudGamepad.pushContext" in diagnostics
     assert "romcloudGamepad.popContext" in diagnostics
     assert 'get("view") === "diagnostics"' in app
+    # Shared LAN navigation between Library and Diagnostics (touch + controller).
+    assert 'id="nav-library"' in html and 'id="nav-diagnostics"' in html
+    assert 'data-controller-zone="global"' in html
+    assert "openDiagnostics" in app and "showLibrary" in app
+    assert '$("nav-library").addEventListener("click", showLibrary)' in app
+    assert '$("nav-diagnostics").addEventListener("click", openDiagnostics)' in app
+    assert "DiagnosticsBrowser" in app
+    assert "close()" in diagnostics
+    assert 'typeof this.exitLocal === "function"' in diagnostics
 
 
 def test_game_and_diagnostics_are_consumers_of_the_shared_browser_navigator() -> None:
@@ -68,6 +77,25 @@ def test_game_and_diagnostics_are_consumers_of_the_shared_browser_navigator() ->
     assert "keydown" not in diagnostics or "event.key === \"Enter\"" in diagnostics
     assert "scrollIntoView" in controller
     assert "RepeatButton" in controller
+
+
+def test_remote_navigation_and_diagnostics_reuse_single_manager_view() -> None:
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    app = (STATIC / "app.js").read_text(encoding="utf-8")
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+
+    # One shell hosts both views; navigation never reloads the page or server.
+    assert 'id="library-main"' in html and 'id="diagnostics-main"' in html
+    assert "location.assign" not in app and "location.href =" not in app
+    # Diagnostics opens for any authenticated session, not only controller-first.
+    assert 'get("view") === "diagnostics"' in app
+    assert 'state.controllerFirst && new URLSearchParams(location.search).get("view")' not in app
+    # Nav buttons are real buttons (mouse/touch) and controller focus targets.
+    assert html.index('id="nav-library"') < html.index('id="nav-diagnostics"')
+    assert 'classList.toggle("active"' in app
+    # Active-view affordance exists and both buttons share the header zone grid.
+    assert "header .icon-button.active" in css
+    assert html.count('data-controller-zone="global"') >= 3
 
 
 def test_browser_and_native_share_one_logical_action_contract() -> None:

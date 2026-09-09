@@ -38,6 +38,7 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .hidden { display: none !important; }
 
 header { position: sticky; top: 0; z-index: 4; display: flex; align-items: center; gap: 1rem; height: 76px; padding: 0 24px; border-bottom: 1px solid var(--border-subtle); background: rgba(3,7,20,.9); backdrop-filter: blur(14px); }
+header .icon-button.active { border-color: var(--accent); color: var(--accent); }
 .brand { display: flex; align-items: center; gap: .78rem; margin-right: auto; }
 .brand > span:last-child { display: flex; flex-direction: column; line-height: 1.15; }
 .brand b { font-size: 1.04rem; font-weight: 800; letter-spacing: .015em; }
@@ -212,6 +213,7 @@ code { color: #7aeafb; font-family: "Cascadia Mono","DejaVu Sans Mono",Consolas,
   .mode { max-width: 88px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .controller-status { display: none; }
   .icon-button { min-height: 36px; padding: .4rem; }
+  #trusted-devices { display: none; }
   .content-head { align-items: flex-end; }
   .content-head #download-pinned { font-size: .78rem; }
   .toolbar { grid-template-columns: 1fr; }

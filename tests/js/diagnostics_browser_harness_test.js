@@ -49,6 +49,21 @@
     window.testButton(5, false); window.testTick(80);
     assert(!exited, "child back leaked into top-level exit");
     navigator._disconnect(window.testPad);
+
+    // A remote (non-controller) session has no exitLocal: top-level back must
+    // return to the Library view instead of requesting an Open Here exit.
+    const remote = new window.ROMCloudDiagnostics.DiagnosticsBrowser({
+      api,
+      contentUpdated: () => window.dispatchEvent(new CustomEvent("romcloud:content-updated")),
+      exitLocal: null,
+    });
+    await remote.open();
+    assert(remote.active && !document.getElementById("diagnostics-main").classList.contains("hidden"), "remote diagnostics did not open");
+    remote.back();
+    assert(!remote.active, "remote back did not leave diagnostics");
+    assert(document.getElementById("diagnostics-main").classList.contains("hidden"), "remote back did not hide diagnostics");
+    assert(!document.getElementById("library-main").classList.contains("hidden"), "remote back did not restore library");
+    assert(document.getElementById("app-section-title").textContent === "Library Manager", "remote back did not restore section title");
     document.body.dataset.result = "passed";
     document.body.textContent = "diagnostics browser controller navigation passed";
   } catch (error) {

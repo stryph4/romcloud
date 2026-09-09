@@ -251,12 +251,10 @@ class ManagerRequestHandler(BaseHTTPRequestHandler):
                 query = {key: values[-1] for key, values in parse_qs(parsed.query).items()}
                 self._json(HTTPStatus.OK, self.server.manager.browse(**query))
             elif parsed.path == "/api/diagnostics":
-                if not self._trusted_local_request():
-                    self._json(
-                        HTTPStatus.FORBIDDEN,
-                        {"error": "Diagnostics are available only in the local Open Here session."},
-                    )
-                elif self.server.diagnostic_store is None:
+                # Reuses the standard authenticated boundary (paired session
+                # cookie, bearer token, or local Open Here); it is not
+                # loopback-only, so a paired phone/PC can open Diagnostics.
+                if self.server.diagnostic_store is None:
                     self._json(
                         HTTPStatus.SERVICE_UNAVAILABLE,
                         {"error": "Diagnostics database is unavailable; text logs remain active."},

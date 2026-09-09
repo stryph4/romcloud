@@ -1,7 +1,10 @@
 <!doctype html>
 <html><head><meta charset="utf-8"><title>Diagnostics controller harness</title></head>
 <body data-result="pending">
-  <span id="app-section-title"></span><main id="library-main"></main>
+  <span id="app-section-title"></span>
+  <button id="nav-library" data-controller-zone="global" data-controller-row="0" data-controller-col="0">Library</button>
+  <button id="nav-diagnostics" data-controller-zone="global" data-controller-row="0" data-controller-col="1">Diagnostics / Logs</button>
+  <main id="library-main"></main>
   <main id="diagnostics-main" class="hidden">
     <button id="diag-operations-tab" data-controller-zone="diagnostic-nav" data-controller-row="0">Operations</button>
     <button id="diag-events-tab" data-controller-zone="diagnostic-nav" data-controller-row="1">Events</button>
