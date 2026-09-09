@@ -105,6 +105,55 @@ def test_diagnostics_view_uses_same_blocking_controller_browser(tmp_path: Path, 
     assert calls == ["/api/auth/local-launch", "/api/local-session-status/diag"]
 
 
+def test_library_and_diagnostics_share_runtime_selection_and_launch_flags(
+    tmp_path: Path, monkeypatch
+) -> None:
+    selected = {
+        "path": "/userdata/system/add-ons/google-chrome/GoogleChrome.AppImage",
+        "source": "Batocera persistent add-on",
+        "ownership": "user-installed",
+        "compatible": True,
+    }
+    discoveries = []
+
+    def discover(**kwargs):
+        discoveries.append(kwargs["data_path"])
+        return {"browser": selected, "diagnostics": [selected]}
+
+    monkeypatch.setattr(lifecycle, "discover_local_browser", discover)
+    monkeypatch.setattr(
+        lifecycle, "manager_status",
+        lambda data_path: {"running": True, "local_url": "https://127.0.0.1:8765/"},
+    )
+    monkeypatch.setattr(
+        lifecycle, "_manager_request",
+        lambda *args, **kwargs: {"launch_id": ""},
+    )
+    monkeypatch.setattr(
+        "romcloud.web.tls.manager_certificate_spki_pin", lambda data_path: "pin"
+    )
+
+    class Process:
+        pid = 42
+        returncode = 0
+        def poll(self): return self.returncode
+
+    commands = []
+    for view in ("library", "diagnostics"):
+        lifecycle.launch_local_browser(
+            tmp_path / "data",
+            view=view,
+            popen=lambda argv, **kwargs: (commands.append(argv), Process())[1],
+            sleep=lambda _: None,
+        )
+
+    assert discoveries == [tmp_path / "data", tmp_path / "data"]
+    assert commands[0][0] == commands[1][0] == selected["path"]
+    assert commands[0][1:-1] == commands[1][1:-1]
+    assert commands[0][-1].endswith("?interaction=controller")
+    assert commands[1][-1].endswith("?interaction=controller&view=diagnostics")
+
+
 def test_known_batocera_appimage_is_capability_validated(tmp_path: Path) -> None:
     appimage = tmp_path / "GoogleChrome.AppImage"
     appimage.write_text("browser")
@@ -234,7 +283,44 @@ def test_browser_start_failure_is_persistently_logged_and_surfaced(
             sleep=lambda _: None,
         )
     log = tmp_path / "logs" / "browser-open.log"
-    assert "browser exited status=23" in log.read_text()
+    text = log.read_text()
+    assert "launch.failed" in text
+    assert '"exit_code":23' in text
+    assert '"browser_view":"library"' in text
+    assert '"launch_strategy":"shared-chromium-kiosk"' in text
+    assert '"server_ready":true' in text
+    assert '"process_ownership":"uidata-process-group"' in text
+
+
+def test_browser_launch_events_use_central_redaction_pipeline(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from romcloud.infrastructure import diagnostics
+
+    events = []
+    monkeypatch.setattr(
+        diagnostics,
+        "event",
+        lambda *args, **kwargs: events.append((args, kwargs)) or True,
+    )
+
+    log_path = tmp_path / "browser-open.log"
+    lifecycle._record_browser_launch(
+        log_path,
+        "launch.failed",
+        "password=hunter2",
+        level="ERROR",
+        browser_view="diagnostics",
+        status="failed",
+        detail="access_token=abc123",
+    )
+
+    text = log_path.read_text()
+    assert "hunter2" not in text
+    assert "abc123" not in text
+    assert text.count("[REDACTED]") == 2
+    assert events[0][0][:2] == ("browser-launch", "launch.failed")
+    assert events[0][1]["metadata"]["browser_view"] == "diagnostics"
 
 
 def test_root_sandbox_refusal_requires_explicit_user_browser_opt_in(

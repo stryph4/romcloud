@@ -274,16 +274,14 @@ def test_savesync_upload_noop_download_and_conflict_chains(tmp_path: Path) -> No
 
 
 def test_graphical_maintenance_exposes_operation_summary() -> None:
-    from ports_gfx.app import MENU_CATEGORIES, _OPERATIONS, format_result
+    from ports_gfx.app import DIAGNOSTICS_ACTION, MENU_CATEGORIES, _OPERATIONS, format_result
     from ports_gfx.client import BackendResult
 
     assert any(
-        item.action == "diagnostics" and item.label == "Diagnostics / Logs"
+        item.action == DIAGNOSTICS_ACTION and item.label == "Diagnostics / Logs"
         for item in MENU_CATEGORIES["Maintenance"]
     )
-    assert _OPERATIONS["diagnostics"].args == (
-        "uidata", "manager-open-local", "--view", "diagnostics"
-    )
+    assert DIAGNOSTICS_ACTION not in _OPERATIONS
     rendered = format_result(
         "diagnostics",
         BackendResult(

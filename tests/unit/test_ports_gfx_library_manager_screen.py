@@ -4,7 +4,9 @@ import json
 
 from ports_gfx.actions import Action
 from ports_gfx.app import (
+    DIAGNOSTICS_ACTION,
     LIBRARY_MANAGER_ACTION,
+    _start_local_browser_screen,
     _handle_library_manager_event,
     _library_manager_body_lines,
     menu_categories_for_state,
@@ -144,6 +146,64 @@ def test_sandbox_refusal_offers_explicit_controller_selectable_fallback() -> Non
     _drain(state)
     assert calls[-1][-1] == "--allow-no-sandbox"
     assert state.step == READY
+
+
+def test_diagnostics_reuses_library_browser_launch_and_sandbox_fallback() -> None:
+    calls = []
+
+    def popen(argv, **kwargs):
+        calls.append(argv)
+        if "--allow-no-sandbox" in argv:
+            return _Process({"ok": True, "closed": True})
+        return _Process(
+            {
+                "ok": False,
+                "error": (
+                    "The user-installed Chrome runtime refused to run as root. "
+                    "This removes Chromium process isolation."
+                ),
+            }
+        )
+
+    state = LibraryManagerScreenState(
+        "romcloud", view="diagnostics", popen=popen
+    )
+    state.open_local()
+    _drain(state)
+
+    assert calls[0] == [
+        "romcloud", "uidata", "manager-open-local", "--view", "diagnostics"
+    ]
+    assert state.title == "Diagnostics / Logs"
+    assert state.actions == ("Open Here Without Sandbox",)
+
+    state.activate()
+    _drain(state)
+    assert calls[1] == [
+        "romcloud", "uidata", "manager-open-local", "--allow-no-sandbox",
+        "--view", "diagnostics",
+    ]
+    assert state.step == READY
+    assert "Diagnostics browser closed" in " ".join(_library_manager_body_lines(state))
+
+
+def test_maintenance_diagnostics_action_routes_to_shared_browser_screen() -> None:
+    calls = []
+
+    state = _start_local_browser_screen(
+        DIAGNOSTICS_ACTION,
+        "romcloud",
+        popen=lambda argv, **kwargs: (
+            calls.append(argv), _Process({"ok": True, "closed": True})
+        )[1],
+    )
+    _drain(state)
+
+    assert isinstance(state, LibraryManagerScreenState)
+    assert state.is_diagnostics
+    assert calls == [[
+        "romcloud", "uidata", "manager-open-local", "--view", "diagnostics"
+    ]]
 
 
 def test_pair_action_displays_short_code_and_stable_url() -> None:

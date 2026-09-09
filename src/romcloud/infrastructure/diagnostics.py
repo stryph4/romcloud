@@ -129,6 +129,11 @@ SAFE_METADATA_KEYS = frozenset(
         "examined",
         "current_hash", "desired_hash", "previous_hash", "size_bytes", "detail",
         "event",
+        "arguments", "browser_pid", "browser_view", "display", "exit_code",
+        "fallback_attempted", "home", "launch_strategy", "runtime_source",
+        "process_ownership", "profile_directory", "runtime_type", "sandbox_enabled",
+        "server_ready", "url",
+        "wayland_display", "working_directory", "xauthority", "xdg_runtime_dir",
     }
 )
 _SECRET_KEY = re.compile(
@@ -137,7 +142,7 @@ _SECRET_KEY = re.compile(
 )
 _SECRET_VALUE = re.compile(
     r"(?:bearer\s+[A-Za-z0-9._~+/=-]+|-----BEGIN [A-Z ]*PRIVATE KEY-----|"
-    r"(?:access|refresh)[_-]?token\s*[:=])", re.I
+    r"(?:access|refresh)[_-]?token\s*[:=]\s*[^\s,;]+)", re.I
 )
 _SECRET_ASSIGNMENT = re.compile(
     r"(?i)\b(password|passphrase|secret|access[_-]?token|refresh[_-]?token|"

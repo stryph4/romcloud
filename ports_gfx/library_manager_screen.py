@@ -1,4 +1,4 @@
-"""Native presentation state for the existing browser Library Manager."""
+"""Shared native presentation state for ROMCloud's local browser views."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ PopenFunc = Callable[..., object]
 @dataclass
 class LibraryManagerScreenState:
     romcloud_bin: str
+    view: str = "library"
     step: str = STARTING
     details: dict[str, Any] = field(default_factory=dict)
     error: str = ""
@@ -26,6 +27,18 @@ class LibraryManagerScreenState:
     selected_index: int = 0
     operation: str = "start"
     _runner: Optional[OperationRunner] = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.view not in {"library", "diagnostics"}:
+            raise ValueError(f"Unsupported local browser view: {self.view}")
+
+    @property
+    def is_diagnostics(self) -> bool:
+        return self.view == "diagnostics"
+
+    @property
+    def title(self) -> str:
+        return "Diagnostics / Logs" if self.is_diagnostics else "Library Manager"
 
     def start_or_refresh(self) -> None:
         self.cancel_pending()
@@ -40,6 +53,12 @@ class LibraryManagerScreenState:
 
     @property
     def actions(self) -> tuple[str, ...]:
+        if self.is_diagnostics:
+            return (
+                "Open Here Without Sandbox"
+                if self.requires_no_sandbox
+                else "Open Diagnostics",
+            )
         if self.requires_no_sandbox:
             return (
                 "Open Here Without Sandbox",
@@ -57,19 +76,8 @@ class LibraryManagerScreenState:
 
     def activate(self) -> None:
         action = self.actions[self.selected_index]
-        if action in ("Open Here", "Open Here Without Sandbox"):
-            self.cancel_pending()
-            self.operation = "open"
-            self.step = OPENING
-            self.error = ""
-            self._runner = start_backend_operation(
-                self.romcloud_bin,
-                "manager-open-local",
-                extra_args=("--allow-no-sandbox",)
-                if action == "Open Here Without Sandbox"
-                else (),
-                popen=self.popen,
-            )
+        if action in ("Open Here", "Open Here Without Sandbox", "Open Diagnostics"):
+            self.open_local(allow_no_sandbox=action == "Open Here Without Sandbox")
         elif action == "Pair Another Device":
             self.cancel_pending()
             self.operation = "pair"
@@ -81,6 +89,24 @@ class LibraryManagerScreenState:
         else:
             self.operation = "start"
             self.start_or_refresh()
+
+    def open_local(self, *, allow_no_sandbox: bool = False) -> None:
+        """Use the one local-browser command for every graphical browser view."""
+        self.cancel_pending()
+        self.operation = "open"
+        self.step = OPENING
+        self.error = ""
+        extra_args = []
+        if allow_no_sandbox:
+            extra_args.append("--allow-no-sandbox")
+        if self.is_diagnostics:
+            extra_args.extend(("--view", "diagnostics"))
+        self._runner = start_backend_operation(
+            self.romcloud_bin,
+            "manager-open-local",
+            extra_args=tuple(extra_args),
+            popen=self.popen,
+        )
 
     def poll(self) -> list:
         if self._runner is None:

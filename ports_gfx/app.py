@@ -144,6 +144,7 @@ SETUP_ACTION = "setup"
 LIBRARY_QUICK_SYNC_ACTION = "library-sync-quick"
 LIBRARY_FULL_SYNC_ACTION = "library-sync-full"
 LIBRARY_MANAGER_ACTION = "library-manager"
+DIAGNOSTICS_ACTION = "diagnostics"
 SELECT_SYSTEMS_ACTION = "select-systems"
 STARTUP_RESTART_SCREEN = "startup-restart"
 MODE_SAVE_CONFLICT_SCREEN = "mode-save-conflict"
@@ -173,7 +174,7 @@ MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
     "Maintenance": (
         MenuItem(
             "Diagnostics / Logs",
-            "diagnostics",
+            DIAGNOSTICS_ACTION,
             "Open the controller-friendly retained diagnostics browser.",
         ),
         MenuItem("Check for Updates", "update-check"),
@@ -386,10 +387,6 @@ _OPERATIONS: dict[str, OperationSpec] = {
     "browser-runtime-status": OperationSpec(
         title="Local Browser Runtime", args=("uidata", "browser-runtime-status")
     ),
-    "diagnostics": OperationSpec(
-        title="Diagnostics / Logs",
-        args=("uidata", "manager-open-local", "--view", "diagnostics"),
-    ),
 }
 _MODE_TRANSITION_ACTIONS = frozenset(
     {"library-connected", "library-cache", "library-offline"}
@@ -570,6 +567,24 @@ def start_operation(action: str, romcloud_bin: str, *, popen=None) -> OperationS
         arms_gui_relaunch=spec.arms_gui_relaunch,
         exits_after_mode_change=spec.exits_after_mode_change,
     )
+
+
+def _start_local_browser_screen(
+    action: str, romcloud_bin: str, *, popen=None  # noqa: ANN001
+) -> LibraryManagerScreenState:
+    """Route every local view through the hardware-proven browser screen state."""
+    if action not in (LIBRARY_MANAGER_ACTION, DIAGNOSTICS_ACTION):
+        raise ValueError(f"Unsupported local browser action: {action}")
+    screen = LibraryManagerScreenState(
+        romcloud_bin=romcloud_bin,
+        view="diagnostics" if action == DIAGNOSTICS_ACTION else "library",
+        popen=popen,
+    )
+    if screen.is_diagnostics:
+        screen.open_local()
+    else:
+        screen.start_or_refresh()
+    return screen
 
 
 def start_remote_wins_operation(
@@ -1224,12 +1239,11 @@ def _run(  # noqa: ANN001
                         current_screen = "savesync"
                     elif (
                         ievent.action == Action.CONFIRM
-                        and item.action == LIBRARY_MANAGER_ACTION
+                        and item.action in (LIBRARY_MANAGER_ACTION, DIAGNOSTICS_ACTION)
                     ):
-                        library_manager_screen = LibraryManagerScreenState(
-                            romcloud_bin=romcloud_bin
+                        library_manager_screen = _start_local_browser_screen(
+                            item.action, romcloud_bin
                         )
-                        library_manager_screen.start_or_refresh()
                         current_screen = "library_manager"
                     elif (
                         ievent.action == Action.CONFIRM
@@ -1970,7 +1984,7 @@ def mode_save_conflict_from_operation(
 def _library_manager_body_lines(screen: LibraryManagerScreenState) -> list[str]:
     if screen.step == "opening":
         return [
-            "Opening the local Library Browser in fullscreen mode…",
+            f"Opening the local {screen.title} browser in fullscreen mode…",
             "Press Back/Exit in the browser to return to ROMCloud.",
         ]
     if screen.step == "starting":
@@ -1993,6 +2007,16 @@ def _library_manager_body_lines(screen: LibraryManagerScreenState) -> list[str]:
             for index, action in enumerate(screen.actions)
         ]))
         return lines
+    if screen.is_diagnostics:
+        return [
+            "Diagnostics browser closed.",
+            "No background browser process was left running.",
+            "",
+            *[
+                ("> " if index == screen.selected_index else "  ") + action
+                for index, action in enumerate(screen.actions)
+            ],
+        ]
     lines = [
         "State: Running",
         "",
@@ -2764,7 +2788,7 @@ def _render_library_manager(  # noqa: ANN001
     state: LibraryManagerScreenState,
 ) -> None:
     screen_surface.fill(_BG_COLOR)
-    title = fonts["title"].render("Library Manager", True, _FG_COLOR)
+    title = fonts["title"].render(state.title, True, _FG_COLOR)
     screen_surface.blit(title, (layout.header_rect.x, layout.header_rect.y))
 
     y = layout.navigation_rect.y
