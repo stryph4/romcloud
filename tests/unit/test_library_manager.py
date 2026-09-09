@@ -333,6 +333,51 @@ def test_local_diagnostics_api_is_paginated_filterable_and_structured(
         thread.join(timeout=2)
 
 
+def test_local_diagnostics_reuses_active_store_without_reinitializing(
+    db, game_repo, cache_repo, cache_service, tmp_path, monkeypatch
+):
+    from romcloud.infrastructure import diagnostics
+
+    diagnostic_path = tmp_path / "diagnostics.db"
+    store = diagnostics.configure_diagnostics(diagnostic_path)
+    assert store is not None
+    assert store.write(
+        level="INFO", subsystem="hardware", event_code="store.active",
+        message="Active diagnostics remain queryable",
+    )
+
+    def unexpected_initialize(_self):
+        raise AssertionError("the manager must not initialize the active store again")
+
+    monkeypatch.setattr(type(store), "initialize", unexpected_initialize)
+    server = ManagerHTTPServer(
+        ("127.0.0.1", 0),
+        _manager(db, game_repo, cache_repo, cache_service),
+        "secret",
+        diagnostics_path=diagnostic_path,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        with urllib.request.urlopen(
+            f"{base}/api/diagnostics?kind=events&subsystem=hardware",
+            timeout=2,
+        ) as response:
+            payload = json.load(response)
+        assert payload["events"][0]["event_code"] == "store.active"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert store.available
+    assert store.write(
+        level="INFO", subsystem="hardware", event_code="server.closed",
+        message="The logging owner still owns the shared store",
+    )
+
+
 def test_real_browser_loads_authenticated_manager_app(
     db, game_repo, cache_repo, cache_service, tmp_path
 ):

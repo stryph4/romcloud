@@ -21,7 +21,11 @@ from urllib.parse import parse_qs, urlparse
 from romcloud.core.exceptions import ROMCloudError
 from romcloud.infrastructure.logging import get_logger
 from romcloud.infrastructure.diagnostics import event as diagnostic_event
-from romcloud.infrastructure.diagnostics import DiagnosticQuery, DiagnosticStore
+from romcloud.infrastructure.diagnostics import (
+    DiagnosticQuery,
+    DiagnosticStore,
+    active_store,
+)
 from romcloud.services.library_manager import LibraryManagerService
 from romcloud.web.auth import (
     REMEMBER_90_DAYS_SECONDS,
@@ -193,20 +197,32 @@ class ManagerHTTPServer(ThreadingHTTPServer):
             if controller_log_path is not None
             else None
         )
-        diagnostic_store = DiagnosticStore(diagnostics_path) if diagnostics_path else None
+        diagnostic_store = None
+        self._owns_diagnostic_store = False
+        current_store = active_store()
+        if (
+            diagnostics_path is not None
+            and current_store is not None
+            and current_store.available
+            and current_store.path.resolve() == Path(diagnostics_path).resolve()
+        ):
+            diagnostic_store = current_store
+        elif diagnostics_path is not None:
+            candidate = DiagnosticStore(diagnostics_path)
+            if candidate.initialize():
+                diagnostic_store = candidate
+                self._owns_diagnostic_store = True
         self.diagnostic_store = (
-            diagnostic_store
-            if diagnostic_store is not None and diagnostic_store.initialize()
-            else None
+            diagnostic_store if diagnostic_store is not None else None
         )
         self.mutation_lock = threading.RLock()
         self.jobs = JobRegistry(manager, self.mutation_lock)
         super().__init__(address, ManagerRequestHandler)
 
     def server_close(self) -> None:
-        if self.diagnostic_store is not None:
+        if self.diagnostic_store is not None and self._owns_diagnostic_store:
             self.diagnostic_store.close()
-            self.diagnostic_store = None
+        self.diagnostic_store = None
         super().server_close()
 
 

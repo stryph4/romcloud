@@ -237,6 +237,11 @@ class DiagnosticStore:
         self._writes = 0
         self._disabled = False
 
+    @property
+    def available(self) -> bool:
+        """Whether this initialized store remains available to local consumers."""
+        return not self._disabled and self._connection is not None
+
     def _connect(self) -> sqlite3.Connection:
         pid = os.getpid()
         if self._connection is not None and self._connection_pid == pid:
