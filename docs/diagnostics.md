@@ -66,12 +66,25 @@ foreground child of the Ports process, so EmulationStation does not resume
 under the controller session.
 
 SaveSync uses event codes including `operation.started`, `operation.stage`,
-`group.classified`, `dirty_marker.created`, `reconciliation.decision`,
+`session.created`, `session.stopped`, `local_observation.completed`,
+`local_observation.failed`, `group.classified`, `dirty_marker.created`,
+`dirty_marker.skipped`, `dirty_state.committed`, `reconciliation.decision`,
 `physical_mutation.before`, `physical_mutation.after`, `journal.committed`,
 `baseline.advanced`, `cursor.advanced`, `worker.busy`, `operation.result`,
 `operation.completed`, and `operation.failed`. Destructive/replacement audit
 records include the exact physical path, logical group, before/after hashes,
 transaction/root identity, decision source, and reason, but never file bytes.
+
+Batocera game-stop troubleshooting begins in
+`<romcloud-home>/logs/auto-savesync-lifecycle.log`. Each stop receives an
+operation ID shared with its structured SaveSync events. The lifecycle log
+records the raw hook arguments, handoff, popup reporter availability, command
+result, and hook return. The structured chain then records the session marker,
+resolved layouts, each bounded scoped observation (up to 100 canonical and
+physical paths, sizes, `mtime_ns` values, and content hashes), ownership groups, dirty state before
+and after persistence, pending Quick Sync candidates, exclusions, and any
+journal/cursor early-return reason. This distinguishes a missing hook from a
+late save write or a rejected/empty candidate scope without logging save data.
 
 Diagnostic support-bundle export is intentionally deferred: safe snapshot and
 configuration allowlisting need a dedicated UI flow. The database/viewer is

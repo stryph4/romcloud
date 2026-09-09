@@ -1890,6 +1890,139 @@ def test_gba_game_stop_uploads_and_periodic_quick_sync_repairs_materialization(
     assert service.quick_sync().status == "unchanged"
 
 
+def test_gba_game_stop_treats_new_group_as_change_against_full_sync_baseline(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """A scoped gameStop scan must not discard an authoritative addition
+    merely because its filesystem mtime predates the lifecycle session."""
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = AutoSaveSyncCoordinator(
+        service,
+        data_root=tmp_path / "data",
+        enabled=True,
+        policy=DEFAULT_SAVE_SELECTION_POLICY,
+        quiet_seconds=0,
+        selected_systems=("gba",),
+    )
+    service.full_sync()
+    local = tmp_path / "local/gba/Pokemon Emerald.srm"
+    remote = tmp_path / "remote/gba/Pokemon Emerald.srm"
+    _write(local, b"new-save-with-preserved-mtime")
+    old_timestamp = time.time() - 3600
+    os.utime(local, (old_timestamp, old_timestamp))
+
+    scanned_layouts: list[frozenset[str]] = []
+    original_scan = service._scan_local_layouts
+
+    def record_scoped_scan(layout_ids):
+        scanned_layouts.append(layout_ids)
+        return original_scan(layout_ids)
+
+    monkeypatch.setattr(service, "_scan_local_layouts", record_scoped_scan)
+    monkeypatch.setattr(
+        service,
+        "_scan_local",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("gameStop performed an all-layout local scan")
+        ),
+    )
+    dirty_at_quick = []
+    quick_results = []
+    original_quick = service.quick_sync
+
+    def capture_dirty_then_quick(**kwargs):
+        dirty_at_quick.extend(
+            group
+            for group in service.get_state().groups
+            if group.dirty_path_hints
+        )
+        result = original_quick(**kwargs)
+        quick_results.append(result)
+        return result
+
+    monkeypatch.setattr(service, "quick_sync", capture_dirty_then_quick)
+
+    coordinator.game_stop(
+        system="gba",
+        emulator="libretro",
+        core="mgba",
+        rom="Pokemon Emerald.gba",
+    )
+
+    assert scanned_layouts
+    assert all(
+        layouts == frozenset({"retroarch-root-gba"})
+        for layouts in scanned_layouts
+    )
+    assert [group.group_id for group in dirty_at_quick] == [
+        "retroarch-root-gba/pokemon emerald"
+    ]
+    assert quick_results[0].processed_groups == (
+        "retroarch-root-gba/pokemon emerald",
+    )
+    assert remote.read_bytes() == b"new-save-with-preserved-mtime"
+
+
+def test_gba_game_stop_observes_late_sram_flush_within_bounded_settle_window(
+    tmp_path: Path,
+    caplog,
+):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = AutoSaveSyncCoordinator(
+        service,
+        data_root=tmp_path / "data",
+        enabled=True,
+        policy=DEFAULT_SAVE_SELECTION_POLICY,
+        quiet_seconds=0.05,
+        stability_checks=4,
+        selected_systems=("gba",),
+    )
+    local = tmp_path / "local/gba/Pokemon Emerald.srm"
+    remote = tmp_path / "remote/gba/Pokemon Emerald.srm"
+    _write(local, b"baseline")
+    service.full_sync()
+    coordinator.game_start(
+        system="gba", emulator="libretro", core="mgba", rom="Pokemon Emerald.gba"
+    )
+
+    def delayed_sram_flush() -> None:
+        time.sleep(0.02)
+        local.write_bytes(b"post-hook-final-save")
+
+    writer = threading.Thread(target=delayed_sram_flush)
+    writer.start()
+    try:
+        with caplog.at_level("INFO"):
+            coordinator.game_stop(
+                system="gba",
+                emulator="libretro",
+                core="mgba",
+                rom="Pokemon Emerald.gba",
+            )
+    finally:
+        writer.join(timeout=5)
+
+    assert not writer.is_alive()
+    assert remote.read_bytes() == b"post-hook-final-save"
+    assert "Scoped local save observation: attempt=1" in caplog.text
+    assert "matches_previous=False" in caplog.text
+    assert "matches_previous=True" in caplog.text
+    assert '"canonical_path":"gba/Pokemon Emerald.srm"' in caplog.text
+    assert '"mtime_ns":' in caplog.text
+    assert "post-hook-final-save" not in caplog.text
+
+
+def test_hook_logs_raw_gba_argv_with_shared_diagnostic_operation_id():
+    content = hook_content(Path("/userdata/system/romcloud/bin/romcloud"))
+
+    assert 'ROMCLOUD_DIAGNOSTIC_OPERATION_ID="game-stop-$$-$(date +%s)"' in content
+    assert 'event="game_stop_argv"' in content
+    assert 'system=%q emulator=%q core=%q rom=%q' in content
+
+
 def test_manual_quick_sync_is_hint_driven_for_unmarked_gba_change(tmp_path: Path):
     provider = _Provider()
     service = _service(tmp_path, provider)

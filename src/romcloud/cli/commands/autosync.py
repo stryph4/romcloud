@@ -18,7 +18,7 @@ from romcloud.infrastructure.library_view import operating_mode
 from romcloud.infrastructure.logging import get_logger
 from romcloud.integrations.batocera import auto_savesync as batocera_auto_savesync
 from romcloud.services.auto_savesync import ActiveSessionStore, AutoSaveSyncCoordinator
-from romcloud.ui.savesync_progress import start_savesync_progress
+from romcloud.ui.savesync_progress import NullSaveSyncProgress, start_savesync_progress
 
 log = get_logger("auto-savesync-cli")
 
@@ -265,6 +265,20 @@ def game_stop(
     # never affect the synchronous SaveSync work below (see
     # NullSaveSyncProgress / SaveSyncProgressReporter).
     progress = start_savesync_progress(launcher)
+    log.info(
+        "gameStop progress reporter initialized: launcher=%s launcher_exists=%s "
+        "reporter=%s operation_id=%s",
+        launcher,
+        launcher.is_file(),
+        type(progress).__name__,
+        os.environ.get("ROMCLOUD_DIAGNOSTIC_OPERATION_ID", "none"),
+    )
+    if isinstance(progress, NullSaveSyncProgress):
+        log.warning(
+            "gameStop progress popup unavailable: launcher=%s launcher_exists=%s",
+            launcher,
+            launcher.is_file(),
+        )
     try:
         quick_sync_started = time.monotonic()
         log.info("gameStop Quick Sync started: worker_pid=%d", worker_pid)

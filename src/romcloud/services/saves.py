@@ -492,6 +492,10 @@ class SaveSyncService:
                 else dict(observed)
             )
             baseline = self._automatic_baseline(state)
+            authoritative_baseline = (
+                state.quick_sync_ready
+                and state.quick_sync_cursor_generation is not None
+            )
             known_groups = {group.group_id for group in state.groups}
             paths_by_group: dict[str, set[str]] = {}
             descriptors = {}
@@ -534,6 +538,15 @@ class SaveSyncService:
                         if changed
                         else "manifest-matches-baseline"
                     )
+                elif authoritative_baseline:
+                    # A completed Full Sync observed this approved layout and
+                    # established that this ownership group did not exist.
+                    # Its presence now is therefore an authoritative addition,
+                    # regardless of mtime. Emulator copies/atomic replacements
+                    # may preserve old timestamps; using the session window here
+                    # would silently discard a real change that Full Sync finds.
+                    changed = bool(local_group)
+                    reason = "new-group-absent-from-full-sync-baseline"
                 else:
                     changed = any(
                         _mtime_at_or_after(
@@ -611,6 +624,22 @@ class SaveSyncService:
                 )
             if next_state != state:
                 _write_state(self._state_path, next_state)
+            if changed_groups == 0:
+                diagnostic_event(
+                    "savesync",
+                    "dirty_marker.skipped",
+                    "Local discovery created no dirty marker",
+                    metadata={
+                        "layout_ids": sorted(allowed_layouts),
+                        "candidate_groups": len(paths_by_group),
+                        "observed_artifacts": len(current),
+                        "reason": (
+                            "no-supported-ownership-groups-observed"
+                            if not paths_by_group
+                            else "all-observed-groups-match-baseline"
+                        ),
+                    },
+                )
             log.info(
                 "SaveSync local discovery complete: candidate_groups=%d "
                 "changed_groups=%d unchanged_groups=%d durable_dirty_state_updated=%s",
@@ -680,6 +709,44 @@ class SaveSyncService:
         if not allowed_layouts:
             return {}
         return dict(self._scan_local_layouts(allowed_layouts).artifacts)
+
+    def describe_local_observation(
+        self, observed: dict[str, SaveArtifact]
+    ) -> tuple[dict[str, object], ...]:
+        """Return safe metadata for a scoped lifecycle observation.
+
+        This is diagnostic-only: paths have already passed the canonical
+        SaveSync registry and were opened by the scanner.  Save contents are
+        never returned.  A stat race is represented explicitly instead of
+        affecting discovery or reconciliation.
+        """
+        details: list[dict[str, object]] = []
+        for canonical_path, artifact in sorted(observed.items())[:100]:
+            item: dict[str, object] = {
+                "canonical_path": canonical_path,
+                "size_bytes": artifact.size_bytes,
+                "content_hash": artifact.content_hash,
+            }
+            try:
+                physical = self._local_path(canonical_path)
+                status = physical.stat()
+            except (OSError, SaveSyncVerificationError) as exc:
+                item.update(
+                    {
+                        "physical_path": "unavailable",
+                        "mtime_ns": None,
+                        "stat_error": type(exc).__name__,
+                    }
+                )
+            else:
+                item.update(
+                    {
+                        "physical_path": str(physical),
+                        "mtime_ns": status.st_mtime_ns,
+                    }
+                )
+            details.append(item)
+        return tuple(details)
 
     def acknowledge_conflict(self, conflict_id: str) -> SaveSyncState:
         """Record Review-Later acknowledgement without resolving a conflict."""
@@ -1871,10 +1938,29 @@ class SaveSyncService:
                     or bool(group.dirty_path_hints)
                 )
             ).union(materialization_groups)
+            excluded_pending_groups = tuple(
+                sorted(
+                    group.group_id
+                    for group in state.groups
+                    if (
+                        group.condition
+                        in {
+                            SaveGroupCondition.LOCAL_DIRTY,
+                            SaveGroupCondition.REMOTE_DIRTY,
+                        }
+                        or bool(group.dirty_path_hints)
+                    )
+                    and (
+                        group.layout_id in excluded_layouts
+                        or not self._layout_enabled(group.layout_id)
+                    )
+                )
+            )
             log.info(
                 "Quick SaveSync preflight: quick_ready=%s cursor=%s "
                 "baseline_artifacts=%d tracked_groups=%d pending_groups=%d "
-                "materialization_groups=%d excluded_layouts=%d pending_group_ids=%s",
+                "materialization_groups=%d excluded_layouts=%d pending_group_ids=%s "
+                "excluded_pending_group_ids=%s",
                 state.quick_sync_ready,
                 cursor if cursor is not None else "none",
                 len(self._automatic_baseline(state)),
@@ -1883,6 +1969,7 @@ class SaveSyncService:
                 len(materialization_groups),
                 len(excluded_layouts),
                 ",".join(sorted(pending_groups)) or "none",
+                ",".join(excluded_pending_groups) or "none",
             )
             if not state.quick_sync_ready or cursor is None:
                 return SaveQuickSyncResult(

@@ -266,7 +266,37 @@ class AutoSaveSyncCoordinator:
     def game_start(self, *, system: str, emulator: str, core: str, rom: str) -> None:
         if not self._enabled:
             return
-        self._sessions.start(system=system, emulator=emulator, core=core, rom=rom)
+        session = self._sessions.start(
+            system=system, emulator=emulator, core=core, rom=rom
+        )
+        session_path = self._sessions._path(system, rom)
+        log.info(
+            "gameStart session recorded: system=%s emulator=%s core=%s rom=%s "
+            "session_id=%s session_path=%s started_at=%.6f boot_id=%s",
+            system,
+            emulator,
+            core,
+            rom,
+            session_path.stem,
+            session_path,
+            session.started_at,
+            session.boot_id,
+        )
+        diagnostic_event(
+            "savesync",
+            "session.created",
+            "gameStart session recorded",
+            metadata={
+                "raw_system": system,
+                "emulator": emulator,
+                "core": core,
+                "rom": rom,
+                "session_id": session_path.stem,
+                "session_path": str(session_path),
+                "started_at": session.started_at,
+                "boot_id": session.boot_id,
+            },
+        )
 
     def game_stop_eligible(self, *, system: str, emulator: str, core: str) -> bool:
         """Return whether a stop owns at least one selected automatic layout."""
@@ -304,6 +334,29 @@ class AutoSaveSyncCoordinator:
             emulator,
             core,
             self._selected_systems,
+        )
+        canonical_systems = tuple(
+            sorted({self._policy.layout(value).system for value in layout_ids})
+        )
+        diagnostic_event(
+            "savesync",
+            "lifecycle.resolved",
+            "gameStop lifecycle identity resolved",
+            metadata={
+                "raw_system": system,
+                "normalized_system": system.strip().casefold(),
+                "emulator": emulator,
+                "core": core,
+                "rom": rom,
+                "selected_systems": (
+                    sorted(self._selected_systems)
+                    if self._selected_systems is not None
+                    else "all"
+                ),
+                "matched_layout_ids": sorted(layout_ids),
+                "canonical_systems": canonical_systems,
+                "reason": "eligible" if layout_ids else "ineligible",
+            },
         )
         if not self.game_stop_eligible(
             system=system, emulator=emulator, core=core
@@ -366,9 +419,7 @@ class AutoSaveSyncCoordinator:
                 else "all"
             ),
             ",".join(sorted(layout_ids)),
-            ",".join(
-                sorted({self._policy.layout(value).system for value in layout_ids})
-            ),
+            ",".join(canonical_systems),
         )
         log.info(
             "gameStop conflict check started: system=%s emulator=%s core=%s",
@@ -404,6 +455,7 @@ class AutoSaveSyncCoordinator:
         layout_ids: frozenset[str],
     ) -> tuple[str, ...]:
         settled: Optional[_SettledObservation] = None
+        stopped_at = time.time()
         with stage_timer("scope"):
             session = self._sessions.stop(system=system, rom=rom)
         log.info(
@@ -415,6 +467,30 @@ class AutoSaveSyncCoordinator:
             len(layout_ids),
             ",".join(sorted(layout_ids)) or "none",
             "present" if session is not None else "missing",
+        )
+        diagnostic_event(
+            "savesync",
+            "session.stopped",
+            "gameStop session marker retired",
+            metadata={
+                "raw_system": system,
+                "emulator": emulator,
+                "core": core,
+                "rom": rom,
+                "session_id": self._sessions._path(system, rom).stem,
+                "session_path": str(self._sessions._path(system, rom)),
+                "session_record": "present" if session is not None else "missing",
+                "session_started_at": (
+                    session.started_at if session is not None else None
+                ),
+                "game_stop_at": stopped_at,
+                "session_duration_seconds": (
+                    max(0.0, stopped_at - session.started_at)
+                    if session is not None
+                    else None
+                ),
+                "layout_ids": sorted(layout_ids),
+            },
         )
         if layout_ids:
             progress.stage("Waiting for save data to settle…")
@@ -463,10 +539,43 @@ class AutoSaveSyncCoordinator:
                 ",".join(sorted(layout_ids)),
             )
             with stage_timer("discovery"):
-                self._service.detect_and_mark_local_changes(
+                state_before = self._service.get_state()
+                dirty_before = _local_dirty_group_ids(state_before)
+                ownership_groups = _ownership_groups(
+                    settled.manifest, self._policy
+                )
+                state_after = self._service.detect_and_mark_local_changes(
                     layout_ids,
                     changed_since=changed_since,
                     observed=settled.manifest,
+                )
+                dirty_after = _local_dirty_group_ids(state_after)
+                log.info(
+                    "gameStop dirty-state commit: ownership_groups=%s "
+                    "dirty_before=%s dirty_after=%s newly_dirty=%s "
+                    "state_commit=%s",
+                    ",".join(ownership_groups) or "none",
+                    ",".join(dirty_before) or "none",
+                    ",".join(dirty_after) or "none",
+                    ",".join(sorted(set(dirty_after) - set(dirty_before))) or "none",
+                    "updated" if state_after != state_before else "unchanged",
+                )
+                diagnostic_event(
+                    "savesync",
+                    "dirty_state.committed",
+                    "gameStop dirty-state classification committed",
+                    metadata={
+                        "layout_ids": sorted(layout_ids),
+                        "ownership_groups": ownership_groups,
+                        "dirty_before": dirty_before,
+                        "dirty_after": dirty_after,
+                        "newly_dirty": sorted(
+                            set(dirty_after) - set(dirty_before)
+                        ),
+                        "state_commit": (
+                            "updated" if state_after != state_before else "unchanged"
+                        ),
+                    },
                 )
         if self._sessions.has_active_session():
             log.info(
@@ -1025,7 +1134,8 @@ class AutoSaveSyncCoordinator:
         window_started_at = seed.window_started_at if seed is not None else 0.0
         latest_at = seed.observed_at if seed is not None else 0.0
         observations = 0
-        for _ in range(self._stability_checks + 1):
+        settle_started_at = time.monotonic()
+        for attempt in range(1, self._stability_checks + 2):
             if previous is not unavailable and self._stability_interval:
                 remaining = self._stability_interval - (
                     time.monotonic() - window_started_at
@@ -1034,14 +1144,58 @@ class AutoSaveSyncCoordinator:
                     time.sleep(remaining)
             try:
                 current = observe()
-            except OSError:
+            except OSError as exc:
                 # An emulator may atomically replace a save between discovery
                 # and hashing. Treat that bounded observation as unstable.
                 previous = unavailable
+                diagnostic_event(
+                    "savesync",
+                    "local_observation.failed",
+                    "Scoped local save observation failed",
+                    level="WARNING",
+                    metadata={
+                        "attempt": attempt,
+                        "elapsed_ms": int(
+                            (time.monotonic() - settle_started_at) * 1000
+                        ),
+                        "error_type": type(exc).__name__,
+                    },
+                )
                 continue
             observations += 1
             latest_at = time.monotonic()
-            if previous is not unavailable and current == previous:
+            matches_previous = previous is not unavailable and current == previous
+            details = self._describe_observation(current)
+            ownership_groups = _ownership_groups(current, self._policy)
+            log.info(
+                "Scoped local save observation: attempt=%d monotonic_ns=%d "
+                "elapsed_ms=%d artifacts=%d ownership_groups=%s "
+                "matches_previous=%s files_truncated=%d files=%s",
+                attempt,
+                time.monotonic_ns(),
+                int((latest_at - settle_started_at) * 1000),
+                len(current),
+                ",".join(ownership_groups) or "none",
+                matches_previous,
+                max(0, len(current) - len(details)),
+                json.dumps(details, sort_keys=True, separators=(",", ":")),
+            )
+            diagnostic_event(
+                "savesync",
+                "local_observation.completed",
+                "Scoped local save observation completed",
+                metadata={
+                    "attempt": attempt,
+                    "monotonic_ns": time.monotonic_ns(),
+                    "elapsed_ms": int((latest_at - settle_started_at) * 1000),
+                    "artifact_count": len(current),
+                    "ownership_groups": ownership_groups,
+                    "matches_previous": matches_previous,
+                    "files_truncated": max(0, len(current) - len(details)),
+                    "files": details,
+                },
+            )
+            if matches_previous:
                 return _SettledObservation(
                     True, observations, current, latest_at, window_started_at
                 )
@@ -1054,6 +1208,53 @@ class AutoSaveSyncCoordinator:
             latest_at,
             window_started_at,
         )
+
+    def _describe_observation(
+        self, observed: dict
+    ) -> tuple[dict[str, object], ...]:
+        describe = getattr(self._service, "describe_local_observation", None)
+        if callable(describe):
+            try:
+                return describe(observed)
+            except Exception:  # noqa: BLE001 - diagnostics must be fail-open
+                log.warning(
+                    "Could not describe scoped local observation", exc_info=True
+                )
+        return tuple(
+            {
+                "canonical_path": path,
+                "size_bytes": getattr(artifact, "size_bytes", None),
+                "content_hash": getattr(artifact, "content_hash", None),
+                "mtime_ns": None,
+                "physical_path": "unavailable",
+            }
+            for path, artifact in sorted(observed.items())[:100]
+        )
+
+
+def _ownership_groups(
+    observed: dict, policy: SaveSelectionPolicy
+) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                descriptor.group_id
+                for path in observed
+                if (descriptor := policy.group_for_path(path)) is not None
+            }
+        )
+    )
+
+
+def _local_dirty_group_ids(state) -> tuple[str, ...]:  # noqa: ANN001
+    return tuple(
+        sorted(
+            group.group_id
+            for group in state.groups
+            if group.condition is SaveGroupCondition.LOCAL_DIRTY
+            or bool(group.dirty_path_hints)
+        )
+    )
 
 
 class _AutoWorkerLock:

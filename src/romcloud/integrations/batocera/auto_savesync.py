@@ -468,20 +468,32 @@ def hook_content(romcloud_bin: Path) -> str:
         ">/dev/null 2>&1 || true\n"
         "    ;;\n"
         "  gameStop)\n"
-        '    printf \'%s pid=%s parent_pid=%s event="game_stop_hook_entered"\\n\' '
+        '    ROMCLOUD_DIAGNOSTIC_OPERATION_ID="game-stop-$$-$(date +%s)"\n'
+        "    export ROMCLOUD_DIAGNOSTIC_OPERATION_ID\n"
+        '    printf \'%s pid=%s parent_pid=%s operation_id=%q '
+        'event="game_stop_hook_entered"\\n\' '
         '"$(date -Iseconds 2>/dev/null || date)" "$$" '
-        '"$PPID" '
+        '"$PPID" "$ROMCLOUD_DIAGNOSTIC_OPERATION_ID" '
+        '>> "$ROMCLOUD_AUTOSYNC_LOG" 2>/dev/null || true\n'
+        '    printf \'%s pid=%s operation_id=%q event="game_stop_argv" '
+        'system=%q emulator=%q core=%q rom=%q\\n\' '
+        '"$(date -Iseconds 2>/dev/null || date)" "$$" '
+        '"$ROMCLOUD_DIAGNOSTIC_OPERATION_ID" "$2" "$3" "$4" "$5" '
         '>> "$ROMCLOUD_AUTOSYNC_LOG" 2>/dev/null || true\n'
         '    if [[ ! -x "$ROMCLOUD_BIN" ]]; then\n'
-        '      printf \'%s pid=%s event="game_stop_handoff_failed" '
+        '      printf \'%s pid=%s operation_id=%q '
+        'event="game_stop_handoff_failed" '
         'reason="romcloud_bin_unavailable"\\n\' '
         '"$(date -Iseconds 2>/dev/null || date)" "$$" '
+        '"$ROMCLOUD_DIAGNOSTIC_OPERATION_ID" '
         '>> "$ROMCLOUD_AUTOSYNC_LOG" 2>/dev/null || true\n'
         "      ROMCLOUD_AUTOSYNC_STATUS=127\n"
         "      ROMCLOUD_HOOK_STATUS=127\n"
         "    else\n"
-        '      printf \'%s pid=%s caller_pid=%s event="game_stop_sync_started"\\n\' '
+        '      printf \'%s pid=%s caller_pid=%s operation_id=%q '
+        'event="game_stop_sync_started"\\n\' '
         '"$(date -Iseconds 2>/dev/null || date)" "$$" "$PPID" '
+        '"$ROMCLOUD_DIAGNOSTIC_OPERATION_ID" '
         '>> "$ROMCLOUD_AUTOSYNC_LOG" 2>/dev/null || true\n'
         "      ROMCLOUD_AUTOSYNC_STATUS=0\n"
         '      ROMCLOUD_AUTOSYNC_CALLER_PID="$PPID" "$ROMCLOUD_BIN" '
@@ -490,16 +502,19 @@ def hook_content(romcloud_bin: Path) -> str:
         '|| ROMCLOUD_AUTOSYNC_STATUS=$?\n'
         '      if [[ "$ROMCLOUD_AUTOSYNC_STATUS" -eq 0 ]]; then\n'
         '        printf \'%s pid=%s caller_pid=%s '
-        'event="game_stop_sync_completed" status=0\\n\' '
+        'operation_id=%q event="game_stop_sync_completed" status=0\\n\' '
         '"$(date -Iseconds 2>/dev/null || date)" "$$" "$PPID" '
+        '"$ROMCLOUD_DIAGNOSTIC_OPERATION_ID" '
         '>> "$ROMCLOUD_AUTOSYNC_LOG" 2>/dev/null || true\n'
         '        ROMCLOUD_AUTOSYNC_CALLER_PID="$PPID" nohup "$ROMCLOUD_BIN" '
         '_autosync conflict-popup '
         '>> "$ROMCLOUD_AUTOSYNC_LOG" 2>&1 </dev/null &\n'
         "      else\n"
-        '        printf \'%s pid=%s event="game_stop_sync_failed" '
+        '        printf \'%s pid=%s operation_id=%q '
+        'event="game_stop_sync_failed" '
         'status=%s\\n\' '
         '"$(date -Iseconds 2>/dev/null || date)" "$$" '
+        '"$ROMCLOUD_DIAGNOSTIC_OPERATION_ID" '
         '"$ROMCLOUD_AUTOSYNC_STATUS" '
         '>> "$ROMCLOUD_AUTOSYNC_LOG" 2>/dev/null || true\n'
         "        ROMCLOUD_HOOK_STATUS=$ROMCLOUD_AUTOSYNC_STATUS\n"
@@ -507,8 +522,10 @@ def hook_content(romcloud_bin: Path) -> str:
         "    fi\n"
         '    nohup "$ROMCLOUD_BIN" _autosync menu-loop '
         ">/dev/null 2>&1 </dev/null &\n"
-        '    printf \'%s pid=%s event="game_stop_hook_returned" status=%s\\n\' '
+        '    printf \'%s pid=%s operation_id=%q '
+        'event="game_stop_hook_returned" status=%s\\n\' '
         '"$(date -Iseconds 2>/dev/null || date)" "$$" '
+        '"$ROMCLOUD_DIAGNOSTIC_OPERATION_ID" '
         '"${ROMCLOUD_AUTOSYNC_STATUS:-127}" '
         '>> "$ROMCLOUD_AUTOSYNC_LOG" 2>/dev/null || true\n'
         "    ;;\n"
