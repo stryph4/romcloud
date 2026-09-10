@@ -324,6 +324,29 @@ class AutoSaveSyncCoordinator:
         )
         self._game_start_sync(system=system, emulator=emulator, core=core, rom=rom)
 
+    def _resolve_game_start_targets(
+        self, layout_ids: frozenset[str], rom: str
+    ) -> dict[str, str]:
+        """Map each resolved layout to its provably safe pre-launch target.
+
+        A shared/container layout never gets a per-ROM guess: it only gets
+        ``shared_container_group_id``'s structural single-container
+        invariant. Every other layout only gets ``group_id_for_rom``'s
+        ROM-name-derived group. A layout resolving to neither is simply
+        absent from the result — callers must skip it, never widen to a
+        broad scan.
+        """
+        group_layout_map: dict[str, str] = {}
+        for layout_id in sorted(layout_ids):
+            layout = self._policy.layout(layout_id)
+            if layout.shared or layout.container_adapter_id:
+                group_id = self._policy.shared_container_group_id(layout_id)
+            else:
+                group_id = self._policy.group_id_for_rom(layout_id, rom)
+            if group_id is not None:
+                group_layout_map[group_id] = layout_id
+        return group_layout_map
+
     def _game_start_sync(
         self, *, system: str, emulator: str, core: str, rom: str
     ) -> None:
@@ -341,21 +364,47 @@ class AutoSaveSyncCoordinator:
             )
             return
 
-        group_layout_map: dict[str, str] = {}
-        for layout_id in sorted(layout_ids):
-            group_id = self._policy.group_id_for_rom(layout_id, rom)
-            if group_id is not None:
-                group_layout_map[group_id] = layout_id
+        try:
+            group_layout_map = self._resolve_game_start_targets(layout_ids, rom)
+        except Exception:  # noqa: BLE001 - gameStart must never block a launch
+            log.warning(
+                "gameStart target resolution failed; continuing launch: "
+                "system=%s emulator=%s core=%s rom=%s layout_ids=%s",
+                system,
+                emulator,
+                core,
+                rom,
+                ",".join(sorted(layout_ids)),
+                exc_info=True,
+            )
+            diagnostic_event(
+                "savesync",
+                "session.sync_unresolved",
+                "gameStart target resolution failed; launch continuing",
+                level="WARNING",
+                metadata={
+                    "raw_system": system,
+                    "emulator": emulator,
+                    "core": core,
+                    "rom": rom,
+                    "layout_ids": sorted(layout_ids),
+                },
+            )
+            self._sessions.record_sync_outcome(
+                system=system, rom=rom, outcome="unresolved"
+            )
+            return
 
         if not group_layout_map:
-            # A shared/container layout (or a grouping strategy that depends
-            # on an observed root/file) cannot be safely attributed to this
-            # ROM from its name alone. Never guess or widen to a broad scan
-            # here \u2014 skip pre-launch sync for this launch and continue,
-            # leaving full reconciliation to gameStop as before.
+            # Neither a provable per-ROM target (group_id_for_rom) nor a
+            # structurally-guaranteed single shared container
+            # (shared_container_group_id) exists for any resolved layout.
+            # Never guess or widen to a broad scan here — skip pre-launch
+            # sync for this launch and continue, leaving full reconciliation
+            # to gameStop as before.
             log.info(
                 "gameStart pre-launch sync skipped: system=%s emulator=%s core=%s "
-                "rom=%s layout_ids=%s reason=no-safe-per-game-target",
+                "rom=%s layout_ids=%s reason=no-safe-target",
                 system,
                 emulator,
                 core,
@@ -365,7 +414,7 @@ class AutoSaveSyncCoordinator:
             diagnostic_event(
                 "savesync",
                 "session.sync_skipped",
-                "gameStart pre-launch sync skipped: no safe per-game target",
+                "gameStart pre-launch sync skipped: no safe target",
                 metadata={
                     "raw_system": system,
                     "emulator": emulator,

@@ -10,21 +10,29 @@ deterministically-resolved save group is ever touched, never a broader scan.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from romcloud.core.capabilities import CapabilityPolicy, OperatingMode
 from romcloud.core.exceptions import SaveSyncError
-from romcloud.core.save_selection import DEFAULT_SAVE_SELECTION_POLICY
+from romcloud.core.save_selection import DEFAULT_SAVE_SELECTION_POLICY, SaveSelectionPolicy
 from romcloud.core.storage import ProviderCapabilities, StorageProvider
 from romcloud.infrastructure import savesync_index
-from romcloud.services.auto_savesync import AutoSaveSyncCoordinator
+from romcloud.infrastructure.ps1_memory_card import (
+    BLOCK_SIZE,
+    CARD_SIZE,
+    FRAME_SIZE,
+    Ps1RawMemoryCardAdapter,
+)
+from romcloud.services.auto_savesync import AutoSaveSyncCoordinator, layout_ids_for_session
 from romcloud.services.saves import SaveSyncService
 
 from tests.unit._savesync_protocol_helpers import (
     index_root_for,
     mutate_remote_out_of_band,
+    publish_current_remote_as_peer,
     seed_peer_commit,
     strip_protocol_ownership,
 )
@@ -86,14 +94,75 @@ def _service(
     )
 
 
-def _coordinator(tmp_path: Path, service: SaveSyncService) -> AutoSaveSyncCoordinator:
+def _coordinator(
+    tmp_path: Path,
+    service: SaveSyncService,
+    *,
+    policy: SaveSelectionPolicy = DEFAULT_SAVE_SELECTION_POLICY,
+) -> AutoSaveSyncCoordinator:
     return AutoSaveSyncCoordinator(
         service,
         data_root=tmp_path / "data",
         enabled=True,
-        policy=DEFAULT_SAVE_SELECTION_POLICY,
+        policy=policy,
         quiet_seconds=0,
     )
+
+
+def _whole_layout_policy(layout_id: str) -> SaveSelectionPolicy:
+    """A structural single-container invariant for *layout_id*, for testing.
+
+    Mirrors ``test_save_containers._whole_layout_policy``: only ``group_by``
+    changes, so the layout's own container adapter/kind (and therefore its
+    existing format-aware merge semantics) are left completely untouched.
+    """
+    return SaveSelectionPolicy(
+        layouts=tuple(
+            replace(layout, group_by="layout")
+            if layout.layout_id == layout_id
+            else layout
+            for layout in DEFAULT_SAVE_SELECTION_POLICY.layouts
+        )
+    )
+
+
+def _checksum(frame: bytearray) -> None:
+    value = 0
+    for byte in frame[:127]:
+        value ^= byte
+    frame[127] = value
+
+
+def _ps1_card(entries: list[tuple[bytes, tuple[int, ...], bytes]]) -> bytes:
+    """Copied from test_save_containers._ps1_card: a minimal valid raw PS1
+    memory card image with one commercial-namespace entry per domain."""
+    raw = bytearray(b"\xff" * CARD_SIZE)
+    header = bytearray(FRAME_SIZE)
+    header[:2] = b"MC"
+    _checksum(header)
+    raw[:FRAME_SIZE] = header
+    for block in range(1, 16):
+        frame = bytearray(FRAME_SIZE)
+        frame[0] = 0xA0
+        frame[8:10] = b"\xff\xff"
+        _checksum(frame)
+        raw[block * FRAME_SIZE : (block + 1) * FRAME_SIZE] = frame
+    for filename, blocks, fill in entries:
+        for index, block in enumerate(blocks):
+            frame = bytearray(FRAME_SIZE)
+            frame[0] = 0x51 if index == 0 else (0x53 if index == len(blocks) - 1 else 0x52)
+            if index == 0:
+                frame[4:8] = (len(blocks) * BLOCK_SIZE).to_bytes(4, "little")
+                frame[10 : 10 + len(filename)] = filename
+            frame[8:10] = (
+                b"\xff\xff"
+                if index == len(blocks) - 1
+                else (blocks[index + 1] - 1).to_bytes(2, "little")
+            )
+            _checksum(frame)
+            raw[block * FRAME_SIZE : (block + 1) * FRAME_SIZE] = frame
+            raw[block * BLOCK_SIZE : (block + 1) * BLOCK_SIZE] = fill * BLOCK_SIZE
+    return bytes(raw)
 
 
 def _session_payload(tmp_path: Path, *, system: str, rom: str) -> dict:
@@ -381,17 +450,194 @@ class TestGameStartScopeAndSafety:
         payload = _session_payload(tmp_path, system="totally-unknown-system", rom="Game.rom")
         assert payload["sync_outcome"] == "unsupported"
 
-    def test_shared_container_layout_skips_rather_than_broad_scans(self, tmp_path: Path):
+    def test_ambiguous_multi_container_layouts_are_skipped(self, tmp_path: Path):
+        """No layout reachable for a plain ps2/pcsx2 launch has a provable
+        single-container invariant via ``group_id_for_rom`` (all four
+        card/folder layouts permit more than one physical container) and
+        none of *those* use group_by="layout" in the shipped registry, so
+        gameStart must do nothing for them regardless of how many/few card
+        files happen to exist locally right now."""
         provider = _Provider()
         service = _service(tmp_path, provider)
+        card = tmp_path / "local" / "ps2" / "pcsx2" / "Mcd001.ps2"
+        _write(card, b"one-card-present")
 
         coordinator = _coordinator(tmp_path, service)
         coordinator.game_start(
             system="ps2", emulator="pcsx2", core="pcsx2", rom="Game.iso"
         )
+        assert not (tmp_path / "remote" / "ps2" / "pcsx2" / "Mcd001.ps2").exists()
         payload = _session_payload(tmp_path, system="ps2", rom="Game.iso")
-        assert payload["sync_outcome"] == "skipped"
-        assert payload["sync_group_ids"] == []
+        assert "pcsx2-legacy-memory-cards/mcd001" not in payload["sync_group_ids"]
+        assert "pcsx2-memory-cards/mcd001" not in payload["sync_group_ids"]
+
+    def test_layout_wide_shared_domain_reconciles_before_launch(self, tmp_path: Path):
+        """``pcsx2-states``/``pcsx2-legacy-states`` are shared *and*
+        group_by="layout" in the shipped registry: the whole layout is
+        *defined* as one save group by the SaveLayout contract itself, a
+        structural invariant independent of what exists on disk."""
+        provider = _Provider()
+        service = _service(tmp_path, provider)
+        state_file = tmp_path / "local" / "ps2" / "pcsx2" / "sstates" / "slot1.p2s"
+        _write(state_file, b"base")
+        service.full_sync()
+        _write(state_file, b"changed")
+        service.mark_local_dirty("ps2/pcsx2/sstates/slot1.p2s")
+
+        coordinator = _coordinator(tmp_path, service)
+        coordinator.game_start(
+            system="ps2", emulator="pcsx2", core="pcsx2", rom="Game.iso"
+        )
+
+        assert (
+            tmp_path / "remote" / "ps2" / "pcsx2" / "sstates" / "slot1.p2s"
+        ).read_bytes() == b"changed"
+        payload = _session_payload(tmp_path, system="ps2", rom="Game.iso")
+        assert "pcsx2-states/dataset" in payload["sync_group_ids"]
+
+    def test_unrelated_multi_container_layout_left_untouched(self, tmp_path: Path):
+        """Reconciling the layout-wide shared domain must never widen to an
+        unrelated, genuinely-ambiguous multi-container layout in the same
+        launch."""
+        provider = _Provider()
+        service = _service(tmp_path, provider)
+        state_file = tmp_path / "local" / "ps2" / "pcsx2" / "sstates" / "slot1.p2s"
+        card_file = tmp_path / "local" / "ps2" / "pcsx2" / "Mcd001.ps2"
+        _write(state_file, b"base")
+        _write(card_file, b"card-base")
+        service.full_sync()
+        _write(state_file, b"changed")
+        service.mark_local_dirty("ps2/pcsx2/sstates/slot1.p2s")
+        _write(card_file, b"card-changed")
+        service.mark_local_dirty("ps2/pcsx2/Mcd001.ps2")
+
+        coordinator = _coordinator(tmp_path, service)
+        coordinator.game_start(
+            system="ps2", emulator="pcsx2", core="pcsx2", rom="Game.iso"
+        )
+
+        assert (
+            tmp_path / "remote" / "ps2" / "pcsx2" / "sstates" / "slot1.p2s"
+        ).read_bytes() == b"changed"
+        assert (
+            tmp_path / "remote" / "ps2" / "pcsx2" / "Mcd001.ps2"
+        ).read_bytes() == b"card-base"
+        assert any(
+            group.dirty_path_hints
+            for group in service.get_state().groups
+            if group.layout_id == "pcsx2-memory-cards"
+        )
+
+    def test_layout_scoped_shared_container_reuses_existing_ps1_merge(
+        self, tmp_path: Path
+    ):
+        """If a shared PS1-card-style layout *did* declare a structural
+        single-container invariant (group_by="layout"), gameStart reconciles
+        that whole container — and the byte-level per-domain PS1 merge
+        (keyed by physical ``container_id``, independent of ``group_by``)
+        is the exact unmodified adapter used everywhere else, not a
+        gameStart-specific shortcut."""
+        policy = _whole_layout_policy("duckstation-memory-cards")
+        provider = _Provider()
+        service = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "remote-data"),
+            local_root=str(tmp_path / "local"),
+            remote_root=str(tmp_path / "remote"),
+            state_path=tmp_path / "data" / "savesync-state.json",
+            policy=policy,
+        )
+        local = tmp_path / "local" / "duckstation" / "memcards" / "card.mcd"
+        local.parent.mkdir(parents=True)
+        name_a = b"BASLUS-00001SAVE"
+        name_b = b"BESCES-00002SAVE"
+        local.write_bytes(_ps1_card([(name_a, (1,), b"A"), (name_b, (2,), b"B")]))
+        service.commit_upload(service.preview_upload())
+        service.full_sync()
+
+        remote = tmp_path / "remote" / "duckstation" / "memcards" / "card.mcd"
+        remote.write_bytes(_ps1_card([(name_a, (1,), b"A"), (name_b, (2,), b"R")]))
+        publish_current_remote_as_peer(service, remote_root=tmp_path / "remote")
+
+        coordinator = _coordinator(tmp_path, service, policy=policy)
+        coordinator.game_start(
+            system="psx", emulator="duckstation", core="duckstation", rom="Any Game.chd"
+        )
+
+        adapter = Ps1RawMemoryCardAdapter()
+        local_snapshot = adapter.snapshot(local, container_id="card")
+        remote_snapshot = adapter.snapshot(remote, container_id="card")
+        # Domain B (an unrelated game's own save inside the *same* physical
+        # card) merged in via the existing adapter; domain A never moved.
+        assert local_snapshot.entries == remote_snapshot.entries
+        payload = _session_payload(tmp_path, system="psx", rom="Any Game.chd")
+        assert payload["sync_outcome"] == "synchronized"
+        assert "duckstation-memory-cards/dataset" in payload["sync_group_ids"]
+
+    def test_opaque_malformed_container_remains_conservative(self, tmp_path: Path):
+        """A layout-wide shared domain whose physical card the adapter
+        cannot parse must fail exactly as conservatively as it already does
+        for gameStop/Quick Sync — gameStart must not weaken that, and must
+        still never block the launch."""
+        policy = _whole_layout_policy("duckstation-memory-cards")
+        provider = _Provider()
+        service = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "remote-data"),
+            local_root=str(tmp_path / "local"),
+            remote_root=str(tmp_path / "remote"),
+            state_path=tmp_path / "data" / "savesync-state.json",
+            policy=policy,
+        )
+        local = tmp_path / "local" / "duckstation" / "memcards" / "card.mcd"
+        local.parent.mkdir(parents=True)
+        local.write_bytes(b"not a valid 128 KiB PS1 card image")
+
+        coordinator = _coordinator(tmp_path, service, policy=policy)
+        coordinator.game_start(
+            system="psx", emulator="duckstation", core="duckstation", rom="Any Game.chd"
+        )  # must not raise
+
+        payload = _session_payload(tmp_path, system="psx", rom="Any Game.chd")
+        assert payload["sync_outcome"] in {"unresolved", "skipped"}
+        assert local.read_bytes() == b"not a valid 128 KiB PS1 card image"
+        assert not (tmp_path / "remote" / "duckstation" / "memcards" / "card.mcd").exists()
+
+    def test_resolution_failure_records_unresolved_not_skipped(
+        self, tmp_path: Path, monkeypatch
+    ):
+        provider = _Provider()
+        service = _service(tmp_path, provider)
+
+        def _boom(self, layout_id):
+            raise RuntimeError("simulated resolver failure")
+
+        monkeypatch.setattr(
+            "romcloud.core.save_selection.SaveSelectionPolicy.shared_container_group_id",
+            _boom,
+        )
+        coordinator = _coordinator(tmp_path, service)
+        coordinator.game_start(
+            system="ps2", emulator="pcsx2", core="pcsx2", rom="Game.iso"
+        )  # must not raise
+        payload = _session_payload(tmp_path, system="ps2", rom="Game.iso")
+        assert payload["sync_outcome"] == "unresolved"
+
+    def test_xbox_hdd_layout_is_lifecycle_disabled_and_never_targeted(
+        self, tmp_path: Path
+    ):
+        """The opt-in xemu/Xbox HDD layout (group_by="layout", a trivially
+        provable single-container invariant on its own) is nonetheless
+        never reachable from gameStart at all: it is
+        ``lifecycle_enabled=False`` in the registry, so
+        ``layout_ids_for_session`` never returns it regardless of resolver
+        logic. It receives no automatic pre-launch sync."""
+        xbox_layout = DEFAULT_SAVE_SELECTION_POLICY.layout("xemu-hdd")
+        assert xbox_layout.group_by == "layout"
+        assert xbox_layout.lifecycle_enabled is False
+        assert "xemu-hdd" not in layout_ids_for_session(
+            DEFAULT_SAVE_SELECTION_POLICY, xbox_layout.system, "xemu", "xemu"
+        )
 
     def test_no_broad_scan_only_target_layout_shard_is_fetched(
         self, tmp_path: Path, monkeypatch
