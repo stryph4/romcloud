@@ -222,6 +222,18 @@ def write_state(path: Path, state: SaveSyncState) -> None:
         raise SaveSyncError(f"Cannot persist SaveSync state {state_path}: {exc}") from exc
 
 
+def write_json_document(path: Path, payload: dict) -> None:
+    """Durably write one small local JSON side-record.
+
+    Not SaveSync state and never reconciliation authority — used for local
+    notes such as which remote dataset this device has seen under the commit
+    protocol.
+    """
+    _durable_atomic_write_text(
+        Path(path), json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    )
+
+
 @contextmanager
 def state_file_lock(path: Path) -> Iterator[None]:
     """Hold the cross-process SaveSync lock shared with sync operations."""

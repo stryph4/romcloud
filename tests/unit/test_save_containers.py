@@ -53,6 +53,11 @@ from romcloud.infrastructure import save_transaction
 from romcloud.core.exceptions import SaveSyncVerificationError
 from romcloud.services.saves import SaveSyncService
 
+from tests.unit._savesync_protocol_helpers import (
+    publish_current_remote_as_peer,
+    strip_protocol_ownership,
+)
+
 
 def _entry(identity: str, domain: str, digest: str) -> ContainerEntry:
     return ContainerEntry(EntryIdentity(identity), domain, digest * 64, 1)
@@ -697,6 +702,9 @@ def test_service_automatically_merges_disjoint_ps1_domains_through_existing_tran
     remote = tmp_path / "remote/duckstation/memcards/card.mcd"
     local.write_bytes(_ps1_card([(first, (1,), b"L"), (second, (2,), b"B")]))
     remote.write_bytes(_ps1_card([(first, (1,), b"A"), (second, (2,), b"R")]))
+    # The remote side stands in for an upgraded peer's commit, so the shared
+    # index matches the bytes. Out-of-band divergence is a separate scenario.
+    publish_current_remote_as_peer(service, remote_root=tmp_path / "remote")
 
     preview = service.preview_reconciliation()
     report = service.reconcile()
@@ -1001,6 +1009,7 @@ def test_quick_sync_migrates_legacy_ps2_namespace_that_is_no_longer_conflicting(
         tmp_path, two_cards=True, disjoint=True
     )
     current = _container_service(tmp_path)
+    publish_current_remote_as_peer(current, remote_root=tmp_path / "remote")
 
     migrated = current.quick_sync()
     repeated = current.quick_sync()
@@ -1075,10 +1084,19 @@ def test_legacy_namespace_migration_can_create_multiple_current_conflicts(
 def test_legacy_conflict_migration_rolls_back_state_and_bytes_if_journal_fails(
     tmp_path: Path, monkeypatch
 ) -> None:
+    """Pre-cutover, the journal is still required discovery state.
+
+    Legacy conflict migration runs on datasets that predate the commit
+    protocol, so a failed journal append means the migration did not happen
+    and everything rolls back. After the ownership cutover the index is the
+    commit point instead — see
+    ``test_save_sync_service.py::TestOwnedDatasetJournalDegradation``.
+    """
     _legacy, old_id = _create_legacy_ps2_conflict(
         tmp_path, two_cards=True, disjoint=True
     )
     current = _container_service(tmp_path)
+    strip_protocol_ownership(tmp_path / "remote", tmp_path / "data")
     local_before = {
         card: (tmp_path / "local/ps2/pcsx2" / card).read_bytes()
         for card in ("Mcd001.ps2", "Mcd002.ps2")
@@ -1171,6 +1189,7 @@ def test_service_automatically_merges_ps2_folder_card_with_complete_versioned_gr
     remote = tmp_path / "remote/ps2/pcsx2/Card1"
     (local / "SAVE-A/data").write_bytes(b"a-local")
     (remote / "SAVE-B/nested/data").write_bytes(b"b-remote")
+    publish_current_remote_as_peer(service, remote_root=tmp_path / "remote")
 
     report = service.reconcile()
 

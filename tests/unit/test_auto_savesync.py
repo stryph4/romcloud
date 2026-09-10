@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 import threading
@@ -19,6 +20,8 @@ from romcloud.core.save_selection import DEFAULT_SAVE_SELECTION_POLICY
 from romcloud.core.storage import StorageProvider
 from romcloud.infrastructure import diagnostics, save_transaction
 from romcloud.infrastructure import save_tree
+from romcloud.infrastructure import savesync_commit
+from romcloud.infrastructure import savesync_index
 from romcloud.infrastructure import savesync_prompts
 from romcloud.infrastructure.config import (
     AppConfig,
@@ -1730,6 +1733,22 @@ class TestGameStopObservationCost:
         local.write_bytes(b"final-save-bytes")
 
         reads = self._counting_hash(monkeypatch)
+        # Attribute reads to the commit protocol's index/payload cross-check
+        # so the extra remote read is proven to be *that* narrow verification
+        # rather than an accidental extra scan somewhere else.
+        cross_check_reads: list[Path] = []
+        original_cross_check = service._observe_remote_group_manifests
+
+        def counting_cross_check(intent_groups):
+            start = len(reads)
+            try:
+                return original_cross_check(intent_groups)
+            finally:
+                cross_check_reads.extend(reads[start:])
+
+        monkeypatch.setattr(
+            service, "_observe_remote_group_manifests", counting_cross_check
+        )
         self._counting_sleep(monkeypatch)
         coordinator.game_stop(
             system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
@@ -1745,7 +1764,12 @@ class TestGameStopObservationCost:
         # staging verification, transaction pre/post check, final
         # verification) therefore re-reads real bytes: this is the safety
         # floor, not a regression to hashing the whole remote tree.
-        assert reads.count(remote) == 5
+        assert reads.count(remote) == 6
+        # Exactly one of those six is the commit protocol's cross-check, and
+        # it read only this group's own remote path. The other five are the
+        # pre-existing verification phases, unchanged.
+        assert cross_check_reads == [remote]
+        assert reads.count(remote) - len(cross_check_reads) == 5
 
     def test_multiple_changed_files_in_one_group_are_each_read_once_per_phase(
         self, tmp_path: Path, monkeypatch
@@ -3060,9 +3084,21 @@ def test_game_stop_cli_schedules_drain_pending_follow_up_on_worker_busy(
     assert len(spawn_calls) == 1
 
 
-def test_failed_remote_journal_commit_rolls_back_bytes_baseline_and_cursor(
-    tmp_path: Path, monkeypatch
+def test_failed_compatibility_journal_after_commit_recovers_forward(
+    tmp_path: Path, monkeypatch, caplog
 ):
+    """After the ownership cutover the legacy journal is history only.
+
+    The remote index is the commit point, so once it has published a
+    verified payload the save is durably shared with every peer on the
+    current protocol. A failing journal append must therefore degrade
+    loudly and recover forward — rolling the committed bytes back to
+    satisfy an old reader would destroy a save that other devices are
+    already entitled to read. (The pre-cutover behavior, where the journal
+    is the only discovery mechanism and a failed append *does* roll back,
+    is covered by
+    ``test_save_sync_service.py::TestLegacyDatasetCommitBehavior``.)
+    """
     provider = _Provider()
     service = _service(tmp_path, provider)
     coordinator = _coordinator(tmp_path, service)
@@ -3070,7 +3106,6 @@ def test_failed_remote_journal_commit_rolls_back_bytes_baseline_and_cursor(
     remote = tmp_path / "remote/snes/Super Metroid.srm"
     _write(local, b"baseline")
     service.full_sync()
-    before = service.get_state()
     coordinator.game_start(
         system="snes",
         emulator="libretro",
@@ -3078,7 +3113,6 @@ def test_failed_remote_journal_commit_rolls_back_bytes_baseline_and_cursor(
         rom="Super Metroid.sfc",
     )
     local.write_bytes(b"new-revision")
-    original_append = service._append_remote_journal
     monkeypatch.setattr(
         service,
         "_append_remote_journal",
@@ -3087,7 +3121,7 @@ def test_failed_remote_journal_commit_rolls_back_bytes_baseline_and_cursor(
         ),
     )
 
-    with pytest.raises(OSError, match="simulated journal commit failure"):
+    with caplog.at_level("ERROR"):
         coordinator.game_stop(
             system="snes",
             emulator="libretro",
@@ -3095,18 +3129,22 @@ def test_failed_remote_journal_commit_rolls_back_bytes_baseline_and_cursor(
             rom="Super Metroid.sfc",
         )
 
-    failed = service.get_state()
-    assert failed.shared_manifest == before.shared_manifest
-    assert failed.quick_sync_cursor_generation == before.quick_sync_cursor_generation
-    assert failed.groups[0].condition is SaveGroupCondition.LOCAL_DIRTY
-    assert failed.groups[0].dirty_path_hints == ("snes/Super Metroid.srm",)
-    assert remote.read_bytes() == b"baseline"
-
-    monkeypatch.setattr(service, "_append_remote_journal", original_append)
-    coordinator.remote_reconnect()
-
+    # The verified payload stayed committed and was published to the index.
     assert remote.read_bytes() == b"new-revision"
+    assert "SaveSync compatibility journal is degraded" in caplog.text
+    assert "rollback=refused" in caplog.text
+    index_root = savesync_index.default_index_root(tmp_path / "remote")
+    head = savesync_index.load_head(index_root)
+    assert head is not None
+    shard = savesync_index.load_shard(
+        index_root, "retroarch-root-snes", head.layouts["retroarch-root-snes"]
+    )
+    group = next(iter(shard.groups))
+    assert group.artifacts[0].sha256 == hashlib.sha256(b"new-revision").hexdigest()
+    # No dirty work is left pending: the change really did commit.
     assert service.get_state().groups[0].condition is SaveGroupCondition.CLEAN
+    # The shared intent was retired rather than left blocking future syncs.
+    assert savesync_commit.load_intent(index_root) is None
 
 
 def test_nonfinal_game_stop_persists_dirty_work_until_last_session_stops(
