@@ -926,7 +926,9 @@ class SaveSyncService:
                     "bytes": sum(item.size_bytes for item in desired.values()),
                 },
             )
-            operation_id = current_operation_id() or uuid.uuid4().hex
+            # Diagnostic correlation IDs and durable transaction IDs have
+            # different contracts. The latter is always an independent UUID.
+            operation_id = uuid.uuid4().hex
             transaction = self._prepare_selected_transaction(
                 destination_views,
                 current=destination,
@@ -3007,7 +3009,11 @@ class SaveSyncService:
                 elif entry.action is SaveReconcileAction.DOWNLOAD and not upload_only:
                     _assign(desired_local, entry.relative_path, entry.remote)
 
-            operation_id = current_operation_id() or uuid.uuid4().hex
+            correlation_id = current_operation_id()
+            # Never reuse a human-readable diagnostic/lifecycle correlation ID
+            # as the filesystem transaction token. Recovery paths require the
+            # transaction ID to remain a 32-character hexadecimal UUID.
+            operation_id = uuid.uuid4().hex
             destination_views: list[_DestinationView] = []
             selected_views: list[save_transaction.SelectedView] = []
             try:
@@ -3060,10 +3066,11 @@ class SaveSyncService:
                     else None
                 )
                 log.info(
-                    "SaveSync transaction start: operation_id=%s scope=%s "
+                    "SaveSync transaction start: operation_id=%s correlation_id=%s scope=%s "
                     "remote_write=%s local_write=%s destination_views=%d "
                     "selected_transaction_paths=%d",
                     operation_id,
+                    correlation_id or "none",
                     plan.scope,
                     remote_changed,
                     local_changed and not upload_only,
@@ -3536,6 +3543,7 @@ class SaveSyncService:
                     "affected_groups": len(affected_group_ids),
                 },
                 operation_id=operation_id,
+                parent_operation_id=correlation_id,
             )
             for group_id in sorted(affected_group_ids):
                 diagnostic_event(
@@ -3546,6 +3554,7 @@ class SaveSyncService:
                         "transaction_id": operation_id,
                     },
                     operation_id=operation_id,
+                    parent_operation_id=correlation_id,
                 )
             if transaction is not None:
                 try:
@@ -3690,7 +3699,8 @@ class SaveSyncService:
                 f"Staging {diff.direction} save/state replacement",
                 metadata={"files": len(source), "bytes": sum(a.size_bytes for a in source.values())},
             )
-            operation_id = current_operation_id() or uuid.uuid4().hex
+            # Keep transaction/recovery identity independent from diagnostics.
+            operation_id = uuid.uuid4().hex
             transaction = self._prepare_selected_transaction(
                 destination_views,
                 current=destination,

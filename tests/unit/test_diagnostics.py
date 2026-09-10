@@ -278,10 +278,22 @@ def test_savesync_upload_noop_download_and_conflict_chains(tmp_path: Path) -> No
     local.parent.mkdir(parents=True)
     local.write_bytes(b"initial")
 
+    def operation_tree(operation_id: str) -> list[dict]:
+        child_ids = [
+            summary["operation_id"]
+            for summary in store.operation_summaries(page_size=200)
+            if summary.get("parent_operation_id") == operation_id
+        ]
+        return store.operation_chain(operation_id) + [
+            event
+            for child_id in child_ids
+            for event in store.operation_chain(child_id)
+        ]
+
     report = service.full_sync()
     assert report.uploaded == 1
     full = store.query(DiagnosticQuery(text="Full Sync started", page_size=1))[0]
-    full_codes = {item["event_code"] for item in store.operation_chain(full["operation_id"])}
+    full_codes = {item["event_code"] for item in operation_tree(full["operation_id"])}
     assert {
         "operation.started", "reconciliation.decision", "physical_mutation.before",
         "physical_mutation.after", "journal.committed", "baseline.advanced",
@@ -301,7 +313,7 @@ def test_savesync_upload_noop_download_and_conflict_chains(tmp_path: Path) -> No
     remote.write_bytes(b"remote-wins")
     service.commit_download(service.preview_download())
     download = store.query(DiagnosticQuery(text="Download All started", page_size=1))[0]
-    download_chain = store.operation_chain(download["operation_id"])
+    download_chain = operation_tree(download["operation_id"])
     assert any(
         item["event_code"] == "physical_mutation.after"
         and item["metadata"].get("group_id") == "retroarch-root-psx/game"

@@ -27,7 +27,10 @@ from typing import Callable, Iterable, Optional
 from romcloud.core.exceptions import SaveSyncError, SaveSyncVerificationError
 from romcloud.core.models.savesync import SaveArtifact
 from romcloud.infrastructure.logging import get_logger
-from romcloud.infrastructure.diagnostics import event as diagnostic_event
+from romcloud.infrastructure.diagnostics import (
+    current_operation_id,
+    event as diagnostic_event,
+)
 from romcloud.infrastructure.save_tree import hash_file, materialize
 
 
@@ -124,6 +127,8 @@ class SelectedTransaction:
     journal_path: Path
     views: tuple[PreparedView, ...]
     metrics: TransactionMetrics
+    # Diagnostic ancestry only; never used in paths, journals, or recovery.
+    parent_operation_id: Optional[str] = None
     _finished: bool = False
     _live_touched: bool = False
 
@@ -158,7 +163,12 @@ class SelectedTransaction:
         errors: list[str] = []
         for view, plan in plans:
             try:
-                _restore_view(view, plan, operation_id=self.operation_id)
+                _restore_view(
+                    view,
+                    plan,
+                    operation_id=self.operation_id,
+                    parent_operation_id=self.parent_operation_id,
+                )
             except Exception as exc:  # noqa: BLE001 - attempt every view
                 errors.append(f"{view.root}: {exc}")
         if not errors:
@@ -174,6 +184,7 @@ class SelectedTransaction:
                     }),
                 },
                 operation_id=self.operation_id,
+                parent_operation_id=self.parent_operation_id,
             )
             log.info(
                 "SaveSync transaction rolled back: operation_id=%s "
@@ -210,6 +221,7 @@ class SelectedTransaction:
                 }),
             },
             operation_id=self.operation_id,
+            parent_operation_id=self.parent_operation_id,
         )
         log.info(
             "SaveSync transaction finalized: operation_id=%s metrics=%s",
@@ -231,8 +243,13 @@ def prepare_transaction(
     views: Iterable[SelectedView],
     *,
     operation_id: Optional[str] = None,
+    parent_operation_id: Optional[str] = None,
 ) -> SelectedTransaction:
     """Stage and verify every desired selected tree, then write the journal.
+
+    ``operation_id`` is the validated transaction/recovery token.
+    ``parent_operation_id`` links its diagnostic events to the enclosing
+    workflow and is never granted transaction identity or filesystem authority.
 
     Live destination paths are untouched until :func:`apply_transaction`.
     Existing stable ``.savesync-previous`` directories contain only allowlisted
@@ -240,6 +257,9 @@ def prepare_transaction(
     """
     op_id = operation_id or uuid.uuid4().hex
     _validate_operation_id(op_id)
+    parent_id = parent_operation_id or current_operation_id()
+    if parent_id == op_id:
+        parent_id = None
     raw_views = tuple(views)
     if not raw_views:
         raise SaveSyncError("SaveSync transaction must contain at least one view")
@@ -310,7 +330,13 @@ def prepare_transaction(
         if not prepared:
             raise SaveSyncError("SaveSync transaction contains no changed paths")
         metrics = _transaction_metrics(prepared)
-        transaction = SelectedTransaction(op_id, journal, tuple(prepared), metrics)
+        transaction = SelectedTransaction(
+            op_id,
+            journal,
+            tuple(prepared),
+            metrics,
+            parent_operation_id=parent_id,
+        )
         _create_journal(transaction, phase="preparing")
         journal_created = True
         for raw_view, view in zip(prepared_sources, prepared):
@@ -321,6 +347,7 @@ def prepare_transaction(
             _materialize_manifest(
                 view.stage, view.desired, raw_view.source_for,
                 operation_id=op_id, logical_groups=view.logical_groups,
+                parent_operation_id=parent_id,
                 transaction_root=view.root,
             )
             _verify_manifest(view.stage, view.desired)
@@ -329,6 +356,7 @@ def prepare_transaction(
                 view.current,
                 lambda relative, _artifact, root=view.root: root / relative,
                 operation_id=op_id, logical_groups=view.logical_groups,
+                parent_operation_id=parent_id,
                 transaction_root=view.root,
             )
             _verify_manifest(view.previous_candidate, view.current)
@@ -345,6 +373,7 @@ def prepare_transaction(
                 }),
             },
             operation_id=transaction.operation_id,
+            parent_operation_id=transaction.parent_operation_id,
         )
         log.info(
             "SaveSync transaction prepared: operation_id=%s metrics=%s",
@@ -392,6 +421,7 @@ def apply_transaction(
             }),
         },
         operation_id=transaction.operation_id,
+        parent_operation_id=transaction.parent_operation_id,
     )
     try:
         # A final full positive scan closes the preview/stage window.  It also
@@ -414,6 +444,7 @@ def apply_transaction(
                 }),
             },
             operation_id=transaction.operation_id,
+            parent_operation_id=transaction.parent_operation_id,
         )
     except BaseException:
         transaction.rollback()
@@ -477,6 +508,7 @@ def _apply_view(view: PreparedView, transaction: SelectedTransaction) -> None:
             "savesync", "physical_mutation.before",
             f"SaveSync physical {action} about to execute",
             metadata=audit, operation_id=transaction.operation_id,
+            parent_operation_id=transaction.parent_operation_id,
         )
         if desired is None:
             transaction._live_touched = True
@@ -485,6 +517,7 @@ def _apply_view(view: PreparedView, transaction: SelectedTransaction) -> None:
                 "savesync", "physical_mutation.after",
                 "SaveSync physical delete completed", metadata=audit,
                 operation_id=transaction.operation_id,
+                parent_operation_id=transaction.parent_operation_id,
             )
             continue
         staged = _safe_target(view.stage, relative, create_parents=False)
@@ -495,6 +528,7 @@ def _apply_view(view: PreparedView, transaction: SelectedTransaction) -> None:
             "savesync", "physical_mutation.after",
             f"SaveSync physical {action} completed", metadata=audit,
             operation_id=transaction.operation_id,
+            parent_operation_id=transaction.parent_operation_id,
         )
 
 
@@ -532,6 +566,7 @@ def _restore_view(
     actions: tuple[_RestoreAction, ...],
     *,
     operation_id: str,
+    parent_operation_id: Optional[str] = None,
 ) -> None:
     for action in actions:
         target = _safe_target(view.root, action.relative, create_parents=True)
@@ -547,6 +582,7 @@ def _restore_view(
             "savesync", "physical_mutation.before",
             "SaveSync rollback mutation about to execute", metadata=audit,
             operation_id=operation_id,
+            parent_operation_id=parent_operation_id,
         )
         if action.original is None:
             target.unlink(missing_ok=True)
@@ -554,6 +590,7 @@ def _restore_view(
                 "savesync", "physical_mutation.after",
                 "SaveSync rollback delete completed", metadata=audit,
                 operation_id=operation_id,
+                parent_operation_id=parent_operation_id,
             )
             continue
         source = _safe_target(
@@ -571,6 +608,7 @@ def _restore_view(
                 "savesync", "physical_mutation.after",
                 "SaveSync rollback restoration completed", metadata=audit,
                 operation_id=operation_id,
+                parent_operation_id=parent_operation_id,
             )
         finally:
             restore_tmp.unlink(missing_ok=True)
@@ -591,6 +629,7 @@ def _materialize_manifest(
     source_for: Callable[[str, SaveArtifact], Path],
     *,
     operation_id: Optional[str] = None,
+    parent_operation_id: Optional[str] = None,
     logical_groups: Optional[dict[str, str]] = None,
     transaction_root: Optional[Path] = None,
 ) -> None:
@@ -614,12 +653,14 @@ def _materialize_manifest(
             "savesync", "physical_mutation.before",
             "SaveSync staged materialization about to execute",
             metadata=audit, operation_id=operation_id,
+            parent_operation_id=parent_operation_id,
         )
         materialize(destination, fresh_source=source)
         diagnostic_event(
             "savesync", "physical_mutation.after",
             "SaveSync staged materialization completed",
             metadata=audit, operation_id=operation_id,
+            parent_operation_id=parent_operation_id,
         )
 
 
@@ -1175,6 +1216,11 @@ def _read_journal(
         path,
         tuple(views),
         _transaction_metrics(views),
+        parent_operation_id=(
+            current_operation_id()
+            if current_operation_id() != operation_id
+            else None
+        ),
         _live_touched=phase in {"applying", "promoted"},
     ), phase
 

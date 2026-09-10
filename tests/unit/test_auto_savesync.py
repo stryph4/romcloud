@@ -17,7 +17,7 @@ from romcloud.core.exceptions import SaveSyncConnectivityError, SaveSyncError
 from romcloud.core.models.savesync import SaveGroupCondition, SaveQuickSyncResult
 from romcloud.core.save_selection import DEFAULT_SAVE_SELECTION_POLICY
 from romcloud.core.storage import StorageProvider
-from romcloud.infrastructure import save_transaction
+from romcloud.infrastructure import diagnostics, save_transaction
 from romcloud.infrastructure import save_tree
 from romcloud.infrastructure import savesync_prompts
 from romcloud.infrastructure.config import (
@@ -34,6 +34,7 @@ from romcloud.services.auto_savesync import (
     AutoSaveSyncCoordinator,
     layout_ids_for_session,
 )
+from romcloud.infrastructure.diagnostics import DiagnosticQuery
 from romcloud.services.saves import SaveSyncService
 
 
@@ -1222,6 +1223,78 @@ def test_local_gba_auto_sync_ignores_rom_import_selection(
         Path(container.config.remote_data.root)
         / "saves/gba/Pokemon Emerald.srm"
     ).read_bytes() == b"local-gba-save"
+
+
+def test_game_stop_correlation_id_is_not_reused_as_transaction_id(
+    tmp_path: Path, monkeypatch
+):
+    lifecycle_id = "game-stop-3215-1788998520"
+    store = diagnostics.configure_diagnostics(tmp_path / "diagnostics.db")
+    assert store is not None
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    local = tmp_path / "local/gba/Pokemon Fire Red.srm"
+    remote = tmp_path / "remote/gba/Pokemon Fire Red.srm"
+    _write(local, b"baseline")
+    service.full_sync()
+    coordinator.game_start(
+        system="gba",
+        emulator="libretro",
+        core="mgba",
+        rom="/userdata/roms/gba/Pokemon Fire Red.gba",
+    )
+    local.write_bytes(b"hardware-final-save")
+
+    transaction_ids: list[str] = []
+    original_prepare = save_transaction.prepare_transaction
+
+    def capture_prepare(*args, **kwargs):
+        transaction_ids.append(kwargs["operation_id"])
+        return original_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(save_transaction, "prepare_transaction", capture_prepare)
+    monkeypatch.setenv("ROMCLOUD_DIAGNOSTIC_OPERATION_ID", lifecycle_id)
+
+    coordinator.game_stop(
+        system="gba",
+        emulator="libretro",
+        core="mgba",
+        rom="/userdata/roms/gba/Pokemon Fire Red.gba",
+    )
+
+    assert remote.read_bytes() == b"hardware-final-save"
+    assert len(transaction_ids) == 1
+    transaction_id = transaction_ids[0]
+    assert len(transaction_id) == 32
+    assert int(transaction_id, 16) >= 0
+    assert transaction_id != lifecycle_id
+
+    lifecycle_chain = store.operation_chain(lifecycle_id)
+    assert lifecycle_chain
+    assert all(event["operation_id"] == lifecycle_id for event in lifecycle_chain)
+    assert any(event["event_code"] == "group.classified" for event in lifecycle_chain)
+
+    transaction_chain = store.operation_chain(transaction_id)
+    assert transaction_chain
+    assert {
+        "transaction.prepared",
+        "transaction.applying",
+        "transaction.promoted",
+        "transaction.finalized",
+    }.issubset({event["event_code"] for event in transaction_chain})
+    assert {
+        event["parent_operation_id"] for event in transaction_chain
+    } == {lifecycle_id}
+    assert all(
+        event["metadata"].get("transaction_id") == transaction_id
+        for event in transaction_chain
+    )
+
+    # The ordinary manual path still creates its own diagnostic and
+    # transaction identifiers and sees the Auto work as fully reconciled.
+    monkeypatch.delenv("ROMCLOUD_DIAGNOSTIC_OPERATION_ID")
+    assert service.quick_sync().status == "unchanged"
 
 
 def test_full_and_quick_sync_share_code_defined_supported_layout_boundary(
@@ -2805,6 +2878,9 @@ def test_game_stop_disconnect_fails_without_consuming_change_then_reconnects(
 def test_failed_game_stop_transaction_retains_baseline_cursor_and_dirty_hint(
     tmp_path: Path, monkeypatch
 ):
+    monkeypatch.setenv(
+        "ROMCLOUD_DIAGNOSTIC_OPERATION_ID", "game-stop-failed-transaction"
+    )
     provider = _Provider()
     service = _service(tmp_path, provider)
     coordinator = _coordinator(tmp_path, service)
