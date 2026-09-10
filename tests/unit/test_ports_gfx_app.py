@@ -1561,6 +1561,23 @@ class TestOperationSummaryMessage:
         assert message == "Refresh Catalog: failed"
         assert kind == "error"
 
+    def test_failed_operation_prefers_actionable_backend_json(self):
+        operation = self._operation(
+            state=OperationState.FAILED,
+            error="exited with code 1",
+        )
+        operation.runner.lines = [
+            OperationLine(
+                "stdout",
+                '{"ok":false,"error":"Configured ROM source is unavailable"}',
+            )
+        ]
+
+        message, kind = operation_summary_message(operation)
+
+        assert message == "Refresh Catalog: failed (Configured ROM source is unavailable)"
+        assert kind == "error"
+
 
 class TestModeTransitionExit:
     def _operation(

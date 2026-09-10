@@ -418,6 +418,28 @@ def test_sftp_browser_failure_surfaces_backend_diagnostic(monkeypatch):
     assert wizard.technical_error in wizard.error
 
 
+def test_successful_setup_with_preserved_conflicts_opens_attention_flow(monkeypatch):
+    wizard = WizardState()
+    wizard.step = WizardStep.APPLY
+    wizard.runner = _Runner()
+    monkeypatch.setattr(
+        "ports_gfx.wizard.operation_result",
+        lambda _runner: BackendResult(
+            True,
+            data={
+                "conflict_ids": ["one", "two"],
+                "save_conflicts": 2,
+            },
+        ),
+    )
+
+    wizard.poll()
+
+    assert wizard.step is WizardStep.DONE
+    assert wizard.savesync_conflict_ids == ("one", "two")
+    assert "need your attention" in wizard.notice
+
+
 def test_sftp_detect_failure_surfaces_backend_diagnostic(monkeypatch):
     wizard = WizardState()
     wizard.source_type = "sftp"

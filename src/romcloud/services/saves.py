@@ -10,16 +10,32 @@ authoritative after preview and confirmation.
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import os
 import shutil
 import tempfile
 import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, Optional
 
 from romcloud.core.capabilities import Capability, CapabilityPolicy
+from romcloud.core.save_containers import (
+    ContainerBaseline,
+    ContainerSnapshot,
+    EntryReplacement,
+    DomainAction,
+    OpaqueContainerError,
+    OpaqueReason,
+    RebuildPlan,
+    SaveContainerAdapter,
+    baseline_from_snapshot,
+    plan_container_reconcile,
+    target_snapshot,
+)
 from romcloud.core.exceptions import (
+    ROMCloudError,
     SaveSyncConnectivityError,
     SaveSyncError,
     SaveSyncVerificationError,
@@ -51,6 +67,7 @@ from romcloud.core.save_selection import (
     RPCS3_DEV_HDD0_PREFIX,
     XBOX_HDD_RELATIVE_PATH,
     XBOX_SYSTEM,
+    SaveGroupDescriptor,
     SaveSelectionPolicy,
 )
 from romcloud.core.storage import StorageAccessResult
@@ -58,13 +75,34 @@ from romcloud.core.remote_data import RemoteDataProvider
 from romcloud.infrastructure import save_tree
 from romcloud.infrastructure import save_transaction
 from romcloud.infrastructure.logging import get_logger
+from romcloud.infrastructure.diagnostics import (
+    correlated_operation,
+    current_operation_id,
+    event as diagnostic_event,
+    stage_timer,
+)
 from romcloud.infrastructure import savesync_state as durable_state
 from romcloud.infrastructure import savesync_journal
 from romcloud.infrastructure.remote_saves import RemoteSaveStore, build_remote_save_store
+from romcloud.infrastructure.save_container_registry import (
+    DEFAULT_SAVE_CONTAINER_REGISTRY,
+    SaveContainerRegistry,
+)
 
 log = get_logger("saves")
 _RPCS3_CANONICAL_PREFIX = f"ps3/{RPCS3_DEV_HDD0_PREFIX}"
 _QUICK_SYNC_HISTORY_REQUIRED = 1
+
+_FILE_TIMESTAMP_KIND = "file"
+_CONTAINER_TIMESTAMP_KIND = "container"
+
+
+def _unknown_modification_evidence(kind: str) -> dict[str, object]:
+    return {
+        "modified_epoch": None,
+        "timestamp_kind": kind,
+        "timestamp_source": "",
+    }
 
 
 class _ScratchDir:
@@ -95,6 +133,8 @@ class _ScratchDir:
 class _DestinationView:
     root: Path
     canonical_prefix: str = ""
+    mapping_id: str = ""
+    ownership_domain: str = ""
 
 
 @dataclass(frozen=True)
@@ -106,6 +146,38 @@ class _LocalMaterializationStatus:
     expected: int
     existing: int
     missing: int
+
+
+@dataclass
+class _ContainerWork:
+    handled_paths: set[str]
+    desired_local: dict[str, SaveArtifact]
+    desired_remote: dict[str, SaveArtifact]
+    local_sources: dict[str, Path]
+    remote_sources: dict[str, Path]
+    baselines: dict[str, ContainerBaseline]
+    expected_local: dict[str, tuple[SaveContainerAdapter, Path, ContainerSnapshot]]
+    expected_remote: dict[str, tuple[SaveContainerAdapter, Path, ContainerSnapshot]]
+    descriptors: dict[str, SaveGroupDescriptor]
+    conflicted_container_ids: set[str]
+    conflict_paths: list[str]
+    preview_entries: list[SaveReconcileEntry]
+    invalidated_container_ids: set[str]
+    uploaded: int = 0
+    downloaded: int = 0
+    upload_bytes: int = 0
+    download_bytes: int = 0
+    unchanged: int = 0
+    scratch: Optional[Path] = None
+
+    @classmethod
+    def empty(cls) -> "_ContainerWork":
+        return cls(set(), {}, {}, {}, {}, {}, {}, {}, {}, set(), [], [], set())
+
+    def cleanup(self) -> None:
+        if self.scratch is not None:
+            shutil.rmtree(self.scratch, ignore_errors=True)
+            self.scratch = None
 
 
 class SaveSyncService:
@@ -123,9 +195,12 @@ class SaveSyncService:
         rpcs3_installed_games_enabled: bool = False,
         ownership_policy: object = None,
         legacy_rpcs3_root: Optional[str] = None,
+        mapped_local_roots: tuple[tuple[str, str, str], ...] = (),
         policy: SaveSelectionPolicy = DEFAULT_SAVE_SELECTION_POLICY,
         capability_policy: Optional[CapabilityPolicy] = None,
         remote_store: Optional[RemoteSaveStore] = None,
+        container_registry: SaveContainerRegistry = DEFAULT_SAVE_CONTAINER_REGISTRY,
+        effective_mode: str = "local-saves",
     ) -> None:
         self._provider = provider
         self._connectivity_root = connectivity_root
@@ -144,6 +219,7 @@ class SaveSyncService:
             else None
         )
         self._state_path = Path(state_path)
+        self._effective_mode = effective_mode
         self._xbox_enabled = xbox_enabled
         # Kept as accepted constructor arguments for configuration/API
         # compatibility. Eligibility is defined solely by the positive
@@ -156,9 +232,33 @@ class SaveSyncService:
         self._legacy_rpcs3_root = (
             Path(legacy_rpcs3_root) if legacy_rpcs3_root is not None else None
         )
+        mapped_views: list[_DestinationView] = []
+        seen_prefixes: set[str] = set()
+        for mapping_id, physical_root, canonical_prefix in mapped_local_roots:
+            normalized = canonical_prefix.replace("\\", "/").strip("/")
+            if (
+                not mapping_id
+                or not normalized
+                or normalized in seen_prefixes
+                or PurePosixPath(normalized).as_posix() != normalized
+                or any(part in {".", ".."} for part in PurePosixPath(normalized).parts)
+            ):
+                raise ValueError("mapped SaveSync roots require unique canonical prefixes")
+            seen_prefixes.add(normalized)
+            mapped_views.append(
+                _DestinationView(
+                    Path(physical_root),
+                    normalized,
+                    mapping_id,
+                    f"mapped:{normalized}",
+                )
+            )
+        self._mapped_local_views = tuple(mapped_views)
         self._policy = policy
         self._capabilities = capability_policy or CapabilityPolicy("smart_cache")
         self._active_read_scratch: Optional[_ScratchDir] = None
+        self._observation_cache: Optional[save_tree.ContentObservationCache] = None
+        self._container_registry = container_registry
 
     # ── connectivity and settings ────────────────────────────────────────
 
@@ -172,9 +272,25 @@ class SaveSyncService:
             )
         return self._remote_store.validate_access()
 
+    def is_remote_writable(
+        self, access: Optional[StorageAccessResult] = None
+    ) -> bool:
+        return self._remote_store is not None and self._remote_store.is_writable(access)
+
     @property
     def is_remote_configured(self) -> bool:
         return self._remote_store is not None
+
+    @property
+    def legacy_filesystem_remote_root(self) -> Optional[Path]:
+        """Filesystem root needed only to validate legacy Direct Save manifests."""
+        if (
+            self._remote_store is None
+            or not self._remote_store.capabilities.filesystem_transactions
+            or not self._remote_store.capabilities.filesystem_journal
+        ):
+            return None
+        return self._remote_root
 
     @property
     def xbox_enabled(self) -> bool:
@@ -211,6 +327,84 @@ class SaveSyncService:
     def _path_enabled(self, canonical_path: str) -> bool:
         descriptor = self._policy.group_for_path(canonical_path)
         return descriptor is not None and self._layout_enabled(descriptor.layout_id)
+
+    def _obsolete_whole_layout_conflicts(
+        self,
+        state: SaveSyncState,
+        *,
+        excluded_layout_ids: frozenset[str] = frozenset(),
+        conflict_ids: Optional[frozenset[str]] = None,
+    ) -> tuple[SaveConflictRecord, ...]:
+        """Identify safely mappable conflicts from an older coarse grouping.
+
+        Historical ``group_by=layout`` records used ``<layout>/dataset`` as
+        their ownership identity.  A later registry may split that layout
+        into narrower current groups.  The stored snapshots remain recovery
+        evidence, but only a fresh layout scan may decide today's outcome.
+        """
+        obsolete: list[SaveConflictRecord] = []
+        for conflict in state.active_conflicts:
+            if conflict_ids is not None and conflict.conflict_id not in conflict_ids:
+                continue
+            legacy_group_id = f"{conflict.layout_id}/dataset"
+            if conflict.group_id != legacy_group_id:
+                continue
+            try:
+                layout = self._policy.layout(conflict.layout_id)
+            except KeyError as exc:
+                raise SaveSyncVerificationError(
+                    "A legacy whole-layout SaveSync conflict references a layout "
+                    f"that this version cannot map safely: {conflict.layout_id}. "
+                    "The conflict was preserved; export diagnostics and keep both "
+                    "save locations unchanged."
+                ) from exc
+            if layout.group_by == "layout":
+                continue
+            if (
+                conflict.layout_id in excluded_layout_ids
+                or not self._layout_enabled(conflict.layout_id)
+            ):
+                continue
+            evidence_paths = {
+                artifact.relative_path
+                for snapshot in (conflict.baseline, conflict.local, conflict.remote)
+                if snapshot is not None
+                for artifact in snapshot.artifacts
+            }
+            if not evidence_paths:
+                raise SaveSyncVerificationError(
+                    "A legacy whole-layout SaveSync conflict contains no mappable "
+                    "save evidence. The conflict was preserved; keep both save "
+                    "locations unchanged and export diagnostics."
+                )
+            descriptors = tuple(
+                self._policy.group_for_path(path) for path in sorted(evidence_paths)
+            )
+            if any(
+                descriptor is None
+                or descriptor.layout_id != conflict.layout_id
+                for descriptor in descriptors
+            ):
+                raise SaveSyncVerificationError(
+                    "A legacy whole-layout SaveSync conflict cannot be mapped "
+                    "unambiguously to the current ownership registry. The conflict "
+                    "was preserved; keep both save locations unchanged and export "
+                    "diagnostics."
+                )
+            current_group_ids = {
+                descriptor.group_id
+                for descriptor in descriptors
+                if descriptor is not None
+            }
+            if legacy_group_id in current_group_ids:
+                raise SaveSyncVerificationError(
+                    "A legacy whole-layout SaveSync conflict overlaps a current "
+                    "ownership identity and cannot be migrated safely. The conflict "
+                    "was preserved; keep both save locations unchanged and export "
+                    "diagnostics."
+                )
+            obsolete.append(conflict)
+        return tuple(obsolete)
 
     # ── state ─────────────────────────────────────────────────────────────
 
@@ -258,11 +452,15 @@ class SaveSyncService:
             paths=hints,
         )
 
+    @correlated_operation(
+        "Local SaveSync discovery", subsystem="savesync", source="local-discovery"
+    )
     def detect_and_mark_local_changes(
         self,
         layout_ids: frozenset[str],
         *,
         changed_since: float,
+        observed: Optional[dict[str, SaveArtifact]] = None,
     ) -> SaveSyncState:
         """Hash audited local layouts and persist changed group hints.
 
@@ -270,6 +468,13 @@ class SaveSyncService:
         are authoritative. For a group never observed before, file mtimes are
         used only to nominate a candidate; reconciliation always rescans and
         hashes both sides before making a decision.
+
+        *observed* lets a caller hand over a manifest it just produced for the
+        exact same layout scope — the settled observation from
+        :meth:`observe_local_layouts` that proved stability moments ago. Doing
+        so avoids re-reading every byte of the same tree a third time; it is
+        never weaker, because that manifest is the newest content observation
+        available and is what the stability proof was made from.
         """
         allowed_layouts = frozenset(
             layout_id
@@ -281,8 +486,16 @@ class SaveSyncService:
             return self.get_state()
         with self._operation_lock():
             state = self._get_state_unlocked()
-            current = self._scan_local_layouts(allowed_layouts).artifacts
+            current = (
+                self._scan_local_layouts(allowed_layouts).artifacts
+                if observed is None
+                else dict(observed)
+            )
             baseline = self._automatic_baseline(state)
+            authoritative_baseline = (
+                state.quick_sync_ready
+                and state.quick_sync_cursor_generation is not None
+            )
             known_groups = {group.group_id for group in state.groups}
             paths_by_group: dict[str, set[str]] = {}
             descriptors = {}
@@ -293,7 +506,26 @@ class SaveSyncService:
                 paths_by_group.setdefault(descriptor.group_id, set()).add(path)
                 descriptors[descriptor.group_id] = descriptor
 
+            log.info(
+                "SaveSync local discovery: layout_count=%d layouts=%s "
+                "current_artifacts=%d baseline_artifacts=%d candidate_groups=%d "
+                "cursor=%s quick_ready=%s",
+                len(allowed_layouts),
+                ",".join(sorted(allowed_layouts)),
+                len(current),
+                len(baseline),
+                len(paths_by_group),
+                (
+                    state.quick_sync_cursor_generation
+                    if state.quick_sync_cursor_generation is not None
+                    else "none"
+                ),
+                state.quick_sync_ready,
+            )
+
             next_state = state
+            changed_groups = 0
+            unchanged_groups = 0
             for group_id, group_paths in sorted(paths_by_group.items()):
                 descriptor = descriptors[group_id]
                 local_group = _group_manifest(current, sorted(group_paths))
@@ -301,6 +533,20 @@ class SaveSyncService:
                 has_baseline = group_id in known_groups or bool(baseline_group)
                 if has_baseline:
                     changed = not _same_manifest(local_group, baseline_group)
+                    reason = (
+                        "manifest-diff-from-baseline"
+                        if changed
+                        else "manifest-matches-baseline"
+                    )
+                elif authoritative_baseline:
+                    # A completed Full Sync observed this approved layout and
+                    # established that this ownership group did not exist.
+                    # Its presence now is therefore an authoritative addition,
+                    # regardless of mtime. Emulator copies/atomic replacements
+                    # may preserve old timestamps; using the session window here
+                    # would silently discard a real change that Full Sync finds.
+                    changed = bool(local_group)
+                    reason = "new-group-absent-from-full-sync-baseline"
                 else:
                     changed = any(
                         _mtime_at_or_after(
@@ -309,8 +555,50 @@ class SaveSyncService:
                         )
                         for artifact in local_group
                     )
+                    reason = (
+                        "new-group-mtime-in-session"
+                        if changed
+                        else "new-group-outside-session-window"
+                    )
+                log.info(
+                    "SaveSync local hash observation: group_id=%r "
+                    "old_hash=%s observed_hash=%s",
+                    group_id,
+                    _manifest_hash_summary(baseline_group),
+                    _manifest_hash_summary(local_group),
+                )
+                log.info(
+                    "SaveSync local classification: layout_id=%s group_id=%r "
+                    "classification=%s reason=%s local_artifacts=%d "
+                    "baseline_artifacts=%d",
+                    descriptor.layout_id,
+                    group_id,
+                    "changed" if changed else "unchanged",
+                    reason,
+                    len(local_group),
+                    len(baseline_group),
+                )
+                diagnostic_event(
+                    "savesync", "group.classified",
+                    f"SaveSync group {group_id} classified",
+                    metadata={
+                        "layout_id": descriptor.layout_id, "group_id": group_id,
+                        "classification": "changed" if changed else "unchanged",
+                        "reason": reason,
+                        "local_hash": _manifest_hash_summary(local_group),
+                        "baseline_hash": _manifest_hash_summary(baseline_group),
+                        "local_artifacts": len(local_group),
+                        "baseline_artifacts": len(baseline_group),
+                    },
+                )
                 if not changed:
+                    unchanged_groups += 1
+                    log.info(
+                        "SaveSync local discovery: no change detected: group_id=%r",
+                        group_id,
+                    )
                     continue
+                changed_groups += 1
                 hints = tuple(
                     path
                     for path in sorted(group_paths)
@@ -322,8 +610,44 @@ class SaveSyncService:
                     layout_id=descriptor.layout_id,
                     paths=hints,
                 )
+                log.info(
+                    "SaveSync local discovery: dirty marker created: group_id=%r "
+                    "paths=%s",
+                    group_id,
+                    ",".join(hints),
+                )
+                diagnostic_event(
+                    "savesync", "dirty_marker.created",
+                    f"Dirty marker created for {group_id}",
+                    metadata={"group_id": group_id, "layout_id": descriptor.layout_id,
+                              "dirty_paths": hints, "reason": reason},
+                )
             if next_state != state:
                 _write_state(self._state_path, next_state)
+            if changed_groups == 0:
+                diagnostic_event(
+                    "savesync",
+                    "dirty_marker.skipped",
+                    "Local discovery created no dirty marker",
+                    metadata={
+                        "layout_ids": sorted(allowed_layouts),
+                        "candidate_groups": len(paths_by_group),
+                        "observed_artifacts": len(current),
+                        "reason": (
+                            "no-supported-ownership-groups-observed"
+                            if not paths_by_group
+                            else "all-observed-groups-match-baseline"
+                        ),
+                    },
+                )
+            log.info(
+                "SaveSync local discovery complete: candidate_groups=%d "
+                "changed_groups=%d unchanged_groups=%d durable_dirty_state_updated=%s",
+                len(paths_by_group),
+                changed_groups,
+                unchanged_groups,
+                next_state != state,
+            )
             return next_state
 
     def observe_local_groups(
@@ -355,12 +679,160 @@ class SaveSyncService:
         report = self._scan_local_layouts(layout_ids)
         return _manifest_for_groups(report.artifacts, group_ids, self._policy)
 
+    def groups_within(
+        self, observed: dict[str, SaveArtifact], group_ids: frozenset[str]
+    ) -> dict[str, SaveArtifact]:
+        """Narrow an already-taken local observation to specific logical groups.
+
+        Pure filtering of a manifest the caller already holds — no filesystem,
+        provider or durable-state access.
+        """
+        return _manifest_for_groups(observed, group_ids, self._policy)
+
+    def observe_local_layouts(
+        self, layout_ids: frozenset[str]
+    ) -> dict[str, SaveArtifact]:
+        """Hash whatever local files currently exist under these layouts.
+
+        Unlike :meth:`observe_local_groups`, this observes content *before*
+        any group has been durably classified as dirty, so a caller can wait
+        for an emulator/core's save write to settle before that
+        classification is ever computed. Advisory and read-only: no durable
+        state, provider, or remote path is touched here.
+        """
+        allowed_layouts = frozenset(
+            layout_id
+            for layout_id in layout_ids
+            if self._policy.is_lifecycle_enabled(layout_id)
+            and self._layout_enabled(layout_id)
+        )
+        if not allowed_layouts:
+            return {}
+        return dict(self._scan_local_layouts(allowed_layouts).artifacts)
+
+    def describe_local_observation(
+        self, observed: dict[str, SaveArtifact]
+    ) -> tuple[dict[str, object], ...]:
+        """Return safe metadata for a scoped lifecycle observation.
+
+        This is diagnostic-only: paths have already passed the canonical
+        SaveSync registry and were opened by the scanner.  Save contents are
+        never returned.  A stat race is represented explicitly instead of
+        affecting discovery or reconciliation.
+        """
+        details: list[dict[str, object]] = []
+        for canonical_path, artifact in sorted(observed.items())[:100]:
+            item: dict[str, object] = {
+                "canonical_path": canonical_path,
+                "size_bytes": artifact.size_bytes,
+                "content_hash": artifact.content_hash,
+            }
+            try:
+                physical = self._local_path(canonical_path)
+                status = physical.stat()
+            except (OSError, SaveSyncVerificationError) as exc:
+                item.update(
+                    {
+                        "physical_path": "unavailable",
+                        "mtime_ns": None,
+                        "stat_error": type(exc).__name__,
+                    }
+                )
+            else:
+                item.update(
+                    {
+                        "physical_path": str(physical),
+                        "mtime_ns": status.st_mtime_ns,
+                    }
+                )
+            details.append(item)
+        return tuple(details)
+
     def acknowledge_conflict(self, conflict_id: str) -> SaveSyncState:
         """Record Review-Later acknowledgement without resolving a conflict."""
         return durable_state.SaveSyncStateStore(
             self._state_path
         ).acknowledge_conflict(conflict_id)
 
+    def conflict_modification_evidence(
+        self, conflict: SaveConflictRecord
+    ) -> dict[str, dict[str, object]]:
+        """Read-only modification timestamps shown while a user resolves a conflict.
+
+        Purely presentational evidence: it never participates in conflict
+        classification, winner selection, or any transaction.  Timestamps come
+        only from the physical local files and from provider metadata — never
+        from scan, detection, journal, or wall-clock time.  Clocks may differ
+        between this device and the remote, so an unavailable or untrusted
+        value is reported as ``None`` rather than approximated.
+        """
+        kind = self._modification_timestamp_kind(conflict.layout_id)
+        return {
+            "local": self._local_modification_evidence(conflict.local, kind),
+            "remote": self._remote_modification_evidence(conflict.remote, kind),
+        }
+
+    def _modification_timestamp_kind(self, layout_id: str) -> str:
+        """``"container"`` when the physical file is a parsed save container.
+
+        No container adapter exposes a per-save logical timestamp, so container
+        layouts must never present their file mtime as a logical save time.
+        """
+        try:
+            layout = self._policy.layout(layout_id)
+        except KeyError:
+            return _FILE_TIMESTAMP_KIND
+        return (
+            _CONTAINER_TIMESTAMP_KIND
+            if layout.container_adapter_id
+            else _FILE_TIMESTAMP_KIND
+        )
+
+    def _local_modification_evidence(
+        self, snapshot: Optional[SaveGroupSnapshot], kind: str
+    ) -> dict[str, object]:
+        if snapshot is None or not snapshot.artifacts:
+            return _unknown_modification_evidence(kind)
+        newest: Optional[float] = None
+        for artifact in snapshot.artifacts:
+            try:
+                path = self._local_path(artifact.relative_path)
+                if path.is_symlink() or not path.is_file():
+                    return _unknown_modification_evidence(kind)
+                stamp = path.stat().st_mtime
+            except (SaveSyncVerificationError, OSError):
+                return _unknown_modification_evidence(kind)
+            newest = stamp if newest is None else max(newest, stamp)
+        return {
+            "modified_epoch": newest,
+            "timestamp_kind": kind,
+            "timestamp_source": "local-filesystem",
+        }
+
+    def _remote_modification_evidence(
+        self, snapshot: Optional[SaveGroupSnapshot], kind: str
+    ) -> dict[str, object]:
+        store = self._remote_store
+        if store is None or snapshot is None or not snapshot.artifacts:
+            return _unknown_modification_evidence(kind)
+        newest: Optional[float] = None
+        for artifact in snapshot.artifacts:
+            try:
+                stamp = store.modified_epoch(artifact.relative_path)
+            except (ROMCloudError, OSError, ValueError):
+                return _unknown_modification_evidence(kind)
+            if stamp is None:
+                return _unknown_modification_evidence(kind)
+            newest = stamp if newest is None else max(newest, stamp)
+        return {
+            "modified_epoch": newest,
+            "timestamp_kind": kind,
+            "timestamp_source": f"remote-provider:{store.provider_id}",
+        }
+
+    @correlated_operation(
+        "Conflict resolution", subsystem="savesync", source="conflict resolution"
+    )
     def resolve_conflict(
         self,
         conflict_id: str,
@@ -454,6 +926,8 @@ class SaveSyncService:
                     "bytes": sum(item.size_bytes for item in desired.values()),
                 },
             )
+            # Diagnostic correlation IDs and durable transaction IDs have
+            # different contracts. The latter is always an independent UUID.
             operation_id = uuid.uuid4().hex
             transaction = self._prepare_selected_transaction(
                 destination_views,
@@ -707,9 +1181,59 @@ class SaveSyncService:
                 scratch.cleanup()
                 self._active_read_scratch = previous
 
+    @contextlib.contextmanager
+    def observation_scope(self):  # noqa: ANN202
+        """Reuse content observations for the duration of one operation.
+
+        Inside this scope a file that the filesystem still reports as
+        untouched (same device/inode/size/mtime_ns) since it was hashed
+        earlier in the *same* operation is not re-read. Nested scopes reuse
+        the outermost cache so a caller-established scope survives the
+        service's own internal operations; the cache is always discarded when
+        the outermost scope exits, so nothing is ever carried between
+        operations.
+        """
+        if self._observation_cache is not None:
+            yield self._observation_cache
+            return
+        cache = save_tree.ContentObservationCache()
+        self._observation_cache = cache
+        try:
+            yield cache
+        finally:
+            self._observation_cache = None
+
+    @contextlib.contextmanager
+    def _fresh_observations(self):  # noqa: ANN202
+        """Suspend observation reuse so a scan re-reads every real byte.
+
+        Used for the post-mutation verification scan, which must prove what is
+        actually on disk now rather than what was true before the transaction.
+        """
+        previous = self._observation_cache
+        self._observation_cache = None
+        try:
+            yield
+        finally:
+            self._observation_cache = previous
+
     @property
     def selection_policy(self) -> SaveSelectionPolicy:
         return self._policy
+    def with_local_root(self, local_root: Path) -> "SaveSyncService":
+        """Create a transition view over an owned canonical local shadow tree."""
+        return SaveSyncService(
+            provider=self._provider,
+            connectivity_root=self._connectivity_root,
+            local_root=str(local_root),
+            remote_root=None,
+            state_path=self._state_path,
+            xbox_enabled=self._xbox_enabled,
+            policy=self._policy,
+            capability_policy=self._capabilities,
+            remote_store=self._remote_store,
+            container_registry=self._container_registry,
+        )
 
     # ── scanning and physical path mapping ───────────────────────────────
 
@@ -721,27 +1245,132 @@ class SaveSyncService:
             self._legacy_rpcs3_root.exists() or self._legacy_rpcs3_root.parent.exists()
         )
 
-    def _scan_primary(self, root: Path) -> save_tree.ScanReport:
+    def _scan_primary(
+        self,
+        root: Path,
+        policy: Optional[SaveSelectionPolicy] = None,
+        *,
+        only_relative_paths: Optional[frozenset[str]] = None,
+        trusted: bool = True,
+    ) -> save_tree.ScanReport:
+        """*trusted* gates whether the operation-scoped observation cache may
+        be consulted. It must be ``False`` for any root that is not one of
+        this service's own known local destinations (see
+        :meth:`_is_local_physical_root`) — a network-backed remote root's
+        metadata is never trustworthy enough to skip a re-read.
+        """
         return save_tree.scan_tree_report(
             root,
-            self._policy,
+            policy or self._policy,
             enabled_optional_systems=self._enabled_optional_systems(),
             enabled_optional_groups=self._enabled_optional_groups(),
+            cache=self._observation_cache if trusted else None,
+            only_relative_paths=only_relative_paths,
+        )
+
+    def _is_local_physical_root(self, root: Path) -> bool:
+        """True only for a root this service itself owns as local storage.
+
+        The sole basis for ever trusting a cached content observation — see
+        :class:`~romcloud.infrastructure.save_tree.ContentObservationCache`.
+        """
+        absolute = self._absolute_root(root)
+        return any(
+            absolute == self._absolute_root(view.root)
+            for view in self._local_views()
+        )
+
+    def _primary_local_policy(
+        self, policy: SaveSelectionPolicy
+    ) -> SaveSelectionPolicy:
+        """Remove mapped subtrees before local discovery enters any of them."""
+        prefixes = [view.canonical_prefix for view in self._mapped_local_views]
+        if self._uses_legacy_rpcs3():
+            prefixes.append(_RPCS3_CANONICAL_PREFIX)
+        if not prefixes:
+            return policy
+        layouts = []
+        for layout in policy.layouts:
+            layout_root = "/".join(
+                part
+                for part in (layout.system, layout.root_pattern.strip("/"))
+                if part
+            )
+            if any(
+                layout_root == prefix or layout_root.startswith(f"{prefix}/")
+                for prefix in prefixes
+            ):
+                continue
+            layouts.append(layout)
+        return SaveSelectionPolicy(layouts=tuple(layouts))
+
+    def _without_mapped_local_prefixes(
+        self, report: save_tree.ScanReport
+    ) -> save_tree.ScanReport:
+        prefixes = tuple(
+            f"{view.canonical_prefix}/" for view in self._mapped_local_views
+        )
+        if self._uses_legacy_rpcs3():
+            prefixes = (*prefixes, f"{_RPCS3_CANONICAL_PREFIX}/")
+        if not prefixes:
+            return report
+        return save_tree.ScanReport(
+            {
+                path: artifact
+                for path, artifact in report.artifacts.items()
+                if not path.startswith(prefixes)
+            },
+            excluded_files=report.excluded_files,
+            excluded_bytes=report.excluded_bytes,
+            optional_groups=report.optional_groups,
+        )
+
+    def _scan_mapped_view(
+        self,
+        view: _DestinationView,
+        policy: SaveSelectionPolicy,
+        *,
+        root: Optional[Path] = None,
+        only_relative_paths: Optional[frozenset[str]] = None,
+    ) -> save_tree.ScanReport:
+        system, _, relative_prefix = view.canonical_prefix.partition("/")
+        return save_tree.scan_mapped_tree_report(
+            view.root if root is None else root,
+            policy,
+            system=system,
+            relative_prefix=relative_prefix,
+            enabled_optional_groups=self._enabled_optional_groups(),
+            cache=self._observation_cache,
+            only_relative_paths=only_relative_paths,
         )
 
     def _scan_local(self) -> save_tree.ScanReport:
-        primary = self._scan_primary(self._local_root)
-        if not self._uses_legacy_rpcs3():
-            return primary
-        assert self._legacy_rpcs3_root is not None
-        legacy = save_tree.scan_mapped_tree_report(
-            self._legacy_rpcs3_root,
-            self._policy,
-            system="ps3",
-            relative_prefix=RPCS3_DEV_HDD0_PREFIX,
-            enabled_optional_groups=self._enabled_optional_groups(),
+        primary_policy = self._primary_local_policy(self._policy)
+        reports = [
+            self._without_mapped_local_prefixes(
+                self._scan_primary(self._local_root, primary_policy)
+            )
+        ]
+        reports.extend(
+            self._scan_mapped_view(view, self._policy)
+            for view in self._mapped_local_views
         )
-        return save_tree.merge_scan_reports(primary, legacy)
+        if self._uses_legacy_rpcs3():
+            assert self._legacy_rpcs3_root is not None
+            reports.append(
+                self._scan_mapped_view(
+                    _DestinationView(
+                        self._legacy_rpcs3_root,
+                        _RPCS3_CANONICAL_PREFIX,
+                        "legacy-rpcs3-dev-hdd0",
+                    ),
+                    self._policy,
+                )
+            )
+        result = reports[0]
+        for report in reports[1:]:
+            result = save_tree.merge_scan_reports(result, report)
+        return result
 
     def _scan_local_layouts(
         self, layout_ids: frozenset[str]
@@ -755,28 +1384,41 @@ class SaveSyncService:
         if not layouts:
             return save_tree.ScanReport({})
         selected_policy = SaveSelectionPolicy(layouts=layouts)
-        primary = save_tree.scan_tree_report(
-            self._local_root,
-            selected_policy,
-            enabled_optional_systems=self._enabled_optional_systems(),
-            enabled_optional_groups=self._enabled_optional_groups(),
+        primary_policy = self._primary_local_policy(selected_policy)
+        primary = self._without_mapped_local_prefixes(
+            self._scan_primary(self._local_root, primary_policy)
         )
-        if not self._uses_legacy_rpcs3() or not any(
-            layout.system == "ps3" for layout in layouts
-        ):
-            return primary
-        assert self._legacy_rpcs3_root is not None
-        legacy = save_tree.scan_mapped_tree_report(
-            self._legacy_rpcs3_root,
-            selected_policy,
-            system="ps3",
-            relative_prefix=RPCS3_DEV_HDD0_PREFIX,
-            enabled_optional_groups=self._enabled_optional_groups(),
+        reports = [primary]
+        selected_systems = {layout.system for layout in layouts}
+        reports.extend(
+            self._scan_mapped_view(view, selected_policy)
+            for view in self._mapped_local_views
+            if view.canonical_prefix.partition("/")[0] in selected_systems
         )
-        return save_tree.merge_scan_reports(primary, legacy)
+        if self._uses_legacy_rpcs3() and "ps3" in selected_systems:
+            assert self._legacy_rpcs3_root is not None
+            reports.append(
+                self._scan_mapped_view(
+                    _DestinationView(
+                        self._legacy_rpcs3_root,
+                        _RPCS3_CANONICAL_PREFIX,
+                        "legacy-rpcs3-dev-hdd0",
+                    ),
+                    selected_policy,
+                )
+            )
+        result = reports[0]
+        for report in reports[1:]:
+            result = save_tree.merge_scan_reports(result, report)
+        return result
 
     def _scan_remote(self) -> save_tree.ScanReport:
         assert self._remote_store is not None
+        # Never pass the local observation cache: the remote dataset may be a
+        # network-backed mount (CIFS/SMB) whose metadata cannot prove another
+        # client did not rewrite a file since an earlier observation in this
+        # same operation. Scope narrowing (see callers) keeps this cheap
+        # without reusing potentially-stale hashes.
         return self._remote_store.scan(
             self._policy,
             enabled_optional_systems=self._enabled_optional_systems(),
@@ -795,6 +1437,7 @@ class SaveSyncService:
         if not layouts:
             return save_tree.ScanReport({})
         selected_policy = SaveSelectionPolicy(layouts=layouts)
+        # See _scan_remote: remote metadata is never trusted across calls.
         return self._remote_store.scan(
             selected_policy,
             enabled_optional_systems=self._enabled_optional_systems(),
@@ -917,10 +1560,23 @@ class SaveSyncService:
         return self._remote_store.materialize(relative_path, local_path)
 
     def _local_views(self) -> tuple[_DestinationView, ...]:
-        views = [_DestinationView(self._local_root)]
+        views = [
+            _DestinationView(
+                self._local_root,
+                mapping_id="primary-local-saves",
+                ownership_domain="primary-local",
+            )
+        ]
+        views.extend(self._mapped_local_views)
         if self._uses_legacy_rpcs3():
             assert self._legacy_rpcs3_root is not None
-            views.append(_DestinationView(self._legacy_rpcs3_root, _RPCS3_CANONICAL_PREFIX))
+            views.append(
+                _DestinationView(
+                    self._legacy_rpcs3_root,
+                    _RPCS3_CANONICAL_PREFIX,
+                    "legacy-rpcs3-dev-hdd0",
+                )
+            )
         return tuple(views)
 
     @property
@@ -945,6 +1601,15 @@ class SaveSyncService:
 
     def _all_destination_roots(self) -> tuple[Path, ...]:
         roots = [view.root for view in self._local_views()]
+        # The transaction planner narrows an overlapping primary local view to
+        # one registered top-level system ownership domain. Keep those exact
+        # roots available to restart recovery without broadening the journal
+        # reader's configured-root equality check.
+        roots.extend(
+            self._local_root / system
+            for system in sorted({layout.system for layout in self._policy.layouts})
+            if not (self._local_root / system).is_symlink()
+        )
         if self._remote_store is not None:
             remote_root = self._remote_store.filesystem_transaction_root
             if remote_root is not None:
@@ -970,15 +1635,24 @@ class SaveSyncService:
 
     # ── authoritative force-operation preview ────────────────────────────
 
-    def preview_upload(self) -> SaveDiff:
+    def preview_upload(
+        self, *, layout_ids: Optional[frozenset[str]] = None
+    ) -> SaveDiff:
         with self._locked_operation():
-            return self._preview("upload")
+            return self._preview("upload", layout_ids=layout_ids)
 
-    def preview_download(self) -> SaveDiff:
+    def preview_download(
+        self, *, layout_ids: Optional[frozenset[str]] = None
+    ) -> SaveDiff:
         with self._locked_operation():
-            return self._preview("download")
+            return self._preview("download", layout_ids=layout_ids)
 
-    def _preview(self, direction: str) -> SaveDiff:
+    def _preview(
+        self,
+        direction: str,
+        *,
+        layout_ids: Optional[frozenset[str]] = None,
+    ) -> SaveDiff:
         self._capabilities.require(Capability.SAVE_SYNC, f"SaveSync {direction}")
         self._require_remote()
         if not self.is_remote_reachable():
@@ -986,8 +1660,16 @@ class SaveSyncService:
                 f"Remote save location is not reachable: {self._connectivity_root}"
             )
         self._recover()
-        local_report = self._scan_local()
-        remote_report = self._scan_remote()
+        local_report = (
+            self._scan_local_layouts(layout_ids)
+            if layout_ids is not None
+            else self._scan_local()
+        )
+        remote_report = (
+            self._scan_remote_layouts(layout_ids)
+            if layout_ids is not None
+            else self._scan_remote()
+        )
         state = self._get_state_unlocked()
         baseline = _baseline_manifest(state)
         new_side, old_side = (
@@ -1009,6 +1691,7 @@ class SaveSyncService:
             optional_groups=_merge_optional_groups(local_report, remote_report),
         )
 
+    @correlated_operation("Full Sync", subsystem="savesync", source="Full Sync")
     def full_sync(self, *, progress: ProgressSink = None) -> SaveReconcileReport:
         """Run authoritative reconciliation and establish Quick Sync baseline."""
         self._require_remote()
@@ -1020,6 +1703,7 @@ class SaveSyncService:
         observed_generation = int(journal["generation"])
         with self._locked_operation():
             state = self._get_state_unlocked()
+            cursor_before = state.quick_sync_cursor_generation
             _write_state(
                 self._state_path,
                 replace(
@@ -1028,8 +1712,27 @@ class SaveSyncService:
                     quick_sync_cursor_generation=observed_generation,
                 ),
             )
+            log.info(
+                "Full SaveSync cursor committed: cursor_before=%s cursor_after=%d "
+                "baseline_artifacts=%d report_revision=%s",
+                cursor_before if cursor_before is not None else "none",
+                observed_generation,
+                len(state.shared_manifest),
+                report.revision,
+            )
+            diagnostic_event(
+                "savesync", "cursor.advanced", "Full SaveSync cursor advanced",
+                metadata={
+                    "cursor_before": cursor_before,
+                    "cursor_after": observed_generation,
+                    "baseline_artifacts": len(state.shared_manifest),
+                    "revision": report.revision,
+                    "reason": "full-sync-complete",
+                },
+            )
         return report
 
+    @correlated_operation("Quick Sync", subsystem="savesync", source="Quick Sync")
     def quick_sync(
         self,
         *,
@@ -1037,8 +1740,33 @@ class SaveSyncService:
         is_group_active: Optional[Callable[[str], bool]] = None,
         is_layout_active: Optional[Callable[[str], bool]] = None,
         exclude_layout_ids: Optional[frozenset[str]] = None,
+        force_current_state: bool = False,
+        include_layout_ids: Optional[frozenset[str]] = None,
+        authoritative_side: Optional[str] = None,
     ) -> SaveQuickSyncResult:
         """Journal-driven discovery optimization for authoritative reconciliation."""
+        with self.observation_scope():
+            return self._quick_sync(
+                progress=progress,
+                is_group_active=is_group_active,
+                is_layout_active=is_layout_active,
+                exclude_layout_ids=exclude_layout_ids,
+                force_current_state=force_current_state,
+                include_layout_ids=include_layout_ids,
+                authoritative_side=authoritative_side,
+            )
+
+    def _quick_sync(
+        self,
+        *,
+        progress: ProgressSink,
+        is_group_active: Optional[Callable[[str], bool]],
+        is_layout_active: Optional[Callable[[str], bool]],
+        exclude_layout_ids: Optional[frozenset[str]],
+        force_current_state: bool,
+        include_layout_ids: Optional[frozenset[str]],
+        authoritative_side: Optional[str],
+    ) -> SaveQuickSyncResult:
         self._capabilities.require(Capability.SAVE_SYNC, "Quick SaveSync")
         self._require_remote()
         self._require_filesystem_remote("Quick SaveSync")
@@ -1048,10 +1776,131 @@ class SaveSyncService:
                 f"Remote save location is not reachable: {self._connectivity_root}"
             )
 
+        if authoritative_side not in {None, "remote"}:
+            raise ValueError("Quick Sync transition authority must be remote or unset")
+        if authoritative_side is not None and not force_current_state:
+            raise ValueError("Quick Sync authority is valid only for a forced current-state scan")
+        if authoritative_side == "remote" and include_layout_ids is None:
+            raise ValueError(
+                "Remote transition authority requires an explicit layout scope"
+            )
+        if include_layout_ids is not None:
+            unknown = include_layout_ids.difference(
+                layout.layout_id for layout in self._policy.layouts
+            )
+            if unknown:
+                raise SaveSyncVerificationError(
+                    f"Unknown SaveSync transition layouts: {', '.join(sorted(unknown))}"
+                )
+
+        if force_current_state:
+            with self._locked_operation():
+                state = self._get_state_unlocked()
+                cursor = state.quick_sync_cursor_generation
+                quick_cursor_was_trusted = state.quick_sync_ready and cursor is not None
+                transition_baseline = {
+                    path: artifact
+                    for path, artifact in _baseline_manifest(state).items()
+                    if include_layout_ids is None
+                    or (
+                        (descriptor := self._policy.group_for_path(path)) is not None
+                        and descriptor.layout_id in include_layout_ids
+                    )
+                }
+                journal = self._load_remote_journal(reset_on_error=False)
+                journal_was_trusted = journal is not None
+                remote_generation = (
+                    int(journal["generation"]) if journal is not None else cursor or 0
+                )
+
+            if authoritative_side == "remote":
+                assert include_layout_ids is not None
+                scope = include_layout_ids
+                preview = self.preview_download(layout_ids=scope)
+                record = self.commit_download(
+                    preview, layout_ids=scope, progress=progress
+                )
+                direct_mutations = self._journal_mutations_for_remote_transition(
+                    before=transition_baseline,
+                    after={
+                        artifact.relative_path: artifact
+                        for artifact in record.manifest
+                    },
+                )
+                if direct_mutations:
+                    self._append_remote_journal(
+                        revision=record.revision,
+                        timestamp=record.timestamp,
+                        mutations=direct_mutations,
+                    )
+                report = SaveReconcileReport(
+                    revision=record.revision,
+                    timestamp=record.timestamp,
+                    uploaded=0,
+                    downloaded=len(preview.added) + len(preview.changed),
+                    conflicts=0,
+                    unchanged=len(preview.unchanged),
+                    upload_bytes=0,
+                    download_bytes=preview.transfer_bytes,
+                    scope="transition_remote_authority",
+                )
+            else:
+                report = self._reconcile(
+                    progress=progress,
+                    selected_layout_ids=include_layout_ids,
+                    upload_only=False,
+                    is_group_active=is_group_active,
+                    is_layout_active=is_layout_active,
+                )
+                if report is None:
+                    return SaveQuickSyncResult(
+                        status="deferred",
+                        remote_generation=remote_generation,
+                        cursor_before=cursor,
+                        cursor_after=cursor,
+                        reason="active-session",
+                    )
+            latest = self._load_remote_journal(reset_on_error=False)
+            advance_quick_cursor = quick_cursor_was_trusted and journal_was_trusted
+            cursor_after = (
+                int(latest["generation"])
+                if advance_quick_cursor and latest is not None
+                else cursor
+            )
+            with self._locked_operation():
+                state = self._get_state_unlocked()
+                _write_state(
+                    self._state_path,
+                    replace(
+                        state,
+                        quick_sync_ready=(
+                            state.quick_sync_ready
+                            if journal_was_trusted
+                            else False
+                        ),
+                        quick_sync_cursor_generation=cursor_after,
+                    ),
+                )
+            return SaveQuickSyncResult(
+                status="reconciled",
+                remote_generation=remote_generation,
+                cursor_before=cursor,
+                cursor_after=cursor_after,
+                processed_groups=tuple(sorted(include_layout_ids or frozenset())),
+                report=report,
+                reason="forced-current-state",
+            )
+
         excluded_layouts = exclude_layout_ids or frozenset()
         with self._locked_operation():
             state = self._get_state_unlocked()
             cursor = state.quick_sync_cursor_generation
+            obsolete_conflicts = self._obsolete_whole_layout_conflicts(
+                state, excluded_layout_ids=excluded_layouts
+            )
+            obsolete_layouts = frozenset(
+                conflict.layout_id for conflict in obsolete_conflicts
+            )
             known_groups = {group.group_id for group in state.groups}
             group_layouts = {
                 group.group_id: group.layout_id for group in state.groups
@@ -1091,6 +1940,39 @@ class SaveSyncService:
                     or bool(group.dirty_path_hints)
                 )
             ).union(materialization_groups)
+            excluded_pending_groups = tuple(
+                sorted(
+                    group.group_id
+                    for group in state.groups
+                    if (
+                        group.condition
+                        in {
+                            SaveGroupCondition.LOCAL_DIRTY,
+                            SaveGroupCondition.REMOTE_DIRTY,
+                        }
+                        or bool(group.dirty_path_hints)
+                    )
+                    and (
+                        group.layout_id in excluded_layouts
+                        or not self._layout_enabled(group.layout_id)
+                    )
+                )
+            )
+            log.info(
+                "Quick SaveSync preflight: quick_ready=%s cursor=%s "
+                "baseline_artifacts=%d tracked_groups=%d pending_groups=%d "
+                "materialization_groups=%d excluded_layouts=%d pending_group_ids=%s "
+                "excluded_pending_group_ids=%s",
+                state.quick_sync_ready,
+                cursor if cursor is not None else "none",
+                len(self._automatic_baseline(state)),
+                len(state.groups),
+                len(pending_groups),
+                len(materialization_groups),
+                len(excluded_layouts),
+                ",".join(sorted(pending_groups)) or "none",
+                ",".join(excluded_pending_groups) or "none",
+            )
             if not state.quick_sync_ready or cursor is None:
                 return SaveQuickSyncResult(
                     status="requires-full-sync",
@@ -1110,7 +1992,21 @@ class SaveSyncService:
                 )
             remote_generation = int(journal["generation"])
             generation_unchanged = remote_generation == cursor
-            if generation_unchanged and not pending_groups:
+            log.info(
+                "Quick SaveSync journal: cursor=%d remote_generation=%d "
+                "generation_state=%s retained_entries=%d",
+                cursor,
+                remote_generation,
+                "current" if generation_unchanged else "advanced",
+                len(journal["history"]),
+            )
+            if generation_unchanged and not pending_groups and not obsolete_conflicts:
+                log.info(
+                    "Quick SaveSync early return: reason=%s cursor=%d "
+                    "pending_group_ids=none",
+                    "journal-current-local-materialized",
+                    cursor,
+                )
                 return SaveQuickSyncResult(
                     status="unchanged",
                     remote_generation=remote_generation,
@@ -1185,6 +2081,44 @@ class SaveSyncService:
                 )
                 selected_groups = None
 
+        if obsolete_layouts:
+            # A stale whole-layout conflict is not a dirty hint and therefore
+            # cannot safely be reconciled by its obsolete group ID. Promote
+            # every affected current layout to a fresh canonical scan, along
+            # with any already-selected groups that share this Quick Sync.
+            group_scope = frozenset(selected_groups or ()).union(pending_groups)
+            selected_layouts = frozenset(selected_layouts or ()).union(
+                obsolete_layouts,
+                (
+                    group_layouts[group_id]
+                    for group_id in group_scope
+                    if group_id in group_layouts
+                ),
+            )
+            selected_groups = None
+            log.info(
+                "Quick SaveSync ownership migration: obsolete_conflicts=%d "
+                "layout_ids=%s",
+                len(obsolete_conflicts),
+                ",".join(sorted(obsolete_layouts)),
+            )
+
+        log.info(
+            "Quick SaveSync scope: mode=%s selected_groups=%d "
+            "selected_layouts=%d pending_groups=%d unseen_journal_entries=%d",
+            (
+                "layout"
+                if selected_layouts is not None
+                else "group"
+                if selected_groups is not None
+                else "none"
+            ),
+            len(selected_groups or frozenset()),
+            len(selected_layouts or frozenset()),
+            len(pending_groups),
+            len(unseen),
+        )
+
         if selected_groups == frozenset() and selected_layouts is None:
             with self._locked_operation():
                 state = self._get_state_unlocked()
@@ -1195,6 +2129,19 @@ class SaveSyncService:
                         quick_sync_ready=True,
                         quick_sync_cursor_generation=remote_generation,
                     ),
+                )
+                log.info(
+                    "Quick SaveSync cursor advanced: cursor_before=%s "
+                    "cursor_after=%d reason=journal-no-eligible-changes",
+                    cursor if cursor is not None else "none",
+                    remote_generation,
+                )
+                diagnostic_event(
+                    "savesync", "cursor.advanced", "Quick SaveSync cursor advanced",
+                    metadata={
+                        "cursor_before": cursor, "cursor_after": remote_generation,
+                        "reason": "journal-no-eligible-changes",
+                    },
                 )
             return SaveQuickSyncResult(
                 status="unchanged",
@@ -1213,6 +2160,9 @@ class SaveSyncService:
             upload_only=False,
             is_group_active=is_group_active,
             is_layout_active=is_layout_active,
+            obsolete_conflict_ids=frozenset(
+                conflict.conflict_id for conflict in obsolete_conflicts
+            ),
         )
         if report is None:
             return SaveQuickSyncResult(
@@ -1239,6 +2189,20 @@ class SaveSyncService:
                     quick_sync_cursor_generation=cursor_after,
                 ),
             )
+            log.info(
+                "Quick SaveSync cursor committed: cursor_before=%s "
+                "cursor_after=%d report_revision=%s",
+                cursor if cursor is not None else "none",
+                cursor_after,
+                report.revision,
+            )
+            diagnostic_event(
+                "savesync", "cursor.advanced", "Quick SaveSync cursor advanced",
+                metadata={
+                    "cursor_before": cursor, "cursor_after": cursor_after,
+                    "revision": report.revision, "reason": "reconciliation-complete",
+                },
+            )
         return SaveQuickSyncResult(
             status="reconciled",
             remote_generation=remote_generation,
@@ -1253,7 +2217,7 @@ class SaveSyncService:
         path = self._remote_journal_path
         if path is None:
             raise SaveSyncConnectivityError("SaveSync remote location is not configured")
-        with savesync_journal.journal_lock(path):
+        with stage_timer("journal-load"), savesync_journal.journal_lock(path):
             if not reset_on_error:
                 try:
                     return savesync_journal.load(path)
@@ -1315,23 +2279,77 @@ class SaveSyncService:
             local_report = self._scan_automatic_local()
             remote_report = self._scan_automatic_remote()
             state = self._get_state_unlocked()
-            return _reconcile_plan(
-                local_report,
-                remote_report,
-                self._automatic_baseline(state),
-                policy=self._policy,
-                scope="all_eligible",
-                repair_local_group_ids=frozenset(
-                    status.group_id
-                    for status in self._local_materialization_gaps(
-                        state, excluded_layout_ids=frozenset()
-                    )
-                ),
+            baseline = self._automatic_baseline(state)
+            repair_local_group_ids = frozenset(
+                status.group_id
+                for status in self._local_materialization_gaps(
+                    state, excluded_layout_ids=frozenset()
+                )
             )
+            container_work = self._prepare_container_reconciliation(
+                local=dict(local_report.artifacts),
+                remote=dict(remote_report.artifacts),
+                state=state,
+                upload_only=False,
+                stage_candidates=False,
+                repair_local_group_ids=repair_local_group_ids,
+            )
+            try:
+                if container_work.handled_paths:
+                    local_report = replace(
+                        local_report,
+                        artifacts={
+                            path: artifact
+                            for path, artifact in local_report.artifacts.items()
+                            if path not in container_work.handled_paths
+                        },
+                    )
+                    remote_report = replace(
+                        remote_report,
+                        artifacts={
+                            path: artifact
+                            for path, artifact in remote_report.artifacts.items()
+                            if path not in container_work.handled_paths
+                        },
+                    )
+                    baseline = {
+                        path: artifact
+                        for path, artifact in baseline.items()
+                        if path not in container_work.handled_paths
+                    }
+                physical = _reconcile_plan(
+                    local_report,
+                    remote_report,
+                    baseline,
+                    policy=self._policy,
+                    scope="all_eligible",
+                    repair_local_group_ids=repair_local_group_ids,
+                )
+                return SaveReconcilePlan(
+                    entries=tuple((*physical.entries, *container_work.preview_entries)),
+                    excluded_files=physical.excluded_files,
+                    excluded_bytes=physical.excluded_bytes,
+                    optional_groups=physical.optional_groups,
+                    scope=physical.scope,
+                )
+            finally:
+                container_work.cleanup()
 
+    @correlated_operation("Reconcile", subsystem="savesync", source="Manual")
     def reconcile(self, *, progress: ProgressSink = None) -> SaveReconcileReport:
         """Apply all non-conflicting changes and preserve both conflict versions."""
-        result = self._reconcile(progress=progress)
+        state = self.get_state()
+        bootstrap = not any(
+            (
+                state.quick_sync_ready,
+                state.last_reconcile is not None,
+                state.last_upload is not None,
+                state.last_download is not None,
+                bool(state.shared_manifest),
+                bool(state.container_baselines),
+            )
+        )
+        result = self._reconcile(progress=progress, bootstrap=bootstrap)
         assert result is not None
         return result
 
@@ -1359,6 +2377,400 @@ class SaveSyncService:
             is_group_active=is_group_active,
         )
 
+    @staticmethod
+    def _container_paths(
+        manifest: dict[str, SaveArtifact], container_id: str, kind: str
+    ) -> set[str]:
+        if kind == "file":
+            return {container_id} if container_id in manifest else set()
+        prefix = f"{container_id}/"
+        return {path for path in manifest if path.startswith(prefix)}
+
+    def _remote_container_path(self, container_id: str, kind: str) -> Optional[Path]:
+        if kind == "directory":
+            if self._remote_root is None:
+                return None
+            return self._remote_root / container_id
+        return self._remote_path(container_id)
+
+    @staticmethod
+    def _snapshot_content(snapshot: ContainerSnapshot) -> tuple:
+        return tuple(
+            (
+                entry.identity,
+                entry.merge_domain_id,
+                entry.canonical_hash,
+                entry.size_bytes,
+            )
+            for entry in snapshot.entries
+        )
+
+    @staticmethod
+    def _candidate_manifest(
+        candidate: Path, *, container_id: str, kind: str
+    ) -> tuple[dict[str, SaveArtifact], dict[str, Path]]:
+        if kind == "file":
+            artifact = SaveArtifact(
+                container_id,
+                candidate.stat().st_size,
+                save_tree.hash_file(candidate),
+            )
+            return {container_id: artifact}, {container_id: candidate}
+        artifacts: dict[str, SaveArtifact] = {}
+        sources: dict[str, Path] = {}
+        for current, directories, filenames in os.walk(candidate, followlinks=False):
+            current_path = Path(current)
+            if current_path.is_symlink():
+                raise SaveSyncVerificationError(
+                    "Container candidate contains a substituted directory"
+                )
+            directories[:] = sorted(
+                name
+                for name in directories
+                if not (current_path / name).is_symlink()
+            )
+            for filename in sorted(filenames):
+                path = current_path / filename
+                if path.is_symlink() or not path.is_file():
+                    raise SaveSyncVerificationError(
+                        "Container candidate contains a substituted path"
+                    )
+                relative = path.relative_to(candidate).as_posix()
+                canonical = f"{container_id}/{relative}"
+                artifacts[canonical] = SaveArtifact(
+                    canonical, path.stat().st_size, save_tree.hash_file(path)
+                )
+                sources[canonical] = path
+        return artifacts, sources
+
+    @staticmethod
+    def _replace_container_manifest(
+        manifest: dict[str, SaveArtifact],
+        *,
+        container_id: str,
+        kind: str,
+        replacement: dict[str, SaveArtifact],
+    ) -> dict[str, SaveArtifact]:
+        paths = SaveSyncService._container_paths(manifest, container_id, kind)
+        result = {path: value for path, value in manifest.items() if path not in paths}
+        result.update(replacement)
+        return result
+
+    def _stage_container_target(
+        self,
+        work: _ContainerWork,
+        *,
+        adapter: SaveContainerAdapter,
+        destination_path: Path,
+        destination_snapshot: ContainerSnapshot,
+        target: ContainerSnapshot,
+        local_path: Path,
+        local_snapshot: ContainerSnapshot,
+        remote_path: Path,
+        remote_snapshot: ContainerSnapshot,
+        kind: str,
+        side: str,
+    ) -> None:
+        if self._snapshot_content(destination_snapshot) == self._snapshot_content(target):
+            expected = (adapter, destination_path, target)
+            if side == "local":
+                work.expected_local[target.container_id] = expected
+            else:
+                work.expected_remote[target.container_id] = expected
+            return
+        if work.scratch is None:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            work.scratch = Path(
+                tempfile.mkdtemp(
+                    prefix=".romcloud-container-stage-",
+                    dir=str(self._state_path.parent),
+                )
+            )
+        stage_root = work.scratch / uuid.uuid4().hex
+        stage_root.mkdir()
+        candidate = stage_root / ("candidate.card" if kind == "file" else "candidate")
+        current = destination_snapshot.entry_map()
+        replacements: list[EntryReplacement] = []
+        for entry in target.entries:
+            current_entry = current.get(entry.identity)
+            if current_entry is not None and (
+                current_entry.canonical_hash == entry.canonical_hash
+                and current_entry.merge_domain_id == entry.merge_domain_id
+            ):
+                continue
+            if any(
+                value.identity == entry.identity
+                and value.canonical_hash == entry.canonical_hash
+                and value.merge_domain_id == entry.merge_domain_id
+                for value in local_snapshot.entries
+            ):
+                source_path, source_snapshot = local_path, local_snapshot
+            elif any(
+                value.identity == entry.identity
+                and value.canonical_hash == entry.canonical_hash
+                and value.merge_domain_id == entry.merge_domain_id
+                for value in remote_snapshot.entries
+            ):
+                source_path, source_snapshot = remote_path, remote_snapshot
+            else:
+                raise SaveSyncVerificationError(
+                    "No verified logical source exists for a container entry"
+                )
+            replacements.append(
+                EntryReplacement(
+                    entry,
+                    adapter.extract_entry(source_path, source_snapshot, entry.identity),
+                )
+            )
+        removals = tuple(
+            identity for identity in current if identity not in target.entry_map()
+        )
+        adapter.rebuild(
+            destination_path,
+            RebuildPlan(
+                expected=target,
+                replacements=tuple(replacements),
+                removals=tuple(sorted(removals)),
+            ),
+            candidate,
+        )
+        candidate_manifest, candidate_sources = self._candidate_manifest(
+            candidate, container_id=target.container_id, kind=kind
+        )
+        if side == "local":
+            work.desired_local = self._replace_container_manifest(
+                work.desired_local,
+                container_id=target.container_id,
+                kind=kind,
+                replacement=candidate_manifest,
+            )
+            work.local_sources.update(candidate_sources)
+            work.expected_local[target.container_id] = (adapter, destination_path, target)
+        else:
+            work.desired_remote = self._replace_container_manifest(
+                work.desired_remote,
+                container_id=target.container_id,
+                kind=kind,
+                replacement=candidate_manifest,
+            )
+            work.remote_sources.update(candidate_sources)
+            work.expected_remote[target.container_id] = (adapter, destination_path, target)
+
+    def _prepare_container_reconciliation(
+        self,
+        *,
+        local: dict[str, SaveArtifact],
+        remote: dict[str, SaveArtifact],
+        state: SaveSyncState,
+        upload_only: bool,
+        stage_candidates: bool = True,
+        repair_local_group_ids: frozenset[str] = frozenset(),
+    ) -> _ContainerWork:
+        work = _ContainerWork.empty()
+        work.desired_local = dict(local)
+        work.desired_remote = dict(remote)
+        if upload_only:
+            return work
+        baselines = {
+            baseline.container_id: baseline for baseline in state.container_baselines
+        }
+        descriptors: dict[str, SaveGroupDescriptor] = {}
+        for path in sorted(set(local).union(remote)):
+            descriptor = self._policy.group_for_path(path)
+            if (
+                descriptor is not None
+                and descriptor.container_id
+                and descriptor.container_adapter_id
+            ):
+                descriptors.setdefault(descriptor.container_id, descriptor)
+
+        for container_id, descriptor in descriptors.items():
+            if descriptor.group_id in repair_local_group_ids:
+                # Preserve the 0.9.32 materialization rule: a durable clean
+                # physical generation missing from the emulator-visible tree
+                # is repaired by the existing physical transaction path.
+                continue
+            adapter = self._container_registry.get(descriptor.container_adapter_id)
+            if adapter is None:
+                continue
+            local_paths = self._container_paths(local, container_id, descriptor.container_kind)
+            remote_paths = self._container_paths(remote, container_id, descriptor.container_kind)
+            if not local_paths or not remote_paths:
+                continue
+            local_path = self._local_root / container_id
+            remote_path = self._remote_container_path(
+                container_id, descriptor.container_kind
+            )
+            if remote_path is None:
+                continue
+            checkpoint = (
+                set(work.handled_paths),
+                dict(work.desired_local),
+                dict(work.desired_remote),
+                dict(work.local_sources),
+                dict(work.remote_sources),
+                dict(work.baselines),
+                dict(work.expected_local),
+                dict(work.expected_remote),
+                dict(work.descriptors),
+                set(work.conflicted_container_ids),
+                list(work.conflict_paths),
+                list(work.preview_entries),
+                set(work.invalidated_container_ids),
+                work.uploaded,
+                work.downloaded,
+                work.upload_bytes,
+                work.download_bytes,
+                work.unchanged,
+            )
+            try:
+                local_snapshot = adapter.snapshot(local_path, container_id=container_id)
+                remote_snapshot = adapter.snapshot(remote_path, container_id=container_id)
+                logical_plan = plan_container_reconcile(
+                    local_snapshot,
+                    remote_snapshot,
+                    baselines.get(container_id),
+                )
+                local_target = target_snapshot(
+                    logical_plan, local_snapshot, remote_snapshot, side="local"
+                )
+                remote_target = target_snapshot(
+                    logical_plan, local_snapshot, remote_snapshot, side="remote"
+                )
+                work.handled_paths.update(local_paths)
+                work.handled_paths.update(remote_paths)
+                work.baselines[container_id] = logical_plan.next_baseline
+                work.descriptors[container_id] = descriptor
+                if logical_plan.conflicts:
+                    work.conflicted_container_ids.add(container_id)
+                    for conflict in logical_plan.conflicts:
+                        fingerprint = hashlib.sha256(
+                            conflict.merge_domain_id.encode("utf-8")
+                        ).hexdigest()[:16]
+                        work.conflict_paths.append(
+                            f"{container_id}/logical-conflict-{fingerprint}"
+                        )
+                for decision in logical_plan.decisions:
+                    domain_fingerprint = hashlib.sha256(
+                        decision.merge_domain_id.encode("utf-8")
+                    ).hexdigest()[:16]
+                    logical_path = (
+                        f"{container_id}/logical-domain-{domain_fingerprint}"
+                    )
+
+                    def logical_artifact(domain):
+                        if domain is None:
+                            return None
+                        digest = hashlib.sha256()
+                        for entry in domain.entries:
+                            digest.update(entry.identity.encode("utf-8"))
+                            digest.update(entry.canonical_hash.encode("ascii"))
+                            digest.update(entry.size_bytes.to_bytes(8, "little"))
+                        return SaveArtifact(
+                            logical_path,
+                            sum(entry.size_bytes for entry in domain.entries),
+                            digest.hexdigest(),
+                        )
+
+                    action = {
+                        DomainAction.USE_LOCAL: SaveReconcileAction.UPLOAD,
+                        DomainAction.USE_REMOTE: SaveReconcileAction.DOWNLOAD,
+                        DomainAction.CONFLICT: SaveReconcileAction.CONFLICT,
+                        DomainAction.CONVERGED: SaveReconcileAction.UNCHANGED,
+                    }[decision.action]
+                    work.preview_entries.append(
+                        SaveReconcileEntry(
+                            relative_path=logical_path,
+                            action=action,
+                            local=logical_artifact(decision.local),
+                            remote=logical_artifact(decision.remote),
+                            baseline=logical_artifact(decision.baseline),
+                        )
+                    )
+                    if decision.action is DomainAction.USE_LOCAL:
+                        work.uploaded += 1
+                        if decision.local is not None:
+                            work.upload_bytes += sum(
+                                entry.size_bytes for entry in decision.local.entries
+                            )
+                    elif decision.action is DomainAction.USE_REMOTE:
+                        work.downloaded += 1
+                        if decision.remote is not None:
+                            work.download_bytes += sum(
+                                entry.size_bytes for entry in decision.remote.entries
+                            )
+                    elif decision.action is DomainAction.CONVERGED:
+                        work.unchanged += 1
+                if not stage_candidates:
+                    continue
+                self._stage_container_target(
+                    work,
+                    adapter=adapter,
+                    destination_path=local_path,
+                    destination_snapshot=local_snapshot,
+                    target=local_target,
+                    local_path=local_path,
+                    local_snapshot=local_snapshot,
+                    remote_path=remote_path,
+                    remote_snapshot=remote_snapshot,
+                    kind=descriptor.container_kind,
+                    side="local",
+                )
+                self._stage_container_target(
+                    work,
+                    adapter=adapter,
+                    destination_path=remote_path,
+                    destination_snapshot=remote_snapshot,
+                    target=remote_target,
+                    local_path=local_path,
+                    local_snapshot=local_snapshot,
+                    remote_path=remote_path,
+                    remote_snapshot=remote_snapshot,
+                    kind=descriptor.container_kind,
+                    side="remote",
+                )
+            except OpaqueContainerError as exc:
+                (
+                    work.handled_paths,
+                    work.desired_local,
+                    work.desired_remote,
+                    work.local_sources,
+                    work.remote_sources,
+                    work.baselines,
+                    work.expected_local,
+                    work.expected_remote,
+                    work.descriptors,
+                    work.conflicted_container_ids,
+                    work.conflict_paths,
+                    work.preview_entries,
+                    work.invalidated_container_ids,
+                    work.uploaded,
+                    work.downloaded,
+                    work.upload_bytes,
+                    work.download_bytes,
+                    work.unchanged,
+                ) = checkpoint
+                if exc.reason is OpaqueReason.ADAPTER_VERSION_MISMATCH:
+                    work.invalidated_container_ids.add(container_id)
+                fingerprint = hashlib.sha256(container_id.encode("utf-8")).hexdigest()[:12]
+                log.info(
+                    "SaveSync container fallback: adapter=%s container=%s reason=%s",
+                    descriptor.container_adapter_id,
+                    fingerprint,
+                    exc.reason.value,
+                )
+                continue
+        return work
+
+    def _verify_container_targets(self, work: _ContainerWork) -> None:
+        for values in (work.expected_local, work.expected_remote):
+            for adapter, path, expected in values.values():
+                actual = adapter.snapshot(path, container_id=expected.container_id)
+                if self._snapshot_content(actual) != self._snapshot_content(expected):
+                    raise SaveSyncVerificationError(
+                        "Promoted container does not match its expected logical snapshot"
+                    )
+
     def _reconcile(
         self,
         *,
@@ -1366,8 +2778,10 @@ class SaveSyncService:
         selected_group_ids: Optional[frozenset[str]] = None,
         selected_layout_ids: Optional[frozenset[str]] = None,
         upload_only: bool = False,
+        bootstrap: bool = False,
         is_group_active: Optional[Callable[[str], bool]] = None,
         is_layout_active: Optional[Callable[[str], bool]] = None,
+        obsolete_conflict_ids: frozenset[str] = frozenset(),
     ) -> Optional[SaveReconcileReport]:
         with self._locked_operation():
             if selected_group_ids is not None and selected_layout_ids is not None:
@@ -1404,6 +2818,38 @@ class SaveSyncService:
             )
             self._recover()
             state = self._get_state_unlocked()
+            obsolete_conflicts = self._obsolete_whole_layout_conflicts(
+                state, conflict_ids=obsolete_conflict_ids
+            )
+            if obsolete_conflicts and (
+                selected_layout_ids is None
+                or any(
+                    conflict.layout_id not in selected_layout_ids
+                    for conflict in obsolete_conflicts
+                )
+            ):
+                raise SaveSyncVerificationError(
+                    "Legacy SaveSync conflict migration requires a complete current "
+                    "layout scan; the conflict was preserved."
+                )
+            diagnostic_event(
+                "savesync", "reconciliation.started",
+                "SaveSync authoritative reconciliation started",
+                metadata={
+                    "effective_mode": self._effective_mode,
+                    "provider_id": getattr(self._provider, "provider_id", "none"),
+                    "provider_type": (
+                        type(self._provider).__name__ if self._provider is not None else "none"
+                    ),
+                    "cursor_before": state.quick_sync_cursor_generation,
+                    "scope": (
+                        "groups" if selected_group_ids is not None else
+                        "layouts" if selected_layout_ids is not None else "all"
+                    ),
+                    "processed_groups": tuple(sorted(selected_group_ids or ())),
+                    "layouts": tuple(sorted(selected_layout_ids or ())),
+                },
+            )
             repair_local_group_ids = frozenset(
                 status.group_id
                 for status in self._local_materialization_gaps(
@@ -1412,8 +2858,15 @@ class SaveSyncService:
             )
             verification_layout_ids: Optional[frozenset[str]] = None
             if selected_layout_ids is not None:
-                local_report = self._scan_local_layouts(selected_layout_ids)
-                remote_report = self._scan_remote_layouts(selected_layout_ids)
+                # Keep every safety and finalization scan on the exact layout
+                # scope used to build the transition plan.  Comparing this
+                # scoped snapshot with a later all-layout scan makes unrelated
+                # local-only layouts look like concurrent mutations.
+                verification_layout_ids = selected_layout_ids
+                with stage_timer("scan-local"):
+                    local_report = self._scan_local_layouts(selected_layout_ids)
+                with stage_timer("scan-remote"):
+                    remote_report = self._scan_remote_layouts(selected_layout_ids)
                 local_report = self._automatic_report(local_report)
                 remote_report = self._automatic_report(remote_report)
             elif selected_group_ids is not None:
@@ -1428,18 +2881,22 @@ class SaveSyncService:
                 )
                 verification_layout_ids = scoped_layouts
                 if scoped_layouts:
-                    local_report = self._automatic_report(
-                        self._scan_local_layouts(scoped_layouts)
-                    )
-                    remote_report = self._automatic_report(
-                        self._scan_remote_layouts(scoped_layouts)
-                    )
+                    with stage_timer("scan-local"):
+                        local_report = self._automatic_report(
+                            self._scan_local_layouts(scoped_layouts)
+                        )
+                    with stage_timer("scan-remote"):
+                        remote_report = self._automatic_report(
+                            self._scan_remote_layouts(scoped_layouts)
+                        )
                 else:
                     local_report = save_tree.ScanReport({})
                     remote_report = save_tree.ScanReport({})
             else:
-                local_report = self._scan_automatic_local()
-                remote_report = self._scan_automatic_remote()
+                with stage_timer("scan-local"):
+                    local_report = self._scan_automatic_local()
+                with stage_timer("scan-remote"):
+                    remote_report = self._scan_automatic_remote()
             complete_local = dict(local_report.artifacts)
             complete_remote = dict(remote_report.artifacts)
             baseline = self._automatic_baseline(state)
@@ -1462,6 +2919,38 @@ class SaveSyncService:
                         and descriptor.layout_id in selected_layout_ids
                     )
                 }
+            original_local = dict(local_report.artifacts)
+            original_remote = dict(remote_report.artifacts)
+            physical_baseline = dict(baseline)
+            container_work = self._prepare_container_reconciliation(
+                local=original_local,
+                remote=original_remote,
+                state=state,
+                upload_only=upload_only,
+                repair_local_group_ids=repair_local_group_ids,
+            )
+            if container_work.handled_paths:
+                local_report = replace(
+                    local_report,
+                    artifacts={
+                        path: artifact
+                        for path, artifact in local_report.artifacts.items()
+                        if path not in container_work.handled_paths
+                    },
+                )
+                remote_report = replace(
+                    remote_report,
+                    artifacts={
+                        path: artifact
+                        for path, artifact in remote_report.artifacts.items()
+                        if path not in container_work.handled_paths
+                    },
+                )
+                baseline = {
+                    path: artifact
+                    for path, artifact in baseline.items()
+                    if path not in container_work.handled_paths
+                }
             plan = _reconcile_plan(
                 local_report,
                 remote_report,
@@ -1476,6 +2965,28 @@ class SaveSyncService:
                 ),
                 repair_local_group_ids=repair_local_group_ids,
             )
+            decision_counts = {
+                action.value: len(
+                    {
+                        _group_id(self._policy, entry.relative_path)
+                        for entry in plan.entries
+                        if entry.action is action
+                    }
+                )
+                for action in SaveReconcileAction
+            }
+            log.info(
+                "SaveSync reconciliation plan: scope=%s candidate_artifacts=%d "
+                "upload_groups=%d download_groups=%d conflict_groups=%d "
+                "unchanged_groups=%d container_groups=%d",
+                plan.scope,
+                len(plan.entries),
+                decision_counts.get(SaveReconcileAction.UPLOAD.value, 0),
+                decision_counts.get(SaveReconcileAction.DOWNLOAD.value, 0),
+                decision_counts.get(SaveReconcileAction.CONFLICT.value, 0),
+                decision_counts.get(SaveReconcileAction.UNCHANGED.value, 0),
+                len(container_work.descriptors),
+            )
             emit_progress(
                 progress,
                 "savesync",
@@ -1488,21 +2999,27 @@ class SaveSyncService:
                 ),
                 metadata=plan.to_dict(),
             )
-            local = local_report.artifacts
-            remote = remote_report.artifacts
-            desired_local = dict(local)
-            desired_remote = dict(remote)
+            local = original_local
+            remote = original_remote
+            desired_local = dict(container_work.desired_local)
+            desired_remote = dict(container_work.desired_remote)
             for entry in plan.entries:
                 if entry.action is SaveReconcileAction.UPLOAD:
                     _assign(desired_remote, entry.relative_path, entry.local)
                 elif entry.action is SaveReconcileAction.DOWNLOAD and not upload_only:
                     _assign(desired_local, entry.relative_path, entry.remote)
 
+            correlation_id = current_operation_id()
+            # Never reuse a human-readable diagnostic/lifecycle correlation ID
+            # as the filesystem transaction token. Recovery paths require the
+            # transaction ID to remain a 32-character hexadecimal UUID.
             operation_id = uuid.uuid4().hex
             destination_views: list[_DestinationView] = []
             selected_views: list[save_transaction.SelectedView] = []
             try:
-                if plan.uploads:
+                remote_changed = desired_remote != remote
+                local_changed = desired_local != local
+                if remote_changed:
                     # Only this branch writes to remote-data; a plan with no
                     # uploads (pure download/no-op) must remain available
                     # regardless of the remote's durable-transaction support.
@@ -1516,12 +3033,14 @@ class SaveSyncService:
                             remote_views,
                             current=remote,
                             desired=desired_remote,
-                            source_for=lambda path, artifact: self._choose_source(
-                                path, artifact, local, remote
+                            source_for=lambda path, artifact: (
+                                container_work.remote_sources[path]
+                                if path in container_work.remote_sources
+                                else self._choose_source(path, artifact, local, remote)
                             ),
                         )
                     )
-                if plan.downloads and not upload_only:
+                if local_changed and not upload_only:
                     local_views = self._local_views()
                     destination_views.extend(local_views)
                     selected_views.extend(
@@ -1529,11 +3048,14 @@ class SaveSyncService:
                             local_views,
                             current=local,
                             desired=desired_local,
-                            source_for=lambda path, artifact: self._choose_source(
-                                path, artifact, local, remote
+                            source_for=lambda path, artifact: (
+                                container_work.local_sources[path]
+                                if path in container_work.local_sources
+                                else self._choose_source(path, artifact, local, remote)
                             ),
                         )
                     )
+                self._log_transaction_root_collisions(selected_views)
                 transaction = (
                     save_transaction.prepare_transaction(
                         self._transaction_journal_path,
@@ -1543,20 +3065,53 @@ class SaveSyncService:
                     if selected_views
                     else None
                 )
+                log.info(
+                    "SaveSync transaction start: operation_id=%s correlation_id=%s scope=%s "
+                    "remote_write=%s local_write=%s destination_views=%d "
+                    "selected_transaction_paths=%d",
+                    operation_id,
+                    correlation_id or "none",
+                    plan.scope,
+                    remote_changed,
+                    local_changed and not upload_only,
+                    len(selected_views),
+                    sum(
+                        sum(
+                            1
+                            for path in set(view.current).union(view.desired)
+                            if not _same_artifact(
+                                view.current.get(path), view.desired.get(path)
+                            )
+                        )
+                        for view in selected_views
+                    ),
+                )
                 if verification_layout_ids is None:
-                    current_local = self._scan_automatic_local()
-                    current_remote = self._scan_automatic_remote()
+                    with stage_timer("staging-verify"):
+                        current_local = self._scan_automatic_local()
+                        current_remote = self._scan_automatic_remote()
                 else:
-                    current_local = self._automatic_report(
-                        self._scan_local_layouts(verification_layout_ids)
-                    )
-                    current_remote = self._automatic_report(
-                        self._scan_remote_layouts(verification_layout_ids)
-                    )
+                    with stage_timer("staging-verify"):
+                        current_local = self._automatic_report(
+                            self._scan_local_layouts(verification_layout_ids)
+                        )
+                        current_remote = self._automatic_report(
+                            self._scan_remote_layouts(verification_layout_ids)
+                        )
                 if (
                     current_local.artifacts != complete_local
                     or current_remote.artifacts != complete_remote
                 ):
+                    self._log_staging_manifest_changes(
+                        side="local",
+                        expected=complete_local,
+                        observed=current_local.artifacts,
+                    )
+                    self._log_staging_manifest_changes(
+                        side="remote",
+                        expected=complete_remote,
+                        observed=current_remote.artifacts,
+                    )
                     raise SaveSyncVerificationError(
                         "Save/state data changed while staging; reconciliation was abandoned."
                     )
@@ -1573,19 +3128,24 @@ class SaveSyncService:
                         transaction.rollback()
                     return None
                 if transaction is not None:
-                    self._apply_selected_transaction(
-                        transaction, tuple(destination_views)
-                    )
-                if verification_layout_ids is None:
-                    final_local_report = self._scan_automatic_local()
-                    final_remote_report = self._scan_automatic_remote()
-                else:
-                    final_local_report = self._automatic_report(
-                        self._scan_local_layouts(verification_layout_ids)
-                    )
-                    final_remote_report = self._automatic_report(
-                        self._scan_remote_layouts(verification_layout_ids)
-                    )
+                    with stage_timer("transaction-apply"):
+                        self._apply_selected_transaction(
+                            transaction, tuple(destination_views)
+                        )
+                self._verify_container_targets(container_work)
+                # Post-mutation proof must read the real bytes now on disk, so
+                # this scan deliberately bypasses observation reuse entirely.
+                with self._fresh_observations(), stage_timer("final-verify"):
+                    if verification_layout_ids is None:
+                        final_local_report = self._scan_automatic_local()
+                        final_remote_report = self._scan_automatic_remote()
+                    else:
+                        final_local_report = self._automatic_report(
+                            self._scan_local_layouts(verification_layout_ids)
+                        )
+                        final_remote_report = self._automatic_report(
+                            self._scan_remote_layouts(verification_layout_ids)
+                        )
                 if (
                     final_local_report.artifacts
                     != (
@@ -1609,30 +3169,65 @@ class SaveSyncService:
                     raise SaveSyncVerificationError(
                         "Save/state data changed before reconciliation completed."
                     )
-            except BaseException:
+                log.info(
+                    "SaveSync transaction materialization committed: "
+                    "operation_id=%s remote_write=%s local_write=%s",
+                    operation_id,
+                    remote_changed,
+                    local_changed and not upload_only,
+                )
+            except BaseException as exc:
                 transaction = locals().get("transaction")
                 if transaction is not None:
                     transaction.rollback()
+                container_work.cleanup()
+                log.warning(
+                    "SaveSync transaction aborted: operation_id=%s "
+                    "reason=%s baseline_advanced=false cursor_advanced=false",
+                    operation_id,
+                    type(exc).__name__,
+                )
                 raise
 
             timestamp = datetime.now(timezone.utc).isoformat()
             report = SaveReconcileReport(
                 revision=uuid.uuid4().hex,
                 timestamp=timestamp,
-                uploaded=len(plan.uploads),
-                downloaded=0 if upload_only else len(plan.downloads),
-                conflicts=len(plan.conflicts),
-                unchanged=len(plan.unchanged),
-                upload_bytes=plan.upload_bytes,
-                download_bytes=0 if upload_only else plan.download_bytes,
-                conflict_paths=tuple(entry.relative_path for entry in plan.conflicts),
+                uploaded=len(plan.uploads) + container_work.uploaded,
+                downloaded=(
+                    0 if upload_only else len(plan.downloads) + container_work.downloaded
+                ),
+                conflicts=len(plan.conflicts) + len(container_work.conflict_paths),
+                unchanged=len(plan.unchanged) + container_work.unchanged,
+                upload_bytes=plan.upload_bytes + container_work.upload_bytes,
+                download_bytes=(
+                    0
+                    if upload_only
+                    else plan.download_bytes + container_work.download_bytes
+                ),
+                conflict_paths=tuple(
+                    [entry.relative_path for entry in plan.conflicts]
+                    + container_work.conflict_paths
+                ),
                 scope=plan.scope,
+                bootstrap=bootstrap,
             )
             selected_baseline = (
                 _upload_only_reconciled_baseline(plan, existing=baseline)
                 if upload_only
                 else _reconciled_baseline(plan, existing=baseline)
             )
+            for container_id, descriptor in container_work.descriptors.items():
+                paths = self._container_paths(
+                    desired_local, container_id, descriptor.container_kind
+                )
+                if container_id in container_work.conflicted_container_ids:
+                    for path in paths:
+                        if path in physical_baseline:
+                            selected_baseline[path] = physical_baseline[path]
+                    continue
+                for path in paths:
+                    selected_baseline[path] = desired_local[path]
             final_local_values = tuple(
                 desired_local[path] for path in sorted(desired_local)
             )
@@ -1652,6 +3247,63 @@ class SaveSyncService:
                     observed_at=timestamp,
                 )
             }
+            container_conflicted_group_ids = {
+                descriptor.group_id
+                for container_id, descriptor in container_work.descriptors.items()
+                if container_id in container_work.conflicted_container_ids
+            }
+            container_conflicted_group_ids.update(
+                descriptor.group_id
+                for entry in plan.conflicts
+                for descriptor in [self._policy.group_for_path(entry.relative_path)]
+                if descriptor is not None
+            )
+            for container_id, descriptor in container_work.descriptors.items():
+                group_id = descriptor.group_id
+                local_artifacts = tuple(
+                    desired_local[path]
+                    for path in sorted(desired_local)
+                    if (
+                        (value := self._policy.group_for_path(path)) is not None
+                        and value.group_id == group_id
+                    )
+                )
+                remote_artifacts = tuple(
+                    desired_remote[path]
+                    for path in sorted(desired_remote)
+                    if (
+                        (value := self._policy.group_for_path(path)) is not None
+                        and value.group_id == group_id
+                    )
+                )
+                local_snapshot = SaveGroupSnapshot(
+                    group_id, descriptor.layout_id, local_artifacts, timestamp
+                )
+                remote_snapshot = SaveGroupSnapshot(
+                    group_id, descriptor.layout_id, remote_artifacts, timestamp
+                )
+                previous_group = next(
+                    (group for group in state.groups if group.group_id == group_id),
+                    None,
+                )
+                conflicted = group_id in container_conflicted_group_ids
+                refreshed_groups[group_id] = SaveGroupState(
+                    group_id=group_id,
+                    layout_id=descriptor.layout_id,
+                    condition=(
+                        SaveGroupCondition.CONFLICT
+                        if conflicted
+                        else SaveGroupCondition.CLEAN
+                    ),
+                    baseline=(
+                        previous_group.baseline
+                        if conflicted and previous_group is not None
+                        else local_snapshot
+                    ),
+                    local_observed=local_snapshot,
+                    remote_observed=remote_snapshot,
+                    verified_at=timestamp,
+                )
             affected_layouts = {}
             for entry in plan.entries:
                 descriptor = self._policy.group_for_path(entry.relative_path)
@@ -1660,6 +3312,8 @@ class SaveSyncService:
                         "Reconciliation plan contains an unsupported path: "
                         f"{entry.relative_path}"
                     )
+                affected_layouts[descriptor.group_id] = descriptor.layout_id
+            for descriptor in container_work.descriptors.values():
                 affected_layouts[descriptor.group_id] = descriptor.layout_id
             # A watcher can mark a supported group dirty before any baseline
             # or file exists. A verified empty reconciliation clears only a
@@ -1736,7 +3390,50 @@ class SaveSyncService:
                 active_operation=None,
                 last_error=None,
                 last_completed_operation_id=operation_id,
+                container_baselines=tuple(
+                    sorted(
+                        {
+                            **{
+                                item.container_id: item
+                                for item in state.container_baselines
+                                if item.container_id
+                                not in container_work.invalidated_container_ids
+                            },
+                            **container_work.baselines,
+                        }.values(),
+                        key=lambda item: item.container_id,
+                    )
+                ),
             )
+            if obsolete_conflicts:
+                obsolete_ids = {
+                    conflict.conflict_id for conflict in obsolete_conflicts
+                }
+                obsolete_group_ids = {
+                    conflict.group_id for conflict in obsolete_conflicts
+                }
+                next_state = replace(
+                    next_state,
+                    groups=tuple(
+                        group
+                        for group in next_state.groups
+                        if group.group_id not in obsolete_group_ids
+                    ),
+                    conflicts=tuple(
+                        replace(
+                            conflict,
+                            resolved_at=timestamp,
+                            resolution=SaveConflictResolution.MANUAL,
+                            resolution_revision=(
+                                f"ownership-migration:{report.revision}"
+                            ),
+                        )
+                        if conflict.conflict_id in obsolete_ids
+                        and not conflict.resolved
+                        else conflict
+                        for conflict in next_state.conflicts
+                    ),
+                )
             conflicted_group_ids = {
                 group.group_id
                 for group in refreshed_groups.values()
@@ -1777,24 +3474,88 @@ class SaveSyncService:
             except BaseException:
                 if transaction is not None:
                     transaction.rollback()
+                container_work.cleanup()
                 raise
-            if plan.uploads:
+            if desired_remote != remote:
                 mutations = self._journal_mutations_for_remote_transition(
                     before=remote,
                     after=desired_remote,
                 )
                 if mutations:
-                    generation = self._append_remote_journal(
-                        revision=report.revision,
-                        timestamp=timestamp,
-                        mutations=mutations,
-                    )
+                    try:
+                        generation = self._append_remote_journal(
+                            revision=report.revision,
+                            timestamp=timestamp,
+                            mutations=mutations,
+                        )
+                    except BaseException as exc:
+                        # A remote write is not a completed incremental commit
+                        # until peers can discover it through the journal. The
+                        # journal writer is atomic, so a raised append leaves
+                        # the previous generation intact; roll the materialized
+                        # bytes and local baseline back to the preflight state.
+                        if transaction is not None:
+                            transaction.rollback()
+                        _write_state(self._state_path, state)
+                        container_work.cleanup()
+                        log.warning(
+                            "SaveSync transaction aborted: operation_id=%s "
+                            "reason=%s stage=remote-journal "
+                            "baseline_advanced=false cursor_advanced=false",
+                            operation_id,
+                            type(exc).__name__,
+                        )
+                        raise
                     if next_state.quick_sync_ready:
                         next_state = replace(
                             next_state,
                             quick_sync_cursor_generation=generation,
                         )
                         _write_state(self._state_path, next_state)
+            if obsolete_conflicts:
+                log.info(
+                    "SaveSync ownership migration committed: revision=%s "
+                    "retired_conflicts=%d replacement_conflicts=%d",
+                    report.revision,
+                    len(obsolete_conflicts),
+                    len(
+                        {
+                            conflict.conflict_id
+                            for conflict in next_state.active_conflicts
+                            if conflict.layout_id
+                            in {item.layout_id for item in obsolete_conflicts}
+                        }
+                    ),
+                )
+            log.info(
+                "SaveSync baseline committed: operation_id=%s revision=%s "
+                "baseline_artifacts=%d affected_groups=%d",
+                operation_id,
+                report.revision,
+                len(next_state.shared_manifest),
+                len(affected_group_ids),
+            )
+            diagnostic_event(
+                "savesync", "baseline.advanced", "SaveSync baseline advanced",
+                metadata={
+                    "transaction_id": operation_id, "revision": report.revision,
+                    "baseline_artifacts": len(next_state.shared_manifest),
+                    "affected_groups": len(affected_group_ids),
+                },
+                operation_id=operation_id,
+                parent_operation_id=correlation_id,
+            )
+            for group_id in sorted(affected_group_ids):
+                diagnostic_event(
+                    "savesync", "dirty_marker.cleared",
+                    f"Dirty marker cleared for {group_id}",
+                    metadata={
+                        "group_id": group_id, "reason": "verified-reconciliation",
+                        "transaction_id": operation_id,
+                    },
+                    operation_id=operation_id,
+                    parent_operation_id=correlation_id,
+                )
             if transaction is not None:
                 try:
                     transaction.finalize()
@@ -1804,6 +3565,7 @@ class SaveSyncService:
                         operation_id,
                         exc_info=True,
                     )
+            container_work.cleanup()
             emit_progress(
                 progress,
                 "savesync",
@@ -1814,10 +3576,49 @@ class SaveSyncService:
             )
             return report
 
+    def _log_staging_manifest_changes(
+        self,
+        *,
+        side: str,
+        expected: dict[str, SaveArtifact],
+        observed: dict[str, SaveArtifact],
+    ) -> None:
+        """Log credential-free detail for a genuine staging invalidation."""
+        for path in sorted(set(expected) | set(observed)):
+            before = expected.get(path)
+            after = observed.get(path)
+            if _same_artifact(before, after):
+                continue
+            if before is None:
+                difference = "added"
+            elif after is None:
+                difference = "removed"
+            else:
+                difference = "modified"
+            descriptor = self._policy.group_for_path(path)
+            log.warning(
+                "SaveSync staging mutation detected: side=%s layout_id=%s "
+                "group_id=%r path=%r difference=%s",
+                side,
+                descriptor.layout_id if descriptor is not None else "unsupported",
+                (
+                    descriptor.group_id
+                    if descriptor is not None
+                    else f"unsupported:{path}"
+                ),
+                path,
+                difference,
+            )
+
     # ── deliberate force upload/download ─────────────────────────────────
 
+    @correlated_operation("Upload All", subsystem="savesync", source="Upload All")
     def commit_upload(
-        self, diff: SaveDiff, *, progress: ProgressSink = None
+        self,
+        diff: SaveDiff,
+        *,
+        layout_ids: Optional[frozenset[str]] = None,
+        progress: ProgressSink = None,
     ) -> SaveSyncRecord:
         if diff.direction != "upload":
             raise SaveSyncVerificationError("Upload requires an upload preview.")
@@ -1826,7 +3627,12 @@ class SaveSyncService:
         self._require_remote()
         return self._commit_force(
             diff,
-            source_scan=self._scan_local,
+            layout_ids=layout_ids,
+            source_scan=(
+                (lambda: self._scan_local_layouts(layout_ids))
+                if layout_ids is not None
+                else self._scan_local
+            ),
             source_path=self._local_path,
             destination_views=(
                 _DestinationView(self._remote_transaction_root()),
@@ -1834,8 +3640,13 @@ class SaveSyncService:
             progress=progress,
         )
 
+    @correlated_operation("Download All", subsystem="savesync", source="Download All")
     def commit_download(
-        self, diff: SaveDiff, *, progress: ProgressSink = None
+        self,
+        diff: SaveDiff,
+        *,
+        layout_ids: Optional[frozenset[str]] = None,
+        progress: ProgressSink = None,
     ) -> SaveSyncRecord:
         if diff.direction != "download":
             raise SaveSyncVerificationError("Download requires a download preview.")
@@ -1843,7 +3654,12 @@ class SaveSyncService:
         self._require_remote()
         return self._commit_force(
             diff,
-            source_scan=self._scan_remote,
+            layout_ids=layout_ids,
+            source_scan=(
+                (lambda: self._scan_remote_layouts(layout_ids))
+                if layout_ids is not None
+                else self._scan_remote
+            ),
             source_path=self._remote_path,
             destination_views=self._local_views(),
             progress=progress,
@@ -1853,6 +3669,7 @@ class SaveSyncService:
         self,
         diff: SaveDiff,
         *,
+        layout_ids: Optional[frozenset[str]],
         source_scan: Callable[[], save_tree.ScanReport],
         source_path: Callable[[str], Path],
         destination_views: tuple[_DestinationView, ...],
@@ -1865,7 +3682,7 @@ class SaveSyncService:
                 )
             # Recompute after taking the lock. A stale or forged preview can
             # never authorize replacing content that the user did not see.
-            current_preview = self._preview(diff.direction)
+            current_preview = self._preview(diff.direction, layout_ids=layout_ids)
             if current_preview.entries != diff.entries:
                 raise SaveSyncVerificationError(
                     "Save/state data changed after the preview; review the operation again."
@@ -1882,6 +3699,7 @@ class SaveSyncService:
                 f"Staging {diff.direction} save/state replacement",
                 metadata={"files": len(source), "bytes": sum(a.size_bytes for a in source.values())},
             )
+            # Keep transaction/recovery identity independent from diagnostics.
             operation_id = uuid.uuid4().hex
             transaction = self._prepare_selected_transaction(
                 destination_views,
@@ -1894,7 +3712,17 @@ class SaveSyncService:
                 # Verify both sides after staging.  This closes the historical
                 # second-rescan race and ensures the committed bytes are
                 # exactly those shown in the confirmed preview.
-                if self._scan_local().artifacts != local or self._scan_remote().artifacts != remote:
+                current_local = (
+                    self._scan_local_layouts(layout_ids)
+                    if layout_ids is not None
+                    else self._scan_local()
+                )
+                current_remote = (
+                    self._scan_remote_layouts(layout_ids)
+                    if layout_ids is not None
+                    else self._scan_remote()
+                )
+                if current_local.artifacts != local or current_remote.artifacts != remote:
                     raise SaveSyncVerificationError(
                         "Save/state data changed while staging; review the operation again."
                     )
@@ -1995,11 +3823,14 @@ class SaveSyncService:
     def _belongs_to_view(self, view: _DestinationView, canonical_path: str) -> bool:
         if view.canonical_prefix:
             return canonical_path.startswith(f"{view.canonical_prefix}/")
-        return not (
-            self._uses_legacy_rpcs3()
-            and view.root == self._local_root
-            and canonical_path.startswith(f"{_RPCS3_CANONICAL_PREFIX}/")
+        if view.root != self._local_root:
+            return True
+        mapped_prefixes = tuple(
+            f"{mapped.canonical_prefix}/"
+            for mapped in self._local_views()
+            if mapped.canonical_prefix
         )
+        return not canonical_path.startswith(mapped_prefixes)
 
     def _physical_manifest(
         self,
@@ -2026,24 +3857,150 @@ class SaveSyncService:
             reverse[relative_path] = canonical_path
         return physical, reverse
 
-    def _scan_view(self, root: Path, view: _DestinationView) -> dict[str, SaveArtifact]:
-        if view.canonical_prefix:
-            report = save_tree.scan_mapped_tree_report(
+    @staticmethod
+    def _absolute_root(path: Path) -> Path:
+        return Path(os.path.abspath(os.fspath(path)))
+
+    def _transaction_destination_views(
+        self,
+        views: tuple[_DestinationView, ...],
+        *,
+        current: dict[str, SaveArtifact],
+        desired: dict[str, SaveArtifact],
+    ) -> tuple[_DestinationView, ...]:
+        """Assign changed paths to non-overlapping physical ownership roots.
+
+        A BUA Switch mapping can live below the ordinary ``/userdata/saves``
+        directory. Discovery correctly removes the mapped canonical namespace
+        from the primary scan, but a transaction rooted at the whole primary
+        directory would still claim an ancestor of the mapped ``save_user``
+        root. Narrow only that broad primary view to registered top-level
+        system roots. Logical grouping and canonical paths remain unchanged.
+        """
+        absolute_views = tuple(self._absolute_root(view.root) for view in views)
+        local_root = self._absolute_root(self._local_root)
+        registered_systems = {layout.system for layout in self._policy.layouts}
+        planned: list[_DestinationView] = []
+        for index, view in enumerate(views):
+            root = absolute_views[index]
+            nested = tuple(
+                other_root
+                for other_index, other_root in enumerate(absolute_views)
+                if other_index != index
+                if other_root != root and other_root.is_relative_to(root)
+            )
+            is_primary_local = (
+                not view.canonical_prefix
+                and root == local_root
+            )
+            if not is_primary_local or not nested:
+                planned.append(view)
+                continue
+
+            changed_domains: set[str] = set()
+            for canonical_path in sorted(set(current) | set(desired)):
+                if not self._belongs_to_view(view, canonical_path):
+                    continue
+                if _same_artifact(current.get(canonical_path), desired.get(canonical_path)):
+                    continue
+                relative = self._path_for_view(view, canonical_path)
+                if relative is None or not relative.parts:
+                    raise SaveSyncVerificationError(
+                        f"SaveSync path has no physical ownership domain: {canonical_path}"
+                    )
+                domain = relative.parts[0]
+                if domain not in registered_systems:
+                    raise SaveSyncVerificationError(
+                        "SaveSync path has no registered physical ownership domain: "
+                        f"{canonical_path}"
+                    )
+                changed_domains.add(domain)
+
+            log.info(
+                "SaveSync transaction ownership partition: broad_root=%s "
+                "nested_roots=%s physical_ownership_domains=%s",
                 root,
+                ",".join(str(value) for value in sorted(nested, key=str)),
+                ",".join(sorted(changed_domains)) or "none",
+            )
+            planned.extend(
+                _DestinationView(
+                    view.root / domain,
+                    domain,
+                    f"primary-local-{domain}",
+                    f"primary:{domain}",
+                )
+                for domain in sorted(changed_domains)
+            )
+        return tuple(planned)
+
+    def _log_transaction_root_collisions(
+        self, views: list[save_transaction.SelectedView]
+    ) -> None:
+        roots: list[Path] = []
+        for view in views:
+            root = self._absolute_root(view.root)
+            for other in roots:
+                if root == other:
+                    relationship = "duplicate"
+                elif root.is_relative_to(other):
+                    relationship = "descendant"
+                elif other.is_relative_to(root):
+                    relationship = "ancestor"
+                else:
+                    continue
+                log.error(
+                    "SaveSync transaction ownership collision: root=%s other_root=%s "
+                    "collision_relationship=%s",
+                    root,
+                    other,
+                    relationship,
+                )
+            roots.append(root)
+
+    def _scan_view(
+        self,
+        root: Path,
+        view: _DestinationView,
+        *,
+        only_relative_paths: Optional[frozenset[str]] = None,
+    ) -> dict[str, SaveArtifact]:
+        """Observe one physical destination view.
+
+        *only_relative_paths* restricts the observation to the exact physical
+        paths a caller is going to compare, so a selected-path transaction
+        check never opens (or reads a single byte of) any unrelated save that
+        merely happens to live under the same destination root. Classification
+        of the observed paths is unchanged.
+        """
+        if view.canonical_prefix:
+            report = self._scan_mapped_view(
+                view,
                 self._policy,
-                system="ps3",
-                relative_prefix=RPCS3_DEV_HDD0_PREFIX,
-                enabled_optional_groups=self._enabled_optional_groups(),
+                root=root,
+                only_relative_paths=only_relative_paths,
             )
         else:
-            report = self._scan_primary(root)
-            if self._uses_legacy_rpcs3() and view.root == self._local_root:
-                report = save_tree.ScanReport(
-                    {
-                        path: artifact
-                        for path, artifact in report.artifacts.items()
-                        if not path.startswith(f"{_RPCS3_CANONICAL_PREFIX}/")
-                    }
+            if view.root == self._local_root:
+                report = self._scan_primary(
+                    root,
+                    self._primary_local_policy(self._policy),
+                    only_relative_paths=only_relative_paths,
+                )
+                report = self._without_mapped_local_prefixes(report)
+            else:
+                # Any other physical root reaching here is the remote
+                # transaction root (a real Path only because
+                # FilesystemRemoteSaveStore keeps ROMCloud's existing
+                # Path-based transaction machinery) — possibly a
+                # network-backed CIFS/SMB mount. Its own store already
+                # refuses a cache (see FilesystemRemoteSaveStore.scan), but
+                # this call reaches the filesystem directly, so the trust
+                # gate must be enforced here too.
+                report = self._scan_primary(
+                    root,
+                    only_relative_paths=only_relative_paths,
+                    trusted=self._is_local_physical_root(root),
                 )
         physical, _ = self._physical_manifest(view, report.artifacts)
         return physical
@@ -2057,11 +4014,40 @@ class SaveSyncService:
         source_for: Callable[[str, SaveArtifact], Path],
     ) -> list[save_transaction.SelectedView]:
         selected_views: list[save_transaction.SelectedView] = []
-        for view in views:
-            view_current, _ = self._physical_manifest(view, current)
+        planned_views = self._transaction_destination_views(
+            views, current=current, desired=desired
+        )
+        for view in planned_views:
+            view_current, current_reverse = self._physical_manifest(view, current)
             view_desired, reverse = self._physical_manifest(view, desired)
             if view_current == view_desired:
                 continue
+            canonical_paths = sorted(
+                set(current_reverse.values()) | set(reverse.values())
+            )
+            descriptors = tuple(
+                descriptor
+                for path in canonical_paths
+                for descriptor in (self._policy.group_for_path(path),)
+                if descriptor is not None
+            )
+            log.info(
+                "SaveSync transaction view planned: normalized_physical_root=%s "
+                "transaction_view_identity=%s physical_ownership_domain=%s "
+                "layout_ids=%s logical_group_ids=%s selected_transaction_path_count=%d",
+                self._absolute_root(view.root),
+                view.mapping_id or "dataset-root",
+                view.ownership_domain or "dataset",
+                ",".join(sorted({value.layout_id for value in descriptors})) or "none",
+                ",".join(sorted({value.group_id for value in descriptors})) or "none",
+                sum(
+                    1
+                    for path in set(view_current) | set(view_desired)
+                    if not _same_artifact(
+                        view_current.get(path), view_desired.get(path)
+                    )
+                ),
+            )
             selected_views.append(
                 save_transaction.SelectedView(
                     root=view.root,
@@ -2069,6 +4055,13 @@ class SaveSyncService:
                     desired=view_desired,
                     source_for=lambda relative, artifact, reverse=reverse: source_for(
                         reverse[relative], desired[reverse[relative]]
+                    ),
+                    logical_group_for=lambda relative, reverse={
+                        **current_reverse, **reverse
+                    }: (
+                        descriptor.group_id
+                        if (descriptor := self._policy.group_for_path(reverse[relative]))
+                        is not None else None
                     ),
                 )
             )
@@ -2089,6 +4082,7 @@ class SaveSyncService:
             desired=desired,
             source_for=source_for,
         )
+        self._log_transaction_root_collisions(selected_views)
         return (
             save_transaction.prepare_transaction(
                 self._transaction_journal_path,
@@ -2104,25 +4098,46 @@ class SaveSyncService:
         transaction: save_transaction.SelectedTransaction,
         views: tuple[_DestinationView, ...],
     ) -> None:
-        by_root = {view.root.absolute(): view for view in views}
+        by_root = {self._absolute_root(view.root): view for view in views}
+        primary = next(
+            (
+                view
+                for view in views
+                if not view.canonical_prefix
+                and self._absolute_root(view.root)
+                == self._absolute_root(self._local_root)
+            ),
+            None,
+        )
+        if primary is not None:
+            registered_systems = {layout.system for layout in self._policy.layouts}
+            for prepared in transaction.views:
+                prepared_root = self._absolute_root(prepared.root)
+                if (
+                    prepared_root.parent == self._absolute_root(primary.root)
+                    and prepared_root.name in registered_systems
+                ):
+                    by_root[prepared_root] = _DestinationView(
+                        prepared.root,
+                        prepared_root.name,
+                        f"primary-local-{prepared_root.name}",
+                        f"primary:{prepared_root.name}",
+                    )
         selected_paths = {
-            view.root.absolute(): frozenset(view.verification_current)
+            self._absolute_root(view.root): frozenset(view.verification_current)
             | frozenset(view.verification_desired)
             for view in transaction.views
         }
 
         def verify(root: Path, expected: dict[str, SaveArtifact]) -> None:
-            view = by_root.get(root.absolute())
+            normalized_root = self._absolute_root(root)
+            view = by_root.get(normalized_root)
             if view is None:
                 raise SaveSyncVerificationError(
                     f"Unexpected SaveSync transaction destination: {root}"
                 )
-            observed = self._scan_view(root, view)
-            observed = {
-                path: artifact
-                for path, artifact in observed.items()
-                if path in selected_paths.get(root.absolute(), frozenset())
-            }
+            selected = selected_paths.get(normalized_root, frozenset())
+            observed = self._scan_view(root, view, only_relative_paths=selected)
             if observed != expected:
                 raise SaveSyncVerificationError(
                     f"Selected save/state tree verification failed for {root}"
@@ -2260,6 +4275,11 @@ class SaveSyncService:
             else conflict
             for conflict in state.conflicts
         )
+        container_baselines = self._container_baselines_after_force(
+            state,
+            record.manifest,
+            affected_paths=frozenset(set(local).union(remote)),
+        )
         _write_state(
             self._state_path,
             replace(
@@ -2271,11 +4291,47 @@ class SaveSyncService:
                 shared_manifest=shared_values,
                 groups=groups,
                 conflicts=conflicts,
+                container_baselines=container_baselines,
                 active_operation=None,
                 last_error=None,
                 last_completed_operation_id=operation_id,
             ),
         )
+
+    def _container_baselines_after_force(
+        self,
+        state: SaveSyncState,
+        manifest: tuple[SaveArtifact, ...],
+        *,
+        affected_paths: frozenset[str],
+    ) -> tuple[ContainerBaseline, ...]:
+        by_id = {item.container_id: item for item in state.container_baselines}
+        descriptors = {}
+        manifest_map = {artifact.relative_path: artifact for artifact in manifest}
+        for path in sorted(set(affected_paths).union(manifest_map)):
+            descriptor = self._policy.group_for_path(path)
+            if descriptor is not None and descriptor.container_id:
+                descriptors.setdefault(descriptor.container_id, descriptor)
+        for container_id, descriptor in descriptors.items():
+            if not self._container_paths(
+                manifest_map, container_id, descriptor.container_kind
+            ):
+                by_id.pop(container_id, None)
+                continue
+            adapter = self._container_registry.get(descriptor.container_adapter_id)
+            if adapter is None:
+                by_id.pop(container_id, None)
+                continue
+            try:
+                snapshot = adapter.snapshot(
+                    self._local_root / container_id,
+                    container_id=container_id,
+                )
+            except OpaqueContainerError:
+                by_id.pop(container_id, None)
+                continue
+            by_id[container_id] = baseline_from_snapshot(snapshot)
+        return tuple(by_id[key] for key in sorted(by_id))
 
     def _append_remote_journal(
         self,
@@ -2288,13 +4344,29 @@ class SaveSyncService:
         if path is None:
             return 0
         state = self._get_state_unlocked()
-        return savesync_journal.append_mutations(
-            path,
-            device_id=state.device_id,
-            revision=revision,
-            timestamp=timestamp,
-            mutations=mutations,
+        with stage_timer("journal-commit"):
+            generation = savesync_journal.append_mutations(
+                path,
+                device_id=state.device_id,
+                revision=revision,
+                timestamp=timestamp,
+                mutations=mutations,
+            )
+        log.info(
+            "SaveSync remote journal committed: revision=%s generation=%d "
+            "mutation_count=%d",
+            revision,
+            generation,
+            len(mutations),
         )
+        diagnostic_event(
+            "savesync", "journal.committed", "SaveSync remote journal committed",
+            metadata={
+                "revision": revision, "generation": generation,
+                "mutation_count": len(mutations),
+            },
+        )
+        return generation
 
     def _journal_mutations_for_remote_transition(
         self,
@@ -2394,6 +4466,16 @@ def _same_manifest(
     left: tuple[SaveArtifact, ...], right: tuple[SaveArtifact, ...]
 ) -> bool:
     return left == right
+
+
+def _manifest_hash_summary(manifest: tuple[SaveArtifact, ...]) -> str:
+    """Compact, log-safe per-path content-hash summary for hardware tracing."""
+    if not manifest:
+        return "none"
+    return ",".join(
+        f"{artifact.relative_path}:{artifact.content_hash[:12]}"
+        for artifact in manifest
+    )
 
 
 def _is_incomplete_local_materialization(
@@ -2598,6 +4680,7 @@ def _reconcile_plan(
         baseline_group = _group_manifest(baseline, group_paths)
         if _same_manifest(local_group, remote_group):
             group_action = SaveReconcileAction.UNCHANGED
+            reason = "local-matches-remote"
         elif (
             group_id in repair_local_group_ids
             and _is_incomplete_local_materialization(
@@ -2609,6 +4692,7 @@ def _reconcile_plan(
             # repaired this by making the remote manifest authoritative; normal
             # reconciliation now makes the same safe decision for a pure gap.
             group_action = SaveReconcileAction.DOWNLOAD
+            reason = "incomplete-local-materialization"
             descriptor = policy.group_for_path(
                 remote_group[0].relative_path
             )
@@ -2633,10 +4717,43 @@ def _reconcile_plan(
             )
         elif _same_manifest(remote_group, baseline_group):
             group_action = SaveReconcileAction.UPLOAD
+            reason = "local-diverged-remote-matches-baseline"
         elif _same_manifest(local_group, baseline_group):
             group_action = SaveReconcileAction.DOWNLOAD
+            reason = "remote-diverged-local-matches-baseline"
         else:
             group_action = SaveReconcileAction.CONFLICT
+            reason = "local-and-remote-diverged-from-baseline"
+        descriptor = policy.group_for_path(group_paths[0])
+        log.info(
+            "SaveSync reconciliation decision: scope=%s layout_id=%s "
+            "group_id=%r decision=%s reason=%s local_artifacts=%d "
+            "remote_artifacts=%d baseline_artifacts=%d",
+            scope,
+            descriptor.layout_id if descriptor is not None else "unsupported",
+            group_id,
+            group_action.value,
+            reason,
+            len(local_group),
+            len(remote_group),
+            len(baseline_group),
+        )
+        diagnostic_event(
+            "savesync", "reconciliation.decision",
+            f"SaveSync decision for {group_id}: {group_action.value}",
+            metadata={
+                "scope": scope,
+                "layout_id": descriptor.layout_id if descriptor is not None else "unsupported",
+                "group_id": group_id, "decision": group_action.value,
+                "reason": reason,
+                "local_hash": _manifest_hash_summary(local_group),
+                "remote_hash": _manifest_hash_summary(remote_group),
+                "baseline_hash": _manifest_hash_summary(baseline_group),
+                "local_artifacts": len(local_group),
+                "remote_artifacts": len(remote_group),
+                "baseline_artifacts": len(baseline_group),
+            },
+        )
         for path in group_paths:
             local_artifact = local.get(path)
             remote_artifact = remote.get(path)

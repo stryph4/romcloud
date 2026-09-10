@@ -85,7 +85,8 @@ connectivity does **not** silently change the selected mode.
 
 Use this when the NAS, PC, or external source is available and you want
 to launch games directly from it. Existing cache files and pins are
-preserved but are not the normal launch path.
+preserved but are not the normal launch path. Emulator saves still use
+Batocera's local save paths; Direct applies only to ROM access.
 
 ### Cached Storage
 
@@ -514,7 +515,8 @@ the read-only ROM source.
 SaveSync is designed around a positive layout allowlist and transactional
 replacement:
 
--   synchronization runs only through explicit SaveSync operations;
+-   manual, periodic, and game-lifecycle triggers all enter the same verified
+    SaveSync reconciliation path;
 -   Offline does not poll or modify remote saves;
 -   conflicts are reported instead of guessed or overwritten;
 -   eligible saves from ROMCloud-managed and ordinary local games receive
@@ -549,6 +551,31 @@ The SaveSync dashboard renders local/configured state immediately. Writable
 `[remote_data]` availability is checked separately with a bounded background
 probe, so Back and application Exit stay responsive when storage is missing.
 
+When Auto SaveSync is enabled in Direct or Cached Storage, ROMCloud's
+Batocera lifecycle hook records game start and completes game-stop Quick Sync
+synchronously. It hashes only the audited layouts associated with that
+system/emulator, waits for concrete save-file stability, and runs ordinary
+Quick Sync. While EmulationStation is idle, the same Quick Sync path performs
+bounded periodic pulls and repairs a missing local materialization. Offline
+keeps dirty work local until an online mode is restored. Periodic/reconnect
+pulls provide receive-side discovery, but there is not yet a hard Quick Sync
+barrier immediately before every game launch.
+
+The audited registry covers common root-level RetroArch save/state formats and
+structured emulator layouts including Azahar title saves, Dolphin GameCube/Wii
+saves and states, Cemu title saves, PPSSPP savedata/states, Vita3K title saves,
+RPCS3 savedata, Flycast VMU images, and Ymir backup RAM/save states. Equivalent
+Yuzu-derived account/title save trees use one canonical remote namespace. On
+conventional Batocera layouts, explicitly detected Eden or Citron NAND save
+roots and Ymir's separate persistent-state root are mapped back to their
+emulator-visible physical locations; keys, firmware/system NAND, caches,
+shaders, logs, configuration, unrelated NAND content, Ymir dumps/exports, and
+Ymir's non-save SMPC state remain excluded.
+These newer mappings are unit-tested but still require emulator-on-hardware
+qualification before they should be treated as fully validated. The
+[popular-system coverage matrix and hardware plan](docs/savesync-coverage.md)
+separate implemented behavior from those remaining device checks.
+
 ### Google Drive foundation
 
 Google Drive is not a beta-supported provider and is omitted from the normal
@@ -578,13 +605,18 @@ token JSON is migrated atomically on first successful read; there is no
 plaintext fallback. The remembered ID of ROMCloud's app-owned folder is not a
 token.
 
-SaveSync does not currently hook emulator launch/exit. Game lifecycle
-synchronization requires a proven way to wait for the real emulator
-process to exit safely.
-
 **Original Xbox:** xemu stores progress inside the complete
 `xbox_hdd.qcow2` virtual disk. Support is disabled by default because
 synchronizing it means transferring the whole opaque file.
+
+**Memory-card merging:** SaveSync automatically reconciles independent saves
+inside structurally valid 128 KiB raw PS1 cards and marker-verified PCSX2
+Folder Memory Cards. PS1 files are grouped conservatively by their documented
+commercial game namespace. A PCSX2 folder with multiple structural entries is
+kept opaque unless a complete versioned grouping supplied from trustworthy
+PCSX2-maintained data is available. Invalid, unsupported, or ambiguous cards
+retain opaque whole-card behavior, as do monolithic PCSX2 `.ps2` cards.
+Batocera/DuckStation/PCSX2 hardware qualification remains pending.
 
 **RPCS3 installed games:** installed titles, patches, firmware, caches,
 configuration, and logs are never SaveSync content. Only the explicitly
@@ -860,9 +892,10 @@ Reopen **Ports → ROMCloud** manually and inspect
     automatically deleted.
 -   Offline play requires complete, intact local cache assets and normal
     local emulator dependencies.
--   SaveSync remains beta, does not currently hook emulator launch/exit,
-    and intentionally excludes data it cannot safely classify or
-    attribute.
+-   SaveSync remains beta. Its Batocera lifecycle/periodic reconciliation is
+    implemented, but each emulator layout still needs representative hardware
+    qualification; data it cannot safely classify or attribute remains
+    excluded.
 -   Library Sync remains opt-in beta functionality.
 -   MS-DOS library/cache behavior is not yet beta-supported or audited.
 -   Original Xbox SaveSync requires transferring xemu's complete virtual

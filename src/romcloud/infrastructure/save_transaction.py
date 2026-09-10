@@ -20,13 +20,17 @@ import re
 import shutil
 import tempfile
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable, Optional
 
 from romcloud.core.exceptions import SaveSyncError, SaveSyncVerificationError
 from romcloud.core.models.savesync import SaveArtifact
 from romcloud.infrastructure.logging import get_logger
+from romcloud.infrastructure.diagnostics import (
+    current_operation_id,
+    event as diagnostic_event,
+)
 from romcloud.infrastructure.save_tree import hash_file, materialize
 
 
@@ -50,6 +54,7 @@ class SelectedView:
     current: dict[str, SaveArtifact]
     desired: dict[str, SaveArtifact]
     source_for: Callable[[str, SaveArtifact], Path]
+    logical_group_for: Optional[Callable[[str], Optional[str]]] = None
 
 
 @dataclass(frozen=True)
@@ -65,6 +70,7 @@ class PreparedView:
     # scope. Recovery after a restart safely falls back to the journaled delta.
     verification_current: dict[str, SaveArtifact]
     verification_desired: dict[str, SaveArtifact]
+    logical_groups: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -121,6 +127,8 @@ class SelectedTransaction:
     journal_path: Path
     views: tuple[PreparedView, ...]
     metrics: TransactionMetrics
+    # Diagnostic ancestry only; never used in paths, journals, or recovery.
+    parent_operation_id: Optional[str] = None
     _finished: bool = False
     _live_touched: bool = False
 
@@ -155,12 +163,29 @@ class SelectedTransaction:
         errors: list[str] = []
         for view, plan in plans:
             try:
-                _restore_view(view, plan, operation_id=self.operation_id)
+                _restore_view(
+                    view,
+                    plan,
+                    operation_id=self.operation_id,
+                    parent_operation_id=self.parent_operation_id,
+                )
             except Exception as exc:  # noqa: BLE001 - attempt every view
                 errors.append(f"{view.root}: {exc}")
         if not errors:
             self._cleanup(remove_journal=True)
             self._finished = True
+            diagnostic_event(
+                "savesync", "transaction.rolled_back",
+                "SaveSync transaction rollback completed",
+                metadata={
+                    "status": "rolled_back", "transaction_id": self.operation_id,
+                    "affected_groups": sorted({
+                        group for view in self.views for group in view.logical_groups.values()
+                    }),
+                },
+                operation_id=self.operation_id,
+                parent_operation_id=self.parent_operation_id,
+            )
             log.info(
                 "SaveSync transaction rolled back: operation_id=%s "
                 "cleanup=complete metrics=%s",
@@ -186,6 +211,18 @@ class SelectedTransaction:
             _install_previous(view)
         self._cleanup(remove_journal=True)
         self._finished = True
+        diagnostic_event(
+            "savesync", "transaction.finalized",
+            "SaveSync transaction finalized",
+            metadata={
+                "status": "finalized", "transaction_id": self.operation_id,
+                "affected_groups": sorted({
+                    group for view in self.views for group in view.logical_groups.values()
+                }),
+            },
+            operation_id=self.operation_id,
+            parent_operation_id=self.parent_operation_id,
+        )
         log.info(
             "SaveSync transaction finalized: operation_id=%s metrics=%s",
             self.operation_id,
@@ -206,8 +243,13 @@ def prepare_transaction(
     views: Iterable[SelectedView],
     *,
     operation_id: Optional[str] = None,
+    parent_operation_id: Optional[str] = None,
 ) -> SelectedTransaction:
     """Stage and verify every desired selected tree, then write the journal.
+
+    ``operation_id`` is the validated transaction/recovery token.
+    ``parent_operation_id`` links its diagnostic events to the enclosing
+    workflow and is never granted transaction identity or filesystem authority.
 
     Live destination paths are untouched until :func:`apply_transaction`.
     Existing stable ``.savesync-previous`` directories contain only allowlisted
@@ -215,6 +257,9 @@ def prepare_transaction(
     """
     op_id = operation_id or uuid.uuid4().hex
     _validate_operation_id(op_id)
+    parent_id = parent_operation_id or current_operation_id()
+    if parent_id == op_id:
+        parent_id = None
     raw_views = tuple(views)
     if not raw_views:
         raise SaveSyncError("SaveSync transaction must contain at least one view")
@@ -272,6 +317,12 @@ def prepare_transaction(
                     desired=desired,
                     verification_current=dict(raw_view.current),
                     verification_desired=dict(raw_view.desired),
+                    logical_groups={
+                        relative: group_id
+                        for relative in sorted(set(current) | set(desired))
+                        if raw_view.logical_group_for is not None
+                        and (group_id := raw_view.logical_group_for(relative)) is not None
+                    },
                 )
             )
             prepared_sources.append(raw_view)
@@ -279,7 +330,13 @@ def prepare_transaction(
         if not prepared:
             raise SaveSyncError("SaveSync transaction contains no changed paths")
         metrics = _transaction_metrics(prepared)
-        transaction = SelectedTransaction(op_id, journal, tuple(prepared), metrics)
+        transaction = SelectedTransaction(
+            op_id,
+            journal,
+            tuple(prepared),
+            metrics,
+            parent_operation_id=parent_id,
+        )
         _create_journal(transaction, phase="preparing")
         journal_created = True
         for raw_view, view in zip(prepared_sources, prepared):
@@ -287,17 +344,37 @@ def prepare_transaction(
                 owned.mkdir(parents=True)
                 created_owned.append(owned)
 
-            _materialize_manifest(view.stage, view.desired, raw_view.source_for)
+            _materialize_manifest(
+                view.stage, view.desired, raw_view.source_for,
+                operation_id=op_id, logical_groups=view.logical_groups,
+                parent_operation_id=parent_id,
+                transaction_root=view.root,
+            )
             _verify_manifest(view.stage, view.desired)
             _materialize_manifest(
                 view.previous_candidate,
                 view.current,
                 lambda relative, _artifact, root=view.root: root / relative,
+                operation_id=op_id, logical_groups=view.logical_groups,
+                parent_operation_id=parent_id,
+                transaction_root=view.root,
             )
             _verify_manifest(view.previous_candidate, view.current)
             _fsync_tree(view.stage)
             _fsync_tree(view.previous_candidate)
         _write_journal(transaction, phase="prepared")
+        diagnostic_event(
+            "savesync", "transaction.prepared",
+            "SaveSync transaction staging completed",
+            metadata={
+                "status": "prepared", "transaction_id": transaction.operation_id,
+                "affected_groups": sorted({
+                    group for view in transaction.views for group in view.logical_groups.values()
+                }),
+            },
+            operation_id=transaction.operation_id,
+            parent_operation_id=transaction.parent_operation_id,
+        )
         log.info(
             "SaveSync transaction prepared: operation_id=%s metrics=%s",
             transaction.operation_id,
@@ -335,6 +412,17 @@ def apply_transaction(
 ) -> None:
     """Apply all prepared views, rolling every view back on any failure."""
     _write_journal(transaction, phase="applying")
+    diagnostic_event(
+        "savesync", "transaction.applying", "SaveSync transaction applying",
+        metadata={
+            "status": "applying", "transaction_id": transaction.operation_id,
+            "affected_groups": sorted({
+                group for view in transaction.views for group in view.logical_groups.values()
+            }),
+        },
+        operation_id=transaction.operation_id,
+        parent_operation_id=transaction.parent_operation_id,
+    )
     try:
         # A final full positive scan closes the preview/stage window.  It also
         # detects newly-created eligible paths, not merely edits to known files.
@@ -347,6 +435,17 @@ def apply_transaction(
         for view in transaction.views:
             _fsync_changed_live_paths(view)
         _write_journal(transaction, phase="promoted")
+        diagnostic_event(
+            "savesync", "transaction.promoted", "SaveSync transaction promoted",
+            metadata={
+                "status": "promoted", "transaction_id": transaction.operation_id,
+                "affected_groups": sorted({
+                    group for view in transaction.views for group in view.logical_groups.values()
+                }),
+            },
+            operation_id=transaction.operation_id,
+            parent_operation_id=transaction.parent_operation_id,
+        )
     except BaseException:
         transaction.rollback()
         raise
@@ -392,14 +491,45 @@ def _apply_view(view: PreparedView, transaction: SelectedTransaction) -> None:
                 f"SaveSync destination changed during staging: {target}"
             )
         desired = view.desired.get(relative)
+        action = "delete" if desired is None else "replace" if before is not None else "create"
+        audit = {
+            "action": action,
+            "group_id": view.logical_groups.get(relative, "unknown"),
+            "physical_path": str(target),
+            "path": relative,
+            "reason": "reconciliation-plan",
+            "decision_source": "selected-transaction",
+            "previous_hash": before.content_hash if before is not None else None,
+            "current_hash": desired.content_hash if desired is not None else None,
+            "transaction_id": transaction.operation_id,
+            "transaction_root": str(view.root),
+        }
+        diagnostic_event(
+            "savesync", "physical_mutation.before",
+            f"SaveSync physical {action} about to execute",
+            metadata=audit, operation_id=transaction.operation_id,
+            parent_operation_id=transaction.parent_operation_id,
+        )
         if desired is None:
             transaction._live_touched = True
             target.unlink(missing_ok=True)
+            diagnostic_event(
+                "savesync", "physical_mutation.after",
+                "SaveSync physical delete completed", metadata=audit,
+                operation_id=transaction.operation_id,
+                parent_operation_id=transaction.parent_operation_id,
+            )
             continue
         staged = _safe_target(view.stage, relative, create_parents=False)
         _verify_one(staged, desired)
         transaction._live_touched = True
         os.replace(staged, target)
+        diagnostic_event(
+            "savesync", "physical_mutation.after",
+            f"SaveSync physical {action} completed", metadata=audit,
+            operation_id=transaction.operation_id,
+            parent_operation_id=transaction.parent_operation_id,
+        )
 
 
 def _plan_restore(view: PreparedView) -> tuple[_RestoreAction, ...]:
@@ -436,11 +566,32 @@ def _restore_view(
     actions: tuple[_RestoreAction, ...],
     *,
     operation_id: str,
+    parent_operation_id: Optional[str] = None,
 ) -> None:
     for action in actions:
         target = _safe_target(view.root, action.relative, create_parents=True)
+        audit = {
+            "action": "rollback-delete" if action.original is None else "rollback-restore",
+            "group_id": view.logical_groups.get(action.relative, "unknown"),
+            "physical_path": str(target), "path": action.relative,
+            "reason": "transaction-rollback", "decision_source": "recovery",
+            "previous_hash": action.original.content_hash if action.original else None,
+            "transaction_id": operation_id, "transaction_root": str(view.root),
+        }
+        diagnostic_event(
+            "savesync", "physical_mutation.before",
+            "SaveSync rollback mutation about to execute", metadata=audit,
+            operation_id=operation_id,
+            parent_operation_id=parent_operation_id,
+        )
         if action.original is None:
             target.unlink(missing_ok=True)
+            diagnostic_event(
+                "savesync", "physical_mutation.after",
+                "SaveSync rollback delete completed", metadata=audit,
+                operation_id=operation_id,
+                parent_operation_id=parent_operation_id,
+            )
             continue
         source = _safe_target(
             view.previous_candidate, action.relative, create_parents=False
@@ -453,6 +604,12 @@ def _restore_view(
             _verify_one(restore_tmp, action.original)
             _fsync_file(restore_tmp)
             os.replace(restore_tmp, target)
+            diagnostic_event(
+                "savesync", "physical_mutation.after",
+                "SaveSync rollback restoration completed", metadata=audit,
+                operation_id=operation_id,
+                parent_operation_id=parent_operation_id,
+            )
         finally:
             restore_tmp.unlink(missing_ok=True)
     _verify_manifest(view.root, view.current)
@@ -470,6 +627,11 @@ def _materialize_manifest(
     root: Path,
     manifest: dict[str, SaveArtifact],
     source_for: Callable[[str, SaveArtifact], Path],
+    *,
+    operation_id: Optional[str] = None,
+    parent_operation_id: Optional[str] = None,
+    logical_groups: Optional[dict[str, str]] = None,
+    transaction_root: Optional[Path] = None,
 ) -> None:
     for relative, artifact in sorted(manifest.items()):
         destination = _safe_target(root, relative, create_parents=True)
@@ -478,7 +640,28 @@ def _materialize_manifest(
         # Staging/rollback generations must never share an inode with a live
         # emulator file: emulators commonly update saves in place, which would
         # otherwise mutate the verified transaction snapshot too.
+        audit = {
+            "action": "staged-materialization", "path": relative,
+            "physical_path": str(destination),
+            "group_id": (logical_groups or {}).get(relative, "unknown"),
+            "reason": "transaction-staging", "decision_source": "selected-transaction",
+            "current_hash": artifact.content_hash,
+            "transaction_id": operation_id,
+            "transaction_root": str(transaction_root) if transaction_root else None,
+        }
+        diagnostic_event(
+            "savesync", "physical_mutation.before",
+            "SaveSync staged materialization about to execute",
+            metadata=audit, operation_id=operation_id,
+            parent_operation_id=parent_operation_id,
+        )
         materialize(destination, fresh_source=source)
+        diagnostic_event(
+            "savesync", "physical_mutation.after",
+            "SaveSync staged materialization completed",
+            metadata=audit, operation_id=operation_id,
+            parent_operation_id=parent_operation_id,
+        )
 
 
 def _verify_manifest(root: Path, manifest: dict[str, SaveArtifact]) -> None:
@@ -864,7 +1047,7 @@ def _durable_atomic_write_text(path: Path, content: str) -> None:
 
 def _journal_payload(transaction: SelectedTransaction, *, phase: str) -> dict[str, object]:
     return {
-        "version": 1,
+        "version": 2,
         "operation_id": transaction.operation_id,
         "phase": phase,
         "views": [
@@ -875,6 +1058,7 @@ def _journal_payload(transaction: SelectedTransaction, *, phase: str) -> dict[st
                 "previous_candidate": str(view.previous_candidate.absolute()),
                 "current": _manifest_dict(view.current),
                 "desired": _manifest_dict(view.desired),
+                "logical_groups": view.logical_groups,
             }
             for view in transaction.views
         ],
@@ -947,7 +1131,7 @@ def _read_journal(
         }:
             raise ValueError("journal has missing or unexpected fields")
         version = payload["version"]
-        if isinstance(version, bool) or not isinstance(version, int) or version != 1:
+        if isinstance(version, bool) or not isinstance(version, int) or version not in {1, 2}:
             raise ValueError("unsupported journal version")
         operation_id = payload["operation_id"]
         _validate_operation_id(operation_id)
@@ -962,14 +1146,17 @@ def _read_journal(
         views: list[PreparedView] = []
         seen_roots: list[Path] = []
         for raw in raw_views:
-            if not isinstance(raw, dict) or set(raw) != {
+            expected_view_fields = {
                 "root",
                 "stage",
                 "previous",
                 "previous_candidate",
                 "current",
                 "desired",
-            }:
+            }
+            if version == 2:
+                expected_view_fields.add("logical_groups")
+            if not isinstance(raw, dict) or set(raw) != expected_view_fields:
                 raise ValueError("invalid journal view")
             root = _journal_absolute_path(raw["root"], "root")
             root = _validated_root(root)
@@ -998,6 +1185,15 @@ def _read_journal(
                 raise ValueError("journal contains an unexpected transaction path")
             current = _manifest_from(raw["current"])
             desired = _manifest_from(raw["desired"])
+            raw_groups = raw.get("logical_groups", {})
+            if not isinstance(raw_groups, dict) or any(
+                not isinstance(relative, str)
+                or relative not in set(current).union(desired)
+                or not isinstance(group_id, str)
+                or not group_id
+                for relative, group_id in raw_groups.items()
+            ):
+                raise ValueError("journal logical group mapping is invalid")
             views.append(
                 PreparedView(
                     root,
@@ -1008,6 +1204,7 @@ def _read_journal(
                     desired,
                     current,
                     desired,
+                    dict(raw_groups),
                 )
             )
     except (OSError, KeyError, TypeError, ValueError, SaveSyncError) as exc:
@@ -1019,6 +1216,11 @@ def _read_journal(
         path,
         tuple(views),
         _transaction_metrics(views),
+        parent_operation_id=(
+            current_operation_id()
+            if current_operation_id() != operation_id
+            else None
+        ),
         _live_touched=phase in {"applying", "promoted"},
     ), phase
 

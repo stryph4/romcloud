@@ -21,8 +21,11 @@ logical = mapper.pressedState(standardPad);
 assert.strictEqual(logical[controller.LOGICAL_ACTIONS.UP], true);
 
 const rawPad = {...standardPad, mapping: ""};
-assert.strictEqual(mapper.supports(rawPad), false);
-assert.ok(Object.values(mapper.pressedState(rawPad)).every((pressed) => pressed === false));
+assert.strictEqual(mapper.supports(rawPad), true);
+assert.strictEqual(mapper.pressedState(rawPad)[controller.LOGICAL_ACTIONS.CONFIRM], true);
+const unknownPad = {connected: true, mapping: "", buttons: [], axes: []};
+assert.strictEqual(mapper.supports(unknownPad), false);
+assert.ok(Object.values(mapper.pressedState(unknownPad)).every((pressed) => pressed === false));
 
 const diagnosticRequests = [];
 let diagnosticTimer = null;
@@ -71,7 +74,8 @@ model.setLayout({
 });
 assert.deepStrictEqual(model.current, {zone: "systems", row: 0, col: 0});
 assert.deepStrictEqual(model.moveVertical(1), {zone: "systems", row: 1, col: 0});
-assert.deepStrictEqual(model.moveHorizontal(1), {zone: "systems", row: 2, col: 0});
+assert.deepStrictEqual(model.moveHorizontal(1), {zone: "primary", row: 0, col: 0});
+model.set({zone: "systems", row: 1, col: 0});
 assert.deepStrictEqual(model.moveVertical(1), {zone: "primary", row: 0, col: 0});
 assert.deepStrictEqual(model.moveVertical(1), {zone: "tabs", row: 0, col: 0});
 assert.deepStrictEqual(model.moveHorizontal(1), {zone: "tabs", row: 0, col: 1});

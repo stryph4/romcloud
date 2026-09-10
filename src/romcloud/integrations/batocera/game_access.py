@@ -8,8 +8,8 @@ user-owned.
 
 from __future__ import annotations
 
-import fcntl
 import json
+import logging
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -22,6 +22,7 @@ from romcloud.core.exceptions import (
     ConfigurationError,
     ModeTransitionError,
     ProviderNotReachableError,
+    ROMCloudError,
 )
 from romcloud.core.progress import ProgressSink, emit_progress
 from romcloud.infrastructure.atomic_file import atomic_write_text
@@ -31,6 +32,7 @@ from romcloud.integrations.batocera.systems import BATOCERA_SYSTEMS
 MANIFEST_FILENAME = "direct-links.json"
 LINK_NAME = "ROMCloud"
 MANIFEST_VERSION = 1
+log = logging.getLogger(__name__)
 
 
 class DirectLinkConflictError(RuntimeError):
@@ -316,6 +318,11 @@ def reconcile_game_access(
         config,
         operating_policy=CapabilityPolicy(config.game_access_mode, mode),
     )
+    _migrate_legacy_direct_saves(
+        config,
+        container=container,
+        allow_remote=mode is not OperatingMode.OFFLINE,
+    )
     selected_games = _selected_catalog_games(config, container)
     systems = sorted(
         {game.system for game in selected_games if game.system in BATOCERA_SYSTEMS}
@@ -483,21 +490,81 @@ def set_offline_library_mode(
     )
 
 
+def _lock_file(handle):
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            raise RuntimeError("ROMCloud already has an active operating-mode lock.")
+        return
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+
+def _unlock_file(handle):
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        return
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 @contextmanager
 def _operating_mode_lock(config: AppConfig):  # noqa: ANN202
     path = Path(config.data_path) / ".operating-mode.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        _lock_file(handle)
         try:
             yield
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            _unlock_file(handle)
 
 
 def _render_library_metadata(config: AppConfig, container: Container) -> None:
     if getattr(getattr(config, "library_sync", None), "enabled", False):
         container.library_sync.render_local()
+
+
+def _direct_save_manifest_exists(config: AppConfig) -> bool:
+    from romcloud.integrations.batocera.direct_saves import MANIFEST_FILENAME
+
+    return os.path.lexists(Path(config.data_path) / MANIFEST_FILENAME)
+
+
+def _migrate_legacy_direct_saves(
+    config: AppConfig,
+    *,
+    container: Container | None = None,
+    progress: ProgressSink = None,
+    allow_remote: bool = True,
+):  # noqa: ANN202
+    """Run the minimum compatibility path for a released legacy manifest."""
+    if not _direct_save_manifest_exists(config):
+        return None
+    from romcloud.integrations.batocera.direct_saves import LegacyDirectSaveMigration
+
+    migration_container = container or Container(
+        config,
+        operating_policy=CapabilityPolicy(config.game_access_mode, OperatingMode.CACHE),
+    )
+    saves = migration_container.saves
+    return LegacyDirectSaveMigration(
+        config,
+        saves.selection_policy,
+        saves.legacy_filesystem_remote_root,
+    ).migrate(saves, progress=progress, allow_remote=allow_remote)
 
 
 def _prepare_connected_source(config: AppConfig, progress: ProgressSink) -> Container:
@@ -682,6 +749,11 @@ def set_operating_mode(
     with _operating_mode_lock(config):
         previous = operating_mode(config)
         if requested is previous:
+            _migrate_legacy_direct_saves(
+                config,
+                progress=progress,
+                allow_remote=requested is not OperatingMode.OFFLINE,
+            )
             emit_progress(
                 progress,
                 "operating_mode",
@@ -706,13 +778,31 @@ def set_operating_mode(
         )
         presentation_attempted = False
         state_committed = False
+        save_reconcile = None
+        transition_stage = "prepare the mode transition"
         try:
             if requested is OperatingMode.CONNECTED:
+                transition_stage = "connect to the configured ROM source"
                 _prepare_connected_source(config, progress)
+            transition_stage = "migrate legacy Direct Save Storage"
+            migration = _migrate_legacy_direct_saves(
+                config,
+                progress=progress,
+                allow_remote=requested is not OperatingMode.OFFLINE,
+            )
+            if migration is not None:
+                save_reconcile = {
+                    "status": migration.status,
+                    "legacy_direct_save_routes": migration.routes,
+                    "localized": migration.localized,
+                    "conflict_ids": list(migration.conflict_ids),
+                }
+            transition_stage = "prepare the game-library presentation"
             presentation_attempted = True
             report, container = _apply_mode_presentation(
                 config, requested, progress=progress
             )
+            transition_stage = "commit the operating mode"
             emit_progress(
                 progress,
                 "operating_mode",
@@ -725,6 +815,7 @@ def set_operating_mode(
             # a later manual ROMCloud launch both observe the requested mode.
             write_operating_mode(config, requested)
             state_committed = True
+            transition_stage = "refresh EmulationStation"
             _update_emulationstation(
                 config,
                 container,
@@ -733,7 +824,12 @@ def set_operating_mode(
                 restart=True,
                 announce_mode_change=True,
             )
-            report = replace(report, mode_changed=True, es_restarted=True)
+            report = replace(
+                report,
+                save_reconcile=save_reconcile,
+                mode_changed=True,
+                es_restarted=True,
+            )
             emit_progress(
                 progress,
                 "operating_mode",
@@ -743,6 +839,18 @@ def set_operating_mode(
             )
             return report
         except Exception as exc:
+            log.exception(
+                "Operating-mode transition failed: previous=%s requested=%s stage=%s",
+                previous.value,
+                requested.value,
+                transition_stage,
+            )
+            rollback_errors: list[Exception] = []
+            if state_committed:
+                try:
+                    write_operating_mode(config, previous)
+                except Exception as rollback_exc:
+                    rollback_errors.append(rollback_exc)
             if presentation_attempted:
                 try:
                     if previous is OperatingMode.CONNECTED:
@@ -761,14 +869,43 @@ def set_operating_mode(
                         _rollback, rollback_container = _apply_mode_presentation(
                             config, previous
                         )
-                    if state_committed:
-                        write_operating_mode(config, previous)
                     _update_emulationstation(
                         config, rollback_container, previous, None
                     )
-                except Exception:
-                    pass
-            raise ModeTransitionError(
-                f"ROMCloud could not enter {requested.value.title()} Mode and remains "
-                f"in {previous.value.title()} Mode. Check the configured source and retry."
-            ) from exc
+                except Exception as rollback_exc:
+                    rollback_errors.append(rollback_exc)
+            if rollback_errors:
+                failure = ModeTransitionError(
+                    f"ROMCloud could not enter {requested.value.title()} Mode, and "
+                    "automatic rollback was incomplete. Do not launch a game until "
+                    "ROMCloud startup recovery or the mode transition is retried. "
+                    f"Original problem: {exc}"
+                )
+                emit_progress(
+                    progress,
+                    "operating_mode",
+                    "rollback",
+                    "error",
+                    str(failure),
+                    detail="; ".join(str(error) for error in rollback_errors),
+                )
+                raise failure from exc
+            if isinstance(exc, ROMCloudError):
+                failure = exc
+            else:
+                failure = ModeTransitionError(
+                    f"ROMCloud could not enter {requested.value.title()} Mode while "
+                    f"trying to {transition_stage}; it remains in "
+                    f"{previous.value.title()} Mode. {exc}"
+                )
+            emit_progress(
+                progress,
+                "operating_mode",
+                "failed",
+                "error",
+                str(failure),
+                detail=f"{type(exc).__name__} during {transition_stage}",
+            )
+            if failure is exc:
+                raise
+            raise failure from exc

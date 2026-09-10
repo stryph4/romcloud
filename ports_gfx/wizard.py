@@ -375,6 +375,7 @@ class WizardState:
         self.show_details = False
         self.notice = ""
         self.technical_error = ""
+        self.savesync_conflict_ids: tuple[str, ...] = ()
         self._progress_event: ActivityEvent | None = None
 
     @property
@@ -1327,11 +1328,21 @@ class WizardState:
             self.notice = "Shared-data folder is accessible. A write test will run when setup is applied."
         elif self.step == WizardStep.APPLY:
             self.applied_summary = dict(result.data)
+            conflict_ids = result.data.get("conflict_ids", [])
+            if (
+                isinstance(conflict_ids, list)
+                and all(isinstance(value, str) for value in conflict_ids)
+            ):
+                self.savesync_conflict_ids = tuple(conflict_ids)
             self.password = ""
             self.remote_password = ""
             self.step = WizardStep.DONE
             self.selected_index = 0
-            self.notice = "ROMCloud setup is complete."
+            self.notice = (
+                "SaveSync initialized. Some saves need your attention."
+                if self.savesync_conflict_ids
+                else "ROMCloud setup is complete."
+            )
         return drained
 
     def request_payload(self) -> dict[str, Any]:

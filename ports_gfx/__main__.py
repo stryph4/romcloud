@@ -17,7 +17,12 @@ from typing import Optional, Sequence
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     conflict_mode = "--savesync-conflicts" in args
-    args = [arg for arg in args if arg != "--savesync-conflicts"]
+    progress_mode = "--savesync-progress" in args
+    args = [
+        arg
+        for arg in args
+        if arg not in ("--savesync-conflicts", "--savesync-progress")
+    ]
     romcloud_bin = os.environ.get("ROMCLOUD_BIN") or (args[0] if args else None)
     if not romcloud_bin:
         print(
@@ -30,6 +35,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         from ports_gfx.savesync_conflict_popup import run_conflict_popup
 
         return run_conflict_popup(romcloud_bin)
+
+    if progress_mode:
+        from ports_gfx.savesync_progress_popup import main as run_progress_popup
+
+        return run_progress_popup(romcloud_bin=romcloud_bin)
 
     from ports_gfx.app import run_app
 

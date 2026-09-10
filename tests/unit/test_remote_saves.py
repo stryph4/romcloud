@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
 from pathlib import Path
 
 import pytest
@@ -14,9 +15,13 @@ from romcloud.core.remote_data import (
     RemoteOperationContext,
     validate_logical_key,
 )
-from romcloud.core.save_selection import DEFAULT_SAVE_SELECTION_POLICY
+from romcloud.core.save_selection import DEFAULT_SAVE_SELECTION_POLICY, SaveSelectionPolicy
 from romcloud.core.storage import ProviderCapabilities, RemoteEntry, StorageAccessResult
-from romcloud.infrastructure.remote_saves import ProviderRemoteSaveStore
+from romcloud.infrastructure import save_tree
+from romcloud.infrastructure.remote_saves import (
+    FilesystemRemoteSaveStore,
+    ProviderRemoteSaveStore,
+)
 from romcloud.infrastructure.providers.local import WritableLocalFilesystemProvider
 from romcloud.services.saves import SaveSyncService
 
@@ -252,3 +257,156 @@ def test_filesystem_remote_data_object_contract(tmp_path: Path) -> None:
 
     with pytest.raises(Exception, match="Unsafe"):
         provider.metadata(str(root), "../escape")
+
+
+class TestFilesystemRemoteSaveStoreObservationTrust:
+    """A ``FilesystemRemoteSaveStore`` may be a mounted CIFS/SMB share whose
+    metadata cannot prove another client did not rewrite a file, so it must
+    never reuse any caller-supplied observation cache."""
+
+    def _store(self, root: Path) -> FilesystemRemoteSaveStore:
+        return FilesystemRemoteSaveStore(
+            WritableLocalFilesystemProvider(), str(root), str(root)
+        )
+
+    def test_ignores_a_stale_cache_entry_keyed_by_current_metadata(
+        self, tmp_path: Path
+    ):
+        """Simulates the worst case: a cache entry that exactly matches the
+        file's *current* (device, inode, size, mtime, ctime) tuple but holds
+        the wrong digest — the scenario a coarse/cached CIFS stat could
+        produce. The store must still report the real content, proving it
+        never even consults the cache rather than merely tending to miss."""
+        root = tmp_path / "remote"
+        save = root / "snes" / "Super Metroid.srm"
+        save.parent.mkdir(parents=True)
+        save.write_bytes(b"real-current-content")
+        status = save.stat()
+
+        poisoned = save_tree.ContentObservationCache()
+        poisoned._entries[
+            (
+                str(save),
+                status.st_dev,
+                status.st_ino,
+                status.st_size,
+                status.st_mtime_ns,
+                status.st_ctime_ns,
+            )
+        ] = "0" * 64  # a plausible-looking but wrong sha256 hex digest
+
+        report = self._store(root).scan(
+            DEFAULT_SAVE_SELECTION_POLICY,
+            enabled_optional_systems=frozenset(),
+            enabled_optional_groups=frozenset(),
+            cache=poisoned,
+        )
+
+        assert (
+            report.artifacts["snes/Super Metroid.srm"].content_hash
+            == save_tree.hash_file(save)
+        )
+        assert report.artifacts["snes/Super Metroid.srm"].content_hash != "0" * 64
+
+    def test_same_size_rewrite_with_coarse_unchanged_mtime_is_still_detected(
+        self, tmp_path: Path
+    ):
+        """A network share can report the same mtime for two scans spanning a
+        same-size rewrite (coarse resolution, client-side attribute caching).
+        Even when the filesystem-level signal genuinely looks unchanged, the
+        store must not have cached the first observation to serve here."""
+        root = tmp_path / "remote"
+        save = root / "snes" / "Super Metroid.srm"
+        save.parent.mkdir(parents=True)
+        save.write_bytes(b"original-save-bytes!")
+        store = self._store(root)
+        cache = save_tree.ContentObservationCache()
+
+        first = store.scan(
+            DEFAULT_SAVE_SELECTION_POLICY,
+            enabled_optional_systems=frozenset(),
+            enabled_optional_groups=frozenset(),
+            cache=cache,
+        )
+        before = save.stat()
+        save.write_bytes(b"different-save-bytes")  # same length
+        os.utime(save, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+        second = store.scan(
+            DEFAULT_SAVE_SELECTION_POLICY,
+            enabled_optional_systems=frozenset(),
+            enabled_optional_groups=frozenset(),
+            cache=cache,
+        )
+
+        assert (
+            first.artifacts["snes/Super Metroid.srm"].content_hash
+            != second.artifacts["snes/Super Metroid.srm"].content_hash
+        )
+        assert (
+            second.artifacts["snes/Super Metroid.srm"].content_hash
+            == save_tree.hash_file(save)
+        )
+
+    def test_repeated_scans_always_re_read_bytes(self, tmp_path: Path, monkeypatch):
+        root = tmp_path / "remote"
+        save = root / "snes" / "Super Metroid.srm"
+        save.parent.mkdir(parents=True)
+        save.write_bytes(b"content")
+        reads: list[Path] = []
+        original = save_tree.hash_file
+        monkeypatch.setattr(
+            save_tree,
+            "hash_file",
+            lambda path: (reads.append(Path(path)), original(path))[1],
+        )
+        store = self._store(root)
+        cache = save_tree.ContentObservationCache()
+
+        store.scan(
+            DEFAULT_SAVE_SELECTION_POLICY,
+            enabled_optional_systems=frozenset(),
+            enabled_optional_groups=frozenset(),
+            cache=cache,
+        )
+        store.scan(
+            DEFAULT_SAVE_SELECTION_POLICY,
+            enabled_optional_systems=frozenset(),
+            enabled_optional_groups=frozenset(),
+            cache=cache,
+        )
+
+        assert len(reads) == 2
+
+    def test_unrelated_remote_saves_are_never_hashed(self, tmp_path: Path, monkeypatch):
+        """Freshness must not regress into scanning unrelated data: a narrow
+        layout scope still only touches its own files."""
+        root = tmp_path / "remote"
+        snes = root / "snes" / "Super Metroid.srm"
+        psx = root / "psx" / "duckstation" / "memcards" / "shared_card_1.mcd"
+        snes.parent.mkdir(parents=True)
+        psx.parent.mkdir(parents=True)
+        snes.write_bytes(b"snes-save")
+        psx.write_bytes(b"unrelated-psx-memory-card")
+        reads: list[Path] = []
+        original = save_tree.hash_file
+        monkeypatch.setattr(
+            save_tree,
+            "hash_file",
+            lambda path: (reads.append(Path(path)), original(path))[1],
+        )
+        snes_only = SaveSelectionPolicy(
+            layouts=tuple(
+                layout
+                for layout in DEFAULT_SAVE_SELECTION_POLICY.layouts
+                if layout.system == "snes"
+            )
+        )
+
+        self._store(root).scan(
+            snes_only,
+            enabled_optional_systems=frozenset(),
+            enabled_optional_groups=frozenset(),
+        )
+
+        assert reads == [snes]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -117,6 +118,8 @@ class _Container:
         save_sync_calls=None,
         full_sync_error=None,
         remote_durable=True,
+        save_conflicts=(),
+        save_sync_report=None,
     ):
         self.config = config
         self.provider = SimpleNamespace(
@@ -152,6 +155,7 @@ class _Container:
         save_sync_state = SimpleNamespace(
             quick_sync_ready=False,
             quick_sync_cursor_generation=None,
+            active_conflicts=tuple(save_conflicts),
         )
 
         def full_sync(progress=None):
@@ -161,7 +165,22 @@ class _Container:
                 raise full_sync_error
             save_sync_state.quick_sync_ready = True
             save_sync_state.quick_sync_cursor_generation = 7
-            return SimpleNamespace()
+            return save_sync_report or SimpleNamespace(
+                uploaded=0,
+                downloaded=0,
+                unchanged=0,
+                conflicts=len(save_conflicts),
+                scope="all_eligible",
+                bootstrap=True,
+                to_dict=lambda: {
+                    "uploaded": 0,
+                    "downloaded": 0,
+                    "unchanged": 0,
+                    "conflicts": len(save_conflicts),
+                    "scope": "all_eligible",
+                    "bootstrap": True,
+                },
+            )
 
         self.saves = SimpleNamespace(
             is_remote_reachable=lambda: remote_reachable,
@@ -176,6 +195,8 @@ class _Container:
             full_sync=full_sync,
             get_state=lambda: save_sync_state,
             _remote_supports_durable_transactions=lambda: remote_durable,
+            selection_policy=SimpleNamespace(),
+            legacy_filesystem_remote_root=Path(config.data_path) / "remote-saves",
         )
 
 
@@ -190,6 +211,8 @@ def _patch_apply_dependencies(
     save_sync_calls=None,
     full_sync_error=None,
     remote_durable=True,
+    save_conflicts=(),
+    save_sync_report=None,
 ):
     monkeypatch.setattr(
         graphical_setup,
@@ -220,11 +243,37 @@ def _patch_apply_dependencies(
             save_sync_calls=save_sync_calls,
             full_sync_error=full_sync_error,
             remote_durable=remote_durable,
+            save_conflicts=save_conflicts,
+            save_sync_report=save_sync_report,
         ),
     )
     monkeypatch.setattr(
         graphical_setup.es_config, "install", lambda *args, **kwargs: None
     )
+
+
+def test_pending_legacy_routes_block_provider_identity_rewrite(tmp_path: Path) -> None:
+    old_data = tmp_path / "old-data"
+    old_data.mkdir()
+    common = {
+        "source": SourceConfig("local", str(tmp_path / "roms")),
+        "cache": CacheConfig(str(tmp_path / "cache")),
+        "local_roms_path": str(tmp_path / "local-roms"),
+        "data_path": str(old_data),
+        "saves": SavesConfig(local_path=str(tmp_path / "saves")),
+    }
+    existing = AppConfig(
+        **common, remote_data=RemoteDataConfig("local", str(tmp_path / "remote-a"))
+    )
+    requested = AppConfig(
+        **common, remote_data=RemoteDataConfig("local", str(tmp_path / "remote-b"))
+    )
+    (old_data / "direct-save-routes.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Legacy Direct Save migration"):
+        graphical_setup._guard_pending_legacy_save_provider_change(  # noqa: SLF001
+            existing, requested
+        )
 
 
 class TestSetupState:
@@ -1266,6 +1315,207 @@ class TestApply:
         )
         assert state["failed_step"] == "initialize SaveSync"
 
+    def test_bootstrap_conflicts_complete_setup_and_are_returned_for_resolution(
+        self, tmp_path, monkeypatch
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        remote_root = tmp_path / "remote-data"
+        conflicts = (
+            SimpleNamespace(conflict_id="one", layout_id="retroarch-root-psx"),
+            SimpleNamespace(conflict_id="two", layout_id="retroarch-root-snes"),
+        )
+        report = SimpleNamespace(
+            uploaded=80,
+            downloaded=70,
+            unchanged=13,
+            conflicts=12,
+            scope="all_eligible",
+            bootstrap=True,
+            to_dict=lambda: {
+                "uploaded": 80,
+                "downloaded": 70,
+                "unchanged": 13,
+                "conflicts": 12,
+                "scope": "all_eligible",
+                "bootstrap": True,
+            },
+        )
+        _patch_apply_dependencies(
+            monkeypatch,
+            save_conflicts=conflicts,
+            save_sync_report=report,
+        )
+        events = []
+
+        result = graphical_setup.apply_setup(
+            config_path,
+            _payload(remote_data_type="local", remote_data_root=str(remote_root)),
+            progress=events.append,
+        )
+
+        assert result["save_sync_initialized"] is True
+        assert result["save_conflicts"] == 2
+        assert result["conflict_ids"] == ["one", "two"]
+        assert result["auto_savesync_pending_conflicts"] is True
+        assert result["save_reconcile"]["scope"] == "all_eligible"
+        assert result["save_reconcile"]["bootstrap"] is True
+        assert any(
+            event.stage == "savesync_initialize" and event.status == "warning"
+            for event in events
+        )
+        assert events[-1].stage == "complete"
+        assert events[-1].status == "success"
+
+    def test_bootstrap_conflicts_log_as_non_fatal_and_pending(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        remote_root = tmp_path / "remote-data"
+        conflicts = (
+            SimpleNamespace(conflict_id="one", layout_id="retroarch-root-psx"),
+            SimpleNamespace(conflict_id="two", layout_id="retroarch-root-snes"),
+        )
+        report = SimpleNamespace(
+            uploaded=80,
+            downloaded=70,
+            unchanged=13,
+            conflicts=12,
+            scope="all_eligible",
+            bootstrap=True,
+            to_dict=lambda: {
+                "uploaded": 80,
+                "downloaded": 70,
+                "unchanged": 13,
+                "conflicts": 12,
+                "scope": "all_eligible",
+                "bootstrap": True,
+            },
+        )
+        _patch_apply_dependencies(
+            monkeypatch,
+            save_conflicts=conflicts,
+            save_sync_report=report,
+        )
+
+        with caplog.at_level(logging.INFO, logger="romcloud.lifecycle.setup"):
+            result = graphical_setup.apply_setup(
+                config_path,
+                _payload(remote_data_type="local", remote_data_root=str(remote_root)),
+            )
+
+        assert result["save_sync_initialized"] is True
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("entering Initial Full Sync" in message for message in messages)
+        assert any(
+            "full_sync() returned" in message and "conflicts=12" in message
+            for message in messages
+        )
+        assert any(
+            "reconciliation succeeded" in message
+            and "unresolved_conflict_count=2" in message
+            for message in messages
+        )
+        assert any(
+            "Auto SaveSync readiness" in message and "ready" in message
+            for message in messages
+        )
+        # A successful bootstrap with preserved conflicts must never be
+        # logged at ERROR — that is reserved for genuine operational failure.
+        assert not any(record.levelno >= logging.ERROR for record in caplog.records)
+
+    def test_setup_bootstrap_exception_is_durably_logged(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        remote_root = tmp_path / "remote-data"
+
+        class _StorageBackendUnavailableError(RuntimeError):
+            pass
+
+        _patch_apply_dependencies(
+            monkeypatch,
+            full_sync_error=_StorageBackendUnavailableError("remote share vanished"),
+        )
+
+        with caplog.at_level(logging.INFO, logger="romcloud.lifecycle.setup"):
+            with pytest.raises(RuntimeError, match="initialize SaveSync"):
+                graphical_setup.apply_setup(
+                    config_path,
+                    _payload(
+                        remote_data_type="local", remote_data_root=str(remote_root)
+                    ),
+                )
+
+        error_records = [
+            record for record in caplog.records if record.levelno >= logging.ERROR
+        ]
+        assert error_records, "expected a durable ERROR-level log record on failure"
+        messages = [record.getMessage() for record in error_records]
+        assert any("Setup failed" in message for message in messages)
+        assert any("step='initialize SaveSync'" in message for message in messages)
+
+    def test_operational_failure_logs_exact_exception_class(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        remote_root = tmp_path / "remote-data"
+
+        class _CustomOperationalError(RuntimeError):
+            pass
+
+        _patch_apply_dependencies(
+            monkeypatch,
+            full_sync_error=_CustomOperationalError("journal corrupted"),
+        )
+
+        with caplog.at_level(logging.INFO, logger="romcloud.lifecycle.setup"):
+            with pytest.raises(RuntimeError):
+                graphical_setup.apply_setup(
+                    config_path,
+                    _payload(
+                        remote_data_type="local", remote_data_root=str(remote_root)
+                    ),
+                )
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any(
+            "exception_type=_CustomOperationalError" in message
+            for message in messages
+        )
+
+    def test_direct_setup_keeps_normal_savesync_conflicts_without_save_routing(
+        self, tmp_path, monkeypatch
+    ):
+        from romcloud.core.capabilities import OperatingMode
+        from romcloud.infrastructure.library_view import operating_mode
+        from romcloud.integrations.batocera import game_access
+
+        config_path = tmp_path / "config" / "romcloud.toml"
+        remote_root = tmp_path / "remote-data"
+        conflict = SimpleNamespace(
+            conflict_id="direct-conflict", layout_id="retroarch-root-psx"
+        )
+        _patch_apply_dependencies(monkeypatch, save_conflicts=(conflict,))
+
+        monkeypatch.setattr(
+            game_access, "reconcile_game_access", lambda *_args, **_kwargs: None
+        )
+
+        result = graphical_setup.apply_setup(
+            config_path,
+            _payload(
+                game_access_mode="direct_nas",
+                remote_data_type="local",
+                remote_data_root=str(remote_root),
+            ),
+        )
+
+        config = graphical_setup.load_config(str(config_path))
+        assert result["conflict_ids"] == ["direct-conflict"]
+        assert "direct_mode_pending" not in result
+        assert "direct_conflict_ids" not in result
+        assert operating_mode(config) is OperatingMode.CONNECTED
+
     def test_unwritable_remote_data_fails_without_exposing_password(
         self, tmp_path, monkeypatch
     ):
@@ -1357,3 +1607,205 @@ class TestApply:
         state_text = (config_path.parent / graphical_setup.SETUP_STATE_FILENAME).read_text()
         assert "target busy" in state_text
         assert "remote-secret-value" not in state_text
+
+
+class TestSaveSyncBootstrapSkipping:
+    """Initial Full Sync is bootstrap behavior, not a consequence of
+    reopening setup to change an unrelated setting (Bug 2)."""
+
+    @staticmethod
+    def _persistent_container_factory(calls, state_holder, *, full_sync_error=None):
+        """*state_holder* is one mutable dict shared across every
+        ``Container(config)`` construction in a test, mirroring how real
+        SaveSync state persists on disk across separate setup invocations."""
+
+        def factory(config):
+            def full_sync(progress=None):
+                calls.append("full-sync")
+                if full_sync_error is not None:
+                    raise full_sync_error
+                state_holder["quick_sync_ready"] = True
+                state_holder["quick_sync_cursor_generation"] = (
+                    state_holder.get("quick_sync_cursor_generation") or 0
+                ) + 1
+                return SimpleNamespace(
+                    uploaded=0,
+                    downloaded=0,
+                    unchanged=0,
+                    conflicts=0,
+                    scope="all_eligible",
+                    bootstrap=True,
+                    to_dict=lambda: {
+                        "uploaded": 0,
+                        "downloaded": 0,
+                        "unchanged": 0,
+                        "conflicts": 0,
+                        "scope": "all_eligible",
+                        "bootstrap": True,
+                    },
+                )
+
+            def get_state():
+                return SimpleNamespace(
+                    quick_sync_ready=state_holder.get("quick_sync_ready", False),
+                    quick_sync_cursor_generation=state_holder.get(
+                        "quick_sync_cursor_generation"
+                    ),
+                    active_conflicts=(),
+                )
+
+            return SimpleNamespace(
+                config=config,
+                provider=SimpleNamespace(
+                    validate_access=lambda root: StorageAccessResult(True, True)
+                ),
+                catalog=SimpleNamespace(
+                    refresh=lambda progress=None: SimpleNamespace(errors=())
+                ),
+                game_repo=SimpleNamespace(list_systems=lambda: ["psx"]),
+                saves=SimpleNamespace(
+                    is_remote_reachable=lambda: True,
+                    validate_remote_storage=lambda: StorageAccessResult(
+                        True, True, write_verified=True, cleanup_verified=True
+                    ),
+                    full_sync=full_sync,
+                    get_state=get_state,
+                    _remote_supports_durable_transactions=lambda: True,
+                    selection_policy=SimpleNamespace(),
+                    legacy_filesystem_remote_root=Path(config.data_path) / "remote-saves",
+                ),
+            )
+
+        return factory
+
+    def test_fresh_setup_runs_initial_full_sync_exactly_once(
+        self, tmp_path, monkeypatch
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        remote_root = tmp_path / "remote-data"
+        _patch_apply_dependencies(monkeypatch)
+        calls: list[str] = []
+        monkeypatch.setattr(
+            graphical_setup,
+            "Container",
+            self._persistent_container_factory(calls, {}),
+        )
+
+        result = graphical_setup.apply_setup(
+            config_path,
+            _payload(remote_data_type="local", remote_data_root=str(remote_root)),
+        )
+
+        assert calls == ["full-sync"]
+        assert result["quick_sync_ready"] is True
+
+    def test_reopening_setup_to_change_cache_size_skips_initial_full_sync(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        remote_root = tmp_path / "remote-data"
+        _patch_apply_dependencies(monkeypatch)
+        calls: list[str] = []
+        state_holder: dict = {}
+        monkeypatch.setattr(
+            graphical_setup,
+            "Container",
+            self._persistent_container_factory(calls, state_holder),
+        )
+        payload = _payload(remote_data_type="local", remote_data_root=str(remote_root))
+
+        graphical_setup.apply_setup(config_path, payload)
+        assert calls == ["full-sync"]
+
+        with caplog.at_level(logging.INFO, logger="romcloud.lifecycle.setup"):
+            result = graphical_setup.apply_setup(
+                config_path, {**payload, "max_size_gb": 80}
+            )
+
+        assert calls == ["full-sync"]
+        assert result["quick_sync_ready"] is True
+        assert result["save_reconcile"] is None
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("skipped Initial Full Sync" in message for message in messages)
+
+    def test_reopening_setup_with_unrelated_settings_change_skips_initial_full_sync(
+        self, tmp_path, monkeypatch
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        remote_root = tmp_path / "remote-data"
+        _patch_apply_dependencies(monkeypatch)
+        calls: list[str] = []
+        state_holder: dict = {}
+        monkeypatch.setattr(
+            graphical_setup,
+            "Container",
+            self._persistent_container_factory(calls, state_holder),
+        )
+        payload = _payload(remote_data_type="local", remote_data_root=str(remote_root))
+
+        graphical_setup.apply_setup(config_path, payload)
+        assert calls == ["full-sync"]
+
+        graphical_setup.apply_setup(config_path, {**payload, "min_free_gb": 9})
+
+        assert calls == ["full-sync"]
+
+    def test_remote_data_root_change_requires_reinitialization(
+        self, tmp_path, monkeypatch
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        first_remote_root = tmp_path / "remote-data-a"
+        second_remote_root = tmp_path / "remote-data-b"
+        _patch_apply_dependencies(monkeypatch)
+        calls: list[str] = []
+        state_holder: dict = {}
+        monkeypatch.setattr(
+            graphical_setup,
+            "Container",
+            self._persistent_container_factory(calls, state_holder),
+        )
+
+        graphical_setup.apply_setup(
+            config_path,
+            _payload(remote_data_type="local", remote_data_root=str(first_remote_root)),
+        )
+        assert calls == ["full-sync"]
+
+        graphical_setup.apply_setup(
+            config_path,
+            _payload(remote_data_type="local", remote_data_root=str(second_remote_root)),
+        )
+
+        assert calls == ["full-sync", "full-sync"]
+
+    def test_interrupted_initial_full_sync_can_be_retried(
+        self, tmp_path, monkeypatch
+    ):
+        config_path = tmp_path / "config" / "romcloud.toml"
+        remote_root = tmp_path / "remote-data"
+        _patch_apply_dependencies(monkeypatch)
+        calls: list[str] = []
+        state_holder: dict = {}
+        payload = _payload(remote_data_type="local", remote_data_root=str(remote_root))
+
+        monkeypatch.setattr(
+            graphical_setup,
+            "Container",
+            self._persistent_container_factory(
+                calls, state_holder, full_sync_error=RuntimeError("bootstrap interrupted")
+            ),
+        )
+        with pytest.raises(RuntimeError, match="initialize SaveSync"):
+            graphical_setup.apply_setup(config_path, payload)
+        assert calls == ["full-sync"]
+        assert state_holder.get("quick_sync_ready", False) is False
+
+        monkeypatch.setattr(
+            graphical_setup,
+            "Container",
+            self._persistent_container_factory(calls, state_holder),
+        )
+        result = graphical_setup.apply_setup(config_path, payload)
+
+        assert calls == ["full-sync", "full-sync"]
+        assert result["quick_sync_ready"] is True

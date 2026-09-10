@@ -90,6 +90,10 @@ from ports_gfx.menu import (
     MenuState,
     NavigationState,
 )
+from ports_gfx.setup_save_conflict import (
+    ACTION_LABELS as MODE_CONFLICT_ACTIONS,
+    SetupSaveConflictState,
+)
 from ports_gfx.operation import OperationRunner, OperationState
 from ports_gfx.operation_screen import (
     OPERATION_SCREEN,
@@ -140,8 +144,10 @@ SETUP_ACTION = "setup"
 LIBRARY_QUICK_SYNC_ACTION = "library-sync-quick"
 LIBRARY_FULL_SYNC_ACTION = "library-sync-full"
 LIBRARY_MANAGER_ACTION = "library-manager"
+DIAGNOSTICS_ACTION = "diagnostics"
 SELECT_SYSTEMS_ACTION = "select-systems"
 STARTUP_RESTART_SCREEN = "startup-restart"
+MODE_SAVE_CONFLICT_SCREEN = "mode-save-conflict"
 
 MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
     "Library": (
@@ -166,6 +172,11 @@ MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
         MenuItem("Unmount", "connection-unmount"),
     ),
     "Maintenance": (
+        MenuItem(
+            "Diagnostics / Logs",
+            DIAGNOSTICS_ACTION,
+            "Open the controller-friendly retained diagnostics browser.",
+        ),
         MenuItem("Check for Updates", "update-check"),
         MenuItem("Update ROMCloud", "update-install"),
         MenuItem("Health Check", "healthcheck"),
@@ -221,9 +232,11 @@ def root_menu_items_for_state(state: dict[str, object]) -> tuple[MenuItem, ...]:
             MenuItem(
                 "Direct",
                 ACTIVE_MODE_ACTION if active_mode == "connected" else "library-connected",
-                "Active"
-                if active_mode == "connected"
-                else "Play games directly from the configured ROM source.",
+                (
+                    ("Active. " if active_mode == "connected" else "")
+                    + "Games run from the configured ROM source. "
+                    + "Gameplay saves stay local and use SaveSync for portability."
+                ),
                 active=active_mode == "connected",
             )
         )
@@ -415,6 +428,41 @@ def format_result(action: str, result: BackendResult) -> str:
     """
     if not result.ok:
         return f"Error: {result.error}"
+    if action == "diagnostics":
+        events = result.data.get("events", [])
+        operations = result.data.get("operations", [])
+        if not isinstance(events, list) or not events:
+            return "Diagnostics / Logs: no matching events"
+        operation_lines = []
+        if isinstance(operations, list) and operations:
+            operation_lines.append("SaveSync operations:")
+            for operation in operations[:8]:
+                if not isinstance(operation, dict):
+                    continue
+                stamp = str(operation.get("timestamp_utc", ""))[11:19]
+                generation = operation.get("generation")
+                generation_text = f" gen={generation}" if generation is not None else ""
+                operation_lines.append(
+                    f"{stamp} {operation.get('name', 'SaveSync')} - "
+                    f"{operation.get('status', 'unknown')}{generation_text} "
+                    f"up={operation.get('uploaded', 0)} "
+                    f"down={operation.get('downloaded', 0)} "
+                    f"conflicts={operation.get('conflicts', 0)}"
+                )
+            operation_lines.append("Raw events:")
+        lines = [f"Diagnostics / Logs — page {result.data.get('page', 1)}"]
+        lines.extend(operation_lines)
+        for item in events[:20]:
+            if not isinstance(item, dict):
+                continue
+            stamp = str(item.get("timestamp_utc", ""))[11:19]
+            lines.append(
+                f"{stamp} {item.get('level', ''):<7} "
+                f"{item.get('subsystem', '')}: {item.get('message', '')}"
+            )
+        if result.data.get("has_more"):
+            lines.append("More events are available through paginated diagnostics queries.")
+        return "\n".join(lines)
     if action == "connection-status":
         state = str(result.data.get("state", "unknown")).replace("_", " ").title()
         source = result.data.get("source", "")
@@ -511,6 +559,24 @@ def start_operation(action: str, romcloud_bin: str, *, popen=None) -> OperationS
     )
 
 
+def _start_local_browser_screen(
+    action: str, romcloud_bin: str, *, popen=None  # noqa: ANN001
+) -> LibraryManagerScreenState:
+    """Route every local view through the hardware-proven browser screen state."""
+    if action not in (LIBRARY_MANAGER_ACTION, DIAGNOSTICS_ACTION):
+        raise ValueError(f"Unsupported local browser action: {action}")
+    screen = LibraryManagerScreenState(
+        romcloud_bin=romcloud_bin,
+        view="diagnostics" if action == DIAGNOSTICS_ACTION else "library",
+        popen=popen,
+    )
+    if screen.is_diagnostics:
+        screen.open_local()
+    else:
+        screen.start_or_refresh()
+    return screen
+
+
 def operation_summary_message(operation: OperationScreenState) -> tuple[str, str]:
     """The dashboard message/kind to show after returning from a finished
     operation screen — this is how the dashboard "refreshes" its status
@@ -521,6 +587,8 @@ def operation_summary_message(operation: OperationScreenState) -> tuple[str, str
     if operation.succeeded:
         return f"{operation.title}: succeeded", "success"
     detail = operation.runner.error
+    if hasattr(operation.runner, "lines"):
+        detail = operation_result(operation.runner).error or detail
     suffix = f" ({detail})" if detail else ""
     return f"{operation.title}: failed{suffix}", "error"
 
@@ -960,6 +1028,7 @@ def _run(  # noqa: ANN001
     library_manager_screen: Optional[LibraryManagerScreenState] = None
     system_selection_screen: Optional[SystemSelectionScreenState] = None
     startup_restart: StartupRestartPromptState | None = None
+    mode_save_conflict: SetupSaveConflictState | None = None
     update_check: UpdateCheckState | None = None
 
     try:
@@ -1080,7 +1149,12 @@ def _run(  # noqa: ANN001
                         savesync_screen is not None
                         and savesync_screen.step == CONFLICTS
                     ):
-                        rects = conflict_action_rects(layout)
+                        rects = conflict_action_rects(
+                            layout,
+                            len(savesync_screen.resolver.detail_lines)
+                            if savesync_screen.resolver is not None
+                            else 0,
+                        )
                     else:
                         rects = (layout.safe_area,)
                 elif current_screen == "library_sync":
@@ -1091,6 +1165,8 @@ def _run(  # noqa: ANN001
                     rects = (layout.safe_area,)
                 elif current_screen == STARTUP_RESTART_SCREEN:
                     rects = tuple(_startup_restart_action_rects(layout))
+                elif current_screen == MODE_SAVE_CONFLICT_SCREEN:
+                    rects = tuple(_mode_save_conflict_action_rects(layout, fonts))
                 else:
                     rects = ()
                 ievent = input_manager.handle_event(
@@ -1143,12 +1219,11 @@ def _run(  # noqa: ANN001
                         current_screen = "savesync"
                     elif (
                         ievent.action == Action.CONFIRM
-                        and item.action == LIBRARY_MANAGER_ACTION
+                        and item.action in (LIBRARY_MANAGER_ACTION, DIAGNOSTICS_ACTION)
                     ):
-                        library_manager_screen = LibraryManagerScreenState(
-                            romcloud_bin=romcloud_bin
+                        library_manager_screen = _start_local_browser_screen(
+                            item.action, romcloud_bin
                         )
-                        library_manager_screen.start_or_refresh()
                         current_screen = "library_manager"
                     elif (
                         ievent.action == Action.CONFIRM
@@ -1224,6 +1299,19 @@ def _run(  # noqa: ANN001
                                 startup_restart.error = (
                                     result.error or "Could not restart Batocera."
                                 )
+                elif (
+                    current_screen == MODE_SAVE_CONFLICT_SCREEN
+                    and mode_save_conflict is not None
+                ):
+                    decision = mode_save_conflict.handle_event(ievent)
+                    if decision == "resolve":
+                        savesync_screen = SaveSyncScreenState(romcloud_bin=romcloud_bin)
+                        savesync_screen.start_conflict_resolution()
+                        current_screen = "savesync"
+                        mode_save_conflict = None
+                    elif decision in {"cancel", "finish"}:
+                        current_screen = "menu"
+                        mode_save_conflict = None
                 elif current_screen == "savesync" and savesync_screen is not None:
                     current_screen = _handle_savesync_event(ievent, savesync_screen)
                     if current_screen == "menu":
@@ -1394,7 +1482,13 @@ def _run(  # noqa: ANN001
             elif current_screen == "wizard" and wizard is not None:
                 for line in wizard.poll():
                     activity.ingest(line.text)
-                if wizard.finished:
+                if wizard.savesync_conflict_ids:
+                    mode_save_conflict = SetupSaveConflictState(
+                        wizard.savesync_conflict_ids
+                    )
+                    wizard = None
+                    current_screen = MODE_SAVE_CONFLICT_SCREEN
+                elif wizard.finished:
                     setup_status = call_backend(romcloud_bin, "setup-status")
                     operating_state = operating_state_from_status(setup_status.data)
                     library_sync_enabled = bool(
@@ -1416,7 +1510,6 @@ def _run(  # noqa: ANN001
                         )
                         message = str(startup_failure or "Setup complete")
                         message_kind = "error" if startup_failure else "success"
-
             should_capture_text = bool(
                 current_screen == "wizard"
                 and wizard is not None
@@ -1487,6 +1580,13 @@ def _run(  # noqa: ANN001
             ):
                 _render_library_manager(
                     pygame, screen, fonts, layout, library_manager_screen
+                )
+            elif (
+                current_screen == MODE_SAVE_CONFLICT_SCREEN
+                and mode_save_conflict is not None
+            ):
+                _render_mode_save_conflict(
+                    pygame, screen, fonts, layout, mode_save_conflict
                 )
             elif (
                 current_screen == "system_selection"
@@ -1818,7 +1918,7 @@ def _system_selection_body_lines(
 def _library_manager_body_lines(screen: LibraryManagerScreenState) -> list[str]:
     if screen.step == "opening":
         return [
-            "Opening the local Library Browser in fullscreen mode…",
+            f"Opening the local {screen.title} browser in fullscreen mode…",
             "Press Back/Exit in the browser to return to ROMCloud.",
         ]
     if screen.step == "starting":
@@ -1841,6 +1941,16 @@ def _library_manager_body_lines(screen: LibraryManagerScreenState) -> list[str]:
             for index, action in enumerate(screen.actions)
         ]))
         return lines
+    if screen.is_diagnostics:
+        return [
+            "Diagnostics browser closed.",
+            "No background browser process was left running.",
+            "",
+            *[
+                ("> " if index == screen.selected_index else "  ") + action
+                for index, action in enumerate(screen.actions)
+            ],
+        ]
     lines = [
         "State: Running",
         "",
@@ -2409,6 +2519,65 @@ def _save_size(num_bytes: int) -> str:
     return f"{value:.1f} TB"
 
 
+def _render_mode_save_conflict(  # noqa: ANN001
+    pygame, screen, fonts: dict, layout: Layout, state: SetupSaveConflictState
+) -> None:
+    screen.fill(_BG_COLOR)
+    title_text = "SaveSync Initialized — Conflicts Need Attention"
+    title = fonts["title"].render(title_text, True, _WARNING_COLOR)
+    screen.blit(title, (layout.header_rect.x, layout.header_rect.y))
+    lines = (
+        (
+            "SaveSync merged every unambiguous local and remote save."
+        ),
+        "Local save changes conflict with the remote versions.",
+        (
+            "Resolve them now or finish setup with the conflicts preserved."
+        ),
+        f"Conflicting save groups: {len(state.conflict_ids)}",
+    )
+    y = layout.navigation_rect.y
+    for line in lines:
+        rendered = fonts["body"].render(line, True, _FG_COLOR)
+        screen.blit(rendered, (layout.navigation_rect.x, y))
+        y += fonts["body"].get_height() + 6
+    controls = _mode_save_conflict_action_rects(
+        layout, fonts, len(state.action_labels)
+    )
+    for index, (label, rect) in enumerate(zip(state.action_labels, controls)):
+        color = _SELECTED_BG if index == state.selected_index else _CARD_BG
+        pygame.draw.rect(screen, color, (rect.x, rect.y, rect.w, rect.h), border_radius=6)
+        text = fonts["body"].render(label, True, _FG_COLOR)
+        screen.blit(text, (rect.x + 16, rect.y + max(0, (rect.h - text.get_height()) // 2)))
+    hint = (
+        "Keep holding Confirm to discard local conflicts."
+        if state.selected_index == state.remote_wins_index and state.confirm.active
+        else "Remote wins requires hold-to-confirm. Back leaves saves unresolved."
+        if state.remote_wins_index is not None
+        else "Resolve now or finish setup with both versions preserved."
+    )
+    screen.blit(
+        fonts["hint"].render(hint, True, _HINT_COLOR),
+        (layout.hint_rect.x, layout.hint_rect.y),
+    )
+    pygame.display.flip()
+
+
+def _mode_save_conflict_action_rects(
+    layout: Layout, fonts: dict, action_count: int = len(MODE_CONFLICT_ACTIONS)
+) -> list[Rect]:
+    body_bottom = layout.navigation_rect.y + 4 * (fonts["body"].get_height() + 6)
+    return compute_vertical_control_rects(
+        Rect(
+            layout.navigation_rect.x,
+            body_bottom + 12,
+            layout.navigation_rect.w,
+            max(1, layout.navigation_rect.bottom - body_bottom - 12),
+        ),
+        action_count,
+    )
+
+
 def _library_sync_body_lines(screen: LibrarySyncScreenState) -> list[str]:
     if screen.step == LIBRARY_PREFLIGHTING:
         return ["Inspecting source game lists…", "No media is being hashed or copied yet."]
@@ -2543,7 +2712,7 @@ def _render_library_manager(  # noqa: ANN001
     state: LibraryManagerScreenState,
 ) -> None:
     screen_surface.fill(_BG_COLOR)
-    title = fonts["title"].render("Library Manager", True, _FG_COLOR)
+    title = fonts["title"].render(state.title, True, _FG_COLOR)
     screen_surface.blit(title, (layout.header_rect.x, layout.header_rect.y))
 
     y = layout.navigation_rect.y
@@ -2682,7 +2851,9 @@ def _render_savesync(  # noqa: ANN001
             fonts,
             layout,
             savesync_screen.resolver,
-            conflict_action_rects(layout),
+            conflict_action_rects(
+                layout, len(savesync_screen.resolver.detail_lines)
+            ),
             colors={
                 "bg": _BG_COLOR,
                 "card": _CARD_BG,
@@ -2942,7 +3113,22 @@ def _wizard_body_lines(wizard: WizardState) -> list[str]:
                 ]
             )
         if wizard.applied_summary.get("save_sync_initialized"):
-            lines.append("\u2713 Initial Full Sync complete — Quick Sync ready")
+            save_reconcile = wizard.applied_summary.get("save_reconcile") or {}
+            merged = sum(
+                int(save_reconcile.get(key, 0))
+                for key in ("uploaded", "downloaded", "unchanged")
+            )
+            conflicts = int(wizard.applied_summary.get("save_conflicts", 0))
+            if conflicts:
+                lines.extend(
+                    [
+                        f"\u2713 SaveSync initialized — {merged:,} save artifact(s) merged",
+                        f"⚠ {conflicts:,} save group(s) need your attention",
+                        "Auto SaveSync is pending for conflicting saves until resolution.",
+                    ]
+                )
+            else:
+                lines.append("\u2713 Initial Full Sync complete — Quick Sync ready")
         if wizard.game_access_mode == "smart_cache":
             lines.append(
                 f"Cache size: {wizard.applied_summary.get('max_size_gb', wizard.max_size_gb):g} GB"

@@ -146,6 +146,11 @@ def _stub_mode_frontend(monkeypatch) -> None:  # noqa: ANN001
         "romcloud.integrations.batocera.game_access._reload_emulationstation",
         lambda: True,
     )
+    # These tests isolate library-media behavior from legacy save migration.
+    monkeypatch.setattr(
+        "romcloud.integrations.batocera.game_access._migrate_legacy_direct_saves",
+        lambda *_args, **_kwargs: None,
+    )
 
 
 def test_opt_in_disabled_does_no_library_work(tmp_path: Path):

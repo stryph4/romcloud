@@ -198,6 +198,13 @@ class SaveSyncError(ROMCloudError):
     """A save-sync operation failed."""
 
 
+class SaveSyncWorkerBusyError(SaveSyncError):
+    """Auto SaveSync could not acquire its worker lock within its bounded
+    retry window because another Manual/Auto Quick Sync was still running.
+    Durable dirty state was already recorded before this was raised; callers
+    must schedule a follow-up sync rather than treat this as data loss."""
+
+
 class SaveSyncConnectivityError(SaveSyncError):
     """The remote save location is not reachable."""
 

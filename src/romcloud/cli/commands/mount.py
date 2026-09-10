@@ -69,6 +69,7 @@ def _get_mount_config(
             # log directory that could itself be remote or unavailable.
             log_dir=None if local_logging_only else config.logging.path,
             console=True,
+            diagnostic_db=str(Path(config.data_path) / "diagnostics.db"),
         )
     return ctx.obj["config"]
 

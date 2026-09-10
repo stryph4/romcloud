@@ -16,6 +16,7 @@ from romcloud.core.exceptions import (
 )
 from romcloud.core.models.game import Game, GameAsset
 from romcloud.core.models.savesync import (
+    SaveArtifact,
     SaveChangeKind,
     SaveDiff,
     SaveGroupCondition,
@@ -151,6 +152,577 @@ class TestConnectivityFailure:
 
 
 class TestBatoceraSaveSelection:
+    def test_exact_eden_config_marker_activates_audited_external_save_root(
+        self, tmp_path: Path
+    ):
+        from romcloud.bootstrap.container import _batocera_mapped_save_roots
+
+        userdata = tmp_path / "userdata"
+        local_saves = userdata / "saves"
+        _write(userdata / "system/configs/eden/qt-config.ini", b"[Data Storage]")
+
+        assert _batocera_mapped_save_roots(local_saves) == (
+            (
+                "eden-switch-user-saves",
+                str(userdata / "system/configs/eden/nand/user/save"),
+                "yuzu",
+            ),
+        )
+
+    def test_only_populated_compatible_switch_root_wins_without_merging(
+        self, tmp_path: Path
+    ):
+        from romcloud.bootstrap.container import _batocera_mapped_save_roots
+
+        userdata = tmp_path / "userdata"
+        local_saves = userdata / "saves"
+        (userdata / "system/configs/eden/nand/user/save").mkdir(parents=True)
+        account = "0123456789abcdef0123456789abcdef"
+        title = "010093801237c000"
+        citron = userdata / "system/configs/citron/nand/user/save"
+        (citron / "0000000000000000" / account / title).mkdir(parents=True)
+
+        assert _batocera_mapped_save_roots(local_saves) == (
+            ("citron-switch-user-saves", str(citron), "yuzu"),
+        )
+
+    def test_ymir_persistent_state_is_an_independent_mapped_root(
+        self, tmp_path: Path
+    ):
+        from romcloud.bootstrap.container import _batocera_mapped_save_roots
+
+        userdata = tmp_path / "userdata"
+        _write(userdata / "system/configs/ymir/Ymir.toml", b"ConfigVersion = 4")
+
+        assert _batocera_mapped_save_roots(userdata / "saves") == (
+            (
+                "ymir-persistent-state",
+                str(userdata / "system/configs/ymir/state"),
+                "ymir/state",
+            ),
+        )
+
+    def test_switch_root_mapping_does_not_guess_outside_batocera_boundary(
+        self, tmp_path: Path
+    ):
+        from romcloud.bootstrap.container import _batocera_mapped_save_roots
+
+        local_saves = tmp_path / "custom-saves"
+        _write(tmp_path / "system/configs/eden/qt-config.ini", b"configured")
+
+        assert _batocera_mapped_save_roots(local_saves) == ()
+
+
+class TestBuaSwitchAliasTopology:
+    """Reproduces the real Batocera Update Assistant (BUA) Switch layout:
+
+    every compatible fork's ``nand/user/save`` is a symlink alias into one
+    shared physical directory, rather than an independent real directory.
+    """
+
+    @staticmethod
+    def _canonical_root(userdata: Path) -> Path:
+        from romcloud.core.save_selection import SWITCH_SHARED_CANONICAL_SAVE_ROOT
+
+        return userdata / SWITCH_SHARED_CANONICAL_SAVE_ROOT
+
+    def _symlink_alias(self, alias: Path, target: Path) -> None:
+        alias.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            alias.symlink_to(target, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlink creation is unavailable on this platform")
+
+    def test_eden_and_citron_aliases_collapse_into_one_canonical_root(
+        self, tmp_path: Path
+    ):
+        from romcloud.bootstrap.container import _batocera_mapped_save_roots
+
+        userdata = tmp_path / "userdata"
+        canonical = self._canonical_root(userdata)
+        account = "0123456789abcdef0123456789abcdef"
+        title = "010093801237c000"
+        (canonical / "0000000000000000" / account / title).mkdir(parents=True)
+        self._symlink_alias(
+            userdata / "system/configs/eden/nand/user/save", canonical
+        )
+        self._symlink_alias(
+            userdata / "system/configs/citron/nand/user/save", canonical
+        )
+
+        result = _batocera_mapped_save_roots(userdata / "saves")
+
+        assert result == (("eden-switch-user-saves", str(canonical), "yuzu"),)
+
+    def test_yuzu_eden_and_citron_aliases_all_collapse_into_one_canonical_root(
+        self, tmp_path: Path
+    ):
+        from romcloud.bootstrap.container import _batocera_mapped_save_roots
+
+        userdata = tmp_path / "userdata"
+        canonical = self._canonical_root(userdata)
+        account = "0123456789abcdef0123456789abcdef"
+        title = "010093801237c000"
+        (canonical / "0000000000000000" / account / title).mkdir(parents=True)
+        self._symlink_alias(
+            userdata / "system/configs/yuzu/nand/user/save", canonical
+        )
+        self._symlink_alias(
+            userdata / "system/configs/eden/nand/user/save", canonical
+        )
+        self._symlink_alias(
+            userdata / "system/configs/citron/nand/user/save", canonical
+        )
+
+        result = _batocera_mapped_save_roots(userdata / "saves")
+
+        # Registry order (eden, citron, yuzu) makes selection deterministic;
+        # the same physical save is never reconciled through more than one alias.
+        assert result == (("eden-switch-user-saves", str(canonical), "yuzu"),)
+
+    def test_eden_config_alias_and_yuzu_save_alias_share_one_physical_root(
+        self, tmp_path: Path
+    ):
+        from romcloud.bootstrap.container import _batocera_mapped_save_roots
+
+        userdata = tmp_path / "userdata"
+        canonical = self._canonical_root(userdata)
+        canonical.mkdir(parents=True)
+        yuzu_config = userdata / "system/configs/yuzu"
+        yuzu_config.mkdir(parents=True)
+        _write(yuzu_config / "qt-config.ini", b"configured")
+        self._symlink_alias(yuzu_config / "nand/user/save", canonical)
+        self._symlink_alias(userdata / "system/configs/eden", yuzu_config)
+
+        # Citron is intentionally absent, as it is on the affected hardware.
+        result = _batocera_mapped_save_roots(userdata / "saves")
+
+        assert result == (("eden-switch-user-saves", str(canonical), "yuzu"),)
+
+    def test_switch_system_save_alias_is_not_accepted_as_user_save_storage(
+        self, tmp_path: Path
+    ):
+        from romcloud.bootstrap.container import _batocera_mapped_save_roots
+
+        userdata = tmp_path / "userdata"
+        system_save = userdata / "saves/switch/eden_citron/save/save_system"
+        system_save.mkdir(parents=True)
+        self._symlink_alias(
+            userdata / "system/configs/yuzu/nand/user/save", system_save
+        )
+
+        assert _batocera_mapped_save_roots(userdata / "saves") == ()
+
+    def test_bua_alias_download_materializes_into_canonical_root_without_symlink_error(
+        self, tmp_path: Path, provider: "_FakeProvider"
+    ):
+        from romcloud.bootstrap.container import _batocera_mapped_save_roots
+
+        userdata = tmp_path / "userdata"
+        local_saves = userdata / "saves"
+        local_saves.mkdir(parents=True)
+        canonical = self._canonical_root(userdata)
+        relative = (
+            Path("0000000000000000")
+            / "0123456789ABCDEF0123456789ABCDEF"
+            / "010093801237C000"
+            / "save.dat"
+        )
+        canonical_physical = canonical / relative
+        _write(canonical_physical, b"switch-progress")
+        self._symlink_alias(
+            userdata / "system/configs/eden/nand/user/save", canonical
+        )
+
+        mapped_roots = _batocera_mapped_save_roots(local_saves)
+        assert mapped_roots == (("eden-switch-user-saves", str(canonical), "yuzu"),)
+
+        service = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "remote-data"),
+            local_root=str(local_saves),
+            remote_root=str(tmp_path / "remote-saves"),
+            state_path=tmp_path / "data/savesync-state.json",
+            mapped_local_roots=mapped_roots,
+        )
+
+        # This previously raised "SaveSync destination root has a symlinked
+        # ancestor" because the raw emulator-facing alias was used directly.
+        service.commit_upload(service.preview_upload())
+        canonical_physical.unlink()
+        service.commit_download(service.preview_download())
+
+        assert canonical_physical.read_bytes() == b"switch-progress"
+        remote_copy = tmp_path / "remote-saves/yuzu" / relative
+        assert remote_copy.read_bytes() == b"switch-progress"
+
+    def test_mixed_snes_and_bua_switch_quick_sync_uses_disjoint_ownership_roots(
+        self, tmp_path: Path, provider: "_FakeProvider", monkeypatch, caplog
+    ):
+        userdata = tmp_path / "userdata"
+        local_saves = userdata / "saves"
+        canonical = self._canonical_root(userdata)
+        switch_relative = (
+            Path("0000000000000000")
+            / "0123456789ABCDEF0123456789ABCDEF"
+            / "010093801237C000"
+            / "save.dat"
+        )
+        switch_physical = canonical / switch_relative
+        snes_relative = Path("snes/Super Metroid (JU) [!].srm")
+        snes_physical = local_saves / snes_relative
+        snes_repair_relative = Path("snes/Zelda.srm")
+        snes_repair_physical = local_saves / snes_repair_relative
+        system_save = userdata / "saves/switch/eden_citron/save/save_system/system.dat"
+        _write(switch_physical, b"switch-progress")
+        _write(snes_physical, b"snes-baseline")
+        _write(snes_repair_physical, b"snes-remote-generation")
+        _write(system_save, b"system-save-must-remain-distinct")
+        service = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "remote-data"),
+            local_root=str(local_saves),
+            remote_root=str(tmp_path / "remote-saves"),
+            state_path=tmp_path / "data/savesync-state.json",
+            mapped_local_roots=(
+                ("eden-switch-user-saves", str(canonical), "yuzu"),
+            ),
+        )
+        service.full_sync()
+        switch_physical.unlink()
+        snes_repair_physical.unlink()
+        snes_physical.write_bytes(b"snes-local-change")
+        service.mark_local_dirty(snes_relative.as_posix())
+
+        captured_roots: list[tuple[Path, ...]] = []
+        real_prepare = save_transaction.prepare_transaction
+
+        def capture_prepare(journal_path, views, **kwargs):
+            selected = tuple(views)
+            captured_roots.append(tuple(Path(view.root) for view in selected))
+            return real_prepare(journal_path, selected, **kwargs)
+
+        monkeypatch.setattr(save_transaction, "prepare_transaction", capture_prepare)
+
+        with caplog.at_level("INFO"):
+            result = service.quick_sync()
+
+        assert result.status == "reconciled"
+        assert result.report is not None
+        assert result.report.uploaded == 1
+        assert result.report.downloaded == 2
+        assert switch_physical.read_bytes() == b"switch-progress"
+        assert snes_physical.read_bytes() == b"snes-local-change"
+        assert snes_repair_physical.read_bytes() == b"snes-remote-generation"
+        assert (
+            tmp_path / "remote-saves" / snes_relative
+        ).read_bytes() == b"snes-local-change"
+        assert system_save.read_bytes() == b"system-save-must-remain-distinct"
+
+        assert len(captured_roots) == 1
+        roots = tuple(path.absolute() for path in captured_roots[0])
+        # Before ownership partitioning, the primary local view used the first
+        # root below and collided with the descendant mapped Switch root.
+        assert canonical.absolute().is_relative_to(local_saves.absolute())
+        assert (local_saves / "snes").absolute() in roots
+        assert canonical.absolute() in roots
+        assert local_saves.absolute() not in roots
+        assert all(
+            left != right
+            and not left.is_relative_to(right)
+            and not right.is_relative_to(left)
+            for index, left in enumerate(roots)
+            for right in roots[index + 1 :]
+        )
+        assert "physical_ownership_domain=primary:snes" in caplog.text
+        assert "layout_ids=retroarch-root-snes" in caplog.text
+        assert "physical_ownership_domain=mapped:yuzu" in caplog.text
+        assert "layout_ids=yuzu-account-title-save" in caplog.text
+
+    def test_mixed_bua_transaction_preparation_failure_preserves_state(
+        self, tmp_path: Path, provider: "_FakeProvider", monkeypatch
+    ):
+        userdata = tmp_path / "userdata"
+        local_saves = userdata / "saves"
+        canonical = self._canonical_root(userdata)
+        switch_relative = (
+            Path("0000000000000000")
+            / "0123456789ABCDEF0123456789ABCDEF"
+            / "010093801237C000"
+            / "save.dat"
+        )
+        switch_physical = canonical / switch_relative
+        snes_relative = Path("snes/Super Metroid (JU) [!].srm")
+        snes_physical = local_saves / snes_relative
+        snes_repair_relative = Path("snes/Zelda.srm")
+        snes_repair_physical = local_saves / snes_repair_relative
+        _write(switch_physical, b"switch-progress")
+        _write(snes_physical, b"snes-baseline")
+        _write(snes_repair_physical, b"snes-remote-generation")
+        service = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "remote-data"),
+            local_root=str(local_saves),
+            remote_root=str(tmp_path / "remote-saves"),
+            state_path=tmp_path / "data/savesync-state.json",
+            mapped_local_roots=(
+                ("eden-switch-user-saves", str(canonical), "yuzu"),
+            ),
+        )
+        service.full_sync()
+        state_before = service.get_state()
+        switch_physical.unlink()
+        snes_repair_physical.unlink()
+        snes_physical.write_bytes(b"snes-local-change")
+        service.mark_local_dirty(snes_relative.as_posix())
+        monkeypatch.setattr(
+            save_transaction,
+            "prepare_transaction",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                SaveSyncError("forced transaction preparation failure")
+            ),
+        )
+
+        with pytest.raises(SaveSyncError, match="preparation failure"):
+            service.quick_sync()
+
+        state_after = service.get_state()
+        assert state_after.quick_sync_cursor_generation == (
+            state_before.quick_sync_cursor_generation
+        )
+        assert state_after.shared_manifest == state_before.shared_manifest
+        assert not switch_physical.exists()
+        assert not snes_repair_physical.exists()
+        assert snes_physical.read_bytes() == b"snes-local-change"
+        assert (
+            tmp_path / "remote-saves" / snes_relative
+        ).read_bytes() == b"snes-baseline"
+
+    def test_partitioned_local_transaction_recovers_after_restart(
+        self, tmp_path: Path, provider: "_FakeProvider"
+    ):
+        userdata = tmp_path / "userdata"
+        local_saves = userdata / "saves"
+        canonical = self._canonical_root(userdata)
+        switch_relative = (
+            Path("0000000000000000")
+            / "0123456789ABCDEF0123456789ABCDEF"
+            / "010093801237C000"
+            / "save.dat"
+        )
+        switch_canonical = (Path("yuzu") / switch_relative).as_posix()
+        snes_canonical = "snes/Recovery.srm"
+        switch_physical = canonical / switch_relative
+        snes_physical = local_saves / snes_canonical
+        _write(switch_physical, b"switch-before")
+        _write(snes_physical, b"snes-before")
+        service = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "remote-data"),
+            local_root=str(local_saves),
+            remote_root=str(tmp_path / "remote-saves"),
+            state_path=tmp_path / "data/savesync-state.json",
+            mapped_local_roots=(
+                ("eden-switch-user-saves", str(canonical), "yuzu"),
+            ),
+        )
+        current = service._scan_local().artifacts
+        sources = {
+            snes_canonical: tmp_path / "sources/snes.srm",
+            switch_canonical: tmp_path / "sources/switch.dat",
+        }
+        _write(sources[snes_canonical], b"snes-after")
+        _write(sources[switch_canonical], b"switch-after")
+        desired = dict(current)
+        for canonical_path, source in sources.items():
+            desired[canonical_path] = SaveArtifact(
+                canonical_path,
+                source.stat().st_size,
+                save_tree.hash_file(source),
+            )
+
+        transaction = service._prepare_selected_transaction(
+            service._local_views(),
+            current=current,
+            desired=desired,
+            source_for=lambda path, _artifact: sources[path],
+            operation_id="f" * 32,
+        )
+        assert transaction is not None
+        service._apply_selected_transaction(transaction, service._local_views())
+        assert snes_physical.read_bytes() == b"snes-after"
+        assert switch_physical.read_bytes() == b"switch-after"
+
+        # No completion receipt was written. Startup recovery must recognize
+        # the narrowed system root and restore both physical ownership domains.
+        service._recover()
+
+        assert snes_physical.read_bytes() == b"snes-before"
+        assert switch_physical.read_bytes() == b"switch-before"
+        assert not service._transaction_journal_path.exists()
+
+    def test_escaping_switch_alias_is_rejected_not_trusted(self, tmp_path: Path):
+        from romcloud.bootstrap.container import _batocera_mapped_save_roots
+
+        userdata = tmp_path / "userdata"
+        escape_target = tmp_path / "outside-userdata-escape"
+        escape_target.mkdir(parents=True)
+        self._symlink_alias(
+            userdata / "system/configs/eden/nand/user/save", escape_target
+        )
+
+        assert _batocera_mapped_save_roots(userdata / "saves") == ()
+
+    def test_broken_switch_alias_is_rejected_not_trusted(self, tmp_path: Path):
+        from romcloud.bootstrap.container import _batocera_mapped_save_roots
+
+        userdata = tmp_path / "userdata"
+        missing_target = userdata / "saves/switch/eden_citron/save/save_user"
+        self._symlink_alias(
+            userdata / "system/configs/eden/nand/user/save", missing_target
+        )
+
+        assert _batocera_mapped_save_roots(userdata / "saves") == ()
+
+    def test_looping_switch_alias_is_rejected_not_trusted(self, tmp_path: Path):
+        from romcloud.bootstrap.container import _batocera_mapped_save_roots
+
+        userdata = tmp_path / "userdata"
+        alias = userdata / "system/configs/eden/nand/user/save"
+        self._symlink_alias(alias, alias)
+
+        assert _batocera_mapped_save_roots(userdata / "saves") == ()
+
+    def test_global_transaction_symlink_safety_is_unchanged_for_arbitrary_destinations(
+        self, tmp_path: Path
+    ):
+        """The Switch alias carve-out never widens the general prohibition
+        against staging/materializing through an arbitrary symlinked root."""
+        real_dir = tmp_path / "real-destination"
+        real_dir.mkdir()
+        arbitrary_alias = tmp_path / "unrelated-system-save-root"
+        try:
+            arbitrary_alias.symlink_to(real_dir, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlink creation is unavailable on this platform")
+
+        with pytest.raises(SaveSyncError, match="symlinked ancestor"):
+            save_transaction._validated_root(arbitrary_alias)
+
+
+    @pytest.mark.parametrize(
+        "relative",
+        (
+            (
+                "3ds/azahar-emu/sdmc/Nintendo 3DS/"
+                "0123456789ABCDEF0123456789ABCDEF/"
+                "FEDCBA9876543210FEDCBA9876543210/"
+                "title/00040000/001B5100/data/00000001/main"
+            ),
+            "wiiu/usr/save/00050000/101C9400/user/80000001/game_data.sav",
+            "psvita/ux0/user/00/savedata/PCSE00762/SlotParam_0.bin",
+            "dreamcast/flycast/vmu_save_A1.bin",
+            "ymir/backup/games/bup-int-NiGHTS into Dreams [MK-81020].bin",
+            "ymir/0123456789ABCDEF0123456789ABCDEF/0.savestate",
+            "dolphin-emu/StateSaves/RMCE01.s01",
+        ),
+        ids=(
+            "azahar",
+            "cemu",
+            "vita3k",
+            "flycast",
+            "ymir-backup",
+            "ymir-state",
+            "dolphin-state",
+        ),
+    )
+    def test_new_layouts_force_upload_and_download_materialize_exact_path(
+        self, tmp_path: Path, service: SaveSyncService, relative: str
+    ):
+        local = tmp_path / "local-saves" / relative
+        remote = tmp_path / "remote-saves" / relative
+        _write(local, b"audited-save")
+
+        service.commit_upload(service.preview_upload())
+        local.unlink()
+        service.commit_download(service.preview_download())
+
+        assert local.read_bytes() == b"audited-save"
+        assert remote.read_bytes() == b"audited-save"
+
+    def test_mapped_switch_force_upload_and_download_use_eden_nand_root(
+        self, tmp_path: Path, provider: _FakeProvider
+    ):
+        local_root = tmp_path / "userdata/saves"
+        eden_root = tmp_path / "userdata/system/configs/eden/nand/user/save"
+        local_root.mkdir(parents=True)
+        relative = (
+            Path("0000000000000000")
+            / "0123456789ABCDEF0123456789ABCDEF"
+            / "010093801237C000"
+            / "save.dat"
+        )
+        physical = eden_root / relative
+        canonical = tmp_path / "remote-saves/yuzu" / relative
+        legacy_relative = (
+            Path("0000000000000000")
+            / "FEDCBA9876543210FEDCBA9876543210"
+            / "01007EF00011E000"
+            / "save.dat"
+        )
+        unselected_legacy = local_root / "yuzu" / legacy_relative
+        _write(physical, b"metroid-force-sync")
+        _write(unselected_legacy, b"leave-legacy-tree-alone")
+        service = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "remote-data"),
+            local_root=str(local_root),
+            remote_root=str(tmp_path / "remote-saves"),
+            state_path=tmp_path / "data/savesync-state.json",
+            mapped_local_roots=(
+                ("eden-switch-user-saves", str(eden_root), "yuzu"),
+            ),
+        )
+
+        service.commit_upload(service.preview_upload())
+        physical.unlink()
+        service.commit_download(service.preview_download())
+
+        assert physical.read_bytes() == b"metroid-force-sync"
+        assert canonical.read_bytes() == b"metroid-force-sync"
+        assert unselected_legacy.read_bytes() == b"leave-legacy-tree-alone"
+        assert not (tmp_path / "remote-saves/yuzu" / legacy_relative).exists()
+
+    def test_mapped_ymir_global_backup_ram_round_trips_without_smpc_state(
+        self, tmp_path: Path, provider: _FakeProvider
+    ):
+        local_root = tmp_path / "userdata/saves"
+        ymir_state = tmp_path / "userdata/system/configs/ymir/state"
+        local_root.mkdir(parents=True)
+        physical = ymir_state / "bup-int.bin"
+        smpc = ymir_state / "smpc-us_eu.bin"
+        _write(physical, b"saturn-progress")
+        _write(smpc, b"system-clock")
+        service = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "remote-data"),
+            local_root=str(local_root),
+            remote_root=str(tmp_path / "remote-saves"),
+            state_path=tmp_path / "data/savesync-state.json",
+            mapped_local_roots=(
+                ("ymir-persistent-state", str(ymir_state), "ymir/state"),
+            ),
+        )
+
+        service.commit_upload(service.preview_upload())
+        physical.unlink()
+        service.commit_download(service.preview_download())
+
+        assert physical.read_bytes() == b"saturn-progress"
+        assert smpc.read_bytes() == b"system-clock"
+        assert (tmp_path / "remote-saves/ymir/state/bup-int.bin").exists()
+        assert not (tmp_path / "remote-saves/ymir/state/smpc-us_eu.bin").exists()
+
     def test_n64_dr_mario_upload_reaches_remote_dataset(self, tmp_path, service):
         local_save = (
             tmp_path / "local-saves" / "n64" / "Dr. Mario 64 (USA).srm"
@@ -811,6 +1383,38 @@ class TestRPCS3PolicyAndLegacyLayout:
 
 
 class TestThreeWayReconciliation:
+    def test_fresh_bootstrap_additively_merges_and_preserves_only_same_group_divergence(
+        self, tmp_path, managed_service
+    ):
+        service = managed_service
+        local_root = tmp_path / "local-saves/psx"
+        remote_root = tmp_path / "remote-saves/psx"
+        _write(local_root / "Local.srm", b"local-only")
+        _write(local_root / "Same.srm", b"identical")
+        _write(remote_root / "Same.srm", b"identical")
+        _write(remote_root / "Remote.srm", b"remote-only")
+        _write(local_root / "Game.srm", b"local-version")
+        _write(remote_root / "Game.srm", b"remote-version")
+
+        report = service.full_sync()
+        state = service.get_state()
+
+        assert report.scope == "all_eligible"
+        assert report.bootstrap is True
+        assert report.uploaded == 1
+        assert report.downloaded == 1
+        assert report.unchanged == 1
+        assert report.conflicts == 1
+        assert (remote_root / "Local.srm").read_bytes() == b"local-only"
+        assert (local_root / "Remote.srm").read_bytes() == b"remote-only"
+        assert (local_root / "Game.srm").read_bytes() == b"local-version"
+        assert (remote_root / "Game.srm").read_bytes() == b"remote-version"
+        assert state.quick_sync_ready is True
+        assert state.last_reconcile is not None
+        assert state.last_reconcile.bootstrap is True
+        assert len(state.active_conflicts) == 1
+        assert state.active_conflicts[0].group_id.endswith("/game")
+
     def test_applies_local_only_and_remote_only_changes(self, tmp_path, managed_service):
         service = managed_service
         shared = tmp_path / "local-saves/psx/Shared.srm"
@@ -861,6 +1465,8 @@ class TestThreeWayReconciliation:
         second = service.reconcile()
 
         assert first.uploaded == 1
+        assert first.bootstrap is True
+        assert second.bootstrap is False
         assert second.uploaded == second.downloaded == second.conflicts == 0
         assert second.unchanged == 1
 
@@ -1117,38 +1723,88 @@ class TestSaveSyncFinalizationSafety:
         assert local.read_bytes() == b"known-local"
         assert service.get_state().last_download is None
 
-    def test_shared_layout_disjoint_changes_are_one_explicit_conflict(
+    def test_duckstation_independent_cards_reconcile_without_cross_card_conflict(
         self, tmp_path, service
     ):
+        # Two distinct DuckStation cards diverging in opposite directions
+        # must never be conflated into one whole-namespace conflict: each
+        # physical card is its own conflict unit, so this converges cleanly
+        # with no conflict and no unrelated card touched.
         card1 = tmp_path / "local-saves/duckstation/memcards/card1.mcd"
         card2 = tmp_path / "local-saves/duckstation/memcards/card2.mcd"
         _write(card1, b"card-one-base")
         _write(card2, b"card-two-base")
         service.commit_upload(service.preview_upload())
         card1.write_bytes(b"card-one-local")
+        remote_card1 = tmp_path / "remote-saves/duckstation/memcards/card1.mcd"
         remote_card2 = tmp_path / "remote-saves/duckstation/memcards/card2.mcd"
         remote_card2.write_bytes(b"card-two-remote")
 
         plan = service.preview_reconciliation()
+
+        assert [entry.relative_path for entry in plan.uploads] == [
+            "duckstation/memcards/card1.mcd"
+        ]
+        assert [entry.relative_path for entry in plan.downloads] == [
+            "duckstation/memcards/card2.mcd"
+        ]
+        assert plan.conflicts == ()
+
         report = service.reconcile()
 
-        assert {entry.relative_path for entry in plan.conflicts} == {
-            "duckstation/memcards/card1.mcd",
-            "duckstation/memcards/card2.mcd",
-        }
-        assert report.conflicts == 2
+        assert report.uploaded == 1
+        assert report.downloaded == 1
+        assert report.conflicts == 0
         assert card1.read_bytes() == b"card-one-local"
-        assert card2.read_bytes() == b"card-two-base"
+        assert remote_card1.read_bytes() == b"card-one-local"
+        assert card2.read_bytes() == b"card-two-remote"
         assert remote_card2.read_bytes() == b"card-two-remote"
-        reloaded = SaveSyncService(
-            provider=service._provider,
-            connectivity_root=service._connectivity_root,
-            local_root=str(service._local_root),
-            remote_root=str(service._remote_root),
-            state_path=service._state_path,
-        ).get_state()
-        assert len(reloaded.active_conflicts) == 1
-        assert reloaded.active_conflicts[0].acknowledged_at is None
+        assert not service.get_state().active_conflicts
+
+    def test_duckstation_card_conflict_resolution_never_touches_unrelated_cards(
+        self, tmp_path, service
+    ):
+        from romcloud.core.models.savesync import SaveConflictResolution
+
+        # Regression for the real-world data-loss shape: resolving the one
+        # card that actually conflicts must never replace or delete other
+        # cards in the same directory (an identical card, a local-only card,
+        # and a remote-only card all coexist here).
+        conflict_local = tmp_path / "local-saves/duckstation/memcards/007.mcd"
+        conflict_remote = tmp_path / "remote-saves/duckstation/memcards/007.mcd"
+        identical_local = tmp_path / "local-saves/duckstation/memcards/resident_evil.mcd"
+        identical_remote = tmp_path / "remote-saves/duckstation/memcards/resident_evil.mcd"
+        _write(conflict_local, b"007-base")
+        _write(identical_local, b"resident-evil-clear")
+        service.commit_upload(service.preview_upload())
+
+        conflict_local.write_bytes(b"007-local-change")
+        conflict_remote.write_bytes(b"007-remote-change")
+        local_only = tmp_path / "local-saves/duckstation/memcards/metal_gear_solid.mcd"
+        _write(local_only, b"mgs-local-only")
+        remote_only = tmp_path / "remote-saves/duckstation/memcards/final_fantasy_viii.mcd"
+        _write(remote_only, b"ff8-remote-only")
+
+        service.reconcile()
+        active = service.get_state().active_conflicts
+        assert len(active) == 1
+        assert active[0].group_id.endswith("/007")
+
+        service.resolve_conflict(active[0].conflict_id, SaveConflictResolution.KEEP_LOCAL)
+        # Reconcile the rest of the namespace (the still-unrelated one-sided
+        # additions) the way a real Quick Sync would.
+        service.reconcile()
+
+        assert conflict_local.read_bytes() == b"007-local-change"
+        assert conflict_remote.read_bytes() == b"007-local-change"
+        assert identical_local.read_bytes() == b"resident-evil-clear"
+        assert identical_remote.read_bytes() == b"resident-evil-clear"
+        local_only_remote = tmp_path / "remote-saves/duckstation/memcards/metal_gear_solid.mcd"
+        remote_only_local = tmp_path / "local-saves/duckstation/memcards/final_fantasy_viii.mcd"
+        assert local_only.read_bytes() == b"mgs-local-only"
+        assert local_only_remote.read_bytes() == b"mgs-local-only"
+        assert remote_only.read_bytes() == b"ff8-remote-only"
+        assert remote_only_local.read_bytes() == b"ff8-remote-only"
 
     def test_dolphin_shared_memory_card_divergence_is_an_explicit_conflict(
         self, tmp_path, service
@@ -1978,3 +2634,165 @@ class TestQuickSyncAndJournal:
             service.quick_sync()
 
         assert service.get_state().quick_sync_cursor_generation == cursor_before
+
+
+class TestTransitionCurrentStateSync:
+    @pytest.mark.parametrize("changed_side", ("local", "remote"))
+    def test_forced_scan_logs_exact_scoped_mutation_and_aborts(
+        self, tmp_path, service, monkeypatch, caplog, changed_side
+    ):
+        relative = "ppsspp/PSP/SAVEDATA/GAME/save.bin"
+        local = tmp_path / "local-saves" / relative
+        remote = tmp_path / "remote-saves" / relative
+        changed = local if changed_side == "local" else remote
+        _write(changed, b"initial")
+        real_prepare = save_transaction.prepare_transaction
+
+        def prepare_then_change(*args, **kwargs):
+            transaction = real_prepare(*args, **kwargs)
+            changed.write_bytes(b"concurrent-emulator-write")
+            return transaction
+
+        monkeypatch.setattr(
+            save_transaction, "prepare_transaction", prepare_then_change
+        )
+
+        with caplog.at_level("WARNING"), pytest.raises(
+            SaveSyncVerificationError, match="changed while staging"
+        ):
+            service.quick_sync(
+                force_current_state=True,
+                include_layout_ids=frozenset({"ppsspp-savedata"}),
+            )
+
+        assert f"side={changed_side}" in caplog.text
+        assert "layout_id=ppsspp-savedata" in caplog.text
+        assert "group_id='ppsspp-savedata/psp/savedata/game'" in caplog.text
+        assert f"path='{relative}'" in caplog.text
+        assert "difference=modified" in caplog.text
+        assert str(tmp_path) not in caplog.text
+        assert "concurrent-emulator-write" not in caplog.text
+
+    def test_forced_scan_establishes_scoped_baseline_without_quick_sync_history(
+        self, tmp_path, service
+    ):
+        local = tmp_path / "local-saves/ppsspp/PSP/SAVEDATA/GAME/save.bin"
+        _write(local, b"first-save")
+
+        forced = service.quick_sync(
+            force_current_state=True,
+            include_layout_ids=frozenset({"ppsspp-savedata"}),
+        )
+
+        assert forced.status == "reconciled"
+        assert forced.report is not None and forced.report.uploaded == 1
+        remote = tmp_path / "remote-saves/ppsspp/PSP/SAVEDATA/GAME/save.bin"
+        assert remote.read_bytes() == b"first-save"
+        assert service.get_state().quick_sync_ready is False
+
+    def test_forced_scan_detects_unjournaled_local_change(self, tmp_path, service):
+        local = tmp_path / "local-saves/ppsspp/PSP/SAVEDATA/GAME/save.bin"
+        _write(local, b"baseline")
+        service.full_sync()
+        local.write_bytes(b"changed-without-dirty-hint")
+
+        assert service.quick_sync().status == "unchanged"
+        forced = service.quick_sync(
+            force_current_state=True,
+            include_layout_ids=frozenset({"ppsspp-savedata"}),
+        )
+
+        assert forced.status == "reconciled"
+        assert forced.report is not None and forced.report.uploaded == 1
+        assert (tmp_path / "remote-saves/ppsspp/PSP/SAVEDATA/GAME/save.bin").read_bytes() == b"changed-without-dirty-hint"
+
+    def test_forced_scan_detects_real_divergence(self, tmp_path, service):
+        local = tmp_path / "local-saves/ppsspp/PSP/SAVEDATA/GAME/save.bin"
+        remote = tmp_path / "remote-saves/ppsspp/PSP/SAVEDATA/GAME/save.bin"
+        _write(local, b"baseline")
+        service.full_sync()
+        local.write_bytes(b"local")
+        remote.write_bytes(b"remote")
+
+        forced = service.quick_sync(
+            force_current_state=True,
+            include_layout_ids=frozenset({"ppsspp-savedata"}),
+        )
+
+        assert forced.report is not None and forced.report.conflicts == 1
+        assert len(service.get_state().active_conflicts) == 1
+        assert local.read_bytes() == b"local"
+        assert remote.read_bytes() == b"remote"
+
+    def test_remote_wins_cannot_reupload_abandoned_local_conflict(
+        self, tmp_path, service
+    ):
+        from romcloud.core.models.savesync import SaveConflictResolution
+
+        local = tmp_path / "local-saves/ppsspp/PSP/SAVEDATA/GAME/save.bin"
+        remote = tmp_path / "remote-saves/ppsspp/PSP/SAVEDATA/GAME/save.bin"
+        _write(local, b"baseline")
+        service.full_sync()
+        local.write_bytes(b"abandoned-local")
+        remote.write_bytes(b"accepted-remote")
+        service.quick_sync(
+            force_current_state=True,
+            include_layout_ids=frozenset({"ppsspp-savedata"}),
+        )
+        conflict = service.get_state().active_conflicts[0]
+
+        service.resolve_conflict(
+            conflict.conflict_id, SaveConflictResolution.KEEP_REMOTE
+        )
+        followup = service.quick_sync(
+            force_current_state=True,
+            include_layout_ids=frozenset({"ppsspp-savedata"}),
+        )
+
+        assert local.read_bytes() == b"accepted-remote"
+        assert remote.read_bytes() == b"accepted-remote"
+        assert followup.report is not None and followup.report.uploaded == 0
+        assert not service.get_state().active_conflicts
+
+    def test_remote_authority_materializes_shadow_and_journals_direct_write(
+        self, tmp_path, service
+    ):
+        local = tmp_path / "local-saves/ppsspp/PSP/SAVEDATA/GAME/save.bin"
+        remote = tmp_path / "remote-saves/ppsspp/PSP/SAVEDATA/GAME/save.bin"
+        _write(local, b"baseline")
+        service.full_sync()
+        cursor = service.get_state().quick_sync_cursor_generation
+        remote.write_bytes(b"direct-write")
+        shadow = tmp_path / "shadow"
+        shadow_local = shadow / "ppsspp/PSP/SAVEDATA/GAME/save.bin"
+        _write(shadow_local, b"baseline")
+
+        result = service.with_local_root(shadow).quick_sync(
+            force_current_state=True,
+            include_layout_ids=frozenset({"ppsspp-savedata"}),
+            authoritative_side="remote",
+        )
+
+        assert result.status == "reconciled"
+        assert shadow_local.read_bytes() == b"direct-write"
+        assert result.cursor_after is not None and result.cursor_after > (cursor or 0)
+        assert not service.get_state().active_conflicts
+
+    def test_remote_authority_materializes_without_prior_quick_sync_history(
+        self, tmp_path, service
+    ):
+        remote = tmp_path / "remote-saves/ppsspp/PSP/SAVEDATA/GAME/save.bin"
+        _write(remote, b"direct-save")
+        shadow = tmp_path / "shadow"
+
+        result = service.with_local_root(shadow).quick_sync(
+            force_current_state=True,
+            include_layout_ids=frozenset({"ppsspp-savedata"}),
+            authoritative_side="remote",
+        )
+
+        assert result.status == "reconciled"
+        assert (
+            shadow / "ppsspp/PSP/SAVEDATA/GAME/save.bin"
+        ).read_bytes() == b"direct-save"
+        assert service.get_state().quick_sync_ready is False

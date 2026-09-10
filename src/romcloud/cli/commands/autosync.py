@@ -1,4 +1,4 @@
-"""Internal Batocera lifecycle commands for background SaveSync."""
+"""Internal Batocera lifecycle commands for durable Auto SaveSync."""
 
 from __future__ import annotations
 
@@ -10,11 +10,15 @@ from pathlib import Path
 import click
 
 from romcloud.cli.context import get_container
+from romcloud.core.capabilities import OperatingMode
+from romcloud.core.exceptions import SaveSyncWorkerBusyError
 from romcloud.infrastructure import savesync_prompts
 from romcloud.infrastructure.config import load_config
+from romcloud.infrastructure.library_view import operating_mode
 from romcloud.infrastructure.logging import get_logger
 from romcloud.integrations.batocera import auto_savesync as batocera_auto_savesync
-from romcloud.services.auto_savesync import AutoSaveSyncCoordinator
+from romcloud.services.auto_savesync import ActiveSessionStore, AutoSaveSyncCoordinator
+from romcloud.ui.savesync_progress import NullSaveSyncProgress, start_savesync_progress
 
 log = get_logger("auto-savesync-cli")
 
@@ -33,13 +37,47 @@ def _event_arguments(command):  # noqa: ANN001, ANN201
 
 def _coordinator(ctx: click.Context) -> AutoSaveSyncCoordinator:
     container = get_container(ctx)
+    enabled = _auto_sync_enabled(container.config)
+
+    def enabled_check() -> bool:
+        current = load_config(ctx.obj["config_path"])
+        return _auto_sync_enabled(current)
+
+    # source.selected_systems is the ROM import/catalog allowlist. SaveSync's
+    # independent positive boundary is the canonical SaveLayout registry.
     return AutoSaveSyncCoordinator(
         container.saves,
         data_root=Path(container.config.data_path),
-        enabled=container.config.saves.auto_sync_enabled,
-        enabled_check=lambda: load_config(
-            ctx.obj["config_path"]
-        ).saves.auto_sync_enabled,
+        enabled=enabled,
+        enabled_check=enabled_check,
+    )
+
+
+def _auto_sync_enabled(config) -> bool:  # noqa: ANN001
+    """Automatic SaveSync runs whenever gameplay is online and locally owned."""
+    return (
+        bool(config.saves.auto_sync_enabled)
+        and operating_mode(config) is not OperatingMode.OFFLINE
+    )
+
+
+def _session_store(config) -> ActiveSessionStore:  # noqa: ANN001
+    """Gameplay markers remain active even when network Auto SaveSync is off."""
+    return ActiveSessionStore(Path(config.data_path))
+
+
+def _resolve_ports_launcher(data_root: Path) -> Path:
+    """Resolve the installed graphical Ports UI wrapper (``romcloud-ports``).
+
+    Shared by both the SaveSync conflict popup and the gameStop Auto
+    SaveSync progress popup — the same wrapper subprocess dispatches to
+    either mode via a CLI flag (see ``ports_gfx/__main__.py``).
+    """
+    romcloud_bin = os.environ.get("ROMCLOUD_BIN")
+    return (
+        Path(romcloud_bin).with_name("romcloud-ports")
+        if romcloud_bin
+        else data_root.parent / "bin" / "romcloud-ports"
     )
 
 
@@ -52,11 +90,7 @@ def _launch_pending_conflict_popup(
         log.info("SaveSync conflict popup launch skipped: durable queue is empty")
         return
     romcloud_bin = os.environ.get("ROMCLOUD_BIN")
-    launcher = (
-        Path(romcloud_bin).with_name("romcloud-ports")
-        if romcloud_bin
-        else data_root.parent / "bin" / "romcloud-ports"
-    )
+    launcher = _resolve_ports_launcher(data_root)
     if not launcher.is_file():
         log.warning(
             "SaveSync conflict popup launch skipped: launcher=%s is unavailable; "
@@ -176,7 +210,13 @@ def _launch_pending_conflict_popup(
 def game_start(
     ctx: click.Context, system: str, emulator: str, core: str, rom: str
 ) -> None:
-    if not ctx.obj["config"].saves.auto_sync_enabled:
+    if not _auto_sync_enabled(ctx.obj["config"]):
+        try:
+            _session_store(ctx.obj["config"]).start(
+                system=system, emulator=emulator, core=core, rom=rom
+            )
+        except Exception:  # noqa: BLE001 - lifecycle hooks never block Batocera
+            log.warning("Could not record Batocera game start", exc_info=True)
         return
     try:
         _coordinator(ctx).game_start(
@@ -192,21 +232,80 @@ def game_start(
 def game_stop(
     ctx: click.Context, system: str, emulator: str, core: str, rom: str
 ) -> None:
-    if not ctx.obj["config"].saves.auto_sync_enabled:
+    """Finish required Quick Sync work before the lifecycle command succeeds."""
+    if not _auto_sync_enabled(ctx.obj["config"]):
+        config = ctx.obj["config"]
+        mode = operating_mode(config)
+        log.info(
+            "gameStop SaveSync skipped before eligibility: system=%s "
+            "emulator=%s core=%s rom=%s auto_sync_enabled=%s mode=%s "
+            "reason=%s operation_id=%s",
+            system,
+            emulator,
+            core,
+            rom,
+            bool(config.saves.auto_sync_enabled),
+            mode.value,
+            (
+                "offline-mode"
+                if mode is OperatingMode.OFFLINE
+                else "auto-sync-disabled"
+            ),
+            os.environ.get("ROMCLOUD_DIAGNOSTIC_OPERATION_ID", "none"),
+        )
+        try:
+            _session_store(config).stop(system=system, rom=rom)
+        except Exception:  # noqa: BLE001 - lifecycle hooks never block Batocera
+            log.warning("Could not clear Batocera game session", exc_info=True)
+        return
+    coordinator = _coordinator(ctx)
+    if not coordinator.game_stop_eligible(
+        system=system, emulator=emulator, core=core
+    ):
+        # Let the coordinator retire the lifecycle marker and emit its scoped
+        # skip diagnostic, but do so before creating any progress UI.
+        coordinator.game_stop(
+            system=system, emulator=emulator, core=core, rom=rom
+        )
         return
     worker_pid = os.getpid()
     caller_pid = batocera_auto_savesync.lifecycle_caller_pid()
     log.info(
-        "gameStop detached worker started: pid=%d lifecycle_caller_pid=%s",
+        "gameStop synchronous worker started: pid=%d lifecycle_caller_pid=%s "
+        "system=%s emulator=%s core=%s",
         worker_pid,
         caller_pid or "unknown",
+        system,
+        emulator,
+        core,
     )
+    data_root = Path(ctx.obj["config"].data_path)
+    launcher = _resolve_ports_launcher(data_root)
+    # Best-effort and fail-open: any failure to launch/drive this popup must
+    # never affect the synchronous SaveSync work below (see
+    # NullSaveSyncProgress / SaveSyncProgressReporter).
+    progress = start_savesync_progress(launcher)
+    log.info(
+        "gameStop progress reporter initialized: launcher=%s launcher_exists=%s "
+        "reporter=%s operation_id=%s",
+        launcher,
+        launcher.is_file(),
+        type(progress).__name__,
+        os.environ.get("ROMCLOUD_DIAGNOSTIC_OPERATION_ID", "none"),
+    )
+    if isinstance(progress, NullSaveSyncProgress):
+        log.warning(
+            "gameStop progress popup unavailable: launcher=%s launcher_exists=%s",
+            launcher,
+            launcher.is_file(),
+        )
     try:
         quick_sync_started = time.monotonic()
         log.info("gameStop Quick Sync started: worker_pid=%d", worker_pid)
         try:
-            conflict_ids = _coordinator(ctx).game_stop(
-                system=system, emulator=emulator, core=core, rom=rom
+            conflict_ids = coordinator.game_stop(
+                system=system, emulator=emulator, core=core, rom=rom,
+                progress=progress,
             )
         except Exception:
             log.warning(
@@ -224,29 +323,61 @@ def game_stop(
             len(conflict_ids),
             ",".join(conflict_ids) or "none",
         )
-        if conflict_ids:
-            log.info(
-                "gameStop new conflict IDs detected: count=%d ids=%s",
-                len(conflict_ids),
-                ",".join(conflict_ids),
-            )
-            _launch_pending_conflict_popup(
-                Path(ctx.obj["config"].data_path),
-                lifecycle_caller_pid=caller_pid,
-            )
-        else:
-            log.info("gameStop popup handoff skipped: no new conflict IDs")
-    except Exception:  # noqa: BLE001 - lifecycle integration must fail open
+        log.info(
+            "gameStop durable Quick Sync result: status=complete "
+            "new_conflicts=%d ids=%s",
+            len(conflict_ids),
+            ",".join(conflict_ids) or "none",
+        )
+    except Exception as exc:
+        if isinstance(exc, SaveSyncWorkerBusyError):
+            try:
+                pid = batocera_auto_savesync.spawn_drain_pending(
+                    operation_id=getattr(exc, "diagnostic_operation_id", None)
+                )
+                log.warning(
+                    "gameStop worker-busy follow-up scheduled: drain_pending_pid=%d",
+                    pid,
+                )
+            except Exception:  # noqa: BLE001 - the failure below still surfaces
+                log.error(
+                    "gameStop could not schedule a worker-busy follow-up sync; "
+                    "durable dirty state remains for the next periodic tick",
+                    exc_info=True,
+                )
         log.warning("SaveSync game-exit pass failed", exc_info=True)
+        raise click.ClickException(
+            "Auto SaveSync did not complete; pending local work was retained."
+        ) from exc
     finally:
-        log.info("gameStop detached worker exited: pid=%d", worker_pid)
+        # Idempotent safety net: the coordinator already closes the popup on
+        # every normal exit path; this only guards an unexpected failure
+        # before/around that call so the popup subprocess is never orphaned.
+        try:
+            progress.close(False, "Save sync failed.\nYour local save has been preserved.")
+        except Exception:  # noqa: BLE001 - never affects the lifecycle hook's result
+            log.warning("Could not close SaveSync progress popup", exc_info=True)
+        log.info("gameStop synchronous worker exited: pid=%d", worker_pid)
+
+
+@autosync_group.command("conflict-popup", hidden=True)
+@click.pass_context
+def conflict_popup(ctx: click.Context) -> None:
+    """Present queued conflicts only after the gameStop hook has returned."""
+    try:
+        _launch_pending_conflict_popup(
+            Path(ctx.obj["config"].data_path),
+            lifecycle_caller_pid=batocera_auto_savesync.lifecycle_caller_pid(),
+        )
+    except Exception:  # noqa: BLE001 - queued conflicts remain durable
+        log.warning("SaveSync conflict popup handoff failed", exc_info=True)
 
 
 @autosync_group.command("menu-tick", hidden=True)
 @click.option("--force", is_flag=True, default=False)
 @click.pass_context
 def menu_tick(ctx: click.Context, force: bool) -> None:
-    if not ctx.obj["config"].saves.auto_sync_enabled:
+    if not _auto_sync_enabled(ctx.obj["config"]):
         return
     try:
         _coordinator(ctx).menu_tick(force=force)
@@ -258,7 +389,7 @@ def menu_tick(ctx: click.Context, force: bool) -> None:
 @click.pass_context
 def remote_reconnect(ctx: click.Context) -> None:
     """Handle one detached unavailable-to-available remote-data edge."""
-    if not ctx.obj["config"].saves.auto_sync_enabled:
+    if not _auto_sync_enabled(ctx.obj["config"]):
         return
     try:
         _coordinator(ctx).remote_reconnect()
@@ -266,10 +397,27 @@ def remote_reconnect(ctx: click.Context) -> None:
         log.warning("Remote-data reconnect Quick Sync failed", exc_info=True)
 
 
+@autosync_group.command("drain-pending", hidden=True)
+@click.pass_context
+def drain_pending(ctx: click.Context) -> None:
+    """Detached, patient follow-up after a worker-busy gameStop deferral.
+
+    Never blocks a lifecycle hook: this always runs as its own spawned
+    process, so it can wait considerably longer than an interactive trigger
+    for the worker lock a busy Manual/Auto Quick Sync is holding to free up.
+    """
+    if not _auto_sync_enabled(ctx.obj["config"]):
+        return
+    try:
+        _coordinator(ctx).drain_pending()
+    except Exception:  # noqa: BLE001 - detached best-effort background work
+        log.warning("Worker-busy follow-up Quick Sync failed", exc_info=True)
+
+
 @autosync_group.command("menu-loop", hidden=True)
 @click.pass_context
 def menu_loop(ctx: click.Context) -> None:
-    if not ctx.obj["config"].saves.auto_sync_enabled:
+    if not _auto_sync_enabled(ctx.obj["config"]):
         return
     try:
         _coordinator(ctx).menu_loop()

@@ -2,6 +2,7 @@ const $ = (id) => document.getElementById(id);
 const state = {token: "", localSession: false, controllerFirst: false, system: "", scope: "full", page: 1, pages: 0, selected: new Set(), status: null, loadSequence: 0};
 let contentUpdateScheduled = false;
 let oskSession = null;
+let diagnosticsBrowser = null;
 
 function contentUpdated() {
   if (contentUpdateScheduled) return;
@@ -154,6 +155,32 @@ function renderGames(games) {
 
 function actionButton(text, action, ids) { const button = el("button", "", text); button.addEventListener("click", () => runAction(action, ids, button)); return button; }
 
+function ensureDiagnosticsBrowser() {
+  if (diagnosticsBrowser) return diagnosticsBrowser;
+  diagnosticsBrowser = new window.ROMCloudDiagnostics.DiagnosticsBrowser({
+    api,
+    contentUpdated,
+    exitLocal: state.controllerFirst ? requestLocalExit : null,
+  });
+  return diagnosticsBrowser;
+}
+
+function setViewNav(diagnosticsActive) {
+  $("nav-library").classList.toggle("active", !diagnosticsActive);
+  $("nav-diagnostics").classList.toggle("active", diagnosticsActive);
+}
+
+async function openDiagnostics() {
+  if (diagnosticsBrowser && diagnosticsBrowser.active) return;
+  setViewNav(true);
+  await ensureDiagnosticsBrowser().open();
+}
+
+function showLibrary() {
+  if (diagnosticsBrowser && diagnosticsBrowser.active) diagnosticsBrowser.close();
+  setViewNav(false);
+}
+
 async function runAction(action, ids, button = null) {
   if (button) button.disabled = true;
   showNotice(`${title(action)} in progress…`);
@@ -231,8 +258,9 @@ function buildOsk() {
 function openControllerKeyboard(source) {
   if (!state.controllerFirst) { source.focus(); return; }
   oskSession = {source, model: new window.ROMCloudController.ControllerKeyboardModel(source.value)};
-  $("osk-title").textContent = source.id === "search" ? "Search library" : "Enter text";
-  $("osk-submit").textContent = source.id === "search" ? "Search" : "Submit";
+  const isSearch = source.type === "search";
+  $("osk-title").textContent = isSearch ? (source.id === "search" ? "Search library" : "Search diagnostics") : "Enter text";
+  $("osk-submit").textContent = isSearch ? "Search" : "Submit";
   renderOskPreview(); $("controller-osk").showModal(); contentUpdated();
 }
 
@@ -300,6 +328,10 @@ $("bulk").querySelectorAll("[data-action]").forEach((button) => button.addEventL
 $("download-pinned").addEventListener("click", showPreflight); $("start-download").addEventListener("click", startDownload);
 
 window.addEventListener("romcloud:page-jump", (event) => {
+  if (diagnosticsBrowser && diagnosticsBrowser.active) {
+    diagnosticsBrowser.pageJump(Number(event.detail.delta || 0));
+    return;
+  }
   if (!state.pages || $("preflight").open) return;
   const nextPage = Math.max(1, Math.min(state.pages, state.page + Number(event.detail.delta || 0)));
   if (nextPage === state.page) return;
@@ -309,6 +341,9 @@ window.addEventListener("romcloud:page-jump", (event) => {
 });
 
 window.addEventListener("romcloud:controller-back", (event) => {
+  if (diagnosticsBrowser && diagnosticsBrowser.active) {
+    event.preventDefault(); diagnosticsBrowser.back(); return;
+  }
   if (state.selected.size) {
     state.selected.clear(); updateBulk(); loadGames(); event.preventDefault(); return;
   }
@@ -344,8 +379,13 @@ window.addEventListener("romcloud:controller-status", (event) => {
   $("controller-menu-button").classList.toggle("hidden", !state.controllerFirst);
   buildOsk();
   state.token = tokenFromStorage();
-  if (state.token) connect(state.token); else {
-    await connect("");
+  $("nav-library").addEventListener("click", showLibrary);
+  $("nav-diagnostics").addEventListener("click", openDiagnostics);
+  await connect(state.token || "");
+  if (new URLSearchParams(location.search).get("view") === "diagnostics") {
+    await openDiagnostics();
+  } else {
+    setViewNav(false);
   }
 })();
 window.romcloudGamepad = window.ROMCloudController.startBrowserController(

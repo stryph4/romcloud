@@ -52,6 +52,8 @@ from romcloud.lifecycle.google_drive_setup import (
 from romcloud.core.progress import ProgressEvent, emit_progress, redact_text
 from romcloud.infrastructure.config import load_config
 from romcloud.infrastructure.capabilities import capability_policy
+from romcloud.infrastructure.logging import configure_logging
+from romcloud.infrastructure.diagnostics import DiagnosticQuery, DiagnosticStore
 from romcloud.infrastructure.source_display import source_display_summary
 from romcloud.infrastructure import savesync_prompts
 from romcloud.integrations.batocera import startup_activation
@@ -73,14 +75,50 @@ def _run_action(ctx: click.Context, build_payload) -> None:
     try:
         payload = build_payload()
     except Exception as exc:  # noqa: BLE001 — must never leak a traceback to stdout
-        _emit(ctx, {"ok": False, "error": str(exc)})
+        _emit(
+            ctx,
+            {
+                "ok": False,
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            },
+        )
         return
     _emit(ctx, {"ok": True, **payload})
 
 
+def _configure_uidata_logging(ctx: click.Context) -> None:
+    """Wire the durable log file for this subprocess.
+
+    ``uidata`` is excluded from ``cli()``'s eager ``configure_logging()`` call
+    (see romcloud/cli/main.py) because most of its actions must work before a
+    config exists. Without this, every graphical-wizard action — including
+    ``setup-apply`` — ran with no log handlers at all, so nothing (not even
+    exceptions) ever reached ``romcloud.log``.
+    """
+    config_path = Path(ctx.obj["config_path"])
+    try:
+        config = load_config(str(config_path))
+        level = "DEBUG" if ctx.obj.get("debug") else config.logging.level
+        log_dir = config.logging.path
+        diagnostic_db = str(Path(config.data_path) / "diagnostics.db")
+    except Exception:  # noqa: BLE001 - logging must never block a fresh install
+        level = "DEBUG" if ctx.obj.get("debug") else "INFO"
+        log_dir = str(config_path.parent.parent / "logs")
+        diagnostic_db = str(config_path.parent.parent / "data" / "diagnostics.db")
+    # stdout is the machine-readable JSON channel and Click's test/runtime
+    # capture may merge stderr into it. The rotating file and SQLite store are
+    # the durable uidata sinks, so never attach a console handler here.
+    configure_logging(
+        level=level, log_dir=log_dir, console=False, diagnostic_db=diagnostic_db
+    )
+
+
 @click.group("uidata", hidden=True)
-def uidata_group() -> None:
+@click.pass_context
+def uidata_group(ctx: click.Context) -> None:
     """Internal: JSON data endpoints for the graphical Ports UI."""
+    _configure_uidata_logging(ctx)
 
 
 def _load_context_config(ctx: click.Context):
@@ -437,7 +475,11 @@ def _run_library_mode_action(ctx: click.Context, mode: str) -> None:
         emit_progress(
             progress, "library", "reconcile", "running", f"Entering {label}…"
         )
-        report = set_operating_mode(container.config, mode, progress=progress)
+        report = set_operating_mode(
+            container.config,
+            mode,
+            progress=progress,
+        )
         emit_progress(
             progress, "library", "reconcile", "success", f"Entered {label}"
         )
@@ -615,6 +657,19 @@ def uidata_manager_boot_start(ctx: click.Context) -> None:
 
         try:
             config = _load_context_config(ctx)
+            # Released builds may have left emulator-visible save bind mounts.
+            # Retire them at the first boot after upgrade, after mount recovery
+            # has run and before the normal manager is reported healthy.
+            from romcloud.integrations.batocera.direct_saves import MANIFEST_FILENAME
+
+            if os.path.lexists(Path(config.data_path) / MANIFEST_FILENAME):
+                from romcloud.integrations.batocera.game_access import reconcile_game_access
+
+                reconcile_game_access(
+                    config,
+                    refresh_es=False,
+                    render_library_metadata=False,
+                )
             romcloud_bin = os.environ.get("ROMCLOUD_BIN") or str(
                 Path(sys.executable).with_name("romcloud")
             )
@@ -666,8 +721,11 @@ def uidata_manager_stop(ctx: click.Context) -> None:
     is_flag=True,
     help="Explicitly disable sandboxing for a user-installed browser only.",
 )
+@click.option("--view", type=click.Choice(["library", "diagnostics"]), default="library")
 @click.pass_context
-def uidata_manager_open_local(ctx: click.Context, allow_no_sandbox: bool) -> None:
+def uidata_manager_open_local(
+    ctx: click.Context, allow_no_sandbox: bool, view: str
+) -> None:
     """Open the manager in the local fullscreen browser until it exits."""
 
     def build() -> dict:
@@ -679,7 +737,7 @@ def uidata_manager_open_local(ctx: click.Context, allow_no_sandbox: bool) -> Non
         )
         start_manager(romcloud_bin, config.data_path)
         return launch_local_browser(
-            config.data_path, allow_no_sandbox=allow_no_sandbox
+            config.data_path, allow_no_sandbox=allow_no_sandbox, view=view
         )
 
     _run_action(ctx, build)
@@ -832,6 +890,60 @@ def uidata_healthcheck(ctx: click.Context) -> None:
     _run_action(ctx, build)
 
 
+@uidata_group.command("diagnostics")
+@click.option("--subsystem", default=None)
+@click.option("--level", default=None)
+@click.option("--operation-id", default=None)
+@click.option("--start-utc", default=None)
+@click.option("--end-utc", default=None)
+@click.option("--search", "text", default=None)
+@click.option("--page", type=click.IntRange(min=1), default=1)
+@click.option("--page-size", type=click.IntRange(min=1, max=200), default=50)
+@click.pass_context
+def uidata_diagnostics(
+    ctx: click.Context,
+    subsystem: str | None,
+    level: str | None,
+    operation_id: str | None,
+    start_utc: str | None,
+    end_utc: str | None,
+    text: str | None,
+    page: int,
+    page_size: int,
+) -> None:
+    """Paginated, filterable Maintenance diagnostics endpoint."""
+    def build() -> dict:
+        config = _load_context_config(ctx)
+        store = DiagnosticStore(Path(config.data_path) / "diagnostics.db")
+        if not store.initialize():
+            raise RuntimeError("Diagnostics database is unavailable; text logs remain active.")
+        query = DiagnosticQuery(
+            subsystem=subsystem, level=level, operation_id=operation_id,
+            start_utc=start_utc, end_utc=end_utc, text=text,
+            page=page, page_size=page_size,
+            chronological=bool(operation_id),
+        )
+        events = store.query(query)
+        operations = (
+            store.operation_summaries(
+                page=page, page_size=min(page_size, 100), subsystem=subsystem,
+                level=level, operation_id=operation_id, start_utc=start_utc,
+                end_utc=end_utc, text=text,
+            )
+            if not operation_id
+            else []
+        )
+        return {
+            "page": page, "page_size": page_size, "events": events,
+            "operations": operations,
+            "has_more": len(events) == page_size,
+            "operation_view": bool(operation_id),
+            "facets": store.facets(),
+        }
+
+    _run_action(ctx, build)
+
+
 @uidata_group.command("cache-status")
 @click.option("--override", is_flag=True, help="Allow this request in Direct.")
 @click.pass_context
@@ -920,12 +1032,18 @@ def _record_dict(record) -> dict | None:
     }
 
 
-def _conflict_prompt_dict(conflict) -> dict:
+def _conflict_prompt_dict(conflict, saves=None) -> dict:  # noqa: ANN001
     artifacts = conflict.local.artifacts or conflict.remote.artifacts
     group_label = conflict.group_id
     if artifacts:
         artifact_path = Path(artifacts[0].relative_path)
         group_label = artifact_path.with_suffix("").as_posix()
+    evidence: dict = {}
+    if saves is not None:
+        try:
+            evidence = saves.conflict_modification_evidence(conflict)
+        except Exception:  # noqa: BLE001 - display evidence must never block a prompt
+            evidence = {}
     return {
         "conflict_id": conflict.conflict_id,
         "group_id": conflict.group_id,
@@ -935,10 +1053,12 @@ def _conflict_prompt_dict(conflict) -> dict:
         "local": {
             "artifact_count": conflict.local.artifact_count,
             "total_bytes": conflict.local.total_bytes,
+            **evidence.get("local", {}),
         },
         "remote": {
             "artifact_count": conflict.remote.artifact_count,
             "total_bytes": conflict.remote.total_bytes,
+            **evidence.get("remote", {}),
         },
     }
 
@@ -949,7 +1069,7 @@ def _conflicts_for_prompt(saves, data_root: Path, source: str) -> list[dict]:  #
         # Manual recovery deliberately includes conflicts whose one-time
         # automatic prompt was previously dismissed.
         return [
-            _conflict_prompt_dict(active[conflict_id])
+            _conflict_prompt_dict(active[conflict_id], saves)
             for conflict_id in sorted(active)
         ]
     if source != "automatic":
@@ -959,7 +1079,7 @@ def _conflicts_for_prompt(saves, data_root: Path, source: str) -> list[dict]:  #
     for conflict_id in savesync_prompts.pending_ids(data_root):
         conflict = active.get(conflict_id)
         if conflict is not None:
-            result.append(_conflict_prompt_dict(conflict))
+            result.append(_conflict_prompt_dict(conflict, saves))
             continue
         # Manual resolution may race an automatic queued prompt. Remove only
         # the stale handoff; durable conflict history remains authoritative.

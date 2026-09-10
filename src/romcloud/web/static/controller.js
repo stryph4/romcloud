@@ -3,7 +3,8 @@
 
   const DEFAULT_ZONES = [
     "auth", "systems", "primary", "tabs", "controls", "bulk",
-    "select", "games", "pager", "global", "dialog",
+    "select", "games", "diagnostic-nav", "diagnostic-filters",
+    "diagnostic-actions", "diagnostic-list", "pager", "global", "dialog",
   ];
 
   // This vocabulary mirrors ports_gfx.actions.Action. It is the stable
@@ -15,10 +16,9 @@
     NEXT_PAGE: "next_page", MENU: "menu",
   });
 
-  // W3C standard Gamepad layout slots. These are deliberately not SDL raw
-  // joystick indices. A pad with mapping === "" has implementation-specific
-  // ordering and is not guessed at; the native persisted raw mapping cannot
-  // safely translate it (and may describe a different, host-side controller).
+  // W3C standard Gamepad layout slots. Chromium on Batocera commonly exposes
+  // otherwise conventional pads with mapping === "", so the same conservative
+  // common layout is accepted when the device exposes enough controls.
   const STANDARD_GAMEPAD_BINDINGS = Object.freeze({
     [LOGICAL_ACTIONS.CONFIRM]: Object.freeze({button: 0}),
     [LOGICAL_ACTIONS.BACK]: Object.freeze({button: 1}),
@@ -31,6 +31,15 @@
     [LOGICAL_ACTIONS.RIGHT]: Object.freeze({button: 15, axis: 0, direction: 1}),
   });
 
+  function compatibleGamepad(pad) {
+    return Boolean(
+      pad && pad.connected && (
+        pad.mapping === "standard" ||
+        (pad.buttons && pad.axes && (pad.buttons.length >= 10 || pad.axes.length >= 2))
+      )
+    );
+  }
+
   class StandardGamepadMapper {
     constructor(bindings = STANDARD_GAMEPAD_BINDINGS, deadzone = 0.58) {
       this.bindings = bindings;
@@ -38,7 +47,7 @@
     }
 
     supports(pad) {
-      return Boolean(pad && pad.connected && pad.mapping === "standard");
+      return compatibleGamepad(pad);
     }
 
     pressedState(pad) {
@@ -90,7 +99,8 @@
       const {zone, row, col} = this.current;
       const rows = this._rows(zone);
       if (zone === "systems") {
-        return this.set({zone, row: row + Math.sign(delta), col: 0});
+        if (delta < 0) return this.current;
+        return this._moveToAdjacentZone(1, col);
       }
       return this.set({zone, row, col: col + Math.sign(delta)});
     }
@@ -103,7 +113,11 @@
       if (rows[row + sign]) {
         return this.set({zone, row: row + sign, col});
       }
-      const zoneIndex = this.zoneOrder.indexOf(zone);
+      return this._moveToAdjacentZone(sign, col);
+    }
+
+    _moveToAdjacentZone(sign, col) {
+      const zoneIndex = this.zoneOrder.indexOf(this.current.zone);
       for (let index = zoneIndex + sign; index >= 0 && index < this.zoneOrder.length; index += sign) {
         const candidateZone = this.zoneOrder[index];
         const candidateRows = this._rows(candidateZone);
@@ -236,7 +250,9 @@
             ? "no-gamepad-exposed"
             : present.some((pad) => pad.connected && pad.mapping === "standard")
               ? "standard-gamepad-exposed"
-              : "nonstandard-gamepad-exposed",
+              : present.some(compatibleGamepad)
+                ? "compatible-nonstandard-gamepad-exposed"
+                : "nonstandard-gamepad-exposed",
       });
       if (!present.length) this.record("gamepad-snapshot", {gamepads: []});
       this.observe(pads);
@@ -247,7 +263,9 @@
       this.record("controller-boundary", {
         state: pad && pad.connected && pad.mapping === "standard"
           ? "standard-gamepad-exposed"
-          : "nonstandard-gamepad-exposed",
+          : compatibleGamepad(pad)
+            ? "compatible-nonstandard-gamepad-exposed"
+            : "nonstandard-gamepad-exposed",
       });
       this.padSignatures.delete(pad.index);
       this.padLayouts.delete(pad.index);
@@ -325,7 +343,7 @@
         index: Number(pad && pad.index),
         id: String(pad && pad.id || "").slice(0, 300),
         mapping: String(pad && pad.mapping || ""),
-        mapping_supported: Boolean(pad && pad.connected && pad.mapping === "standard"),
+        mapping_supported: compatibleGamepad(pad),
         connected: Boolean(pad && pad.connected),
         buttons: pad && pad.buttons ? pad.buttons.length : 0,
         axes: pad && pad.axes ? pad.axes.length : 0,
@@ -381,6 +399,8 @@
       this.editing = null;
       this.editingOriginal = null;
       this.lastNonModal = null;
+      this.contextStack = [];
+      this.inputArmed = false;
       this.repeaters = {
         up: new RepeatButton(), down: new RepeatButton(),
         left: new RepeatButton(), right: new RepeatButton(),
@@ -469,10 +489,24 @@
       if (this.model.set({zone, row: 0, col: 0})) this._focusCurrent();
     }
 
+    pushContext(preferred = null) {
+      this.contextStack.push(this.model.current ? {...this.model.current} : null);
+      this.model.current = preferred;
+      this.reconcile(this.usingController);
+    }
+
+    popContext() {
+      if (!this.contextStack.length) return false;
+      this.model.current = this.contextStack.pop();
+      this.reconcile(this.usingController);
+      return true;
+    }
+
     _connect(gamepad) {
       this.connected.add(gamepad.index);
       if (this.diagnostics) this.diagnostics.connected(gamepad);
       this._resetInputs();
+      this.inputArmed = false;
       if (this.mapper.supports(gamepad)) {
         this._setControllerMode(true);
         this.reconcile(true);
@@ -485,6 +519,7 @@
       this.connected.delete(gamepad.index);
       if (this.diagnostics) this.diagnostics.disconnected(gamepad);
       this._resetInputs();
+      this.inputArmed = false;
       if (!this._activePad(gamepad.index)) {
         if (this.frame !== null) this.window.cancelAnimationFrame(this.frame);
         this.frame = null;
@@ -504,9 +539,17 @@
       });
       observed.forEach((pad) => { if (pad) this.connected.add(pad.index); });
       const pad = this._activePad();
-      if (!pad) { this._resetInputs(); this._schedule(); return; }
+      if (!pad) { this._resetInputs(); this.inputArmed = false; this._schedule(); return; }
       const pressed = this._pressedState(pad);
       if (this.diagnostics) this.diagnostics.logical(pressed, this.model.current);
+      if (!this.inputArmed) {
+        if (!Object.values(pressed).some(Boolean)) {
+          this.inputArmed = true;
+          this._resetInputs();
+        }
+        this._schedule();
+        return;
+      }
       const up = this.repeaters.up.update(pressed.up, now);
       const down = this.repeaters.down.update(pressed.down, now);
       const left = this.repeaters.left.update(pressed.left, now);

@@ -10,6 +10,7 @@ import signal
 import socket
 import ssl
 import subprocess
+import tempfile
 import time
 import urllib.request
 from contextlib import contextmanager
@@ -34,6 +35,60 @@ BATOCERA_BROWSER_PATHS = (
     Path("/userdata/system/add-ons/chromium/Chromium.AppImage"),
 )
 BATOCERA_BROWSER_DIRECTORIES = tuple(path.parent for path in BATOCERA_BROWSER_PATHS)
+_BROWSER_OUTPUT_LIMIT = 8192
+
+
+def _record_browser_launch(
+    log_path: Path,
+    event_code: str,
+    message: str,
+    *,
+    level: str = "INFO",
+    **metadata: object,
+) -> None:
+    """Write one redacted browser event to the text and SQLite diagnostics."""
+    from romcloud.infrastructure.diagnostics import event, redact_metadata
+
+    safe_metadata = redact_metadata(metadata)
+    safe_message = str(redact_metadata({"detail": message}).get("detail", ""))
+    payload = json.dumps(safe_metadata, sort_keys=True, separators=(",", ":"))
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("ab") as handle:
+            timestamp = datetime.now(timezone.utc).isoformat()
+            handle.write(
+                f"[{timestamp}] {event_code}: {safe_message} {payload}\n".encode()
+            )
+    except OSError:
+        pass
+    event(
+        "browser-launch",
+        event_code,
+        safe_message,
+        level=level,
+        metadata=safe_metadata,
+    )
+
+
+def _browser_output(handle) -> str:  # noqa: ANN001
+    """Return only a bounded tail of combined browser stdout/stderr."""
+    try:
+        handle.flush()
+        size = handle.seek(0, os.SEEK_END)
+        handle.seek(max(0, size - _BROWSER_OUTPUT_LIMIT))
+        return handle.read().decode(errors="replace")
+    except (OSError, ValueError):
+        return ""
+
+
+def _safe_browser_arguments(argv: list[str]) -> list[str]:
+    """Keep launch forensics useful without persisting certificate material."""
+    return [
+        "--ignore-certificate-errors-spki-list=[REDACTED]"
+        if value.startswith("--ignore-certificate-errors-spki-list=")
+        else value
+        for value in argv[1:]
+    ]
 
 
 def manager_state_path(data_path: str | Path) -> Path:
@@ -662,25 +717,71 @@ def launch_local_browser(
     *,
     browser: str | None = None,
     allow_no_sandbox: bool = False,
+    view: str = "library",
     popen=subprocess.Popen,
     sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, object]:
     """Launch a kiosk browser and return only after it exits cleanly."""
 
-    discovery = None if browser else discover_local_browser(data_path=data_path)
+    if view not in {"library", "diagnostics"}:
+        raise ValueError(f"Unsupported local browser view: {view}")
+
+    log_path = Path(data_path).parent / "logs" / "browser-open.log"
+    common = {
+        "browser_view": view,
+        "fallback_attempted": allow_no_sandbox,
+        "launch_strategy": "shared-chromium-kiosk",
+    }
+    _record_browser_launch(
+        log_path,
+        "launch.requested",
+        f"Local browser requested for {view}",
+        **common,
+    )
+    try:
+        discovery = None if browser else discover_local_browser(data_path=data_path)
+    except Exception as exc:
+        _record_browser_launch(
+            log_path,
+            "launch.failed",
+            "Browser runtime discovery failed",
+            level="ERROR",
+            **common,
+            stage="runtime-discovery",
+            status="failed",
+            detail=str(exc),
+        )
+        raise
     selected = discovery.get("browser") if discovery else None
     executable = browser or (str(selected["path"]) if isinstance(selected, dict) else None)
-    log_path = Path(data_path).parent / "logs" / "browser-open.log"
+    for diagnostic in (discovery or {}).get("diagnostics", []):
+        _record_browser_launch(
+            log_path,
+            "runtime.probed",
+            "Browser runtime candidate was probed",
+            level="INFO" if diagnostic.get("compatible") else "WARNING",
+            **common,
+            path=diagnostic.get("path"),
+            runtime_source=diagnostic.get("source"),
+            runtime_type=diagnostic.get("ownership"),
+            status="compatible" if diagnostic.get("compatible") else "rejected",
+            detail=diagnostic.get("version") or diagnostic.get("reason"),
+        )
     if not executable:
         diagnostics = "; ".join(
             f"{item['source']} ({item['path']}): {item['reason']}"
             for item in (discovery or {}).get("diagnostics", [])
         )
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("ab") as log_handle:
-            log_handle.write(
-                f"[{datetime.now(timezone.utc).isoformat()}] browser resolution failed: {diagnostics}\n".encode()
-            )
+        _record_browser_launch(
+            log_path,
+            "launch.failed",
+            "No compatible local browser runtime was found",
+            level="ERROR",
+            **common,
+            stage="runtime-discovery",
+            status="failed",
+            detail=diagnostics,
+        )
         raise RuntimeError(
             "Open Here requires a Chromium-compatible local browser runtime; "
             "none was found. Managed installation is not enabled until Chrome for "
@@ -688,80 +789,161 @@ def launch_local_browser(
             f"Library Browser access remains available. Probes: {diagnostics}. See {log_path}"
         )
     ownership = selected.get("ownership") if isinstance(selected, dict) else "explicit"
+    source = selected.get("source") if isinstance(selected, dict) else "explicit argument"
+    _record_browser_launch(
+        log_path,
+        "runtime.resolved",
+        "Local browser runtime resolved",
+        **common,
+        path=executable,
+        runtime_source=source,
+        runtime_type=ownership,
+        status="selected",
+    )
     if allow_no_sandbox and ownership != "user-installed":
+        _record_browser_launch(
+            log_path,
+            "launch.failed",
+            "Unsafe fallback was rejected for a non-user-installed runtime",
+            level="ERROR",
+            **common,
+            path=executable,
+            runtime_source=source,
+            runtime_type=ownership,
+            stage="safety-policy",
+            status="failed",
+        )
         raise RuntimeError(
             "Disabling the browser sandbox is allowed only as an explicit fallback "
             "for a user-installed browser, never for a ROMCloud-managed runtime."
         )
-    launch = _manager_request(
-        data_path,
-        "/api/auth/local-launch",
-        method="POST",
-        body={},
+    try:
+        launch = _manager_request(
+            data_path,
+            "/api/auth/local-launch",
+            method="POST",
+            body={},
+        )
+        manager = manager_status(data_path)
+        local_url = str(manager.get("local_url", ""))
+        # A successful authenticated launch registration proves the server is
+        # accepting requests; the local URL is the remaining construction input.
+        if not local_url:
+            raise RuntimeError("Library Manager did not report a ready local server.")
+    except Exception as exc:
+        _record_browser_launch(
+            log_path,
+            "launch.failed",
+            "Local browser server was not ready",
+            level="ERROR",
+            **common,
+            stage="server-readiness",
+            status="failed",
+            server_ready=False,
+            detail=str(exc),
+        )
+        raise
+    _record_browser_launch(
+        log_path,
+        "server.ready",
+        "Local browser server and launch session are ready",
+        **common,
+        status="ready",
+        server_ready=True,
+        url=local_url,
     )
-    from romcloud.web.tls import manager_certificate_spki_pin
+    try:
+        from romcloud.web.tls import manager_certificate_spki_pin
 
-    certificate_pin = manager_certificate_spki_pin(data_path)
-    profile = Path(data_path) / "web" / "local-browser-profile"
-    profile.mkdir(parents=True, exist_ok=True)
-    local_url = str(manager_status(data_path).get("local_url", ""))
-    separator = "&" if "?" in local_url else "?"
-    controller_url = f"{local_url}{separator}interaction=controller"
-    argv = [
-        executable,
-        "--kiosk",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-session-crashed-bubble",
-        f"--ignore-certificate-errors-spki-list={certificate_pin}",
-        f"--user-data-dir={profile}",
-        controller_url,
-    ]
-    if allow_no_sandbox:
-        argv.insert(1, "--no-sandbox")
+        certificate_pin = manager_certificate_spki_pin(data_path)
+        profile = Path(data_path) / "web" / "local-browser-profile"
+        profile.mkdir(parents=True, exist_ok=True)
+        separator = "&" if "?" in local_url else "?"
+        controller_url = f"{local_url}{separator}interaction=controller"
+        if view != "library":
+            controller_url += f"&view={view}"
+        argv = [
+            executable,
+            "--kiosk",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-session-crashed-bubble",
+            f"--ignore-certificate-errors-spki-list={certificate_pin}",
+            f"--user-data-dir={profile}",
+            controller_url,
+        ]
+        if allow_no_sandbox:
+            argv.insert(1, "--no-sandbox")
+    except Exception as exc:
+        _record_browser_launch(
+            log_path,
+            "launch.failed",
+            "Browser launch preparation failed",
+            level="ERROR",
+            **common,
+            path=executable,
+            runtime_source=source,
+            runtime_type=ownership,
+            stage="launch-preparation",
+            status="failed",
+            detail=str(exc),
+        )
+        raise
     environment = os.environ.copy()
-    log_path.parent.mkdir(parents=True, exist_ok=True)
     launch_id = str(launch.get("launch_id", ""))
-    with _local_browser_lock(data_path):
-        with log_path.open("a+b") as log_handle:
-            timestamp = datetime.now(timezone.utc).isoformat()
-            display = environment.get("DISPLAY", "<unset>")
-            xauthority = environment.get("XAUTHORITY", "<unset>")
-            wayland = environment.get("WAYLAND_DISPLAY", "<unset>")
-            xdg_runtime = environment.get("XDG_RUNTIME_DIR", "<unset>")
-            log_handle.write(
-                (
-                    f"[{timestamp}] Open Here launch browser={executable} uid={getattr(os, 'getuid', lambda: 'unknown')()} "
-                    f"DISPLAY={display} XAUTHORITY={xauthority} WAYLAND_DISPLAY={wayland} "
-                    f"XDG_RUNTIME_DIR={xdg_runtime} sandbox_flags="
-                    f"{'--no-sandbox (explicit user opt-in)' if allow_no_sandbox else 'none'}\n"
-                ).encode()
-            )
-            for diagnostic in (discovery or {}).get("diagnostics", []):
-                log_handle.write(
-                    (
-                        f"[{timestamp}] probe source={diagnostic['source']} path={diagnostic['path']} "
-                        f"compatible={diagnostic['compatible']} detail="
-                        f"{diagnostic.get('version') or diagnostic.get('reason')}\n"
-                    ).encode()
-                )
-            log_handle.flush()
-            child_output_start = log_handle.tell()
+    try:
+        working_directory = os.getcwd()
+    except OSError:
+        working_directory = "<unavailable>"
+    launch_metadata = {
+        **common,
+        "path": executable,
+        "runtime_source": source,
+        "runtime_type": ownership,
+        "arguments": _safe_browser_arguments(argv),
+        "profile_directory": str(profile),
+        "sandbox_enabled": not allow_no_sandbox,
+        "home": environment.get("HOME", "<unset>"),
+        "display": environment.get("DISPLAY", "<unset>"),
+        "xauthority": environment.get("XAUTHORITY", "<unset>"),
+        "wayland_display": environment.get("WAYLAND_DISPLAY", "<unset>"),
+        "xdg_runtime_dir": environment.get("XDG_RUNTIME_DIR", "<unset>"),
+        "working_directory": working_directory,
+        "process": f"uid={getattr(os, 'getuid', lambda: 'unknown')()}",
+        "process_ownership": "uidata-process-group",
+    }
+    _record_browser_launch(
+        log_path,
+        "launch.prepared",
+        "Browser launch environment and arguments prepared",
+        **launch_metadata,
+        status="prepared",
+        url=controller_url,
+    )
+    try:
+        with _local_browser_lock(data_path), tempfile.TemporaryFile() as output_handle:
             # Stay in the uidata operation's process group so cancelling the native
             # screen also terminates the browser it owns.
             try:
                 process = popen(
                     argv,
                     stdin=subprocess.DEVNULL,
-                    stdout=log_handle,
+                    stdout=output_handle,
                     stderr=subprocess.STDOUT,
                     env=environment,
                 )
             except OSError as exc:
-                log_handle.write(
-                    f"[{datetime.now(timezone.utc).isoformat()}] browser spawn failed: {exc}\n".encode()
-                )
-                raise RuntimeError(f"Open Here browser could not start; see {log_path}") from exc
+                raise RuntimeError(
+                    f"Open Here browser could not start; see {log_path}"
+                ) from exc
+            _record_browser_launch(
+                log_path,
+                "process.started",
+                "Browser process started",
+                **launch_metadata,
+                status="running",
+                browser_pid=getattr(process, "pid", "unknown"),
+            )
             try:
                 while process.poll() is None:
                     if launch_id:
@@ -784,14 +966,19 @@ def launch_local_browser(
                     except subprocess.TimeoutExpired:
                         process.kill()
             returncode = process.poll()
-            if returncode not in (None, 0):
-                log_handle.flush()
-                log_handle.seek(child_output_start)
-                child_output = log_handle.read().decode(errors="replace")
-                log_handle.seek(0, os.SEEK_END)
-                log_handle.write(
-                    f"[{datetime.now(timezone.utc).isoformat()}] browser exited status={returncode}\n".encode()
+            child_output = _browser_output(output_handle)
+            if child_output:
+                _record_browser_launch(
+                    log_path,
+                    "process.output",
+                    "Browser process produced diagnostic output",
+                    level="WARNING" if returncode not in (None, 0) else "INFO",
+                    **common,
+                    status="captured",
+                    exit_code=returncode,
+                    detail=child_output,
                 )
+            if returncode not in (None, 0):
                 if (
                     not allow_no_sandbox
                     and ownership == "user-installed"
@@ -807,6 +994,27 @@ def launch_local_browser(
                 raise RuntimeError(
                     f"Open Here browser exited with status {returncode}; see {log_path}"
                 )
+    except Exception as exc:
+        _record_browser_launch(
+            log_path,
+            "launch.failed",
+            "Local browser launch failed",
+            level="ERROR",
+            **launch_metadata,
+            stage="browser-process",
+            status="failed",
+            exit_code=locals().get("returncode"),
+            detail=str(exc.__cause__ or exc),
+        )
+        raise
+    _record_browser_launch(
+        log_path,
+        "launch.completed",
+        "Local browser closed cleanly",
+        **launch_metadata,
+        status="success",
+        exit_code=returncode,
+    )
     return {
         "closed": True,
         "browser": executable,

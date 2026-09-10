@@ -539,6 +539,19 @@ def test_duplicate_and_overlapping_destination_roots_are_rejected(
         )
 
 
+def test_duplicate_non_switch_destination_roots_are_rejected(tmp_path: Path) -> None:
+    root = tmp_path / "ordinary-saves"
+    views = (
+        save_transaction.SelectedView(root, {}, {}, lambda *_: tmp_path),
+        save_transaction.SelectedView(root, {}, {}, lambda *_: tmp_path),
+    )
+
+    with pytest.raises(SaveSyncError, match="duplicate or overlapping roots"):
+        save_transaction.prepare_transaction(
+            tmp_path / "transaction.json", views, operation_id=_OPERATION_ID
+        )
+
+
 def test_forged_out_of_scope_journal_root_is_preserved_and_rejected(
     tmp_path: Path,
 ) -> None:

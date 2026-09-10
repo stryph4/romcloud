@@ -34,6 +34,110 @@ DISPLAYING = "displaying"
 APPLYING = "applying"
 DONE = "done"
 
+UNKNOWN_TIMESTAMP = "Unknown"
+_MONTHS = (
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+)
+_BASE_DETAIL_LINES = 4
+
+
+def format_local_timestamp(epoch, *, localtime=time.localtime) -> str:
+    """Human-friendly local-time rendering of a UTC epoch value.
+
+    Raw epoch values are never shown; an absent or unusable value is reported
+    as ``Unknown`` instead of being approximated from anything else.
+    """
+    if not isinstance(epoch, (int, float)) or isinstance(epoch, bool):
+        return UNKNOWN_TIMESTAMP
+    try:
+        parts = localtime(float(epoch))
+    except (OSError, OverflowError, ValueError):
+        return UNKNOWN_TIMESTAMP
+    hour = parts.tm_hour % 12 or 12
+    meridiem = "AM" if parts.tm_hour < 12 else "PM"
+    month = _MONTHS[parts.tm_mon - 1]
+    return f"{month} {parts.tm_mday}, {parts.tm_year} {hour}:{parts.tm_min:02d} {meridiem}"
+
+
+def _modified_line(side: dict, *, localtime=time.localtime) -> str:
+    label = (
+        "Container modified"
+        if side.get("timestamp_kind") == "container"
+        else "Modified"
+    )
+    stamp = format_local_timestamp(side.get("modified_epoch"), localtime=localtime)
+    return f"{label}: {stamp}"
+
+
+def _content_line(side: dict) -> str:
+    count = int(side.get("artifact_count", 0) or 0)
+    noun = "file" if count == 1 else "files"
+    return f"{count} {noun}, {_size(int(side.get('total_bytes', 0) or 0))}"
+
+
+def _humanize_delta(seconds: float) -> str:
+    for limit, divisor, noun in (
+        (3600.0, 60.0, "minute"),
+        (86400.0, 3600.0, "hour"),
+        (None, 86400.0, "day"),
+    ):
+        if limit is None or seconds < limit:
+            value = int(seconds // divisor)
+            return f"{value} {noun}" if value == 1 else f"{value} {noun}s"
+    return ""
+
+
+def comparison_line(local: dict, remote: dict) -> str:
+    """Neutral evidence about relative age -- never a recommendation.
+
+    Empty when either timestamp is unknown, since clocks on two systems are
+    not guaranteed to agree and a one-sided value proves nothing.
+    """
+    left = local.get("modified_epoch")
+    right = remote.get("modified_epoch")
+    if not isinstance(left, (int, float)) or isinstance(left, bool):
+        return ""
+    if not isinstance(right, (int, float)) or isinstance(right, bool):
+        return ""
+    delta = float(left) - float(right)
+    if abs(delta) < 60.0:
+        return "Local and remote timestamps are within a minute of each other."
+    side = "Local" if delta > 0 else "Remote"
+    return f"{side} is {_humanize_delta(abs(delta))} newer"
+
+
+def conflict_detail_lines(conflict: dict, *, localtime=time.localtime) -> tuple[str, ...]:
+    """Comparison block shown above the actions -- presentation only."""
+    if not conflict:
+        return ()
+    local = conflict.get("local") or {}
+    remote = conflict.get("remote") or {}
+    lines = [
+        str(conflict.get("group_label") or conflict.get("group_id") or "Save group"),
+        f"Layout: {conflict.get('layout_id', 'unknown')}",
+        "Local Save",
+        f"  {_modified_line(local, localtime=localtime)}",
+        f"  {_content_line(local)}",
+        "Remote Save",
+        f"  {_modified_line(remote, localtime=localtime)}",
+        f"  {_content_line(remote)}",
+    ]
+    comparison = comparison_line(local, remote)
+    if comparison:
+        lines.append(comparison)
+    return tuple(lines)
+
 
 @dataclass
 class ConflictPopupState:
@@ -69,6 +173,10 @@ class ConflictPopupState:
         if self.selected_index == 1:
             return "Hold to download remote save…"
         return "Resolve Later does not modify either copy."
+
+    @property
+    def detail_lines(self) -> tuple[str, ...]:
+        return conflict_detail_lines(self.conflict)
 
     def handle_event(self, event: InputEvent) -> None:
         if self.step != DISPLAYING:
@@ -208,9 +316,9 @@ class ConflictPopupState:
             self.record(event, **fields)
 
 
-def action_rects(layout) -> list[Rect]:  # noqa: ANN001
+def action_rects(layout, detail_lines: int = _BASE_DETAIL_LINES) -> list[Rect]:  # noqa: ANN001
     line_height = layout.fonts.body + 6
-    top = layout.navigation_rect.y + line_height * 4
+    top = layout.navigation_rect.y + line_height * max(_BASE_DETAIL_LINES, detail_lines)
     bottom = layout.navigation_rect.bottom - line_height * 3
     area = Rect(
         layout.navigation_rect.x,
@@ -363,7 +471,7 @@ def run_conflict_popup(romcloud_bin: str) -> int:
         input_capture_failed = False
         while running and state.step != DONE:
             dt = clock.tick(30) / 1000.0
-            rects = action_rects(layout)
+            rects = action_rects(layout, len(state.detail_lines))
             now = pygame.time.get_ticks() / 1000.0
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -716,20 +824,10 @@ def render_conflict_resolver(  # noqa: ANN001
     y = layout.navigation_rect.y
     line_h = layout.fonts.body + 6
     if state.conflict:
-        local = state.conflict.get("local", {})
-        remote = state.conflict.get("remote", {})
-        info = (
-            str(state.conflict.get("group_label") or state.conflict.get("group_id", "Save group")),
-            f"Layout: {state.conflict.get('layout_id', 'unknown')}",
-            "Local: "
-            f"{int(local.get('artifact_count', 0))} file(s), "
-            f"{_size(int(local.get('total_bytes', 0)))}",
-            "Remote: "
-            f"{int(remote.get('artifact_count', 0))} file(s), "
-            f"{_size(int(remote.get('total_bytes', 0)))}",
-        )
-        for line in info:
-            screen.blit(fonts["body"].render(line, True, colors["fg"]), (x, y))
+        for line in state.detail_lines:
+            font = fonts["body"] if not line.startswith("  ") else fonts["hint"]
+            color = colors["hint"] if line.startswith("  ") else colors["fg"]
+            screen.blit(font.render(line, True, color), (x, y))
             y += line_h
     else:
         status = "Loading conflict…" if state.step == LOADING else "Working…"

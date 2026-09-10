@@ -32,6 +32,64 @@ YUZU_ACCOUNT_SAVE_GLOB = (
 )
 
 
+@dataclass(frozen=True)
+class BatoceraSaveRootMapping:
+    """One audited emulator path outside Batocera's main saves directory.
+
+    ``physical_root`` and ``activation_markers`` are relative to
+    ``/userdata``.  The service maps files below that root into
+    ``canonical_prefix``; remote data and conflict identities therefore do
+    not depend on which compatible emulator fork is installed locally.
+    """
+
+    mapping_id: str
+    emulator: str
+    physical_root: str
+    canonical_prefix: str
+    activation_markers: tuple[str, ...]
+
+
+BATOCERA_SAVE_ROOT_MAPPINGS: tuple[BatoceraSaveRootMapping, ...] = (
+    BatoceraSaveRootMapping(
+        mapping_id="eden-switch-user-saves",
+        emulator="eden",
+        physical_root="system/configs/eden/nand/user/save",
+        canonical_prefix="yuzu",
+        activation_markers=("system/configs/eden/qt-config.ini",),
+    ),
+    BatoceraSaveRootMapping(
+        mapping_id="citron-switch-user-saves",
+        emulator="citron",
+        physical_root="system/configs/citron/nand/user/save",
+        canonical_prefix="yuzu",
+        activation_markers=("system/configs/citron/qt-config.ini",),
+    ),
+    BatoceraSaveRootMapping(
+        mapping_id="yuzu-switch-user-saves",
+        emulator="yuzu",
+        physical_root="system/configs/yuzu/nand/user/save",
+        canonical_prefix="yuzu",
+        activation_markers=("system/configs/yuzu/qt-config.ini",),
+    ),
+    BatoceraSaveRootMapping(
+        mapping_id="ymir-persistent-state",
+        emulator="ymir",
+        physical_root="system/configs/ymir/state",
+        canonical_prefix="ymir/state",
+        activation_markers=("system/configs/ymir/Ymir.toml",),
+    ),
+)
+
+# Recent Batocera Update Assistant (BUA) Switch emulator installs no longer
+# give Eden/Citron/Yuzu each an independent physical nand/user/save — every
+# compatible fork's config path is instead a symlink alias into this one
+# shared physical tree, relative to ``/userdata``. This is the only alias
+# target ROMCloud's Switch save-root resolution trusts; see
+# ``romcloud.bootstrap.container._resolve_audited_switch_physical_root``.
+SWITCH_SHARED_CANONICAL_SAVE_ROOT = "saves/switch/eden_citron/save/save_user"
+
+
+
 def _match(path: str, pattern: str) -> bool:
     return fnmatch.fnmatch(path, pattern.replace("**", "*"))
 
@@ -93,6 +151,10 @@ class SaveLayout:
     lifecycle_cores: tuple[str, ...] = ()
     lifecycle_enabled: bool = True
     description: str = ""
+    container_adapter_id: str = ""
+    container_policy_id: str = ""
+    container_kind: str = ""
+    root_markers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -103,6 +165,10 @@ class SaveGroupDescriptor:
     layout_id: str
     system: str
     shared: bool
+    container_id: str = ""
+    container_adapter_id: str = ""
+    container_policy_id: str = ""
+    container_kind: str = ""
 
 
 @dataclass(frozen=True)
@@ -140,6 +206,13 @@ _TOKEN_VALIDATORS = {
     "{sony_title_id}": re.compile(r"[A-Za-z]{4}[0-9]{5}").fullmatch,
     "{dolphin_gc_region}": frozenset({"EUR", "USA", "JAP", "JPN"}).__contains__,
     "{dolphin_gc_card}": frozenset({"Card A", "Card B"}).__contains__,
+    # Used only by marker-gated container layouts. The marker check happens
+    # before the directory becomes an approved traversal root.
+    "{host_directory}": lambda value: bool(value)
+    and value not in {".", ".."}
+    and "/" not in value
+    and "\\" not in value
+    and "\x00" not in value,
     # Dolphin's game, downloadable-channel, and game-with-channel title
     # namespaces. System channels, DLC, hidden channels, and other NAND
     # namespaces are deliberately not traversable SaveSync roots.
@@ -185,6 +258,38 @@ _RETROARCH_SRM_SYSTEMS = frozenset(
 
 _SPECIAL_ROOT_SYSTEMS = frozenset({"mame", "n64", "n64dd", "nds"})
 
+# Batocera's libretro generator forces both savefile_directory and
+# savestate_directory to /userdata/saves/<system>.  These conventional console
+# systems therefore have a complete, isolated per-system namespace rather than
+# a shared RetroArch directory. Computers, ports, broad arcade trees, and
+# systems with mixed standalone-emulator storage retain narrower selection.
+_COMPLETE_RETROARCH_CLASSIC_SYSTEMS = frozenset(
+    """
+    atari2600 atari5200 atari7800 colecovision fds gamegear gb gb2players gba
+    gbc gbc2players intellivision jaguar jaguarcd lynx mastersystem megacd
+    megadrive megadrive-msu neogeo neogeocd nes ngp ngpc odyssey2 pcengine
+    pcenginecd psx satellaview sega32x sg1000 sgb sgb-msu1 snes snes-msu1
+    sufami supergrafx supervision vectrex virtualboy wswan wswanc
+    """.split()
+)
+
+# Batocera exposes a few equivalent frontend system names while its emulator
+# generators keep save data in one canonical namespace.  Keep those identities
+# on the SaveLayout registry itself so lifecycle eligibility, dirty ownership,
+# Quick Sync, and Full Sync all converge on ``layout.system``.
+# These are names already present in ROMCloud's audited Batocera system catalog;
+# they are not an Auto SaveSync-specific allowlist.
+_LIFECYCLE_SYSTEM_ALIASES: dict[str, tuple[str, ...]] = {
+    "bbcmicro": ("bbc",),
+    "gameandwatch": ("gw",),
+    "lynx": ("atarilynx",),
+    "megacd": ("segacd",),
+    "megadrive": ("genesis",),
+    "msx1": ("msx",),
+    "wswan": ("wonderswan",),
+    "wswanc": ("wonderswancolor",),
+}
+
 
 def _layout(
     layout_id: str,
@@ -203,6 +308,10 @@ def _layout(
     lifecycle_cores: tuple[str, ...] = (),
     lifecycle_enabled: bool = True,
     description: str = "",
+    container_adapter_id: str = "",
+    container_policy_id: str = "",
+    container_kind: str = "",
+    root_markers: tuple[str, ...] = (),
 ) -> SaveLayout:
     return SaveLayout(
         layout_id=layout_id,
@@ -220,6 +329,10 @@ def _layout(
         lifecycle_cores=lifecycle_cores,
         lifecycle_enabled=lifecycle_enabled,
         description=description,
+        container_adapter_id=container_adapter_id,
+        container_policy_id=container_policy_id,
+        container_kind=container_kind,
+        root_markers=root_markers,
     )
 
 
@@ -227,8 +340,18 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
     _layout(
         f"retroarch-root-{system}",
         system,
-        files=("*.srm", "*.state*"),
-        description="Root-only RetroArch save RAM and save states",
+        recursive=system in _COMPLETE_RETROARCH_CLASSIC_SYSTEMS,
+        files=(
+            ("*",)
+            if system in _COMPLETE_RETROARCH_CLASSIC_SYSTEMS
+            else ("*.srm", "*.state*")
+        ),
+        description=(
+            "Complete Batocera-isolated RetroArch save and state namespace"
+            if system in _COMPLETE_RETROARCH_CLASSIC_SYSTEMS
+            else "Root-only RetroArch save RAM and save states"
+        ),
+        lifecycle_systems=(system, *_LIFECYCLE_SYSTEM_ALIASES.get(system, ())),
     )
     for system in sorted(_RETROARCH_SRM_SYSTEMS - _SPECIAL_ROOT_SYSTEMS)
 ) + (
@@ -256,8 +379,14 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
         description="Nintendo DS root saves and states; shared SD images omitted",
     ),
     _layout("mame-root", "mame", files=("*.srm", "*.state*")),
-    _layout("mame-nvram", "mame", root="nvram", recursive=True, group_by="first_descendant"),
-    _layout("mame-state", "mame", root="state", recursive=True, group_by="first_descendant"),
+    _layout(
+        "mame-nvram", "mame", root="nvram", recursive=True,
+        group_by="first_descendant",
+    ),
+    _layout(
+        "mame-state", "mame", root="state", recursive=True,
+        group_by="first_descendant",
+    ),
     _layout(
         "duckstation-memory-cards",
         "duckstation",
@@ -265,10 +394,26 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
         recursive=True,
         exclusions=("*_resume.sav",),
         shared=True,
-        group_by="layout",
+        # Each physical .mcd is an independently named, independently
+        # addressable card (DuckStation can emit one per game), not one
+        # shared indivisible namespace. Grouping conflicts by the whole
+        # layout would let resolving one card's conflict silently replace
+        # or delete every unrelated card in the directory. One group per
+        # physical card keeps that blast radius to the card that actually
+        # diverged; per-domain merging inside a card is still handled by
+        # the ps1-raw-memory-card container adapter below.
+        group_by="root_file",
         lifecycle_systems=("psx",),
         lifecycle_emulators=("duckstation",),
         lifecycle_cores=("duckstation",),
+        container_adapter_id="ps1-raw-memory-card",
+        container_policy_id="ps1-commercial-namespace",
+        container_kind="file",
+        description=(
+            "Per-card DuckStation raw memory-card images; each physical "
+            "card is an independent conflict unit, with commercial-game "
+            "domains inside a valid 128 KiB card merged automatically"
+        ),
     ),
     _layout(
         "duckstation-root-sav",
@@ -281,7 +426,16 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
     ),
     _layout(
         "pcsx2-legacy-memory-cards", "pcsx2", files=("Mcd*.ps2",),
-        shared=True, group_by="layout", lifecycle_systems=("ps2", "pcsx2"),
+        shared=True,
+        # Batocera/PCSX2 can enable multiple independent card slots
+        # (Mcd001.ps2, Mcd002.ps2, ...); grouping the whole layout together
+        # would let resolving one slot's conflict replace or delete an
+        # unrelated slot. Each physical card file is its own conflict unit;
+        # a single card's own contents still stay opaque (unproven format).
+        group_by="root_file", lifecycle_systems=("ps2", "pcsx2"),
+        container_adapter_id="pcsx2-monolithic-file-card",
+        container_policy_id="opaque-only",
+        container_kind="file",
     ),
     _layout(
         "pcsx2-legacy-states", "pcsx2", root="sstates", recursive=True,
@@ -289,7 +443,28 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
     ),
     _layout(
         "pcsx2-memory-cards", "ps2", root="pcsx2", files=("Mcd*.ps2",),
-        shared=True, group_by="layout", lifecycle_systems=("ps2", "pcsx2"),
+        shared=True,
+        # Same independent-slot reasoning as pcsx2-legacy-memory-cards: each
+        # Mcd*.ps2 file is its own physical card and conflict unit.
+        group_by="root_file", lifecycle_systems=("ps2", "pcsx2"),
+        description="Opaque monolithic PCSX2 .ps2 memory-card images; each card is an independent conflict unit",
+        container_adapter_id="pcsx2-monolithic-file-card",
+        container_policy_id="opaque-only",
+        container_kind="file",
+    ),
+    _layout(
+        "pcsx2-folder-memory-cards",
+        "ps2",
+        root="pcsx2/{host_directory}",
+        recursive=True,
+        shared=True,
+        group_by="root",
+        lifecycle_systems=("ps2", "pcsx2"),
+        container_adapter_id="pcsx2-folder-memory-card",
+        container_policy_id="pcsx2-folder-single-entry",
+        container_kind="directory",
+        root_markers=("_pcsx2_superblock",),
+        description="Marker-verified PCSX2 Folder Memory Card",
     ),
     _layout(
         "pcsx2-states", "ps2", root="pcsx2/sstates", recursive=True,
@@ -353,7 +528,114 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
         recursive=True,
         group_by="root",
         lifecycle_systems=("switch", "yuzu"),
-        description="Yuzu user/title saves; NAND, keys, cache, shaders and config omitted",
+        lifecycle_emulators=("eden", "citron", "yuzu"),
+        lifecycle_cores=("eden", "citron", "yuzu"),
+        description=(
+            "Switch account/title saves shared by compatible Yuzu-derived "
+            "emulators; system NAND, keys, cache, shaders and config omitted"
+        ),
+    ),
+    _layout(
+        "azahar-title-saves",
+        "3ds",
+        root=(
+            "azahar-emu/sdmc/Nintendo 3DS/{hex32}/{hex32}/"
+            "title/{hex8}/{hex8}"
+        ),
+        recursive=True,
+        files=("data/*",),
+        group_by="root",
+        lifecycle_systems=("3ds",),
+        lifecycle_emulators=("azahar",),
+        lifecycle_cores=("azahar",),
+        description=(
+            "Azahar per-account/per-title save archive including format metadata; "
+            "installed title content and unrelated SD/NAND data omitted"
+        ),
+    ),
+    _layout(
+        "cemu-title-saves",
+        "wiiu",
+        root="usr/save/{hex8}/{hex8}",
+        recursive=True,
+        group_by="root",
+        lifecycle_systems=("wiiu",),
+        lifecycle_emulators=("cemu",),
+        lifecycle_cores=("cemu",),
+        description="Cemu per-title MLC save tree; title/update/content trees omitted",
+    ),
+    _layout(
+        "vita3k-title-saves",
+        "psvita",
+        root="ux0/user/00/savedata/{sony_title_id}",
+        recursive=True,
+        group_by="root",
+        lifecycle_systems=("psvita", "vita"),
+        lifecycle_emulators=("vita3k",),
+        lifecycle_cores=("vita3k",),
+        description=(
+            "Vita3K user 00 per-title savedata; applications and shader data omitted"
+        ),
+    ),
+    _layout(
+        "flycast-vmu-cards",
+        "dreamcast",
+        root="flycast",
+        files=(
+            "vmu_save_[A-D][1-2].bin",
+            "*_vmu_save_[A-D][1-2].bin",
+        ),
+        shared=True,
+        group_by="root_file",
+        lifecycle_systems=("dreamcast",),
+        lifecycle_emulators=("flycast",),
+        lifecycle_cores=("flycast",),
+        description=(
+            "Opaque Flycast global and per-game VMU images; each physical card "
+            "is an independent conflict unit"
+        ),
+    ),
+    _layout(
+        "ymir-per-game-backup-memory",
+        "ymir",
+        root="backup/games",
+        files=("bup-int-*.bin", "bup-ext-*M-*.bin"),
+        shared=True,
+        group_by="root_file",
+        lifecycle_systems=("saturn",),
+        lifecycle_emulators=("ymir",),
+        lifecycle_cores=("ymir",),
+        description=(
+            "Opaque Ymir per-game internal/external backup RAM images; exports "
+            "and dumps omitted"
+        ),
+    ),
+    _layout(
+        "ymir-save-states",
+        "ymir",
+        root="{hex32}",
+        files=("*.savestate", "meta.txt"),
+        group_by="root",
+        lifecycle_systems=("saturn",),
+        lifecycle_emulators=("ymir",),
+        lifecycle_cores=("ymir",),
+        description=(
+            "Ymir save-state slots and metadata grouped by 128-bit disc hash"
+        ),
+    ),
+    _layout(
+        "ymir-global-backup-memory",
+        "ymir",
+        root="state",
+        files=("bup-int.bin",),
+        shared=True,
+        group_by="root_file",
+        lifecycle_systems=("saturn",),
+        lifecycle_emulators=("ymir",),
+        lifecycle_cores=("ymir",),
+        description=(
+            "Opaque Ymir global internal backup RAM; SMPC persistent state omitted"
+        ),
     ),
     _layout(
         "dolphin-gc-memory-card-images",
@@ -382,6 +664,18 @@ _LAYOUTS: tuple[SaveLayout, ...] = tuple(
         group_by="root",
         lifecycle_systems=("wii",),
         description="Per-title Dolphin Wii save data; other NAND content omitted",
+    ),
+    _layout(
+        "dolphin-save-states",
+        "dolphin-emu",
+        root="StateSaves",
+        files=("*.s[0-9][0-9]", "*.s[0-9][0-9].dtm"),
+        group_by="dolphin_state",
+        lifecycle_systems=("gamecube", "wii"),
+        description=(
+            "Dolphin per-game state slots and their input-recording companions; "
+            "temporary undo states omitted"
+        ),
     ),
     _layout(
         "xemu-hdd",
@@ -466,6 +760,12 @@ def _group_key(layout: SaveLayout, root: tuple[str, ...], remainder: tuple[str, 
         # ``Game.srm``. They are one game dataset, so independent edits across
         # those siblings must conflict rather than merge silently.
         return re.sub(r"\.\d+$", "", _root_stem(remainder[-1]))
+    if layout.group_by == "dolphin_state":
+        # A state slot and its optional input-recording companion must move
+        # together. All slots for one six-character Dolphin game ID share a
+        # conflict domain so independently edited slots cannot be combined
+        # into a generation the emulator never wrote.
+        return re.sub(r"\.s\d{2}(?:\.dtm)?$", "", remainder[-1], flags=re.I).casefold()
     raise ValueError(f"unknown SaveSync grouping strategy: {layout.group_by}")
 
 
@@ -633,6 +933,7 @@ class SaveSelectionPolicy:
         relative_path: str,
         *,
         enabled_optional_groups: frozenset[str] = frozenset(),
+        trusted_layout_id: str = "",
     ) -> SaveSelectionDecision:
         # Keep exact legacy optional-group behavior for external custom policies.
         if self._legacy_rules is not None:
@@ -659,7 +960,9 @@ class SaveSelectionPolicy:
             return SaveSelectionDecision(False, excluded_reason="not selected by policy")
 
         if any(
-            layout.system == system and _match_layout(layout, relative_path) is not None
+            layout.system == system
+            and (not layout.root_markers or layout.layout_id == trusted_layout_id)
+            and _match_layout(layout, relative_path) is not None
             for layout in self._layouts
         ):
             return SaveSelectionDecision(True)
@@ -700,7 +1003,17 @@ class SaveSelectionPolicy:
             part in {".", ".."} for part in PurePosixPath(canonical_path).parts
         ):
             return None
-        for layout in self._layouts:
+        # Prefer a fully literal registered root over a marker-gated dynamic
+        # root when both shapes could describe the same path (for example
+        # PCSX2's literal ``sstates`` tree versus a folder-card name).
+        layouts = sorted(
+            self._layouts,
+            key=lambda value: sum(
+                segment in _TOKEN_VALIDATORS
+                for segment in _segments(value.root_pattern)
+            ),
+        )
+        for layout in layouts:
             if layout.system != system:
                 continue
             matched = _match_layout(layout, relative)
@@ -713,6 +1026,16 @@ class SaveSelectionPolicy:
                 layout_id=layout.layout_id,
                 system=system,
                 shared=layout.shared,
+                container_id=(
+                    canonical_path
+                    if layout.container_kind == "file"
+                    else "/".join((system, *root))
+                    if layout.container_kind == "directory"
+                    else ""
+                ),
+                container_adapter_id=layout.container_adapter_id,
+                container_policy_id=layout.container_policy_id,
+                container_kind=layout.container_kind,
             )
         return None
 
@@ -775,6 +1098,12 @@ class SaveSelectionPolicy:
                     break
 
             for physical, canonical in candidates:
+                if layout.root_markers and any(
+                    (physical / marker).is_symlink()
+                    or not (physical / marker).is_file()
+                    for marker in layout.root_markers
+                ):
+                    continue
                 resolved.append(
                     SaveWatchRoot(
                         layout.layout_id,
@@ -789,6 +1118,7 @@ class SaveSelectionPolicy:
         self,
         dir_exists: Callable[[str], bool],
         list_subdirs: Callable[[str], tuple[str, ...]],
+        file_exists: Optional[Callable[[str], bool]] = None,
         *,
         enabled_optional_systems: frozenset[str] = frozenset(),
         canonical_prefix: str = "",
@@ -843,6 +1173,16 @@ class SaveSelectionPolicy:
                     break
 
             for relative, canonical in candidates:
+                if layout.root_markers and (
+                    file_exists is None
+                    or any(
+                        not file_exists(
+                            f"{relative}/{marker}" if relative else marker
+                        )
+                        for marker in layout.root_markers
+                    )
+                ):
+                    continue
                 resolved.append(
                     ProviderSaveWatchRoot(
                         layout.layout_id,

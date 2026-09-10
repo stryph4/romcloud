@@ -97,6 +97,9 @@ def manager_cmd(
                         / "logs"
                         / "browser-controller.log"
                     ),
+                    diagnostics_path=str(
+                        Path(container.config.data_path) / "diagnostics.db"
+                    ),
                     # Publishing state is the readiness edge: the socket has
                     # already bound and TLS has already loaded successfully.
                     on_ready=lambda: write_manager_state(

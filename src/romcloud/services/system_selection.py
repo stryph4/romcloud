@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -63,6 +64,16 @@ def update_selection(
 
     old_selected = tuple(status["selected_systems"])
     config = load_config(str(config_path))
+    from romcloud.integrations.batocera.direct_saves import MANIFEST_FILENAME
+
+    if (
+        os.path.lexists(Path(config.data_path) / MANIFEST_FILENAME)
+        and config.source.selected_systems != selected
+    ):
+        raise ValueError(
+            "Legacy Direct Save migration is pending. Run startup repair before "
+            "changing selected systems so its paths remain safely attributable."
+        )
     updated = replace(
         config,
         source=replace(config.source, selected_systems=selected),

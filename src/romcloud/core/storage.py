@@ -31,6 +31,13 @@ class RemoteEntry:
     checksum: Optional[str] = None
     """Provider-verified content checksum, when trustworthy and available."""
 
+    modified_epoch: Optional[float] = None
+    """Provider-reported modification time (UTC epoch seconds), or ``None``.
+
+    Display evidence only. Providers that cannot report a trustworthy value
+    must leave it ``None`` rather than substituting an unrelated timestamp.
+    """
+
 
 @dataclass(frozen=True)
 class ProviderCapabilities:

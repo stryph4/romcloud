@@ -6,19 +6,24 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from click.testing import CliRunner
 
+from romcloud.bootstrap.container import Container
 from romcloud.core.capabilities import CapabilityPolicy, OperatingMode
-from romcloud.core.models.savesync import SaveGroupCondition
+from romcloud.core.exceptions import SaveSyncConnectivityError, SaveSyncError
+from romcloud.core.models.savesync import SaveGroupCondition, SaveQuickSyncResult
 from romcloud.core.save_selection import DEFAULT_SAVE_SELECTION_POLICY
 from romcloud.core.storage import StorageProvider
-from romcloud.infrastructure import save_transaction
+from romcloud.infrastructure import diagnostics, save_transaction
+from romcloud.infrastructure import save_tree
 from romcloud.infrastructure import savesync_prompts
 from romcloud.infrastructure.config import (
     AppConfig,
     CacheConfig,
+    RemoteDataConfig,
     SavesConfig,
     SourceConfig,
     write_config,
@@ -29,6 +34,7 @@ from romcloud.services.auto_savesync import (
     AutoSaveSyncCoordinator,
     layout_ids_for_session,
 )
+from romcloud.infrastructure.diagnostics import DiagnosticQuery
 from romcloud.services.saves import SaveSyncService
 
 
@@ -108,6 +114,30 @@ def _coordinator(tmp_path: Path, service: SaveSyncService) -> AutoSaveSyncCoordi
     )
 
 
+def _container_with_rom_selection(
+    tmp_path: Path, *, selected_systems: tuple[str, ...]
+) -> tuple[Container, Path]:
+    source = tmp_path / "rom-source"
+    source.mkdir()
+    local_saves = tmp_path / "selected-local-saves"
+    local_saves.mkdir()
+    remote_data = tmp_path / "selected-remote-data"
+    remote_data.mkdir()
+    config = AppConfig(
+        source=SourceConfig(
+            "local", str(source), selected_systems=selected_systems
+        ),
+        cache=CacheConfig(str(tmp_path / "selected-cache")),
+        local_roms_path=str(tmp_path / "selected-local-roms"),
+        data_path=str(tmp_path / "selected-data"),
+        remote_data=RemoteDataConfig("local", str(remote_data)),
+        saves=SavesConfig(local_path=str(local_saves), auto_sync_enabled=True),
+    )
+    config_path = tmp_path / "selected-romcloud.toml"
+    write_config(config, str(config_path))
+    return Container(config), config_path
+
+
 def test_disabled_coordinator_is_an_immediate_filesystem_and_service_noop(
     tmp_path: Path,
 ):
@@ -136,61 +166,92 @@ def test_disabled_coordinator_is_an_immediate_filesystem_and_service_noop(
     assert not (tmp_path / "data").exists()
 
 
-def test_disabled_lifecycle_cli_does_not_construct_coordinator(
-    tmp_path: Path, monkeypatch
+def test_automatic_savesync_is_enabled_in_cached_and_direct_modes(tmp_path: Path):
+    from romcloud.cli.commands.autosync import _auto_sync_enabled
+    from romcloud.infrastructure.library_view import write_operating_mode
+
+    config = AppConfig(
+        source=SourceConfig("local", str(tmp_path / "roms")),
+        cache=CacheConfig(str(tmp_path / "cache")),
+        local_roms_path=str(tmp_path / "local-roms"),
+        data_path=str(tmp_path / "data"),
+        saves=SavesConfig(local_path=str(tmp_path / "saves"), auto_sync_enabled=True),
+    )
+    for mode, expected in (
+        (OperatingMode.CACHE, True),
+        (OperatingMode.CONNECTED, True),
+        (OperatingMode.OFFLINE, False),
+    ):
+        write_operating_mode(config, mode)
+        assert _auto_sync_enabled(config) is expected
+
+
+@pytest.mark.parametrize(
+    ("auto_enabled", "mode"),
+    (
+        (False, OperatingMode.CACHE),
+        (True, OperatingMode.OFFLINE),
+    ),
+)
+def test_inactive_lifecycle_cli_does_not_construct_coordinator(
+    tmp_path: Path, monkeypatch, auto_enabled: bool, mode: OperatingMode
 ):
     from romcloud.cli.commands import autosync as autosync_commands
     from romcloud.cli.main import cli
+    from romcloud.infrastructure.library_view import write_operating_mode
 
     config_path = tmp_path / "romcloud.toml"
-    write_config(
-        AppConfig(
-            source=SourceConfig("local", (tmp_path / "roms").as_posix()),
-            cache=CacheConfig((tmp_path / "cache").as_posix()),
-            local_roms_path=(tmp_path / "local-roms").as_posix(),
-            data_path=(tmp_path / "data").as_posix(),
-            saves=SavesConfig(
-                local_path=(tmp_path / "saves").as_posix(),
-                auto_sync_enabled=False,
-            ),
-        ),
-        str(config_path),
-    )
-    monkeypatch.setattr(
-        autosync_commands,
-        "_coordinator",
-        lambda _ctx: (_ for _ in ()).throw(
-            AssertionError("disabled lifecycle entry constructed coordinator")
+    config = AppConfig(
+        source=SourceConfig("local", (tmp_path / "roms").as_posix()),
+        cache=CacheConfig((tmp_path / "cache").as_posix()),
+        local_roms_path=(tmp_path / "local-roms").as_posix(),
+        data_path=(tmp_path / "data").as_posix(),
+        saves=SavesConfig(
+            local_path=(tmp_path / "saves").as_posix(),
+            auto_sync_enabled=auto_enabled,
         ),
     )
+    write_config(config, str(config_path))
+    write_operating_mode(config, mode)
+    coordinator_calls = []
+
+    def unexpected_coordinator(_ctx):
+        coordinator_calls.append(True)
+        return object()
+
+    monkeypatch.setattr(autosync_commands, "_coordinator", unexpected_coordinator)
 
     runner = CliRunner()
-    for event in ("game-start", "game-stop"):
+    commands = [
+        ["game-start", "psx", "libretro", "pcsx", "Game.chd"],
+        ["game-stop", "psx", "libretro", "pcsx", "Game.chd"],
+        ["menu-tick"],
+        ["remote-reconnect"],
+        ["menu-loop"],
+    ]
+    for command in commands:
         result = runner.invoke(
             cli,
             [
                 "--config",
                 str(config_path),
                 "_autosync",
-                event,
-                "psx",
-                "libretro",
-                "pcsx",
-                "Game.chd",
+                *command,
             ],
         )
         assert result.exit_code == 0, result.output
+    assert coordinator_calls == []
 
 
-def test_game_stop_worker_skips_popup_when_quick_sync_finds_no_new_conflict(
-    tmp_path: Path, monkeypatch
+@pytest.mark.parametrize("mode", [OperatingMode.CACHE, OperatingMode.CONNECTED])
+def test_game_stop_worker_runs_quick_sync_in_cached_and_direct_modes(
+    tmp_path: Path, monkeypatch, mode: OperatingMode
 ):
     from romcloud.cli.commands import autosync as autosync_commands
     from romcloud.cli.main import cli
 
     config_path = tmp_path / "romcloud.toml"
-    write_config(
-        AppConfig(
+    config = AppConfig(
             source=SourceConfig("local", (tmp_path / "roms").as_posix()),
             cache=CacheConfig((tmp_path / "cache").as_posix()),
             local_roms_path=(tmp_path / "local-roms").as_posix(),
@@ -199,10 +260,18 @@ def test_game_stop_worker_skips_popup_when_quick_sync_finds_no_new_conflict(
                 local_path=(tmp_path / "saves").as_posix(),
                 auto_sync_enabled=True,
             ),
-        ),
-        str(config_path),
     )
-    coordinator = type("Coordinator", (), {"game_stop": lambda self, **_kwargs: ()})()
+    write_config(config, str(config_path))
+    from romcloud.infrastructure.library_view import write_operating_mode
+    write_operating_mode(config, mode)
+    calls = []
+    coordinator = type(
+        "Coordinator", (),
+        {
+            "game_stop_eligible": lambda self, **kwargs: True,
+            "game_stop": lambda self, **kwargs: calls.append(kwargs) or (),
+        },
+    )()
     monkeypatch.setattr(autosync_commands, "_coordinator", lambda _ctx: coordinator)
     monkeypatch.setattr(
         autosync_commands,
@@ -227,9 +296,72 @@ def test_game_stop_worker_skips_popup_when_quick_sync_finds_no_new_conflict(
     )
 
     assert result.exit_code == 0, result.output
+    assert len(calls) == 1
 
 
-def test_game_stop_worker_passes_exact_caller_to_one_popup_launch(
+def test_ineligible_lifecycle_cli_returns_before_starting_progress_popup(
+    tmp_path: Path, monkeypatch
+):
+    from romcloud.cli.commands import autosync as autosync_commands
+    from romcloud.cli.main import cli
+
+    config_path = tmp_path / "romcloud.toml"
+    config = AppConfig(
+        source=SourceConfig(
+            "local", (tmp_path / "roms").as_posix(), selected_systems=("snes",)
+        ),
+        cache=CacheConfig((tmp_path / "cache").as_posix()),
+        local_roms_path=(tmp_path / "local-roms").as_posix(),
+        data_path=(tmp_path / "data").as_posix(),
+        saves=SavesConfig(
+            local_path=(tmp_path / "saves").as_posix(), auto_sync_enabled=True
+        ),
+    )
+    write_config(config, str(config_path))
+    calls = []
+    coordinator = type(
+        "Coordinator",
+        (),
+        {
+            "game_stop_eligible": lambda self, **_kwargs: False,
+            "game_stop": lambda self, **kwargs: calls.append(kwargs) or (),
+        },
+    )()
+    monkeypatch.setattr(autosync_commands, "_coordinator", lambda _ctx: coordinator)
+    monkeypatch.setattr(
+        autosync_commands,
+        "start_savesync_progress",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ineligible exit started progress UI")
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config",
+            str(config_path),
+            "_autosync",
+            "game-stop",
+            "ports",
+            "pygame",
+            "pygame",
+            "Application.sh",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == [
+        {
+            "system": "ports",
+            "emulator": "pygame",
+            "core": "pygame",
+            "rom": "Application.sh",
+        }
+    ]
+
+
+def test_conflict_popup_worker_passes_exact_lifecycle_caller(
     tmp_path: Path, monkeypatch
 ):
     from romcloud.cli.commands import autosync as autosync_commands
@@ -249,14 +381,8 @@ def test_game_stop_worker_passes_exact_caller_to_one_popup_launch(
         ),
         str(config_path),
     )
-    coordinator = type(
-        "Coordinator",
-        (),
-        {"game_stop": lambda self, **_kwargs: ("new-conflict-id",)},
-    )()
     launches = []
     monkeypatch.setenv("ROMCLOUD_AUTOSYNC_CALLER_PID", "4242")
-    monkeypatch.setattr(autosync_commands, "_coordinator", lambda _ctx: coordinator)
     monkeypatch.setattr(
         autosync_commands,
         "_launch_pending_conflict_popup",
@@ -269,11 +395,7 @@ def test_game_stop_worker_passes_exact_caller_to_one_popup_launch(
             "--config",
             str(config_path),
             "_autosync",
-            "game-stop",
-            "psx",
-            "libretro",
-            "pcsx",
-            "Game.chd",
+            "conflict-popup",
         ],
     )
 
@@ -504,19 +626,25 @@ def test_manual_resolution_during_readiness_skips_stale_queued_popup(
     assert savesync_prompts.pending_ids(data_root) == ()
 
 
-def test_batocera_hook_detaches_game_stop_and_records_handoff(tmp_path: Path):
+def test_batocera_hook_waits_for_game_stop_and_detaches_only_followup_work(
+    tmp_path: Path,
+):
     target = tmp_path / "scripts" / "romcloud-autosync"
     install_hook(tmp_path / "bin" / "romcloud", hook_path=target)
     content = target.read_text(encoding="utf-8")
 
     assert "gameStart" in content and "gameStop" in content
     assert "game-start" in content and "game-stop" in content
-    assert 'nohup "$ROMCLOUD_BIN" _autosync game-stop' in content
+    assert 'nohup "$ROMCLOUD_BIN" _autosync game-stop' not in content
+    assert '"$ROMCLOUD_BIN" _autosync game-stop' in content
+    assert 'nohup "$ROMCLOUD_BIN" _autosync conflict-popup' in content
     assert 'ROMCLOUD_AUTOSYNC_CALLER_PID="$PPID"' in content
     assert 'nohup "$ROMCLOUD_BIN" _autosync menu-loop' in content
     assert "auto-savesync-lifecycle.log" in content
     assert 'event="game_stop_hook_entered"' in content
-    assert 'event="game_stop_handoff_started"' in content
+    assert 'event="game_stop_sync_started"' in content
+    assert 'event="game_stop_sync_completed"' in content
+    assert 'event="game_stop_sync_failed"' in content
     assert 'event="game_stop_handoff_failed"' in content
     assert 'event="game_stop_hook_returned"' in content
     assert "</dev/null &" in content
@@ -662,9 +790,17 @@ def test_owned_menu_loop_stop_is_bounded_and_clears_restart_record(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Batocera hook is a POSIX shell script")
-def test_game_stop_hook_returns_while_worker_continues(tmp_path: Path):
+def test_game_stop_hook_returns_only_after_durable_worker_completion(tmp_path: Path):
     binary = tmp_path / "romcloud"
-    binary.write_text("#!/bin/bash\nsleep 0.4\n", encoding="utf-8")
+    committed = tmp_path / "remote-commit-receipt"
+    binary.write_text(
+        "#!/bin/bash\n"
+        "if [[ \"$2\" == \"game-stop\" ]]; then\n"
+        "  sleep 0.3\n"
+        f"  printf committed > \"{committed}\"\n"
+        "fi\n",
+        encoding="utf-8",
+    )
     binary.chmod(0o755)
     hook = install_hook(binary, hook_path=tmp_path / "romcloud-autosync")
 
@@ -675,7 +811,58 @@ def test_game_stop_hook_returns_while_worker_continues(tmp_path: Path):
         timeout=2,
     )
 
-    assert time.monotonic() - started < 0.2
+    assert time.monotonic() - started >= 0.25
+    assert committed.read_text(encoding="utf-8") == "committed"
+
+
+def test_game_stop_cli_reports_failure_when_required_sync_does_not_complete(
+    tmp_path: Path, monkeypatch
+):
+    from romcloud.cli.commands import autosync as autosync_commands
+    from romcloud.cli.main import cli
+
+    config_path = tmp_path / "romcloud.toml"
+    write_config(
+        AppConfig(
+            source=SourceConfig("local", (tmp_path / "roms").as_posix()),
+            cache=CacheConfig((tmp_path / "cache").as_posix()),
+            local_roms_path=(tmp_path / "local-roms").as_posix(),
+            data_path=(tmp_path / "data").as_posix(),
+            saves=SavesConfig(
+                local_path=(tmp_path / "saves").as_posix(),
+                auto_sync_enabled=True,
+            ),
+        ),
+        str(config_path),
+    )
+    coordinator = type(
+        "Coordinator",
+        (),
+        {
+            "game_stop_eligible": lambda self, **_kwargs: True,
+            "game_stop": lambda self, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("remote commit failed")
+            )
+        },
+    )()
+    monkeypatch.setattr(autosync_commands, "_coordinator", lambda _ctx: coordinator)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config",
+            str(config_path),
+            "_autosync",
+            "game-stop",
+            "snes",
+            "libretro",
+            "snes9x",
+            "Super Metroid.sfc",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "did not complete" in result.output
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Batocera hook is a POSIX shell script")
@@ -683,12 +870,13 @@ def test_game_stop_hook_logs_missing_worker_binary(tmp_path: Path):
     binary = tmp_path / "missing-romcloud"
     hook = install_hook(binary, hook_path=tmp_path / "romcloud-autosync")
 
-    subprocess.run(
+    result = subprocess.run(
         [str(hook), "gameStop", "psx", "libretro", "pcsx", "Game.chd"],
-        check=True,
+        check=False,
         timeout=2,
     )
 
+    assert result.returncode != 0
     lifecycle_log = tmp_path.parent / "logs" / "auto-savesync-lifecycle.log"
     assert 'event="game_stop_handoff_failed"' in lifecycle_log.read_text(
         encoding="utf-8"
@@ -842,10 +1030,14 @@ def test_lifecycle_mapping_is_registry_bounded_and_xemu_is_never_automatic():
     policy = DEFAULT_SAVE_SELECTION_POLICY
 
     assert layout_ids_for_session(policy, "gamecube") == frozenset(
-        {"dolphin-gc-memory-card-images", "dolphin-gc-gci-saves"}
+        {
+            "dolphin-gc-memory-card-images",
+            "dolphin-gc-gci-saves",
+            "dolphin-save-states",
+        }
     )
     assert layout_ids_for_session(policy, "wii") == frozenset(
-        {"dolphin-wii-title-saves"}
+        {"dolphin-wii-title-saves", "dolphin-save-states"}
     )
     assert layout_ids_for_session(policy, "psx", "duckstation") == frozenset(
         {"duckstation-memory-cards", "duckstation-root-sav"}
@@ -853,8 +1045,286 @@ def test_lifecycle_mapping_is_registry_bounded_and_xemu_is_never_automatic():
     assert layout_ids_for_session(policy, "psx", "libretro", "pcsx-rearmed") == (
         frozenset({"retroarch-root-psx"})
     )
+    assert layout_ids_for_session(policy, "saturn", "ymir", "ymir") == frozenset(
+        {
+            "ymir-global-backup-memory",
+            "ymir-per-game-backup-memory",
+            "ymir-save-states",
+        }
+    )
     assert layout_ids_for_session(policy, "xbox", "xemu") == frozenset()
     assert layout_ids_for_session(policy, "unknown-system") == frozenset()
+
+
+def test_every_automatic_layout_round_trips_through_lifecycle_registry():
+    """Registry additions fail if lifecycle cannot recover canonical ownership."""
+    policy = DEFAULT_SAVE_SELECTION_POLICY
+    for layout in policy.layouts:
+        if not layout.lifecycle_enabled:
+            continue
+        lifecycle_system = (layout.lifecycle_systems or (layout.system,))[0]
+        emulator = layout.lifecycle_emulators[0] if layout.lifecycle_emulators else ""
+        core = layout.lifecycle_cores[0] if layout.lifecycle_cores else ""
+        resolved = layout_ids_for_session(
+            policy, lifecycle_system, emulator, core
+        )
+        assert layout.layout_id in resolved, (
+            layout.layout_id,
+            lifecycle_system,
+            emulator,
+            core,
+        )
+        assert policy.layout(layout.layout_id).system == layout.system
+
+
+@pytest.mark.parametrize(
+    ("event_system", "layout_id", "canonical_system"),
+    (
+        ("gba", "retroarch-root-gba", "gba"),
+        ("genesis", "retroarch-root-megadrive", "megadrive"),
+        ("segacd", "retroarch-root-megacd", "megacd"),
+        ("vita", "vita3k-title-saves", "psvita"),
+    ),
+)
+def test_lifecycle_aliases_resolve_one_canonical_ownership_domain(
+    event_system: str,
+    layout_id: str,
+    canonical_system: str,
+):
+    policy = DEFAULT_SAVE_SELECTION_POLICY
+    layout = policy.layout(layout_id)
+    emulator = layout.lifecycle_emulators[0] if layout.lifecycle_emulators else ""
+    core = layout.lifecycle_cores[0] if layout.lifecycle_cores else ""
+
+    resolved = layout_ids_for_session(policy, event_system, emulator, core)
+
+    assert layout_id in resolved
+    assert {policy.layout(value).system for value in resolved} == {canonical_system}
+
+
+@pytest.mark.parametrize(
+    ("system", "emulator", "core"),
+    (
+        ("ports", "pygame", "pygame"),
+        ("switch", "ryujinx", "ryujinx"),
+    ),
+    ids=(
+        "unsupported-application",
+        "unsupported-layout",
+    ),
+)
+def test_ineligible_game_stop_is_total_savesync_noop_before_popup_or_service_access(
+    tmp_path: Path,
+    monkeypatch,
+    system: str,
+    emulator: str,
+    core: str,
+):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = AutoSaveSyncCoordinator(
+        service,
+        data_root=tmp_path / "data",
+        enabled=True,
+        policy=DEFAULT_SAVE_SELECTION_POLICY,
+        quiet_seconds=0,
+    )
+    coordinator.game_start(
+        system=system, emulator=emulator, core=core, rom="Application.rom"
+    )
+    progress = _FakeProgress()
+
+    @contextmanager
+    def unexpected_observation_scope():
+        raise AssertionError("ineligible gameStop entered SaveSync observation")
+        yield
+
+    monkeypatch.setattr(service, "observation_scope", unexpected_observation_scope)
+    monkeypatch.setattr(
+        service,
+        "quick_sync",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ineligible gameStop ran Quick Sync")
+        ),
+    )
+
+    assert coordinator.game_stop(
+        system=system,
+        emulator=emulator,
+        core=core,
+        rom="Application.rom",
+        progress=progress,
+    ) == ()
+    assert progress.calls == []
+    assert provider.reachability_checks == 0
+    assert not (tmp_path / "data/savesync-state.json").exists()
+    assert coordinator._sessions.has_active_session() is False
+
+
+def test_supported_game_stop_remains_synchronous_and_eligible(
+    tmp_path: Path,
+):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = AutoSaveSyncCoordinator(
+        service,
+        data_root=tmp_path / "data",
+        enabled=True,
+        policy=DEFAULT_SAVE_SELECTION_POLICY,
+        quiet_seconds=0,
+    )
+    local = tmp_path / "local/snes/Super Metroid.srm"
+    remote = tmp_path / "remote/snes/Super Metroid.srm"
+    _write(local, b"baseline")
+    service.full_sync()
+    local.write_bytes(b"eligible-final-save")
+
+    coordinator.game_stop(
+        system="snes",
+        emulator="libretro",
+        core="snes9x",
+        rom="Super Metroid.sfc",
+    )
+
+    assert remote.read_bytes() == b"eligible-final-save"
+
+
+def test_local_gba_auto_sync_ignores_rom_import_selection(
+    tmp_path: Path, monkeypatch
+):
+    """ROM source selection must never gate a supported local save layout."""
+    from romcloud.cli.commands import autosync as autosync_commands
+
+    container, config_path = _container_with_rom_selection(
+        tmp_path, selected_systems=("psx",)
+    )
+    service = container.saves
+    service.full_sync()
+    local = Path(container.config.saves.local_path) / "gba/Pokemon Emerald.srm"
+    _write(local, b"local-gba-save")
+
+    monkeypatch.setattr(
+        autosync_commands, "get_container", lambda _ctx: container
+    )
+    coordinator = autosync_commands._coordinator(
+        SimpleNamespace(obj={"config_path": str(config_path)})
+    )
+    coordinator._stability_interval = 0
+
+    coordinator.game_stop(
+        system="gba",
+        emulator="libretro",
+        core="mgba",
+        rom="/userdata/roms/gba/Pokemon Emerald.gba",
+    )
+
+    assert container.config.source.selected_systems == ("psx",)
+    assert (
+        Path(container.config.remote_data.root)
+        / "saves/gba/Pokemon Emerald.srm"
+    ).read_bytes() == b"local-gba-save"
+
+
+def test_game_stop_correlation_id_is_not_reused_as_transaction_id(
+    tmp_path: Path, monkeypatch
+):
+    lifecycle_id = "game-stop-3215-1788998520"
+    store = diagnostics.configure_diagnostics(tmp_path / "diagnostics.db")
+    assert store is not None
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    local = tmp_path / "local/gba/Pokemon Fire Red.srm"
+    remote = tmp_path / "remote/gba/Pokemon Fire Red.srm"
+    _write(local, b"baseline")
+    service.full_sync()
+    coordinator.game_start(
+        system="gba",
+        emulator="libretro",
+        core="mgba",
+        rom="/userdata/roms/gba/Pokemon Fire Red.gba",
+    )
+    local.write_bytes(b"hardware-final-save")
+
+    transaction_ids: list[str] = []
+    original_prepare = save_transaction.prepare_transaction
+
+    def capture_prepare(*args, **kwargs):
+        transaction_ids.append(kwargs["operation_id"])
+        return original_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(save_transaction, "prepare_transaction", capture_prepare)
+    monkeypatch.setenv("ROMCLOUD_DIAGNOSTIC_OPERATION_ID", lifecycle_id)
+
+    coordinator.game_stop(
+        system="gba",
+        emulator="libretro",
+        core="mgba",
+        rom="/userdata/roms/gba/Pokemon Fire Red.gba",
+    )
+
+    assert remote.read_bytes() == b"hardware-final-save"
+    assert len(transaction_ids) == 1
+    transaction_id = transaction_ids[0]
+    assert len(transaction_id) == 32
+    assert int(transaction_id, 16) >= 0
+    assert transaction_id != lifecycle_id
+
+    lifecycle_chain = store.operation_chain(lifecycle_id)
+    assert lifecycle_chain
+    assert all(event["operation_id"] == lifecycle_id for event in lifecycle_chain)
+    assert any(event["event_code"] == "group.classified" for event in lifecycle_chain)
+
+    transaction_chain = store.operation_chain(transaction_id)
+    assert transaction_chain
+    assert {
+        "transaction.prepared",
+        "transaction.applying",
+        "transaction.promoted",
+        "transaction.finalized",
+    }.issubset({event["event_code"] for event in transaction_chain})
+    assert {
+        event["parent_operation_id"] for event in transaction_chain
+    } == {lifecycle_id}
+    assert all(
+        event["metadata"].get("transaction_id") == transaction_id
+        for event in transaction_chain
+    )
+
+    # The ordinary manual path still creates its own diagnostic and
+    # transaction identifiers and sees the Auto work as fully reconciled.
+    monkeypatch.delenv("ROMCLOUD_DIAGNOSTIC_OPERATION_ID")
+    assert service.quick_sync().status == "unchanged"
+
+
+def test_full_and_quick_sync_share_code_defined_supported_layout_boundary(
+    tmp_path: Path,
+):
+    container, _config_path = _container_with_rom_selection(
+        tmp_path, selected_systems=("psx",)
+    )
+    service = container.saves
+    local_root = Path(container.config.saves.local_path)
+    remote_root = Path(container.config.remote_data.root) / "saves"
+    gba = local_root / "gba/Pokemon Emerald.srm"
+    unsupported = local_root / "unsupported/Pokemon Emerald.sav"
+    _write(gba, b"gba-baseline")
+    _write(unsupported, b"must-not-sync")
+
+    full = service.full_sync()
+
+    assert full.uploaded == 1
+    assert (remote_root / "gba/Pokemon Emerald.srm").read_bytes() == b"gba-baseline"
+    assert not (remote_root / "unsupported/Pokemon Emerald.sav").exists()
+
+    gba.write_bytes(b"gba-dirty")
+    service.mark_local_dirty("gba/Pokemon Emerald.srm")
+    quick = service.quick_sync()
+
+    assert quick.status == "reconciled"
+    assert quick.processed_groups == ("retroarch-root-gba/pokemon emerald",)
+    assert (remote_root / "gba/Pokemon Emerald.srm").read_bytes() == b"gba-dirty"
+    assert not (remote_root / "unsupported/Pokemon Emerald.sav").exists()
 
 
 def test_game_exit_detects_first_save_and_uploads_only_that_registry_group(tmp_path: Path):
@@ -873,12 +1343,677 @@ def test_game_exit_detects_first_save_and_uploads_only_that_registry_group(tmp_p
     assert all(not group.dirty_path_hints for group in service.get_state().groups)
 
 
+def test_two_client_snes_existing_save_game_stop_quick_and_full_converge(
+    tmp_path: Path, caplog
+):
+    provider = _Provider()
+    remote = tmp_path / "remote"
+
+    def device(name: str) -> tuple[SaveSyncService, AutoSaveSyncCoordinator, Path]:
+        root = tmp_path / name
+        local = root / "saves"
+        local.mkdir(parents=True)
+        service = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "remote-data"),
+            local_root=str(local),
+            remote_root=str(remote),
+            state_path=root / "data/savesync-state.json",
+        )
+        coordinator = AutoSaveSyncCoordinator(
+            service,
+            data_root=root / "data",
+            enabled=True,
+            policy=DEFAULT_SAVE_SELECTION_POLICY,
+            quiet_seconds=0,
+        )
+        return service, coordinator, local
+
+    laptop, _laptop_auto, laptop_root = device("laptop")
+    main_pc, main_auto, main_root = device("main-pc")
+    laptop_save = laptop_root / "snes/Super Metroid.srm"
+    main_save = main_root / "snes/Super Metroid.srm"
+    remote_save = remote / "snes/Super Metroid.srm"
+
+    _write(laptop_save, b"laptop-original")
+    laptop.full_sync()
+    main_pc.full_sync()
+    assert main_save.read_bytes() == b"laptop-original"
+
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        main_auto.game_start(
+            system="snes",
+            emulator="libretro",
+            core="snes9x",
+            rom="Super Metroid.sfc",
+        )
+        main_save.write_bytes(b"main-pc-newer")
+        main_auto.game_stop(
+            system="snes",
+            emulator="libretro",
+            core="snes9x",
+            rom="Super Metroid.sfc",
+        )
+
+    assert remote_save.read_bytes() == b"main-pc-newer"
+    trace = caplog.text
+    for evidence in (
+        "layout_ids=retroarch-root-snes",
+        "candidate_groups=1",
+        "classification=changed reason=manifest-diff-from-baseline",
+        "Quick SaveSync preflight: quick_ready=True",
+        "Quick SaveSync scope: mode=group selected_groups=1",
+        "decision=upload reason=local-diverged-remote-matches-baseline",
+        "SaveSync transaction start:",
+        "SaveSync transaction materialization committed:",
+        "SaveSync baseline committed:",
+        "SaveSync remote journal committed:",
+        "Quick SaveSync cursor committed:",
+        "Auto SaveSync final result: trigger=game stop status=reconciled",
+    ):
+        assert evidence in trace
+    assert "main-pc-newer" not in trace
+    assert laptop.quick_sync().status == "reconciled"
+    assert laptop_save.read_bytes() == b"main-pc-newer"
+    full_report = laptop.full_sync()
+    assert full_report.uploaded == 0
+    assert full_report.downloaded == 0
+    assert laptop_save.read_bytes() == remote_save.read_bytes() == b"main-pc-newer"
+
+
+def test_game_stop_normal_uncontended_path_traces_every_required_step(
+    tmp_path: Path, caplog
+):
+    """End-to-end proof for the normal, uncontended gameStop path: every one
+    of the required observable steps (hook received, local discovery,
+    per-group hash observation, dirty marker creation, worker lock
+    acquisition, quick sync start, reconciliation decision, transaction
+    commit, remote journal commit, cursor advancement, final result) is
+    present in the durable log, in the order a real hardware trace would
+    need to diagnose this exact bug."""
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    local = tmp_path / "local/snes/Super Metroid.srm"
+    remote = tmp_path / "remote/snes/Super Metroid.srm"
+    _write(local, b"baseline")
+    service.full_sync()
+    cursor_before = service.get_state().quick_sync_cursor_generation
+
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        coordinator.game_start(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+        local.write_bytes(b"final-save-bytes")
+        conflict_ids = coordinator.game_stop(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+
+    assert conflict_ids == ()
+    assert remote.read_bytes() == b"final-save-bytes"
+    trace = caplog.text
+    for evidence in (
+        "gameStop received: system=snes emulator=libretro core=snes9x rom=Super Metroid.sfc",
+        "gameStop local discovery started: layout_ids=retroarch-root-snes",
+        "SaveSync local hash observation: group_id=",
+        "SaveSync local classification: layout_id=retroarch-root-snes",
+        "classification=changed reason=manifest-diff-from-baseline",
+        "SaveSync local discovery: dirty marker created: group_id=",
+        "Auto SaveSync worker lock acquired: trigger=game stop",
+        "Auto SaveSync quick sync started: trigger=game stop",
+        "decision=upload reason=local-diverged-remote-matches-baseline",
+        "SaveSync transaction materialization committed:",
+        "SaveSync remote journal committed:",
+        "Quick SaveSync cursor committed:",
+        "Auto SaveSync final result: trigger=game stop status=reconciled",
+    ):
+        assert evidence in trace, f"missing required trace evidence: {evidence!r}"
+    # Hardware-log tracing must never require reading save contents.
+    assert "final-save-bytes" not in trace
+    assert service.get_state().quick_sync_cursor_generation != cursor_before
+
+    # Manual Quick Sync immediately afterward must see no remaining mutation.
+    manual = service.quick_sync()
+    assert manual.status == "unchanged"
+
+
+def test_game_stop_waits_through_inflight_save_write_and_uploads_final_bytes(
+    tmp_path: Path,
+):
+    """Prove the exact hardware-suspected race: the emulator/core is still
+    writing the save (observably changing content) at the instant gameStop
+    fires. This must not be classified as unchanged; gameStop must wait for
+    real settling and then publish the true final bytes, not a torn/stale
+    intermediate value."""
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = AutoSaveSyncCoordinator(
+        service,
+        data_root=tmp_path / "data",
+        enabled=True,
+        policy=DEFAULT_SAVE_SELECTION_POLICY,
+        quiet_seconds=0.05,
+    )
+    local = tmp_path / "local/snes/Super Metroid.srm"
+    remote = tmp_path / "remote/snes/Super Metroid.srm"
+    _write(local, b"baseline")
+    service.full_sync()
+    coordinator.game_start(
+        system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+    )
+
+    def emulator_flush() -> None:
+        time.sleep(0.02)
+        local.write_bytes(b"torn-in-flight-write")
+        time.sleep(0.06)
+        local.write_bytes(b"true-final-save-bytes")
+
+    writer = threading.Thread(target=emulator_flush)
+    writer.start()
+    try:
+        conflict_ids = coordinator.game_stop(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+    finally:
+        writer.join(timeout=5)
+
+    assert conflict_ids == ()
+    assert not writer.is_alive()
+    assert remote.read_bytes() == b"true-final-save-bytes"
+    assert local.read_bytes() == b"true-final-save-bytes"
+
+
+def test_game_stop_never_stabilizing_save_is_conservatively_deferred(
+    tmp_path: Path, caplog
+):
+    """Prove the conservative side of the same race: if the save never
+    settles within the bounded window, gameStop must defer/fail loudly
+    rather than silently classify a moving target as unchanged (false
+    success) or publish a torn intermediate value. Nothing durable is
+    marked dirty from an unstable pass, and a later, genuinely stable
+    gameStop is not permanently blocked."""
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = AutoSaveSyncCoordinator(
+        service,
+        data_root=tmp_path / "data",
+        enabled=True,
+        policy=DEFAULT_SAVE_SELECTION_POLICY,
+        quiet_seconds=0.03,
+        stability_checks=3,
+    )
+    local = tmp_path / "local/snes/Super Metroid.srm"
+    remote = tmp_path / "remote/snes/Super Metroid.srm"
+    _write(local, b"baseline")
+    service.full_sync()
+    coordinator.game_start(
+        system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+    )
+
+    stop_writing = threading.Event()
+
+    def never_settles() -> None:
+        counter = 0
+        while not stop_writing.is_set():
+            local.write_bytes(f"still-writing-{counter}".encode())
+            counter += 1
+            time.sleep(0.01)
+
+    writer = threading.Thread(target=never_settles)
+    writer.start()
+    try:
+        with caplog.at_level("WARNING"):
+            with pytest.raises(SaveSyncError, match="did not stabilize"):
+                coordinator.game_stop(
+                    system="snes",
+                    emulator="libretro",
+                    core="snes9x",
+                    rom="Super Metroid.sfc",
+                )
+    finally:
+        stop_writing.set()
+        writer.join(timeout=5)
+
+    assert "gameStop save stability timeout" in caplog.text
+    assert (
+        "status=deferred reason=local-data-unstable-pre-discovery" in caplog.text
+    )
+    assert remote.read_bytes() == b"baseline"
+    assert all(
+        group.condition is SaveGroupCondition.CLEAN
+        for group in service.get_state().groups
+    )
+
+    # Once the save genuinely settles, a later gameStop is not locked out.
+    local.write_bytes(b"finally-settled")
+    coordinator.game_stop(
+        system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+    )
+    assert remote.read_bytes() == b"finally-settled"
+
+
+class TestGameStopObservationCost:
+    """Latency-focused regression tests for the synchronous gameStop path.
+
+    These assert *operation counts* (how many times a byte of a save is read,
+    how many settle windows are slept through, which roots are entered) rather
+    than wall-clock thresholds, so they stay meaningful on any hardware.
+    """
+
+    @staticmethod
+    def _counting_hash(monkeypatch) -> list[Path]:
+        reads: list[Path] = []
+        original = save_tree.hash_file
+
+        def counted(path: Path) -> str:
+            reads.append(Path(path))
+            return original(path)
+
+        monkeypatch.setattr(save_tree, "hash_file", counted)
+        return reads
+
+    @staticmethod
+    def _counting_sleep(monkeypatch) -> list[float]:
+        """Count settle windows without shortening them — the window is real
+        elapsed time, so shortcutting it here would make the reuse under test
+        look free when it is not."""
+        slept: list[float] = []
+        original = time.sleep
+
+        def counted(seconds: float) -> None:
+            slept.append(seconds)
+            original(seconds)
+
+        monkeypatch.setattr(
+            "romcloud.services.auto_savesync.time.sleep", counted
+        )
+        return slept
+
+    def _prepared(self, tmp_path: Path):
+        provider = _Provider()
+        service = _service(tmp_path, provider)
+        coordinator = AutoSaveSyncCoordinator(
+            service,
+            data_root=tmp_path / "data",
+            enabled=True,
+            policy=DEFAULT_SAVE_SELECTION_POLICY,
+            quiet_seconds=0.2,
+        )
+        return service, coordinator
+
+    def test_no_change_game_stop_reads_each_local_save_exactly_once(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """The overwhelmingly common case — nothing changed — must not read
+        the same save tree over and over. One content observation is reused by
+        the second (stat-confirmed) stability observation and by discovery."""
+        service, coordinator = self._prepared(tmp_path)
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        _write(local, b"baseline")
+        service.full_sync()
+        coordinator.game_start(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+
+        reads = self._counting_hash(monkeypatch)
+        self._counting_sleep(monkeypatch)
+        assert (
+            coordinator.game_stop(
+                system="snes",
+                emulator="libretro",
+                core="snes9x",
+                rom="Super Metroid.sfc",
+            )
+            == ()
+        )
+
+        assert reads == [local]
+
+    def test_no_change_game_stop_sleeps_through_one_settle_window(
+        self, tmp_path: Path, monkeypatch
+    ):
+        service, coordinator = self._prepared(tmp_path)
+        _write(tmp_path / "local/snes/Super Metroid.srm", b"baseline")
+        service.full_sync()
+        coordinator.game_start(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+
+        slept = self._counting_sleep(monkeypatch)
+        coordinator.game_stop(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+
+        assert len(slept) == 1
+        assert slept[0] <= 0.2
+
+    def test_changed_save_game_stop_does_not_sleep_a_second_settle_window(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """The pre-discovery settle already proved stability for this exact
+        content; Quick Sync's own preflight must extend that proven quiet run
+        with one fresh observation instead of restarting the whole window."""
+        service, coordinator = self._prepared(tmp_path)
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        remote = tmp_path / "remote/snes/Super Metroid.srm"
+        _write(local, b"baseline")
+        service.full_sync()
+        coordinator.game_start(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+        local.write_bytes(b"final-save-bytes")
+
+        slept = self._counting_sleep(monkeypatch)
+        coordinator.game_stop(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+
+        assert len(slept) == 1
+        assert remote.read_bytes() == b"final-save-bytes"
+
+    def test_changed_save_game_stop_re_reads_only_what_correctness_requires(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """One tiny changed save: the local file is read once for the settle
+        proof and once more by the post-mutation verification that must see
+        real bytes on disk — never once per scan phase."""
+        service, coordinator = self._prepared(tmp_path)
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        remote = tmp_path / "remote/snes/Super Metroid.srm"
+        _write(local, b"baseline")
+        service.full_sync()
+        coordinator.game_start(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+        local.write_bytes(b"final-save-bytes")
+
+        reads = self._counting_hash(monkeypatch)
+        self._counting_sleep(monkeypatch)
+        coordinator.game_stop(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+
+        assert remote.read_bytes() == b"final-save-bytes"
+        assert reads.count(local) == 2
+        # Local content may be reused within one operation once its content
+        # is proven stable; remote content is never reused at all — the
+        # remote dataset may be a network-backed CIFS/SMB mount whose
+        # metadata cannot prove another client did not rewrite a file since
+        # an earlier observation. Every remote-touching phase (plan scan,
+        # staging verification, transaction pre/post check, final
+        # verification) therefore re-reads real bytes: this is the safety
+        # floor, not a regression to hashing the whole remote tree.
+        assert reads.count(remote) == 5
+
+    def test_multiple_changed_files_in_one_group_are_each_read_once_per_phase(
+        self, tmp_path: Path, monkeypatch
+    ):
+        service, coordinator = self._prepared(tmp_path)
+        first = tmp_path / "local/psx/duckstation/memcards/shared_card_1.mcd"
+        second = tmp_path / "local/psx/duckstation/memcards/shared_card_2.mcd"
+        _write(first, b"card-one-baseline")
+        _write(second, b"card-two-baseline")
+        service.full_sync()
+        coordinator.game_start(
+            system="psx", emulator="libretro", core="swanstation", rom="FF7.chd"
+        )
+        first.write_bytes(b"card-one-final")
+        second.write_bytes(b"card-two-final")
+
+        reads = self._counting_hash(monkeypatch)
+        self._counting_sleep(monkeypatch)
+        coordinator.game_stop(
+            system="psx", emulator="libretro", core="swanstation", rom="FF7.chd"
+        )
+
+        assert (
+            tmp_path / "remote/psx/duckstation/memcards/shared_card_1.mcd"
+        ).read_bytes() == b"card-one-final"
+        assert (
+            tmp_path / "remote/psx/duckstation/memcards/shared_card_2.mcd"
+        ).read_bytes() == b"card-two-final"
+        assert reads.count(first) == 2
+        assert reads.count(second) == 2
+
+    def test_narrow_game_stop_never_enters_unrelated_save_roots(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """One SNES game closing must not read a single byte of any other
+        system's saves, however large that data is."""
+        service, coordinator = self._prepared(tmp_path)
+        snes = tmp_path / "local/snes/Super Metroid.srm"
+        unrelated = tmp_path / "local/psx/duckstation/memcards/shared_card_1.mcd"
+        _write(snes, b"baseline")
+        _write(unrelated, b"unrelated-psx-memory-card")
+        service.full_sync()
+        coordinator.game_start(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+        snes.write_bytes(b"final-save-bytes")
+
+        reads = self._counting_hash(monkeypatch)
+        self._counting_sleep(monkeypatch)
+        coordinator.game_stop(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+
+        assert unrelated not in reads
+        assert not any("duckstation" in read.parts for read in reads), reads
+        assert unrelated.read_bytes() == b"unrelated-psx-memory-card"
+
+    def test_a_save_still_being_written_is_re_read_until_it_settles(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """Observation reuse must never short-circuit the settle proof: an
+        actively changing file has to be re-read on every observation and the
+        published bytes must be the final ones."""
+        service, coordinator = self._prepared(tmp_path)
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        remote = tmp_path / "remote/snes/Super Metroid.srm"
+        _write(local, b"baseline")
+        service.full_sync()
+        coordinator.game_start(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+
+        reads = self._counting_hash(monkeypatch)
+        observations = {"count": 0}
+        original_observe = service.observe_local_layouts
+
+        def flushing_observe(layout_ids):
+            observations["count"] += 1
+            if observations["count"] <= 2:
+                local.write_bytes(
+                    f"torn-in-flight-{observations['count']}".encode()
+                )
+            elif observations["count"] == 3:
+                local.write_bytes(b"true-final-save-bytes")
+            return original_observe(layout_ids)
+
+        monkeypatch.setattr(service, "observe_local_layouts", flushing_observe)
+        self._counting_sleep(monkeypatch)
+        coordinator.game_stop(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+
+        assert observations["count"] >= 4
+        assert reads.count(local) >= observations["count"]
+        assert remote.read_bytes() == b"true-final-save-bytes"
+        assert local.read_bytes() == b"true-final-save-bytes"
+
+    def test_post_mutation_verification_always_re_reads_real_bytes(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """The final proof must come from disk, never from an earlier
+        observation: corrupting the committed remote file behind ROMCloud's
+        back has to be detected and the transaction rolled back."""
+        service, coordinator = self._prepared(tmp_path)
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        remote = tmp_path / "remote/snes/Super Metroid.srm"
+        _write(local, b"baseline")
+        service.full_sync()
+        coordinator.game_start(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+        local.write_bytes(b"final-save-bytes")
+
+        original_apply = save_transaction.apply_transaction
+
+        def corrupting_apply(*args, **kwargs):
+            result = original_apply(*args, **kwargs)
+            remote.write_bytes(b"corrupted-by-something-else")
+            return result
+
+        monkeypatch.setattr(
+            "romcloud.services.saves.save_transaction.apply_transaction",
+            corrupting_apply,
+        )
+        self._counting_sleep(monkeypatch)
+
+        with pytest.raises(SaveSyncError):
+            coordinator.game_stop(
+                system="snes",
+                emulator="libretro",
+                core="snes9x",
+                rom="Super Metroid.sfc",
+            )
+
+        assert local.read_bytes() == b"final-save-bytes"
+
+    def test_remote_change_mid_operation_is_never_hidden_by_reused_metadata(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """The critical reconciliation boundary: if the remote content
+        actually changes partway through one gameStop operation (another
+        client on the network wrote a same-size save between this
+        operation's plan scan and its staging check), that must be detected
+        rather than silently confirmed as unchanged from an earlier, reused
+        observation and must never be silently overwritten by either side.
+        Remote content is never cached, so every remote-touching phase
+        re-reads real bytes and a genuine divergence is always seen — here,
+        surfaced as a conflict between two independent changes."""
+        service, coordinator = self._prepared(tmp_path)
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        remote = tmp_path / "remote/snes/Super Metroid.srm"
+        _write(local, b"baseline")
+        service.full_sync()
+        coordinator.game_start(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+        local.write_bytes(b"our-final-save-bytes")
+
+        remote_scans = {"count": 0}
+        original_scan_remote_layouts = service._scan_remote_layouts
+
+        def injecting_scan_remote_layouts(layout_ids):
+            remote_scans["count"] += 1
+            if remote_scans["count"] == 2:
+                # Simulate another client's write landing mid-operation, after
+                # this operation's own plan scan already observed the old
+                # remote bytes.
+                remote.write_bytes(b"same-size-bytes-from-elsewhere")
+            return original_scan_remote_layouts(layout_ids)
+
+        monkeypatch.setattr(
+            service, "_scan_remote_layouts", injecting_scan_remote_layouts
+        )
+        self._counting_sleep(monkeypatch)
+
+        conflict_ids = coordinator.game_stop(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+
+        assert remote_scans["count"] >= 2
+        assert conflict_ids != ()
+        assert service.get_state().active_conflicts
+        # Detecting the mid-operation change must never let either side's
+        # write be silently overwritten by the other.
+        assert local.read_bytes() == b"our-final-save-bytes"
+        assert remote.read_bytes() == b"same-size-bytes-from-elsewhere"
+
+    def test_narrowly_scoped_remote_observation_never_hashes_other_systems(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """Freshness (never caching remote content) must not regress into
+        scanning the whole remote dataset: a narrow gameStop scope still
+        never opens an unrelated system's remote save, however large."""
+        service, coordinator = self._prepared(tmp_path)
+        snes_local = tmp_path / "local/snes/Super Metroid.srm"
+        psx_local = tmp_path / "local/psx/duckstation/memcards/shared_card_1.mcd"
+        _write(snes_local, b"snes-baseline")
+        _write(psx_local, b"unrelated-psx-memory-card")
+        service.full_sync()
+        coordinator.game_start(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+        snes_local.write_bytes(b"snes-final-save-bytes")
+
+        reads = self._counting_hash(monkeypatch)
+        self._counting_sleep(monkeypatch)
+        coordinator.game_stop(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+
+        remote_psx = tmp_path / "remote/psx/duckstation/memcards/shared_card_1.mcd"
+        assert remote_psx not in reads
+        assert not any("duckstation" in read.parts for read in reads), reads
+        assert remote_psx.read_bytes() == b"unrelated-psx-memory-card"
+
+
+def test_snes_game_stop_never_invokes_container_reconciliation(tmp_path: Path):
+    class _UnexpectedContainerRegistry:
+        def get(self, _adapter_id):
+            raise AssertionError("ordinary SNES saves must not use a container adapter")
+
+    provider = _Provider()
+    local = tmp_path / "local"
+    local.mkdir()
+    service = SaveSyncService(
+        provider=provider,
+        connectivity_root=str(tmp_path / "remote-data"),
+        local_root=str(local),
+        remote_root=str(tmp_path / "remote"),
+        state_path=tmp_path / "data/savesync-state.json",
+        container_registry=_UnexpectedContainerRegistry(),  # type: ignore[arg-type]
+    )
+    coordinator = _coordinator(tmp_path, service)
+    save = local / "snes/Super Metroid.srm"
+    _write(save, b"baseline")
+    service.full_sync()
+    coordinator.game_start(
+        system="snes",
+        emulator="libretro",
+        core="snes9x",
+        rom="Super Metroid.sfc",
+    )
+    save.write_bytes(b"ordinary-update")
+
+    coordinator.game_stop(
+        system="snes",
+        emulator="libretro",
+        core="snes9x",
+        rom="Super Metroid.sfc",
+    )
+
+    assert (tmp_path / "remote/snes/Super Metroid.srm").read_bytes() == (
+        b"ordinary-update"
+    )
+
+
 def test_gba_game_stop_uploads_and_periodic_quick_sync_repairs_materialization(
     tmp_path: Path,
 ):
     provider = _Provider()
     service = _service(tmp_path, provider)
-    coordinator = _coordinator(tmp_path, service)
+    coordinator = AutoSaveSyncCoordinator(
+        service,
+        data_root=tmp_path / "data",
+        enabled=True,
+        policy=DEFAULT_SAVE_SELECTION_POLICY,
+        quiet_seconds=0,
+    )
     local = tmp_path / "local" / "gba" / "Game.srm"
     remote = tmp_path / "remote" / "gba" / "Game.srm"
     service.full_sync()
@@ -900,6 +2035,421 @@ def test_gba_game_stop_uploads_and_periodic_quick_sync_repairs_materialization(
     assert local.read_bytes() == b"gba-progress"
     assert remote.read_bytes() == b"gba-progress"
     assert service.quick_sync().status == "unchanged"
+
+
+def test_local_gba_game_stop_without_session_scans_only_canonical_gba_scope(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """A scoped gameStop scan must not discard an authoritative addition
+    merely because its filesystem mtime predates the lifecycle session."""
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = AutoSaveSyncCoordinator(
+        service,
+        data_root=tmp_path / "data",
+        enabled=True,
+        policy=DEFAULT_SAVE_SELECTION_POLICY,
+        quiet_seconds=0,
+    )
+    service.full_sync()
+    local = tmp_path / "local/gba/Pokemon Emerald.srm"
+    remote = tmp_path / "remote/gba/Pokemon Emerald.srm"
+    _write(local, b"new-save-with-preserved-mtime")
+    old_timestamp = time.time() - 3600
+    os.utime(local, (old_timestamp, old_timestamp))
+
+    scanned_layouts: list[frozenset[str]] = []
+    original_scan = service._scan_local_layouts
+
+    def record_scoped_scan(layout_ids):
+        scanned_layouts.append(layout_ids)
+        return original_scan(layout_ids)
+
+    monkeypatch.setattr(service, "_scan_local_layouts", record_scoped_scan)
+    monkeypatch.setattr(
+        service,
+        "_scan_local",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("gameStop performed an all-layout local scan")
+        ),
+    )
+    dirty_at_quick = []
+    quick_results = []
+    original_quick = service.quick_sync
+
+    def capture_dirty_then_quick(**kwargs):
+        dirty_at_quick.extend(
+            group
+            for group in service.get_state().groups
+            if group.dirty_path_hints
+        )
+        result = original_quick(**kwargs)
+        quick_results.append(result)
+        return result
+
+    monkeypatch.setattr(service, "quick_sync", capture_dirty_then_quick)
+
+    coordinator.game_stop(
+        system="gba",
+        emulator="libretro",
+        core="mgba",
+        rom="/userdata/roms/gba/Pokemon Emerald.gba",
+    )
+
+    assert scanned_layouts
+    assert all(
+        layouts == frozenset({"retroarch-root-gba"})
+        for layouts in scanned_layouts
+    )
+    assert [group.group_id for group in dirty_at_quick] == [
+        "retroarch-root-gba/pokemon emerald"
+    ]
+    assert quick_results[0].processed_groups == (
+        "retroarch-root-gba/pokemon emerald",
+    )
+    assert remote.read_bytes() == b"new-save-with-preserved-mtime"
+
+
+@pytest.mark.parametrize(
+    ("system", "emulator", "core"),
+    (
+        ("", "libretro", "mgba"),
+        ("unknown", "", ""),
+    ),
+)
+def test_ambiguous_game_stop_identity_fails_closed_before_observation(
+    tmp_path: Path,
+    monkeypatch,
+    system: str,
+    emulator: str,
+    core: str,
+):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = AutoSaveSyncCoordinator(
+        service,
+        data_root=tmp_path / "data",
+        enabled=True,
+        policy=DEFAULT_SAVE_SELECTION_POLICY,
+        quiet_seconds=0,
+    )
+    monkeypatch.setattr(
+        service,
+        "observe_local_layouts",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ambiguous gameStop entered local observation")
+        ),
+    )
+
+    assert coordinator.game_stop(
+        system=system,
+        emulator=emulator,
+        core=core,
+        rom="/userdata/roms/gba/Pokemon Emerald.gba",
+    ) == ()
+    assert provider.reachability_checks == 0
+
+
+def test_gba_game_stop_observes_late_sram_flush_within_bounded_settle_window(
+    tmp_path: Path,
+    caplog,
+):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = AutoSaveSyncCoordinator(
+        service,
+        data_root=tmp_path / "data",
+        enabled=True,
+        policy=DEFAULT_SAVE_SELECTION_POLICY,
+        quiet_seconds=0.05,
+        stability_checks=4,
+    )
+    local = tmp_path / "local/gba/Pokemon Emerald.srm"
+    remote = tmp_path / "remote/gba/Pokemon Emerald.srm"
+    _write(local, b"baseline")
+    service.full_sync()
+    coordinator.game_start(
+        system="gba", emulator="libretro", core="mgba", rom="Pokemon Emerald.gba"
+    )
+
+    def delayed_sram_flush() -> None:
+        time.sleep(0.02)
+        local.write_bytes(b"post-hook-final-save")
+
+    writer = threading.Thread(target=delayed_sram_flush)
+    writer.start()
+    try:
+        with caplog.at_level("INFO"):
+            coordinator.game_stop(
+                system="gba",
+                emulator="libretro",
+                core="mgba",
+                rom="Pokemon Emerald.gba",
+            )
+    finally:
+        writer.join(timeout=5)
+
+    assert not writer.is_alive()
+    assert remote.read_bytes() == b"post-hook-final-save"
+    assert "Scoped local save observation: attempt=1" in caplog.text
+    assert "matches_previous=False" in caplog.text
+    assert "matches_previous=True" in caplog.text
+    assert '"canonical_path":"gba/Pokemon Emerald.srm"' in caplog.text
+    assert '"mtime_ns":' in caplog.text
+    assert "post-hook-final-save" not in caplog.text
+
+
+def test_hook_logs_raw_gba_argv_with_shared_diagnostic_operation_id():
+    content = hook_content(Path("/userdata/system/romcloud/bin/romcloud"))
+
+    assert 'ROMCLOUD_DIAGNOSTIC_OPERATION_ID="game-stop-$$-$(date +%s)"' in content
+    assert 'event="game_stop_argv"' in content
+    assert 'system=%q emulator=%q core=%q rom=%q' in content
+
+
+def test_manual_quick_sync_is_hint_driven_for_unmarked_gba_change(tmp_path: Path):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    local = tmp_path / "local/gba/Pokemon Emerald.srm"
+    remote = tmp_path / "remote/gba/Pokemon Emerald.srm"
+    _write(local, b"baseline")
+    service.full_sync()
+    local.write_bytes(b"changed-without-game-stop-marker")
+
+    result = service.quick_sync()
+
+    assert result.status == "unchanged"
+    assert result.reason == "journal-current-local-materialized"
+    assert remote.read_bytes() == b"baseline"
+
+    full = service.full_sync()
+    assert full.uploaded == 1
+    assert remote.read_bytes() == b"changed-without-game-stop-marker"
+
+
+def test_gba_game_stop_persists_canonical_dirty_domain_for_restart_quick_sync(
+    tmp_path: Path,
+    monkeypatch,
+):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = AutoSaveSyncCoordinator(
+        service,
+        data_root=tmp_path / "data",
+        enabled=True,
+        policy=DEFAULT_SAVE_SELECTION_POLICY,
+        quiet_seconds=0,
+    )
+    local = tmp_path / "local/gba/Pokemon Emerald.srm"
+    remote = tmp_path / "remote/gba/Pokemon Emerald.srm"
+    _write(local, b"baseline")
+    service.full_sync()
+    coordinator.game_start(
+        system="gba", emulator="libretro", core="mgba", rom="Pokemon Emerald.gba"
+    )
+    local.write_bytes(b"changed")
+
+    def stop_after_mark(*_args, **_kwargs):
+        raise SaveSyncConnectivityError("simulate process exit after durable mark")
+
+    monkeypatch.setattr(service, "quick_sync", stop_after_mark)
+    with pytest.raises(SaveSyncConnectivityError):
+        coordinator.game_stop(
+            system="gba",
+            emulator="libretro",
+            core="mgba",
+            rom="Pokemon Emerald.gba",
+        )
+
+    persisted = service.get_state()
+    dirty = [group for group in persisted.groups if group.dirty_path_hints]
+    assert [(group.group_id, group.layout_id, group.dirty_path_hints) for group in dirty] == [
+        (
+            "retroarch-root-gba/pokemon emerald",
+            "retroarch-root-gba",
+            ("gba/Pokemon Emerald.srm",),
+        )
+    ]
+
+    restarted = SaveSyncService(
+        provider=provider,
+        connectivity_root=str(tmp_path / "remote-data"),
+        local_root=str(tmp_path / "local"),
+        remote_root=str(tmp_path / "remote"),
+        state_path=tmp_path / "data/savesync-state.json",
+    )
+    result = restarted.quick_sync()
+
+    assert result.status == "reconciled"
+    assert "retroarch-root-gba/pokemon emerald" in result.processed_groups
+    assert remote.read_bytes() == b"changed"
+
+
+def test_eden_metroid_game_stop_and_peer_quick_sync_use_physical_nand_roots(
+    tmp_path: Path,
+):
+    provider = _Provider()
+    remote = tmp_path / "remote"
+    account = "0123456789ABCDEF0123456789ABCDEF"
+    title = "010093801237C000"
+    relative = Path("0000000000000000") / account / title / "slot_00" / "save.dat"
+
+    def device(name: str) -> tuple[SaveSyncService, AutoSaveSyncCoordinator, Path]:
+        root = tmp_path / name
+        local = root / "saves"
+        eden_save_root = root / "system/configs/eden/nand/user/save"
+        local.mkdir(parents=True)
+        service = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "remote-data"),
+            local_root=str(local),
+            remote_root=str(remote),
+            state_path=root / "data/savesync-state.json",
+            mapped_local_roots=(
+                ("eden-switch-user-saves", str(eden_save_root), "yuzu"),
+            ),
+        )
+        coordinator = AutoSaveSyncCoordinator(
+            service,
+            data_root=root / "data",
+            enabled=True,
+            policy=DEFAULT_SAVE_SELECTION_POLICY,
+            quiet_seconds=0,
+        )
+        return service, coordinator, eden_save_root / relative
+
+    service_a, coordinator_a, physical_a = device("device-a")
+    service_b, _coordinator_b, physical_b = device("device-b")
+    service_a.full_sync()
+    service_b.full_sync()
+
+    coordinator_a.game_start(
+        system="switch", emulator="eden", core="eden", rom="Metroid Dread.xci"
+    )
+    _write(physical_a, b"metroid-progress")
+    coordinator_a.game_stop(
+        system="switch", emulator="eden", core="eden", rom="Metroid Dread.xci"
+    )
+
+    canonical = remote / "yuzu" / relative
+    assert canonical.read_bytes() == b"metroid-progress"
+    assert service_b.quick_sync().status == "reconciled"
+    assert physical_b.read_bytes() == b"metroid-progress"
+    assert not (tmp_path / "device-b/saves/yuzu").exists()
+
+    coordinator_a.game_start(
+        system="switch", emulator="eden", core="eden", rom="Metroid Dread.xci"
+    )
+    physical_a.write_bytes(b"metroid-progress-updated")
+    coordinator_a.game_stop(
+        system="switch", emulator="eden", core="eden", rom="Metroid Dread.xci"
+    )
+    assert service_b.quick_sync().status == "reconciled"
+    assert physical_b.read_bytes() == b"metroid-progress-updated"
+
+    coordinator_a.game_start(
+        system="switch", emulator="eden", core="eden", rom="Metroid Dread.xci"
+    )
+    physical_a.unlink()
+    coordinator_a.game_stop(
+        system="switch", emulator="eden", core="eden", rom="Metroid Dread.xci"
+    )
+    assert service_b.quick_sync().status == "reconciled"
+    assert not physical_b.exists()
+    assert not canonical.exists()
+    assert service_b.quick_sync().status == "unchanged"
+
+
+def test_eden_switch_titles_merge_independently_but_same_title_conflicts(
+    tmp_path: Path,
+):
+    provider = _Provider()
+    remote = tmp_path / "remote"
+    account = "0123456789ABCDEF0123456789ABCDEF"
+    metroid = "010093801237C000"
+    other_title = "01007EF00011E000"
+
+    def device(name: str) -> tuple[SaveSyncService, AutoSaveSyncCoordinator, Path]:
+        root = tmp_path / name
+        local = root / "saves"
+        eden_save_root = root / "system/configs/eden/nand/user/save"
+        local.mkdir(parents=True)
+        service = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "remote-data"),
+            local_root=str(local),
+            remote_root=str(remote),
+            state_path=root / "data/savesync-state.json",
+            mapped_local_roots=(
+                ("eden-switch-user-saves", str(eden_save_root), "yuzu"),
+            ),
+        )
+        return (
+            service,
+            AutoSaveSyncCoordinator(
+                service,
+                data_root=root / "data",
+                enabled=True,
+                policy=DEFAULT_SAVE_SELECTION_POLICY,
+                quiet_seconds=0,
+            ),
+            eden_save_root / "0000000000000000" / account,
+        )
+
+    service_a, coordinator_a, account_a = device("device-a")
+    service_b, coordinator_b, account_b = device("device-b")
+    _write(account_a / metroid / "save.dat", b"metroid-base")
+    _write(account_a / other_title / "save.dat", b"other-base")
+    service_a.full_sync()
+    service_b.full_sync()
+
+    coordinator_a.game_start(
+        system="switch", emulator="eden", core="eden", rom="Metroid Dread.xci"
+    )
+    coordinator_b.game_start(
+        system="switch", emulator="eden", core="eden", rom="Other Game.xci"
+    )
+    (account_a / metroid / "save.dat").write_bytes(b"metroid-device-a")
+    (account_b / other_title / "save.dat").write_bytes(b"other-device-b")
+    coordinator_a.game_stop(
+        system="switch", emulator="eden", core="eden", rom="Metroid Dread.xci"
+    )
+    assert coordinator_b.game_stop(
+        system="switch", emulator="eden", core="eden", rom="Other Game.xci"
+    ) == ()
+
+    assert (account_b / metroid / "save.dat").read_bytes() == b"metroid-device-a"
+    assert (account_a / other_title / "save.dat").read_bytes() == b"other-base"
+    assert (
+        remote / "yuzu/0000000000000000" / account / other_title / "save.dat"
+    ).read_bytes() == b"other-device-b"
+    assert service_a.quick_sync().status == "reconciled"
+    assert (account_a / other_title / "save.dat").read_bytes() == b"other-device-b"
+
+    coordinator_a.game_start(
+        system="switch", emulator="eden", core="eden", rom="Metroid Dread.xci"
+    )
+    coordinator_b.game_start(
+        system="switch", emulator="eden", core="eden", rom="Metroid Dread.xci"
+    )
+    (account_a / metroid / "save.dat").write_bytes(b"metroid-a-conflict")
+    (account_b / metroid / "save.dat").write_bytes(b"metroid-b-conflict")
+    coordinator_a.game_stop(
+        system="switch", emulator="eden", core="eden", rom="Metroid Dread.xci"
+    )
+    conflicts = coordinator_b.game_stop(
+        system="switch", emulator="eden", core="eden", rom="Metroid Dread.xci"
+    )
+
+    assert len(conflicts) == 1
+    assert (account_b / metroid / "save.dat").read_bytes() == b"metroid-b-conflict"
+    assert (
+        remote / "yuzu/0000000000000000" / account / metroid / "save.dat"
+    ).read_bytes() == b"metroid-a-conflict"
+    assert service_b.get_state().active_conflicts[0].layout_id == (
+        "yuzu-account-title-save"
+    )
 
 
 def test_game_exit_remote_dirty_downloads_through_quick_sync(tmp_path: Path):
@@ -1282,20 +2832,391 @@ def test_unavailable_remote_preserves_durable_dirty_state(tmp_path: Path):
     assert (tmp_path / "remote" / "psx" / "Game.srm").read_bytes() == b"changed"
 
 
-def test_offline_game_mode_still_allows_independent_savesync(tmp_path: Path):
+def test_game_stop_disconnect_fails_without_consuming_change_then_reconnects(
+    tmp_path: Path,
+):
     provider = _Provider()
-    offline = CapabilityPolicy("smart_cache", OperatingMode.OFFLINE)
-    service = _service(tmp_path, provider, capability_policy=offline)
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    local = tmp_path / "local/snes/Super Metroid.srm"
+    remote = tmp_path / "remote/snes/Super Metroid.srm"
+    _write(local, b"baseline")
+    service.full_sync()
+    cursor = service.get_state().quick_sync_cursor_generation
+    coordinator.game_start(
+        system="snes",
+        emulator="libretro",
+        core="snes9x",
+        rom="Super Metroid.sfc",
+    )
+    local.write_bytes(b"unsynchronized-change")
+    provider.reachable = False
+
+    with pytest.raises(
+        SaveSyncConnectivityError, match="remote-data storage is not readable"
+    ):
+        coordinator.game_stop(
+            system="snes",
+            emulator="libretro",
+            core="snes9x",
+            rom="Super Metroid.sfc",
+        )
+
+    state = service.get_state()
+    assert state.quick_sync_cursor_generation == cursor
+    assert state.groups[0].condition is SaveGroupCondition.LOCAL_DIRTY
+    assert state.groups[0].dirty_path_hints == ("snes/Super Metroid.srm",)
+    assert remote.read_bytes() == b"baseline"
+
+    provider.reachable = True
+    coordinator.remote_reconnect()
+
+    assert remote.read_bytes() == b"unsynchronized-change"
+    assert service.get_state().groups[0].condition is SaveGroupCondition.CLEAN
+
+
+def test_failed_game_stop_transaction_retains_baseline_cursor_and_dirty_hint(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setenv(
+        "ROMCLOUD_DIAGNOSTIC_OPERATION_ID", "game-stop-failed-transaction"
+    )
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    local = tmp_path / "local/snes/Super Metroid.srm"
+    remote = tmp_path / "remote/snes/Super Metroid.srm"
+    _write(local, b"baseline")
+    service.full_sync()
+    before = service.get_state()
+    coordinator.game_start(
+        system="snes",
+        emulator="libretro",
+        core="snes9x",
+        rom="Super Metroid.sfc",
+    )
+    local.write_bytes(b"new-revision")
+    original_apply = service._apply_selected_transaction
+    monkeypatch.setattr(
+        service,
+        "_apply_selected_transaction",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("simulated remote commit failure")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="simulated remote commit failure"):
+        coordinator.game_stop(
+            system="snes",
+            emulator="libretro",
+            core="snes9x",
+            rom="Super Metroid.sfc",
+        )
+
+    failed = service.get_state()
+    assert failed.shared_manifest == before.shared_manifest
+    assert failed.quick_sync_cursor_generation == before.quick_sync_cursor_generation
+    assert failed.groups[0].condition is SaveGroupCondition.LOCAL_DIRTY
+    assert failed.groups[0].dirty_path_hints == ("snes/Super Metroid.srm",)
+    assert remote.read_bytes() == b"baseline"
+
+    monkeypatch.setattr(service, "_apply_selected_transaction", original_apply)
+    coordinator.remote_reconnect()
+
+    assert remote.read_bytes() == b"new-revision"
+    assert service.get_state().groups[0].condition is SaveGroupCondition.CLEAN
+
+
+def test_game_stop_worker_busy_retains_dirty_state_and_drain_pending_completes_it(
+    tmp_path: Path, monkeypatch
+):
+    """A gameStop that loses the worker lock to a live Quick Sync must not
+    silently discard the change: durable dirty state is captured before the
+    lock is even attempted, and the guaranteed drain-pending follow-up (what
+    the CLI spawns detached on this exact failure) completes it once the
+    busy operation releases the lock."""
+    from romcloud.core.exceptions import SaveSyncWorkerBusyError
+
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    other_worker = _coordinator(tmp_path, service)
+    psx_local = tmp_path / "local/psx/Game.srm"
+    snes_local = tmp_path / "local/snes/Super Metroid.srm"
+    snes_remote = tmp_path / "remote/snes/Super Metroid.srm"
+    _write(psx_local, b"psx-base")
+    _write(snes_local, b"baseline")
+    service.full_sync()
+
+    busy_entered = threading.Event()
+    release_busy = threading.Event()
+    original_quick_sync = service.quick_sync
+
+    def slow_quick_sync(*args, **kwargs):
+        busy_entered.set()
+        assert release_busy.wait(timeout=2)
+        return original_quick_sync(*args, **kwargs)
+
+    monkeypatch.setattr(service, "quick_sync", slow_quick_sync)
+    psx_local.write_bytes(b"psx-changed")
+    service.mark_local_dirty("psx/Game.srm")
+    busy_thread = threading.Thread(target=other_worker.drain_pending)
+    busy_thread.start()
+    assert busy_entered.wait(timeout=2)
+
+    coordinator.game_start(
+        system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+    )
+    snes_local.write_bytes(b"main-pc-newer")
+    with pytest.raises(SaveSyncWorkerBusyError):
+        coordinator.game_stop(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+
+    # Not silently discarded: durable dirty state was captured before the
+    # lock was even attempted, and the remote was never touched by this pass.
+    snes_group = next(
+        group
+        for group in service.get_state().groups
+        if group.layout_id == "retroarch-root-snes"
+    )
+    assert snes_group.condition is SaveGroupCondition.LOCAL_DIRTY
+    assert snes_remote.read_bytes() == b"baseline"
+
+    release_busy.set()
+    busy_thread.join(timeout=5)
+    assert not busy_thread.is_alive()
+    assert (tmp_path / "remote/psx/Game.srm").read_bytes() == b"psx-changed"
+
+    # The guaranteed follow-up (spawned detached by the CLI on this exact
+    # failure) drains the retained work once the busy operation has released
+    # the lock.
+    coordinator.drain_pending()
+
+    assert snes_remote.read_bytes() == b"main-pc-newer"
+    snes_group = next(
+        group
+        for group in service.get_state().groups
+        if group.layout_id == "retroarch-root-snes"
+    )
+    assert snes_group.condition is SaveGroupCondition.CLEAN
+
+
+def test_game_stop_cli_schedules_drain_pending_follow_up_on_worker_busy(
+    tmp_path: Path, monkeypatch
+):
+    from romcloud.cli.commands import autosync as autosync_commands
+    from romcloud.cli.main import cli
+    from romcloud.core.exceptions import SaveSyncWorkerBusyError
+
+    config_path = tmp_path / "romcloud.toml"
+    write_config(
+        AppConfig(
+            source=SourceConfig("local", (tmp_path / "roms").as_posix()),
+            cache=CacheConfig((tmp_path / "cache").as_posix()),
+            local_roms_path=(tmp_path / "local-roms").as_posix(),
+            data_path=(tmp_path / "data").as_posix(),
+            saves=SavesConfig(
+                local_path=(tmp_path / "saves").as_posix(),
+                auto_sync_enabled=True,
+            ),
+        ),
+        str(config_path),
+    )
+    coordinator = type(
+        "Coordinator",
+        (),
+        {
+            "game_stop_eligible": lambda self, **_kwargs: True,
+            "game_stop": lambda self, **_kwargs: (_ for _ in ()).throw(
+                SaveSyncWorkerBusyError("worker lock busy")
+            )
+        },
+    )()
+    monkeypatch.setattr(autosync_commands, "_coordinator", lambda _ctx: coordinator)
+    spawn_calls = []
+    monkeypatch.setattr(
+        batocera_auto_savesync,
+        "spawn_drain_pending",
+        lambda **kwargs: spawn_calls.append(kwargs) or 4242,
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config",
+            str(config_path),
+            "_autosync",
+            "game-stop",
+            "snes",
+            "libretro",
+            "snes9x",
+            "Super Metroid.sfc",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "did not complete" in result.output
+    assert len(spawn_calls) == 1
+
+
+def test_failed_remote_journal_commit_rolls_back_bytes_baseline_and_cursor(
+    tmp_path: Path, monkeypatch
+):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    local = tmp_path / "local/snes/Super Metroid.srm"
+    remote = tmp_path / "remote/snes/Super Metroid.srm"
+    _write(local, b"baseline")
+    service.full_sync()
+    before = service.get_state()
+    coordinator.game_start(
+        system="snes",
+        emulator="libretro",
+        core="snes9x",
+        rom="Super Metroid.sfc",
+    )
+    local.write_bytes(b"new-revision")
+    original_append = service._append_remote_journal
+    monkeypatch.setattr(
+        service,
+        "_append_remote_journal",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            OSError("simulated journal commit failure")
+        ),
+    )
+
+    with pytest.raises(OSError, match="simulated journal commit failure"):
+        coordinator.game_stop(
+            system="snes",
+            emulator="libretro",
+            core="snes9x",
+            rom="Super Metroid.sfc",
+        )
+
+    failed = service.get_state()
+    assert failed.shared_manifest == before.shared_manifest
+    assert failed.quick_sync_cursor_generation == before.quick_sync_cursor_generation
+    assert failed.groups[0].condition is SaveGroupCondition.LOCAL_DIRTY
+    assert failed.groups[0].dirty_path_hints == ("snes/Super Metroid.srm",)
+    assert remote.read_bytes() == b"baseline"
+
+    monkeypatch.setattr(service, "_append_remote_journal", original_append)
+    coordinator.remote_reconnect()
+
+    assert remote.read_bytes() == b"new-revision"
+    assert service.get_state().groups[0].condition is SaveGroupCondition.CLEAN
+
+
+def test_nonfinal_game_stop_persists_dirty_work_until_last_session_stops(
+    tmp_path: Path, monkeypatch
+):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    first = tmp_path / "local/snes/First.srm"
+    second = tmp_path / "local/snes/Second.srm"
+    _write(first, b"first-baseline")
+    _write(second, b"second-baseline")
+    service.full_sync()
+    coordinator.game_start(
+        system="snes", emulator="libretro", core="snes9x", rom="First.sfc"
+    )
+    coordinator.game_start(
+        system="snes", emulator="libretro", core="snes9x", rom="Second.sfc"
+    )
+    first.write_bytes(b"first-new")
+    quick_calls = 0
+    original_quick_sync = service.quick_sync
+
+    def counted_quick_sync(**kwargs):
+        nonlocal quick_calls
+        quick_calls += 1
+        return original_quick_sync(**kwargs)
+
+    monkeypatch.setattr(service, "quick_sync", counted_quick_sync)
+
+    assert coordinator.game_stop(
+        system="snes", emulator="libretro", core="snes9x", rom="First.sfc"
+    ) == ()
+    assert quick_calls == 0
+    assert service.get_state().groups[0].condition is SaveGroupCondition.LOCAL_DIRTY
+    assert (tmp_path / "remote/snes/First.srm").read_bytes() == b"first-baseline"
+
+    coordinator.game_stop(
+        system="snes", emulator="libretro", core="snes9x", rom="Second.sfc"
+    )
+
+    assert quick_calls == 1
+    assert (tmp_path / "remote/snes/First.srm").read_bytes() == b"first-new"
+
+
+def test_final_game_stop_cannot_succeed_with_unchanged_dirty_work(
+    tmp_path: Path, monkeypatch
+):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
+    coordinator = _coordinator(tmp_path, service)
+    local = tmp_path / "local/snes/Super Metroid.srm"
+    _write(local, b"baseline")
+    service.full_sync()
+    coordinator.game_start(
+        system="snes",
+        emulator="libretro",
+        core="snes9x",
+        rom="Super Metroid.sfc",
+    )
+    local.write_bytes(b"new-revision")
+    cursor = service.get_state().quick_sync_cursor_generation
+    monkeypatch.setattr(
+        service,
+        "quick_sync",
+        lambda **_kwargs: SaveQuickSyncResult(
+            status="unchanged",
+            remote_generation=cursor or 0,
+            cursor_before=cursor,
+            cursor_after=cursor,
+            reason="simulated-no-progress",
+        ),
+    )
+
+    with pytest.raises(SaveSyncError, match="made no progress"):
+        coordinator.game_stop(
+            system="snes",
+            emulator="libretro",
+            core="snes9x",
+            rom="Super Metroid.sfc",
+        )
+
+    state = service.get_state()
+    assert state.groups[0].condition is SaveGroupCondition.LOCAL_DIRTY
+    assert state.quick_sync_cursor_generation == cursor
+    assert (tmp_path / "remote/snes/Super Metroid.srm").read_bytes() == b"baseline"
+
+
+def test_offline_game_mode_retains_local_dirty_work_without_network(tmp_path: Path):
+    provider = _Provider()
+    service = _service(tmp_path, provider)
     path = tmp_path / "local" / "psx" / "Game.srm"
     _write(path, b"base")
     service.full_sync()
     _write(path, b"local")
     service.mark_local_dirty("psx/Game.srm")
+    checks_before = provider.reachability_checks
 
-    _coordinator(tmp_path, service).drain_pending()
+    coordinator = AutoSaveSyncCoordinator(
+        service,
+        data_root=tmp_path / "data",
+        enabled=False,
+        policy=DEFAULT_SAVE_SELECTION_POLICY,
+        quiet_seconds=0,
+    )
+    coordinator.drain_pending()
 
-    assert provider.reachability_checks > 0
-    assert (tmp_path / "remote" / "psx" / "Game.srm").read_bytes() == b"local"
+    assert provider.reachability_checks == checks_before
+    assert (tmp_path / "remote" / "psx" / "Game.srm").read_bytes() == b"base"
+    assert service.get_state().groups[0].condition is SaveGroupCondition.LOCAL_DIRTY
 
 
 def test_verified_unchanged_hint_clears_without_transaction(
@@ -1730,7 +3651,13 @@ def test_menu_loop_suppresses_gameplay_then_resumes_after_game_stop(
     def counted_quick_sync(**kwargs):
         nonlocal quick_calls
         quick_calls += 1
-        return None
+        return SaveQuickSyncResult(
+            status="unchanged",
+            remote_generation=0,
+            cursor_before=0,
+            cursor_after=0,
+            reason="test-noop",
+        )
 
     monkeypatch.setattr(service, "quick_sync", counted_quick_sync)
     coordinator.game_start(
@@ -1755,9 +3682,10 @@ def test_menu_loop_suppresses_gameplay_then_resumes_after_game_stop(
     with pytest.raises(StopLoop):
         coordinator.menu_loop()
 
-    # The initial and first interval ticks were suppressed during gameplay;
-    # gameStop reconciled immediately, then the forced-due test tick ran too.
-    assert quick_calls == 2
+    # The initial and first interval ticks were suppressed during gameplay.
+    # This unsupported application's gameStop only retires its session marker;
+    # the next forced-due menu tick is the sole Quick Sync.
+    assert quick_calls == 1
 
 
 def test_menu_tick_unchanged_journal_performs_no_save_layout_scan(
@@ -2062,3 +3990,298 @@ def test_periodic_pull_never_auto_pulls_xemu(tmp_path: Path):
     coordinator.menu_tick(force=True)
 
     assert local.read_bytes() == b"local"
+
+
+class _FakeProgress:
+    """Records every stage()/close() call in order, for asserting the exact
+    sequence gameStop's Auto SaveSync progress popup would have shown."""
+
+    def __init__(self, *, raise_on_call: bool = False) -> None:
+        self.calls: list[tuple] = []
+        self._raise_on_call = raise_on_call
+
+    def stage(self, text: str) -> None:
+        self.calls.append(("stage", text))
+        if self._raise_on_call:
+            raise RuntimeError("progress popup UI crashed")
+
+    def close(self, ok: bool, message=None) -> None:
+        self.calls.append(("close", ok, message))
+        if self._raise_on_call:
+            raise RuntimeError("progress popup UI crashed")
+
+    @property
+    def stages(self) -> list[str]:
+        return [call[1] for call in self.calls if call[0] == "stage"]
+
+
+class TestGameStopProgressPopup:
+    """Requirement coverage for the gameStop Auto SaveSync progress popup:
+    the popup is requested immediately, synchronous SaveSync behavior is
+    unchanged, real stage/result text is surfaced, and any UI failure never
+    affects the real SaveSync outcome."""
+
+    def test_progress_is_requested_immediately_as_the_very_first_call(
+        self, tmp_path: Path
+    ):
+        provider = _Provider()
+        service = _service(tmp_path, provider)
+        coordinator = _coordinator(tmp_path, service)
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        _write(local, b"baseline")
+        service.full_sync()
+        local.write_bytes(b"final-save-bytes")
+
+        progress = _FakeProgress()
+        coordinator.game_stop(
+            system="snes",
+            emulator="libretro",
+            core="snes9x",
+            rom="Super Metroid.sfc",
+            progress=progress,
+        )
+
+        assert progress.calls[0] == ("stage", "Checking save changes…")
+
+    def test_synchronous_savesync_result_is_unchanged_by_the_popup(
+        self, tmp_path: Path
+    ):
+        provider = _Provider()
+        service = _service(tmp_path, provider)
+        coordinator = _coordinator(tmp_path, service)
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        remote = tmp_path / "remote/snes/Super Metroid.srm"
+        _write(local, b"baseline")
+        service.full_sync()
+        local.write_bytes(b"final-save-bytes")
+
+        progress = _FakeProgress()
+        conflict_ids = coordinator.game_stop(
+            system="snes",
+            emulator="libretro",
+            core="snes9x",
+            rom="Super Metroid.sfc",
+            progress=progress,
+        )
+
+        assert conflict_ids == ()
+        assert remote.read_bytes() == b"final-save-bytes"
+
+    def test_real_stage_progression_is_surfaced_for_an_uploaded_save(
+        self, tmp_path: Path
+    ):
+        provider = _Provider()
+        service = _service(tmp_path, provider)
+        coordinator = _coordinator(tmp_path, service)
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        _write(local, b"baseline")
+        service.full_sync()
+        local.write_bytes(b"final-save-bytes")
+
+        progress = _FakeProgress()
+        coordinator.game_stop(
+            system="snes",
+            emulator="libretro",
+            core="snes9x",
+            rom="Super Metroid.sfc",
+            progress=progress,
+        )
+
+        assert progress.stages == [
+            "Checking save changes…",
+            "Waiting for save data to settle…",
+            "Preparing save sync…",
+            "Uploading changed save…",
+        ]
+        assert progress.calls[-1] == ("close", True, None)
+
+    def test_fast_no_change_path_still_shows_immediate_feedback_and_closes(
+        self, tmp_path: Path
+    ):
+        provider = _Provider()
+        service = _service(tmp_path, provider)
+        coordinator = _coordinator(tmp_path, service)
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        _write(local, b"baseline")
+        service.full_sync()
+        # No change at all since the last full sync.
+
+        progress = _FakeProgress()
+        conflict_ids = coordinator.game_stop(
+            system="snes",
+            emulator="libretro",
+            core="snes9x",
+            rom="Super Metroid.sfc",
+            progress=progress,
+        )
+
+        assert conflict_ids == ()
+        assert progress.stages[0] == "Checking save changes…"
+        assert "No save changes detected." in progress.stages
+        assert progress.calls[-1] == ("close", True, None)
+
+    def test_failure_produces_a_visible_failure_state_without_a_traceback(
+        self, tmp_path: Path, caplog
+    ):
+        provider = _Provider()
+        service = _service(tmp_path, provider)
+        coordinator = AutoSaveSyncCoordinator(
+            service,
+            data_root=tmp_path / "data",
+            enabled=True,
+            policy=DEFAULT_SAVE_SELECTION_POLICY,
+            quiet_seconds=0.03,
+            stability_checks=3,
+        )
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        _write(local, b"baseline")
+        service.full_sync()
+        coordinator.game_start(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+
+        stop_writing = threading.Event()
+
+        def never_settles() -> None:
+            counter = 0
+            while not stop_writing.is_set():
+                local.write_bytes(f"still-writing-{counter}".encode())
+                counter += 1
+                time.sleep(0.01)
+
+        writer = threading.Thread(target=never_settles)
+        writer.start()
+        progress = _FakeProgress()
+        try:
+            with pytest.raises(SaveSyncError):
+                coordinator.game_stop(
+                    system="snes",
+                    emulator="libretro",
+                    core="snes9x",
+                    rom="Super Metroid.sfc",
+                    progress=progress,
+                )
+        finally:
+            stop_writing.set()
+            writer.join(timeout=5)
+
+        assert progress.calls[-1] == (
+            "close",
+            False,
+            "Save sync failed.\nYour local save has been preserved.",
+        )
+        # No internal traceback text ever reaches the popup.
+        assert "Traceback" not in progress.calls[-1][2]
+
+    def test_ui_failure_never_fails_savesync(self, tmp_path: Path):
+        """A progress reporter whose stage()/close() raise must never abort
+        or corrupt the real synchronous SaveSync operation."""
+        provider = _Provider()
+        service = _service(tmp_path, provider)
+        coordinator = _coordinator(tmp_path, service)
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        remote = tmp_path / "remote/snes/Super Metroid.srm"
+        _write(local, b"baseline")
+        service.full_sync()
+        local.write_bytes(b"final-save-bytes")
+
+        progress = _FakeProgress(raise_on_call=True)
+        conflict_ids = coordinator.game_stop(
+            system="snes",
+            emulator="libretro",
+            core="snes9x",
+            rom="Super Metroid.sfc",
+            progress=progress,
+        )
+
+        assert conflict_ids == ()
+        assert remote.read_bytes() == b"final-save-bytes"
+
+    def test_default_progress_is_a_safe_noop_when_none_is_provided(
+        self, tmp_path: Path
+    ):
+        provider = _Provider()
+        service = _service(tmp_path, provider)
+        coordinator = _coordinator(tmp_path, service)
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        remote = tmp_path / "remote/snes/Super Metroid.srm"
+        _write(local, b"baseline")
+        service.full_sync()
+        local.write_bytes(b"final-save-bytes")
+
+        conflict_ids = coordinator.game_stop(
+            system="snes", emulator="libretro", core="snes9x", rom="Super Metroid.sfc"
+        )
+
+        assert conflict_ids == ()
+        assert remote.read_bytes() == b"final-save-bytes"
+
+    def test_conflict_handling_is_unaffected_by_the_progress_popup(
+        self, tmp_path: Path
+    ):
+        """New conflicts discovered during gameStop are still returned for
+        the existing conflict-popup handoff even with a progress reporter
+        attached — no new conflict-resolution UI is invented here."""
+        provider = _Provider()
+        service = _service(tmp_path, provider)
+        coordinator = _coordinator(tmp_path, service)
+        local = tmp_path / "local" / "psx" / "Game.srm"
+        remote = tmp_path / "remote" / "psx" / "Game.srm"
+        _write(local, b"base")
+        service.full_sync()
+        coordinator.game_start(
+            system="psx", emulator="libretro", core="pcsx", rom="Game.chd"
+        )
+        _write(local, b"local-progress")
+        _write(remote, b"peer-progress")
+        service._append_remote_journal(  # type: ignore[attr-defined]
+            revision="peer-conflict",
+            timestamp="2026-01-01T00:00:00+00:00",
+            mutations=[
+                {
+                    "system": "psx",
+                    "layout_id": "retroarch-root-psx",
+                    "group_id": "retroarch-root-psx:psx/Game",
+                    "object_id": "psx/Game.srm",
+                    "operation": "update",
+                }
+            ],
+        )
+
+        progress = _FakeProgress()
+        conflict_ids = coordinator.game_stop(
+            system="psx",
+            emulator="libretro",
+            core="pcsx",
+            rom="Game.chd",
+            progress=progress,
+        )
+
+        assert conflict_ids != ()
+        assert service.get_state().groups[0].condition is SaveGroupCondition.CONFLICT
+        # The popup itself only ever shows sync-progress text — never a
+        # conflict-resolution UI.
+        assert not any("conflict" in text.lower() for text in progress.stages)
+
+    def test_no_duplicate_quick_sync_operation_is_introduced_by_the_popup(
+        self, tmp_path: Path, caplog
+    ):
+        provider = _Provider()
+        service = _service(tmp_path, provider)
+        coordinator = _coordinator(tmp_path, service)
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        _write(local, b"baseline")
+        service.full_sync()
+        local.write_bytes(b"final-save-bytes")
+
+        progress = _FakeProgress()
+        with caplog.at_level("INFO"):
+            coordinator.game_stop(
+                system="snes",
+                emulator="libretro",
+                core="snes9x",
+                rom="Super Metroid.sfc",
+                progress=progress,
+            )
+
+        assert caplog.text.count("Auto SaveSync quick sync started: trigger=game stop") == 1
