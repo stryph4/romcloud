@@ -59,7 +59,7 @@ def test_operation_id_propagates_and_chain_is_chronological(tmp_path: Path) -> N
     chain = store.operation_chain(op_id)
     assert [item["event_code"] for item in chain] == [
         "operation.started", "group.classified", "operation.result",
-        "operation.completed",
+        "operation.completed", "operation.timing_summary",
     ]
     assert {item["operation_id"] for item in chain} == {op_id}
     summary = store.operation_summaries()[0]
@@ -88,6 +88,49 @@ def test_stage_timings_form_an_inspectable_operation_timeline(tmp_path: Path) ->
     assert timeline[0]["stage"] == "scan-remote"
     assert timeline[0]["percent"] > 50
     assert round(sum(entry["percent"] for entry in timeline)) == 100
+
+
+def test_stage_timer_and_counters_share_one_operation_scoped_summary(
+    tmp_path: Path,
+) -> None:
+    store = diagnostics.configure_diagnostics(tmp_path / "diagnostics.db")
+    assert store is not None
+    with operation("targeted gameStart", subsystem="savesync") as op_id:
+        with diagnostics.stage_timer("head-read"):
+            diagnostics.increment_operation_counter("head_reads")
+        snapshot = diagnostics.current_timing_snapshot()
+        assert snapshot["stages"]["head-read"]["count"] == 1
+        assert snapshot["counters"] == {"head_reads": 1}
+
+    summary = next(
+        event
+        for event in store.operation_chain(op_id)
+        if event["event_code"] == "operation.timing_summary"
+    )
+    assert summary["metadata"]["total_ms"] >= 0
+    assert summary["metadata"]["stages"]["head-read"]["count"] == 1
+    assert summary["metadata"]["counters"] == {"head_reads": 1}
+
+
+def test_operation_can_emit_one_concise_timing_log(caplog) -> None:
+    logger = logging.getLogger("romcloud.timing-test")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        with operation(
+            "gameStart",
+            subsystem="savesync",
+            timing_logger=logger,
+            timing_label="targeted-gameStart",
+        ):
+            with diagnostics.stage_timer("head-read"):
+                diagnostics.increment_operation_counter("head_reads")
+    summaries = [
+        record.message
+        for record in caplog.records
+        if record.message.startswith("SaveSync timing summary:")
+    ]
+    assert len(summaries) == 1
+    assert "operation=targeted-gameStart" in summaries[0]
+    assert '"head_reads":1' in summaries[0]
 
 
 def test_stage_timer_is_fail_open_without_a_configured_store(monkeypatch) -> None:

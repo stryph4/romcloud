@@ -111,6 +111,31 @@ class TestSaveSyncProgressReporter:
         reporter.stage("Checking save changes…")
         assert proc.stdin.events == [{"stage": "Checking save changes…"}]
 
+    def test_stage_optionally_sends_trustworthy_byte_progress(self):
+        proc = _FakeProcess()
+        reporter = SaveSyncProgressReporter(proc)
+        reporter.stage("Downloading save…", current=2048, total=8192)
+        assert proc.stdin.events == [
+            {
+                "stage": "Downloading save…",
+                "current": 2048,
+                "total": 8192,
+            }
+        ]
+
+    def test_stage_without_a_valid_total_remains_indeterminate(self):
+        proc = _FakeProcess()
+        reporter = SaveSyncProgressReporter(proc)
+        reporter.stage("Downloading save…", current=2048, total=0)
+        assert proc.stdin.events == [{"stage": "Downloading save…"}]
+
+    def test_same_text_with_new_byte_progress_is_not_deduplicated(self):
+        proc = _FakeProcess()
+        reporter = SaveSyncProgressReporter(proc)
+        reporter.stage("Downloading save…", current=1, total=2)
+        reporter.stage("Downloading save…", current=2, total=2)
+        assert [event["current"] for event in proc.stdin.events] == [1, 2]
+
     def test_close_sends_done_event_and_closes_stdin(self):
         proc = _FakeProcess()
         reporter = SaveSyncProgressReporter(proc)

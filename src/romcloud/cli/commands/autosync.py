@@ -16,6 +16,10 @@ from romcloud.infrastructure import savesync_prompts
 from romcloud.infrastructure.config import load_config
 from romcloud.infrastructure.library_view import operating_mode
 from romcloud.infrastructure.logging import get_logger
+from romcloud.infrastructure.diagnostics import (
+    operation as diagnostic_operation,
+    stage_timer,
+)
 from romcloud.integrations.batocera import auto_savesync as batocera_auto_savesync
 from romcloud.services.auto_savesync import ActiveSessionStore, AutoSaveSyncCoordinator
 from romcloud.ui.savesync_progress import NullSaveSyncProgress, start_savesync_progress
@@ -83,15 +87,16 @@ def _resolve_ports_launcher(data_root: Path) -> Path:
 
 def _start_lifecycle_progress(data_root: Path, *, operation: str):  # noqa: ANN201
     """Create the one shared gameStart/gameStop SaveSync presenter."""
-    launcher = _resolve_ports_launcher(data_root)
-    progress = start_savesync_progress(
-        launcher,
-        initial_stage=(
-            "Checking save…"
-            if operation == "gameStart"
-            else "Checking save changes…"
-        ),
-    )
+    with stage_timer("progress-popup-startup"):
+        launcher = _resolve_ports_launcher(data_root)
+        progress = start_savesync_progress(
+            launcher,
+            initial_stage=(
+                "Checking save…"
+                if operation == "gameStart"
+                else "Checking save changes…"
+            ),
+        )
     log.info(
         "%s progress reporter initialized: launcher=%s launcher_exists=%s "
         "reporter=%s operation_id=%s",
@@ -114,9 +119,10 @@ def _start_lifecycle_progress(data_root: Path, *, operation: str):  # noqa: ANN2
 def _wait_for_progress_close(progress) -> None:  # noqa: ANN001
     """Wait only where launch ordering requires the overlay to be gone."""
     try:
-        wait_until_closed = getattr(progress, "wait_until_closed", None)
-        if callable(wait_until_closed):
-            wait_until_closed()
+        with stage_timer("progress-popup-shutdown"):
+            wait_until_closed = getattr(progress, "wait_until_closed", None)
+            if callable(wait_until_closed):
+                wait_until_closed()
     except Exception:  # noqa: BLE001 - UI failure never blocks game launch
         log.warning("Could not wait for SaveSync progress popup to close", exc_info=True)
 
@@ -209,18 +215,19 @@ def _launch_pending_conflict_popup(
             display_environment,
         )
         try:
-            with process_log.open("a", encoding="utf-8") as output:
-                result = subprocess.run(
-                    [str(launcher), "--savesync-conflicts"],
-                    stdin=subprocess.DEVNULL,
-                    stdout=output,
-                    stderr=output,
-                    check=False,
-                    close_fds=True,
-                    start_new_session=True,
-                    cwd=str(data_root.parent),
-                    env=environment,
-                )
+            with stage_timer("conflict-popup-startup-shutdown"):
+                with process_log.open("a", encoding="utf-8") as output:
+                    result = subprocess.run(
+                        [str(launcher), "--savesync-conflicts"],
+                        stdin=subprocess.DEVNULL,
+                        stdout=output,
+                        stderr=output,
+                        check=False,
+                        close_fds=True,
+                        start_new_session=True,
+                        cwd=str(data_root.parent),
+                        env=environment,
+                    )
         except OSError:
             log.warning(
                 "SaveSync conflict popup subprocess launch failed: launcher=%s log=%s",
@@ -262,6 +269,20 @@ def game_start(
         except Exception:  # noqa: BLE001 - lifecycle hooks never block Batocera
             log.warning("Could not record Batocera game start", exc_info=True)
         return
+    with diagnostic_operation(
+        "gameStart",
+        subsystem="savesync",
+        source="Auto gameStart",
+        timing_logger=log,
+        timing_label="targeted-gameStart",
+    ):
+        _run_enabled_game_start(ctx, system, emulator, core, rom)
+
+
+def _run_enabled_game_start(
+    ctx: click.Context, system: str, emulator: str, core: str, rom: str
+) -> None:
+    """Run the timed, popup-owning portion of an eligible gameStart hook."""
     coordinator = _coordinator(ctx)
     kwargs = {
         "system": system,
@@ -269,7 +290,9 @@ def game_start(
         "core": core,
         "rom": rom,
     }
-    if not coordinator.game_start_eligible(**kwargs):
+    with stage_timer("lifecycle-target-resolution"):
+        eligible = coordinator.game_start_eligible(**kwargs)
+    if not eligible:
         try:
             coordinator.game_start(**kwargs)
         except Exception:  # noqa: BLE001 - lifecycle hooks never block Batocera

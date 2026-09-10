@@ -31,6 +31,10 @@ from romcloud.core.remote_data import (
 from romcloud.core.models.savesync import SaveArtifact
 from romcloud.core.save_selection import SaveSelectionPolicy
 from romcloud.core.storage import StorageProvider
+from romcloud.infrastructure.diagnostics import (
+    increment_operation_counter,
+    stage_timer,
+)
 
 _CHUNK = 1024 * 1024
 
@@ -52,11 +56,14 @@ class DirectoryPromotion:
 def hash_file(path: Path) -> str:
     """sha256 hex digest of *path*'s content, streamed in chunks."""
     digest = hashlib.sha256()
+    increment_operation_counter("payload_opens")
     with path.open("rb") as fh:
         while True:
+            increment_operation_counter("payload_read_calls")
             chunk = fh.read(_CHUNK)
             if not chunk:
                 break
+            increment_operation_counter("payload_bytes_read", len(chunk))
             digest.update(chunk)
     return digest.hexdigest()
 
@@ -160,6 +167,7 @@ def scan_tree_report(
     opened, which is what keeps a transaction's own selected-path verification
     from reading every unrelated save in the destination tree.
     """
+    increment_operation_counter("manifest_observations")
     roots = policy.watch_roots(
         root,
         enabled_optional_systems=enabled_optional_systems,
@@ -199,6 +207,7 @@ def scan_mapped_tree_report(
     The returned paths are mapped into the same canonical ``ps3/rpcs3/dev_hdd0``
     namespace used by newer Batocera releases and by the remote dataset.
     """
+    increment_operation_counter("manifest_observations")
     roots = policy.watch_roots(
         root,
         canonical_prefix=f"{system}/{relative_prefix.strip('/')}",
@@ -263,6 +272,7 @@ def _scan_watch_roots(
                 continue
             if canonical in artifacts:
                 raise SaveSyncError(f"SaveSync found duplicate canonical path: {canonical}")
+            increment_operation_counter("payload_stats")
             status = file_path.stat()
             digest = (
                 hash_file(file_path)
@@ -486,14 +496,19 @@ def materialize(dest_path: Path, *, fresh_source: Path, unchanged_source: Option
             return
         except OSError:
             pass
-    with fresh_source.open("rb") as src, dest_path.open("wb") as dst:
-        while True:
-            chunk = src.read(_CHUNK)
-            if not chunk:
-                break
-            dst.write(chunk)
-        dst.flush()
-        os.fsync(dst.fileno())
+    with stage_timer("payload-transfer"):
+        increment_operation_counter("payload_opens", 2)
+        with fresh_source.open("rb") as src, dest_path.open("wb") as dst:
+            while True:
+                increment_operation_counter("payload_read_calls")
+                chunk = src.read(_CHUNK)
+                if not chunk:
+                    break
+                increment_operation_counter("payload_bytes_read", len(chunk))
+                increment_operation_counter("payload_bytes_transferred", len(chunk))
+                dst.write(chunk)
+            dst.flush()
+            os.fsync(dst.fileno())
 
 
 def new_staging_dir(sibling_of: Path) -> Path:

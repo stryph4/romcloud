@@ -126,7 +126,7 @@ SAFE_METADATA_KEYS = frozenset(
         "selected_side", "source", "stage", "status", "transaction_id",
         "transaction_root", "transaction_view", "trigger", "unchanged",
         "uploaded", "worker_state", "quick_ready", "duration_ms", "count",
-        "examined",
+        "examined", "total_ms", "stages", "counters",
         "attempts", "cache_hits", "hashed_files", "observations", "scanned_files",
         "sleep_ms", "stage_scope",
         "current_hash", "desired_hash", "previous_hash", "size_bytes", "detail",
@@ -165,6 +165,43 @@ _operation_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
 )
 _parent_operation_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "romcloud_diagnostic_parent_operation_id", default=None
+)
+
+
+@dataclass
+class OperationTiming:
+    """In-memory timing/counter roll-up for one correlated operation.
+
+    ``stage_timer`` remains the only phase timer. This accumulator merely
+    collects those already-recorded boundaries so an interactive lifecycle
+    operation and a hardware benchmark can emit the same concise summary.
+    It performs no filesystem or provider work of its own.
+    """
+
+    started_ns: int
+    stages: dict[str, dict[str, float | int]]
+    counters: dict[str, int]
+    total_ms: Optional[float] = None
+
+    def snapshot(self) -> dict[str, Any]:
+        total_ms = self.total_ms
+        if total_ms is None:
+            total_ms = round((time.monotonic_ns() - self.started_ns) / 1_000_000, 3)
+        return {
+            "total_ms": total_ms,
+            "stages": {
+                name: {
+                    "duration_ms": round(float(values["duration_ms"]), 3),
+                    "count": int(values["count"]),
+                }
+                for name, values in sorted(self.stages.items())
+            },
+            "counters": dict(sorted(self.counters.items())),
+        }
+
+
+_operation_timing: contextvars.ContextVar[Optional[OperationTiming]] = (
+    contextvars.ContextVar("romcloud_diagnostic_operation_timing", default=None)
 )
 _active_store: Optional["DiagnosticStore"] = None
 _active_store_lock = threading.RLock()
@@ -749,6 +786,8 @@ def operation(
     name: str, *, subsystem: str, source: Optional[str] = None,
     operation_id: Optional[str] = None, parent_operation_id: Optional[str] = None,
     metadata: Optional[Mapping[str, Any]] = None,
+    timing_logger: Optional[logging.Logger] = None,
+    timing_label: Optional[str] = None,
 ) -> Iterator[str]:
     """Bind one correlation ID to an entire synchronous workflow."""
     parent = parent_operation_id or _operation_id.get()
@@ -760,6 +799,8 @@ def operation(
     token_id = _operation_id.set(identifier)
     token_parent = _parent_operation_id.set(parent)
     started = time.monotonic_ns()
+    timing = OperationTiming(started, {}, {})
+    token_timing = _operation_timing.set(timing)
     fields = dict(metadata or {})
     fields.update({"operation_name": name, "source": source})
     event(subsystem, "operation.started", f"{name} started", metadata=fields)
@@ -778,12 +819,55 @@ def operation(
             metadata={**fields, "status": "success", "duration_ms": (time.monotonic_ns() - started) // 1_000_000},
         )
     finally:
+        timing.total_ms = round((time.monotonic_ns() - started) / 1_000_000, 3)
+        summary = timing.snapshot()
+        with contextlib.suppress(Exception):
+            event(
+                subsystem,
+                "operation.timing_summary",
+                f"{name} timing summary",
+                metadata={
+                    "operation_name": name,
+                    "total_ms": summary["total_ms"],
+                    "stages": summary["stages"],
+                    "counters": summary["counters"],
+                },
+            )
+        if timing_logger is not None:
+            with contextlib.suppress(Exception):
+                timing_logger.info(
+                    "SaveSync timing summary: operation=%s total_ms=%.3f stages=%s counters=%s",
+                    timing_label or name,
+                    summary["total_ms"],
+                    json.dumps(summary["stages"], sort_keys=True, separators=(",", ":")),
+                    json.dumps(summary["counters"], sort_keys=True, separators=(",", ":")),
+                )
+        _operation_timing.reset(token_timing)
         _parent_operation_id.reset(token_parent)
         _operation_id.reset(token_id)
 
 
 def current_operation_id() -> Optional[str]:
     return _operation_id.get()
+
+
+def current_timing_snapshot() -> dict[str, Any]:
+    """Return a read-only copy of the active operation's measurements."""
+    timing = _operation_timing.get()
+    return timing.snapshot() if timing is not None else {
+        "total_ms": 0.0,
+        "stages": {},
+        "counters": {},
+    }
+
+
+def increment_operation_counter(name: str, amount: int = 1) -> None:
+    """Count work already occurring inside the active operation, fail-open."""
+    timing = _operation_timing.get()
+    if timing is None or amount == 0:
+        return
+    with contextlib.suppress(Exception):
+        timing.counters[name] = timing.counters.get(name, 0) + int(amount)
 
 
 @contextlib.contextmanager
@@ -809,6 +893,17 @@ def stage_timer(
     try:
         yield fields
     finally:
+        duration_ms = round((time.monotonic_ns() - started) / 1_000_000, 3)
+        timing = _operation_timing.get()
+        if timing is not None:
+            with contextlib.suppress(Exception):
+                accumulated = timing.stages.setdefault(
+                    stage, {"duration_ms": 0.0, "count": 0}
+                )
+                accumulated["duration_ms"] = (
+                    float(accumulated["duration_ms"]) + duration_ms
+                )
+                accumulated["count"] = int(accumulated["count"]) + 1
         with contextlib.suppress(Exception):
             event(
                 subsystem,
@@ -817,7 +912,7 @@ def stage_timer(
                 metadata={
                     **fields,
                     "stage": stage,
-                    "duration_ms": (time.monotonic_ns() - started) // 1_000_000,
+                    "duration_ms": duration_ms,
                 },
             )
 

@@ -24,6 +24,7 @@ from romcloud.core.remote_data import (
 from romcloud.core.save_selection import SaveSelectionPolicy
 from romcloud.core.storage import StorageAccessResult
 from romcloud.infrastructure import save_tree, savesync_journal
+from romcloud.infrastructure.diagnostics import increment_operation_counter
 
 
 class RemoteSaveStore(ABC):
@@ -53,6 +54,7 @@ class RemoteSaveStore(ABC):
         return str(self._connectivity_root)
 
     def validate_access(self) -> StorageAccessResult:
+        increment_operation_counter("remote_access_checks")
         return self._provider.validate_access(self._connectivity_root)
 
     def is_readable(self) -> bool:
@@ -157,6 +159,7 @@ class FilesystemRemoteSaveStore(RemoteSaveStore):
     ) -> save_tree.ScanReport:
         if operation is not None:
             operation.check()
+        increment_operation_counter("remote_manifest_scan_calls")
         del cache  # never trusted: this root may be a network-backed mount
         return save_tree.scan_tree_report(
             self._root,
@@ -174,6 +177,7 @@ class FilesystemRemoteSaveStore(RemoteSaveStore):
         operation: Optional[RemoteOperationContext] = None,
     ) -> Path:
         relative_path = validate_logical_key(relative_path)
+        increment_operation_counter("remote_materializations")
         if operation is not None:
             operation.check()
         # SaveSelectionPolicy has already validated the canonical key. The

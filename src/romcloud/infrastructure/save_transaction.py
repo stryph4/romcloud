@@ -30,6 +30,8 @@ from romcloud.infrastructure.logging import get_logger
 from romcloud.infrastructure.diagnostics import (
     current_operation_id,
     event as diagnostic_event,
+    increment_operation_counter,
+    stage_timer,
 )
 from romcloud.infrastructure.save_tree import hash_file, materialize
 
@@ -426,12 +428,17 @@ def apply_transaction(
     try:
         # A final full positive scan closes the preview/stage window.  It also
         # detects newly-created eligible paths, not merely edits to known files.
-        for view in transaction.views:
-            verify_current(view.root, view.verification_current)
-        for view in transaction.views:
-            _apply_view(view, transaction)
-        for view in transaction.views:
-            verify_desired(view.root, view.verification_desired)
+        with stage_timer("pre-promotion-verification"):
+            increment_operation_counter("verification_passes")
+            for view in transaction.views:
+                verify_current(view.root, view.verification_current)
+        with stage_timer("promotion-materialization"):
+            for view in transaction.views:
+                _apply_view(view, transaction)
+        with stage_timer("post-promotion-verification"):
+            increment_operation_counter("verification_passes")
+            for view in transaction.views:
+                verify_desired(view.root, view.verification_desired)
         for view in transaction.views:
             _fsync_changed_live_paths(view)
         _write_journal(transaction, phase="promoted")
@@ -665,13 +672,16 @@ def _materialize_manifest(
 
 
 def _verify_manifest(root: Path, manifest: dict[str, SaveArtifact]) -> None:
-    for relative, artifact in manifest.items():
-        _verify_one(_safe_target(root, relative, create_parents=False), artifact)
+    with stage_timer("staged-payload-verification"):
+        increment_operation_counter("verification_passes")
+        for relative, artifact in manifest.items():
+            _verify_one(_safe_target(root, relative, create_parents=False), artifact)
 
 
 def _verify_one(path: Path, artifact: SaveArtifact) -> None:
     if path.is_symlink() or not path.is_file():
         raise SaveSyncVerificationError(f"Expected staged save file is missing: {path}")
+    increment_operation_counter("payload_stats")
     stat = path.stat()
     if stat.st_size != artifact.size_bytes or hash_file(path) != artifact.content_hash:
         raise SaveSyncVerificationError(f"SaveSync content verification failed: {path}")
@@ -683,6 +693,7 @@ def _path_matches(path: Path, artifact: Optional[SaveArtifact]) -> bool:
     if path.is_symlink() or not path.is_file():
         return False
     try:
+        increment_operation_counter("payload_stats")
         return (
             path.stat().st_size == artifact.size_bytes
             and hash_file(path) == artifact.content_hash

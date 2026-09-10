@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Iterator
 
 from romcloud.core.exceptions import SaveSyncError
+from romcloud.infrastructure.diagnostics import increment_operation_counter
 
 SCHEMA_VERSION = 1
 MAX_HISTORY = 512
@@ -129,6 +130,7 @@ def journal_lock(path: Path) -> Iterator[None]:
 
     lock_path = Path(path).with_name(".savesync-journal.lock")
     with savesync_commit.exclusive_lock(lock_path):
+        increment_operation_counter("journal_lock_acquisitions")
         yield
 
 

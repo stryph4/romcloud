@@ -13,6 +13,7 @@ never mutually excluded. Nothing in this file claims otherwise.
 from __future__ import annotations
 
 import hashlib
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -23,7 +24,7 @@ from romcloud.core.exceptions import (
     SaveSyncVerificationError,
 )
 from romcloud.core.storage import ProviderCapabilities, StorageProvider
-from romcloud.infrastructure import savesync_commit, savesync_index
+from romcloud.infrastructure import diagnostics, savesync_commit, savesync_index
 from romcloud.services.saves import SaveSyncService
 
 from tests.unit._savesync_protocol_helpers import (
@@ -523,3 +524,33 @@ class TestCommitLockExclusion:
         # Re-acquirable, so nothing leaked.
         with savesync_commit.commit_lock(root):
             pass
+
+    def test_service_counts_one_successful_commit_root_acquisition(
+        self, tmp_path: Path
+    ):
+        device = _device(tmp_path, "device-a")
+        with diagnostics.operation("count commit lock", subsystem="savesync"):
+            with device._remote_commit_scope():
+                device._enter_remote_commit()
+                # Re-entry is deliberately a no-op for the already-held root.
+                device._enter_remote_commit()
+            counters = diagnostics.current_timing_snapshot()["counters"]
+        assert counters["remote_commit_lock_acquisitions"] == 1
+
+    def test_failed_commit_root_acquisition_is_not_counted(
+        self, tmp_path: Path, monkeypatch
+    ):
+        device = _device(tmp_path, "device-a")
+
+        @contextmanager
+        def failed_lock(_root):
+            raise OSError("lock unavailable")
+            yield  # pragma: no cover - makes this a context manager
+
+        monkeypatch.setattr(savesync_commit, "commit_lock", failed_lock)
+        with diagnostics.operation("failed commit lock", subsystem="savesync"):
+            with pytest.raises(OSError, match="lock unavailable"):
+                with device._remote_commit_scope():
+                    device._enter_remote_commit()
+            counters = diagnostics.current_timing_snapshot()["counters"]
+        assert counters.get("remote_commit_lock_acquisitions", 0) == 0

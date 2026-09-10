@@ -19,7 +19,7 @@ from romcloud.core.capabilities import CapabilityPolicy, OperatingMode
 from romcloud.core.exceptions import SaveSyncError
 from romcloud.core.save_selection import DEFAULT_SAVE_SELECTION_POLICY, SaveSelectionPolicy
 from romcloud.core.storage import ProviderCapabilities, StorageProvider
-from romcloud.infrastructure import savesync_index, savesync_prompts
+from romcloud.infrastructure import diagnostics, savesync_index, savesync_prompts
 from romcloud.infrastructure.ps1_memory_card import (
     BLOCK_SIZE,
     CARD_SIZE,
@@ -361,6 +361,55 @@ class TestGameStartOwnedDataset:
         assert (tmp_path / "local" / "snes" / "Super Metroid.srm").read_bytes() == b"peer-advanced"
         payload = _session_payload(tmp_path, system="snes", rom="Super Metroid.sfc")
         assert payload["sync_outcome"] == "synchronized"
+
+    def test_targeted_remote_newer_exposes_phase_timings_and_io_counts(
+        self, tmp_path: Path
+    ):
+        provider = _Provider()
+        service = _service(tmp_path, provider)
+        local = tmp_path / "local/snes/Super Metroid.srm"
+        _write(local, b"base")
+        service.full_sync()
+        seed_peer_commit(
+            service,
+            remote_root=tmp_path / "remote",
+            relative_path="snes/Super Metroid.srm",
+            content=b"peer-advanced",
+        )
+
+        with diagnostics.operation("targeted gameStart", subsystem="savesync"):
+            result = service.targeted_game_start_sync(
+                {"retroarch-root-snes/super metroid": "retroarch-root-snes"}
+            )
+            timing = diagnostics.current_timing_snapshot()
+
+        assert result.report is not None and result.report.downloaded == 1
+        assert {
+            "remote-readiness",
+            "protocol-ownership-resolution",
+            "head-read",
+            "layout-shard-read",
+            "journal-generation-check",
+            "scan-local",
+            "scan-remote",
+            "reconciliation-planning",
+            "staging",
+            "payload-transfer",
+            "staging-verify",
+            "staging-verify-remote",
+            "transaction-apply",
+            "promotion-materialization",
+            "final-verify",
+            "final-verify-remote",
+            "local-state-persistence",
+        }.issubset(timing["stages"])
+        assert timing["counters"]["head_reads"] >= 1
+        assert timing["counters"]["shard_reads"] >= 1
+        assert timing["counters"]["payload_opens"] >= 1
+        assert timing["counters"]["payload_read_calls"] >= 1
+        assert timing["counters"]["payload_stats"] >= 1
+        assert timing["counters"]["remote_manifest_observations"] >= 1
+        assert timing["counters"]["verification_passes"] >= 1
 
     def test_peer_advanced_with_no_local_dirty_hint(self, tmp_path: Path):
         provider = _Provider()

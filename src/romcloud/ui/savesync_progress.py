@@ -33,7 +33,13 @@ _SUBPROCESS_EXIT_GRACE_SECONDS = 3.0
 
 
 class SaveSyncProgressLike(Protocol):
-    def stage(self, text: str) -> None: ...
+    def stage(
+        self,
+        text: str,
+        *,
+        current: Optional[int] = None,
+        total: Optional[int] = None,
+    ) -> None: ...
 
     def close(self, ok: bool, message: Optional[str] = None) -> None: ...
 
@@ -43,7 +49,13 @@ class SaveSyncProgressLike(Protocol):
 class NullSaveSyncProgress:
     """No-op reporter used whenever the graphical popup is unavailable."""
 
-    def stage(self, text: str) -> None:  # noqa: ARG002
+    def stage(
+        self,
+        text: str,
+        *,
+        current: Optional[int] = None,
+        total: Optional[int] = None,
+    ) -> None:  # noqa: ARG002
         return None
 
     def close(self, ok: bool, message: Optional[str] = None) -> None:  # noqa: ARG002
@@ -64,13 +76,35 @@ class SaveSyncProgressReporter:
     def __init__(self, proc: "subprocess.Popen[str]") -> None:
         self._proc = proc
         self._closed = False
-        self._last_stage: Optional[str] = None
+        self._last_stage: Optional[tuple[str, Optional[int], Optional[int]]] = None
 
-    def stage(self, text: str) -> None:
-        if text == self._last_stage:
+    def stage(
+        self,
+        text: str,
+        *,
+        current: Optional[int] = None,
+        total: Optional[int] = None,
+    ) -> None:
+        if (
+            current is None
+            or total is None
+            or isinstance(current, bool)
+            or isinstance(total, bool)
+            or current < 0
+            or total <= 0
+        ):
+            current = None
+            total = None
+        else:
+            current = min(current, total)
+        stage = (text, current, total)
+        if stage == self._last_stage:
             return
-        self._last_stage = text
-        self._send({"stage": text})
+        self._last_stage = stage
+        event: dict[str, object] = {"stage": text}
+        if current is not None and total is not None:
+            event.update({"current": current, "total": total})
+        self._send(event)
 
     def close(self, ok: bool, message: Optional[str] = None) -> None:
         if self._closed:

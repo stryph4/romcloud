@@ -211,7 +211,13 @@ class SaveSyncProgressReporterLike(Protocol):
     every real implementation must already be fail-open (never raise).
     """
 
-    def stage(self, text: str) -> None: ...
+    def stage(
+        self,
+        text: str,
+        *,
+        current: Optional[int] = None,
+        total: Optional[int] = None,
+    ) -> None: ...
 
     def close(self, ok: bool, message: Optional[str] = None) -> None: ...
 
@@ -220,7 +226,13 @@ class _NullSaveSyncProgress:
     """Default no-op progress reporter — every other trigger (periodic
     menu tick, remote reconnect, drain-pending) never shows a popup."""
 
-    def stage(self, text: str) -> None:  # noqa: ARG002
+    def stage(
+        self,
+        text: str,
+        *,
+        current: Optional[int] = None,
+        total: Optional[int] = None,
+    ) -> None:  # noqa: ARG002
         return None
 
     def close(self, ok: bool, message: Optional[str] = None) -> None:  # noqa: ARG002
@@ -237,14 +249,32 @@ class _SafeProgress:
 
     def __init__(self, inner: SaveSyncProgressReporterLike) -> None:
         self._inner = inner
-        self._last_stage: Optional[str] = None
+        self._last_stage: Optional[tuple[str, Optional[int], Optional[int]]] = None
 
-    def stage(self, text: str) -> None:
-        if text == self._last_stage:
+    def stage(
+        self,
+        text: str,
+        *,
+        current: Optional[int] = None,
+        total: Optional[int] = None,
+    ) -> None:
+        stage = (text, current, total)
+        if stage == self._last_stage:
             return
-        self._last_stage = text
+        self._last_stage = stage
         try:
-            self._inner.stage(text)
+            if current is None or total is None:
+                self._inner.stage(text)
+            else:
+                self._inner.stage(text, current=current, total=total)
+        except TypeError:
+            # Compatibility with older/custom presentation-only reporters.
+            # They still receive truthful phase text; only the optional byte
+            # fields are omitted.
+            try:
+                self._inner.stage(text)
+            except Exception:  # noqa: BLE001 - UI failures never affect SaveSync
+                log.warning("SaveSync progress popup stage update failed", exc_info=True)
         except Exception:  # noqa: BLE001 - UI failures must never affect SaveSync
             log.warning("SaveSync progress popup stage update failed", exc_info=True)
 
@@ -267,8 +297,16 @@ def _lifecycle_progress_sink(
     """
 
     def report(event: ProgressEvent) -> None:
+        byte_progress = (
+            event.current,
+            event.total,
+        ) if event.current is not None and event.total is not None else (None, None)
         if event.stage == "preflight" and event.status == "running":
-            progress.stage("Comparing save versions…")
+            progress.stage(
+                "Comparing save versions…",
+                current=byte_progress[0],
+                total=byte_progress[1],
+            )
             return
         if event.stage == "preflight":
             metadata = event.metadata or {}
@@ -284,7 +322,11 @@ def _lifecycle_progress_sink(
                 progress.stage("Save conflict found.")
             return
         if event.stage == "verify" and event.status == "running":
-            progress.stage("Verifying save…")
+            progress.stage(
+                "Verifying save…",
+                current=byte_progress[0],
+                total=byte_progress[1],
+            )
 
     return report
 
@@ -338,9 +380,10 @@ class AutoSaveSyncCoordinator:
         """
         if not self._enabled:
             return ()
-        session = self._sessions.start(
-            system=system, emulator=emulator, core=core, rom=rom
-        )
+        with stage_timer("lifecycle-session-record"):
+            session = self._sessions.start(
+                system=system, emulator=emulator, core=core, rom=rom
+            )
         session_path = self._sessions._path(system, rom)
         log.info(
             "gameStart session recorded: system=%s emulator=%s core=%s rom=%s "
@@ -383,7 +426,8 @@ class AutoSaveSyncCoordinator:
         """Return whether gameStart has a locally provable safe target."""
         if not self._enabled:
             return False
-        layout_ids = layout_ids_for_session(self._policy, system, emulator, core)
+        with stage_timer("lifecycle-target-resolution"):
+            layout_ids = layout_ids_for_session(self._policy, system, emulator, core)
         if not layout_ids:
             return False
         try:
@@ -438,7 +482,8 @@ class AutoSaveSyncCoordinator:
             return ()
 
         try:
-            group_layout_map = self._resolve_game_start_targets(layout_ids, rom)
+            with stage_timer("lifecycle-target-resolution"):
+                group_layout_map = self._resolve_game_start_targets(layout_ids, rom)
         except Exception:  # noqa: BLE001 - gameStart must never block a launch
             log.warning(
                 "gameStart target resolution failed; continuing launch: "

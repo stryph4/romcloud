@@ -83,6 +83,7 @@ from romcloud.infrastructure.diagnostics import (
     correlated_operation,
     current_operation_id,
     event as diagnostic_event,
+    increment_operation_counter,
     stage_timer,
 )
 from romcloud.infrastructure import savesync_state as durable_state
@@ -1432,6 +1433,7 @@ class SaveSyncService:
         directory for :meth:`_remote_path` to fetch into — always cleaned
         up when the operation ends, success or failure."""
         with self._operation_lock():
+            increment_operation_counter("state_lock_acquisitions")
             scratch = _ScratchDir(self._state_path.parent)
             previous = self._active_read_scratch
             self._active_read_scratch = scratch
@@ -1636,6 +1638,7 @@ class SaveSyncService:
         self, layout_ids: frozenset[str]
     ) -> save_tree.ScanReport:
         """Scan only explicit registry roots associated with a game session."""
+        increment_operation_counter("local_manifest_observations")
         layouts = tuple(
             layout
             for layout in self._policy.layouts
@@ -1689,6 +1692,7 @@ class SaveSyncService:
         self, layout_ids: frozenset[str], *, only_relative_paths: Optional[frozenset[str]] = None
     ) -> save_tree.ScanReport:
         assert self._remote_store is not None
+        increment_operation_counter("remote_manifest_observations")
         layouts = tuple(
             layout
             for layout in self._policy.layouts
@@ -2272,6 +2276,7 @@ class SaveSyncService:
             return
         with stage_timer("commit-lock-wait"):
             stack.enter_context(savesync_commit.commit_lock(root))
+        increment_operation_counter("remote_commit_lock_acquisitions")
         self._commit_lock_held = True
 
     def _changed_remote_groups(
@@ -2412,14 +2417,15 @@ class SaveSyncService:
 
     def _save_index_watermark(self, watermark: _IndexWatermark) -> None:
         try:
-            durable_state.write_json_document(
-                self._index_watermark_path(),
-                {
-                    "dataset_id": watermark.dataset_id,
-                    "index_generation": watermark.index_generation,
-                    "layout_generations": watermark.layout_generations,
-                },
-            )
+            with stage_timer("local-state-persistence"):
+                durable_state.write_json_document(
+                    self._index_watermark_path(),
+                    {
+                        "dataset_id": watermark.dataset_id,
+                        "index_generation": watermark.index_generation,
+                        "layout_generations": watermark.layout_generations,
+                    },
+                )
         except (OSError, SaveSyncError):
             log.warning("Could not persist SaveSync index watermark", exc_info=True)
 
@@ -2541,15 +2547,19 @@ class SaveSyncService:
             return SaveGameStartSyncResult(status="skipped", reason="no-target-group")
 
         self._capabilities.require(Capability.SAVE_SYNC, "Targeted gameStart sync")
-        self._require_remote()
-        self._require_filesystem_remote("Targeted gameStart sync")
-        self._require_durable_remote("Targeted gameStart sync")
-        if not self.is_remote_reachable():
-            raise SaveSyncConnectivityError(
-                f"Remote save location is not reachable: {self._connectivity_root}"
-            )
+        with stage_timer("remote-readiness"):
+            self._require_remote()
+            self._require_filesystem_remote("Targeted gameStart sync")
+            self._require_durable_remote("Targeted gameStart sync")
+            if not self.is_remote_reachable():
+                raise SaveSyncConnectivityError(
+                    f"Remote save location is not reachable: {self._connectivity_root}"
+                )
 
-        dataset = self._require_commit_ready_dataset(operation="Targeted gameStart sync")
+        with stage_timer("protocol-ownership-resolution"):
+            dataset = self._require_commit_ready_dataset(
+                operation="Targeted gameStart sync"
+            )
         if dataset.ownership is savesync_index.DatasetOwnership.OWNED:
             return self._targeted_game_start_sync_owned(
                 dataset,
@@ -2632,7 +2642,8 @@ class SaveSyncService:
             # Same cheap, unconditional divergence check Quick Sync performs
             # even on its empty fast path — proof an old, non-participating
             # writer touched the dataset without a matching index rebuild.
-            journal_generation = self._current_journal_generation()
+            with stage_timer("journal-generation-check"):
+                journal_generation = self._current_journal_generation()
             if savesync_index.journal_diverged(head, journal_generation):
                 log.warning(
                     "gameStart pre-launch sync found journal/index divergence: "
@@ -4673,49 +4684,50 @@ class SaveSyncService:
             original_local = dict(local_report.artifacts)
             original_remote = dict(remote_report.artifacts)
             physical_baseline = dict(baseline)
-            container_work = self._prepare_container_reconciliation(
-                local=original_local,
-                remote=original_remote,
-                state=state,
-                upload_only=upload_only,
-                repair_local_group_ids=repair_local_group_ids,
-            )
-            if container_work.handled_paths:
-                local_report = replace(
+            with stage_timer("reconciliation-planning"):
+                container_work = self._prepare_container_reconciliation(
+                    local=original_local,
+                    remote=original_remote,
+                    state=state,
+                    upload_only=upload_only,
+                    repair_local_group_ids=repair_local_group_ids,
+                )
+                if container_work.handled_paths:
+                    local_report = replace(
+                        local_report,
+                        artifacts={
+                            path: artifact
+                            for path, artifact in local_report.artifacts.items()
+                            if path not in container_work.handled_paths
+                        },
+                    )
+                    remote_report = replace(
+                        remote_report,
+                        artifacts={
+                            path: artifact
+                            for path, artifact in remote_report.artifacts.items()
+                            if path not in container_work.handled_paths
+                        },
+                    )
+                    baseline = {
+                        path: artifact
+                        for path, artifact in baseline.items()
+                        if path not in container_work.handled_paths
+                    }
+                plan = _reconcile_plan(
                     local_report,
-                    artifacts={
-                        path: artifact
-                        for path, artifact in local_report.artifacts.items()
-                        if path not in container_work.handled_paths
-                    },
-                )
-                remote_report = replace(
                     remote_report,
-                    artifacts={
-                        path: artifact
-                        for path, artifact in remote_report.artifacts.items()
-                        if path not in container_work.handled_paths
-                    },
+                    baseline,
+                    policy=self._policy,
+                    scope=(
+                        "pending_dirty"
+                        if selected_group_ids is not None
+                        else "journal-layout"
+                        if selected_layout_ids is not None
+                        else "all_eligible"
+                    ),
+                    repair_local_group_ids=repair_local_group_ids,
                 )
-                baseline = {
-                    path: artifact
-                    for path, artifact in baseline.items()
-                    if path not in container_work.handled_paths
-                }
-            plan = _reconcile_plan(
-                local_report,
-                remote_report,
-                baseline,
-                policy=self._policy,
-                scope=(
-                    "pending_dirty"
-                    if selected_group_ids is not None
-                    else "journal-layout"
-                    if selected_layout_ids is not None
-                    else "all_eligible"
-                ),
-                repair_local_group_ids=repair_local_group_ids,
-            )
             decision_counts = {
                 action.value: len(
                     {
@@ -4818,15 +4830,16 @@ class SaveSyncService:
                         )
                     )
                 self._log_transaction_root_collisions(selected_views)
-                transaction = (
-                    save_transaction.prepare_transaction(
-                        self._transaction_journal_path,
-                        selected_views,
-                        operation_id=operation_id,
+                with stage_timer("staging"):
+                    transaction = (
+                        save_transaction.prepare_transaction(
+                            self._transaction_journal_path,
+                            selected_views,
+                            operation_id=operation_id,
+                        )
+                        if selected_views
+                        else None
                     )
-                    if selected_views
-                    else None
-                )
                 log.info(
                     "SaveSync transaction start: operation_id=%s correlation_id=%s scope=%s "
                     "remote_write=%s local_write=%s destination_views=%d "
@@ -4866,19 +4879,25 @@ class SaveSyncService:
                 )
                 if verification_layout_ids is None:
                     with stage_timer("staging-verify"):
-                        current_local = self._scan_automatic_local()
-                        current_remote = self._scan_automatic_remote()
+                        increment_operation_counter("verification_passes")
+                        with stage_timer("staging-verify-local"):
+                            current_local = self._scan_automatic_local()
+                        with stage_timer("staging-verify-remote"):
+                            current_remote = self._scan_automatic_remote()
                 else:
                     with stage_timer("staging-verify"):
-                        current_local = self._automatic_report(
-                            self._scan_local_layouts(verification_layout_ids)
-                        )
-                        current_remote = self._automatic_report(
-                            self._scan_remote_layouts(
-                                verification_layout_ids,
-                                only_relative_paths=verification_remote_scope_paths,
+                        increment_operation_counter("verification_passes")
+                        with stage_timer("staging-verify-local"):
+                            current_local = self._automatic_report(
+                                self._scan_local_layouts(verification_layout_ids)
                             )
-                        )
+                        with stage_timer("staging-verify-remote"):
+                            current_remote = self._automatic_report(
+                                self._scan_remote_layouts(
+                                    verification_layout_ids,
+                                    only_relative_paths=verification_remote_scope_paths,
+                                )
+                            )
                 if (
                     current_local.artifacts != complete_local
                     or current_remote.artifacts != complete_remote
@@ -4919,19 +4938,24 @@ class SaveSyncService:
                 # Post-mutation proof must read the real bytes now on disk, so
                 # this scan deliberately bypasses observation reuse entirely.
                 with self._fresh_observations(), stage_timer("final-verify"):
+                    increment_operation_counter("verification_passes")
                     if verification_layout_ids is None:
-                        final_local_report = self._scan_automatic_local()
-                        final_remote_report = self._scan_automatic_remote()
+                        with stage_timer("final-verify-local"):
+                            final_local_report = self._scan_automatic_local()
+                        with stage_timer("final-verify-remote"):
+                            final_remote_report = self._scan_automatic_remote()
                     else:
-                        final_local_report = self._automatic_report(
-                            self._scan_local_layouts(verification_layout_ids)
-                        )
-                        final_remote_report = self._automatic_report(
-                            self._scan_remote_layouts(
-                                verification_layout_ids,
-                                only_relative_paths=verification_remote_scope_paths,
+                        with stage_timer("final-verify-local"):
+                            final_local_report = self._automatic_report(
+                                self._scan_local_layouts(verification_layout_ids)
                             )
-                        )
+                        with stage_timer("final-verify-remote"):
+                            final_remote_report = self._automatic_report(
+                                self._scan_remote_layouts(
+                                    verification_layout_ids,
+                                    only_relative_paths=verification_remote_scope_paths,
+                                )
+                            )
                 if (
                     final_local_report.artifacts
                     != (
@@ -6724,7 +6748,8 @@ def _read_state(path: Path) -> SaveSyncState:
 
 
 def _write_state(path: Path, state: SaveSyncState) -> None:
-    durable_state.write_state(path, state)
+    with stage_timer("local-state-persistence"):
+        durable_state.write_state(path, state)
 
 
 def _baseline_manifest(state: SaveSyncState) -> dict[str, SaveArtifact]:

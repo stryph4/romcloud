@@ -36,6 +36,10 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from romcloud.core.exceptions import SaveSyncError
+from romcloud.infrastructure.diagnostics import (
+    increment_operation_counter,
+    stage_timer,
+)
 
 SCHEMA_VERSION = 1
 PROTOCOL_VERSION = 1
@@ -432,10 +436,12 @@ def write_shard(index_root: Path, shard: IndexShard) -> IndexLayoutHead:
 
 def load_shard(index_root: Path, layout_id: str, layout_head: IndexLayoutHead) -> IndexShard:
     path = Path(index_root) / "layouts" / layout_head.object
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise SaveSyncError(f"Cannot read SaveSync index shard: {path}") from exc
+    with stage_timer("layout-shard-read", metadata={"layout_id": layout_id}):
+        increment_operation_counter("shard_reads")
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise SaveSyncError(f"Cannot read SaveSync index shard: {path}") from exc
     try:
         payload = json.loads(raw)
     except ValueError as exc:
@@ -465,10 +471,12 @@ def load_head(index_root: Path) -> Optional[IndexHead]:
     path = head_path(index_root)
     if not path.exists():
         return None
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise SaveSyncError(f"SaveSync index HEAD is corrupt: {path}") from exc
+    with stage_timer("head-read"):
+        increment_operation_counter("head_reads")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise SaveSyncError(f"SaveSync index HEAD is corrupt: {path}") from exc
     return validate_head_document(payload, path=path)
 
 
@@ -1112,5 +1120,4 @@ def committed_transaction_ids(index_root: Path, head: Optional[IndexHead]) -> fr
             if group.completed_transaction_id:
                 receipts.add(group.completed_transaction_id)
     return frozenset(receipts)
-
 
