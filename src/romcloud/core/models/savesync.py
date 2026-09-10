@@ -500,3 +500,19 @@ class SaveQuickSyncResult:
     processed_groups: tuple[str, ...] = ()
     reason: str = ""
     report: Optional[SaveReconcileReport] = None
+
+
+@dataclass(frozen=True)
+class SaveGameStartSyncResult:
+    """Result of a targeted, best-effort pre-launch synchronization pass.
+
+    This is never a launch gate — every status here still means "the game
+    may proceed." ``group_ids`` names the resolved per-game target(s) this
+    attempt covered, regardless of outcome.
+    """
+
+    status: str
+    """One of: synchronized, skipped, unresolved."""
+    reason: str = ""
+    group_ids: frozenset[str] = frozenset()
+    report: Optional[SaveReconcileReport] = None

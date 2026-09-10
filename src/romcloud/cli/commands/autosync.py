@@ -16,6 +16,10 @@ from romcloud.infrastructure import savesync_prompts
 from romcloud.infrastructure.config import load_config
 from romcloud.infrastructure.library_view import operating_mode
 from romcloud.infrastructure.logging import get_logger
+from romcloud.infrastructure.diagnostics import (
+    operation as diagnostic_operation,
+    stage_timer,
+)
 from romcloud.integrations.batocera import auto_savesync as batocera_auto_savesync
 from romcloud.services.auto_savesync import ActiveSessionStore, AutoSaveSyncCoordinator
 from romcloud.ui.savesync_progress import NullSaveSyncProgress, start_savesync_progress
@@ -81,8 +85,53 @@ def _resolve_ports_launcher(data_root: Path) -> Path:
     )
 
 
+def _start_lifecycle_progress(data_root: Path, *, operation: str):  # noqa: ANN201
+    """Create the one shared gameStart/gameStop SaveSync presenter."""
+    with stage_timer("progress-popup-startup"):
+        launcher = _resolve_ports_launcher(data_root)
+        progress = start_savesync_progress(
+            launcher,
+            initial_stage=(
+                "Checking save…"
+                if operation == "gameStart"
+                else "Checking save changes…"
+            ),
+        )
+    log.info(
+        "%s progress reporter initialized: launcher=%s launcher_exists=%s "
+        "reporter=%s operation_id=%s",
+        operation,
+        launcher,
+        launcher.is_file(),
+        type(progress).__name__,
+        os.environ.get("ROMCLOUD_DIAGNOSTIC_OPERATION_ID", "none"),
+    )
+    if isinstance(progress, NullSaveSyncProgress):
+        log.warning(
+            "%s progress popup unavailable: launcher=%s launcher_exists=%s",
+            operation,
+            launcher,
+            launcher.is_file(),
+        )
+    return progress
+
+
+def _wait_for_progress_close(progress) -> None:  # noqa: ANN001
+    """Wait only where launch ordering requires the overlay to be gone."""
+    try:
+        with stage_timer("progress-popup-shutdown"):
+            wait_until_closed = getattr(progress, "wait_until_closed", None)
+            if callable(wait_until_closed):
+                wait_until_closed()
+    except Exception:  # noqa: BLE001 - UI failure never blocks game launch
+        log.warning("Could not wait for SaveSync progress popup to close", exc_info=True)
+
+
 def _launch_pending_conflict_popup(
-    data_root: Path, *, lifecycle_caller_pid: int | None = None
+    data_root: Path,
+    *,
+    lifecycle_caller_pid: int | None = None,
+    wait_for_frontend: bool = True,
 ) -> None:
     """Run the focused system-Python UI after releasing every sync lock."""
     pending = savesync_prompts.pending_ids(data_root)
@@ -106,33 +155,34 @@ def _launch_pending_conflict_popup(
                 ",".join(pending),
             )
             return
-        log.info(
-            "EmulationStation readiness wait started: caller_pid=%s timeout=%.1fs",
-            lifecycle_caller_pid or "unknown",
-            batocera_auto_savesync.ES_READINESS_TIMEOUT_SECONDS,
-        )
-        readiness = batocera_auto_savesync.wait_for_emulationstation_display(
-            lifecycle_caller_pid
-        )
-        if not readiness.ready:
-            log.warning(
-                "EmulationStation readiness wait timed out: elapsed=%.3fs "
-                "attempts=%d signal=%s detail=%s; conflict prompt remains queued "
-                "for manual resolution",
+        if wait_for_frontend:
+            log.info(
+                "EmulationStation readiness wait started: caller_pid=%s timeout=%.1fs",
+                lifecycle_caller_pid or "unknown",
+                batocera_auto_savesync.ES_READINESS_TIMEOUT_SECONDS,
+            )
+            readiness = batocera_auto_savesync.wait_for_emulationstation_display(
+                lifecycle_caller_pid
+            )
+            if not readiness.ready:
+                log.warning(
+                    "EmulationStation readiness wait timed out: elapsed=%.3fs "
+                    "attempts=%d signal=%s detail=%s; conflict prompt remains queued "
+                    "for manual resolution",
+                    readiness.elapsed_seconds,
+                    readiness.attempts,
+                    readiness.signal,
+                    readiness.detail,
+                )
+                return
+            log.info(
+                "EmulationStation readiness condition satisfied: elapsed=%.3fs "
+                "attempts=%d signal=%s detail=%s",
                 readiness.elapsed_seconds,
                 readiness.attempts,
                 readiness.signal,
                 readiness.detail,
             )
-            return
-        log.info(
-            "EmulationStation readiness condition satisfied: elapsed=%.3fs "
-            "attempts=%d signal=%s detail=%s",
-            readiness.elapsed_seconds,
-            readiness.attempts,
-            readiness.signal,
-            readiness.detail,
-        )
         pending = savesync_prompts.pending_ids(data_root)
         if not pending:
             log.info(
@@ -165,18 +215,19 @@ def _launch_pending_conflict_popup(
             display_environment,
         )
         try:
-            with process_log.open("a", encoding="utf-8") as output:
-                result = subprocess.run(
-                    [str(launcher), "--savesync-conflicts"],
-                    stdin=subprocess.DEVNULL,
-                    stdout=output,
-                    stderr=output,
-                    check=False,
-                    close_fds=True,
-                    start_new_session=True,
-                    cwd=str(data_root.parent),
-                    env=environment,
-                )
+            with stage_timer("conflict-popup-startup-shutdown"):
+                with process_log.open("a", encoding="utf-8") as output:
+                    result = subprocess.run(
+                        [str(launcher), "--savesync-conflicts"],
+                        stdin=subprocess.DEVNULL,
+                        stdout=output,
+                        stderr=output,
+                        check=False,
+                        close_fds=True,
+                        start_new_session=True,
+                        cwd=str(data_root.parent),
+                        env=environment,
+                    )
         except OSError:
             log.warning(
                 "SaveSync conflict popup subprocess launch failed: launcher=%s log=%s",
@@ -218,12 +269,71 @@ def game_start(
         except Exception:  # noqa: BLE001 - lifecycle hooks never block Batocera
             log.warning("Could not record Batocera game start", exc_info=True)
         return
+    with diagnostic_operation(
+        "gameStart",
+        subsystem="savesync",
+        source="Auto gameStart",
+        timing_logger=log,
+        timing_label="targeted-gameStart",
+    ):
+        _run_enabled_game_start(ctx, system, emulator, core, rom)
+
+
+def _run_enabled_game_start(
+    ctx: click.Context, system: str, emulator: str, core: str, rom: str
+) -> None:
+    """Run the timed, popup-owning portion of an eligible gameStart hook."""
+    with stage_timer("lifecycle-coordinator-initialization"):
+        coordinator = _coordinator(ctx)
+    kwargs = {
+        "system": system,
+        "emulator": emulator,
+        "core": core,
+        "rom": rom,
+    }
+    with stage_timer("lifecycle-target-resolution"):
+        eligible = coordinator.game_start_eligible(**kwargs)
+    if not eligible:
+        try:
+            coordinator.game_start(**kwargs)
+        except Exception:  # noqa: BLE001 - lifecycle hooks never block Batocera
+            log.warning("Could not record Batocera game start", exc_info=True)
+        return
+
+    data_root = Path(ctx.obj["config"].data_path)
+    progress = _start_lifecycle_progress(data_root, operation="gameStart")
+    conflict_ids: tuple[str, ...] = ()
     try:
-        _coordinator(ctx).game_start(
-            system=system, emulator=emulator, core=core, rom=rom
-        )
+        with stage_timer("targeted-gameStart-coordinator"):
+            conflict_ids = coordinator.game_start(**kwargs, progress=progress)
     except Exception:  # noqa: BLE001 - lifecycle hooks never block Batocera
         log.warning("Could not record Batocera game start", exc_info=True)
+        try:
+            progress.close(
+                False,
+                "Save sync unavailable.\nLaunching with your local save.",
+            )
+        except Exception:  # noqa: BLE001 - lifecycle hooks never block Batocera
+            pass
+    finally:
+        # Unlike gameStop, gameStart must not let the progress overlay linger
+        # over either the conflict resolver or the newly launched emulator.
+        _wait_for_progress_close(progress)
+
+    if conflict_ids:
+        try:
+            _launch_pending_conflict_popup(
+                data_root,
+                lifecycle_caller_pid=batocera_auto_savesync.lifecycle_caller_pid(),
+                # The gameStart hook itself is holding emulatorlauncher open;
+                # waiting for that caller to exit here would deadlock launch.
+                wait_for_frontend=False,
+            )
+        except Exception:  # noqa: BLE001 - queued conflict remains durable
+            log.warning(
+                "gameStart SaveSync conflict popup handoff failed; launch continuing",
+                exc_info=True,
+            )
 
 
 @autosync_group.command("game-stop", hidden=True)
@@ -280,25 +390,8 @@ def game_stop(
         core,
     )
     data_root = Path(ctx.obj["config"].data_path)
-    launcher = _resolve_ports_launcher(data_root)
-    # Best-effort and fail-open: any failure to launch/drive this popup must
-    # never affect the synchronous SaveSync work below (see
-    # NullSaveSyncProgress / SaveSyncProgressReporter).
-    progress = start_savesync_progress(launcher)
-    log.info(
-        "gameStop progress reporter initialized: launcher=%s launcher_exists=%s "
-        "reporter=%s operation_id=%s",
-        launcher,
-        launcher.is_file(),
-        type(progress).__name__,
-        os.environ.get("ROMCLOUD_DIAGNOSTIC_OPERATION_ID", "none"),
-    )
-    if isinstance(progress, NullSaveSyncProgress):
-        log.warning(
-            "gameStop progress popup unavailable: launcher=%s launcher_exists=%s",
-            launcher,
-            launcher.is_file(),
-        )
+    # Best-effort and fail-open: both lifecycle edges use this same presenter.
+    progress = _start_lifecycle_progress(data_root, operation="gameStop")
     try:
         quick_sync_started = time.monotonic()
         log.info("gameStop Quick Sync started: worker_pid=%d", worker_pid)

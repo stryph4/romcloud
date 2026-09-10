@@ -24,6 +24,7 @@ from romcloud.core.remote_data import (
 from romcloud.core.save_selection import SaveSelectionPolicy
 from romcloud.core.storage import StorageAccessResult
 from romcloud.infrastructure import save_tree, savesync_journal
+from romcloud.infrastructure.diagnostics import increment_operation_counter
 
 
 class RemoteSaveStore(ABC):
@@ -53,6 +54,7 @@ class RemoteSaveStore(ABC):
         return str(self._connectivity_root)
 
     def validate_access(self) -> StorageAccessResult:
+        increment_operation_counter("remote_access_checks")
         return self._provider.validate_access(self._connectivity_root)
 
     def is_readable(self) -> bool:
@@ -76,6 +78,7 @@ class RemoteSaveStore(ABC):
         enabled_optional_groups: frozenset[str],
         operation: Optional[RemoteOperationContext] = None,
         cache: Optional[save_tree.ContentObservationCache] = None,
+        only_relative_paths: Optional[frozenset[str]] = None,
     ) -> save_tree.ScanReport:
         """Return the provider's current logical save-artifact manifest.
 
@@ -88,6 +91,13 @@ class RemoteSaveStore(ABC):
         since an earlier observation, so it always re-reads regardless of
         what is passed here; protocol-only stores have no local stat to
         memoize against in the first place.
+
+        *only_relative_paths*, when given, narrows the result to exactly
+        those canonical paths — every other file is skipped before it is
+        opened/hashed. A caller must only pass a set it already knows is
+        the exhaustive current membership for what it is scanning; this
+        never widens discovery, so any narrower set silently hides content
+        this call would otherwise have found.
         """
 
     @abstractmethod
@@ -145,15 +155,18 @@ class FilesystemRemoteSaveStore(RemoteSaveStore):
         enabled_optional_groups: frozenset[str],
         operation: Optional[RemoteOperationContext] = None,
         cache: Optional[save_tree.ContentObservationCache] = None,
+        only_relative_paths: Optional[frozenset[str]] = None,
     ) -> save_tree.ScanReport:
         if operation is not None:
             operation.check()
+        increment_operation_counter("remote_manifest_scan_calls")
         del cache  # never trusted: this root may be a network-backed mount
         return save_tree.scan_tree_report(
             self._root,
             policy,
             enabled_optional_systems=enabled_optional_systems,
             enabled_optional_groups=enabled_optional_groups,
+            only_relative_paths=only_relative_paths,
         )
 
     def materialize(
@@ -164,6 +177,7 @@ class FilesystemRemoteSaveStore(RemoteSaveStore):
         operation: Optional[RemoteOperationContext] = None,
     ) -> Path:
         relative_path = validate_logical_key(relative_path)
+        increment_operation_counter("remote_materializations")
         if operation is not None:
             operation.check()
         # SaveSelectionPolicy has already validated the canonical key. The
@@ -224,6 +238,7 @@ class ProviderRemoteSaveStore(RemoteSaveStore):
         enabled_optional_groups: frozenset[str],
         operation: Optional[RemoteOperationContext] = None,
         cache: Optional[save_tree.ContentObservationCache] = None,
+        only_relative_paths: Optional[frozenset[str]] = None,
     ) -> save_tree.ScanReport:
         # A protocol-only provider exposes no device/inode identity, so there
         # is nothing this store may safely reuse: it always re-reads.
@@ -234,6 +249,7 @@ class ProviderRemoteSaveStore(RemoteSaveStore):
             enabled_optional_systems=enabled_optional_systems,
             enabled_optional_groups=enabled_optional_groups,
             operation=operation,
+            only_relative_paths=only_relative_paths,
         )
 
     def materialize(

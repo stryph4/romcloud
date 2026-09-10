@@ -11,6 +11,7 @@ from ports_gfx.savesync_progress_popup import (
     _STREAM_CLOSED_GRACE_SECONDS,
     _SUCCESS_DISMISS_SECONDS,
     card_rect,
+    activity_segment,
     parse_event,
     read_events,
     spinner_angle_degrees,
@@ -47,6 +48,18 @@ class TestSaveSyncProgressStateApply:
         state.apply({"stage": "Preparing save sync…"})
         assert state.stage_text == "Preparing save sync…"
 
+    def test_stage_with_byte_progress_selects_determinate_mode(self):
+        state = SaveSyncProgressState()
+        state.apply({"stage": "Downloading save…", "current": 4096, "total": 8192})
+        assert state.current == 4096
+        assert state.total == 8192
+
+    def test_stage_without_complete_byte_progress_selects_indeterminate_mode(self):
+        state = SaveSyncProgressState()
+        state.apply({"stage": "Downloading save…", "current": 4096})
+        assert state.current is None
+        assert state.total is None
+
     def test_done_event_sets_done_and_ok(self):
         state = SaveSyncProgressState()
         state.apply({"event": "done", "ok": True})
@@ -78,12 +91,19 @@ class TestSaveSyncProgressStateApply:
     def test_snapshot_returns_consistent_tuple(self):
         state = SaveSyncProgressState()
         state.apply({"stage": "Finalizing sync…"})
-        assert state.snapshot() == ("Finalizing sync…", False, True, False)
+        assert state.snapshot() == (
+            "Finalizing sync…",
+            False,
+            True,
+            False,
+            None,
+            None,
+        )
 
     def test_mark_stream_closed_is_reflected_in_snapshot(self):
         state = SaveSyncProgressState()
         state.mark_stream_closed()
-        _, _, _, stream_closed = state.snapshot()
+        _, _, _, stream_closed, _, _ = state.snapshot()
         assert stream_closed
 
 
@@ -176,3 +196,15 @@ class TestSpinnerAngle:
     def test_wraps_between_zero_and_360(self):
         assert spinner_angle_degrees(0.0) == 0.0
         assert 0.0 <= spinner_angle_degrees(1234.5) < 360.0
+
+
+class TestActivitySegment:
+    def test_segment_is_visible_and_stays_inside_track(self):
+        for elapsed in (0.0, 0.2, 0.7, 1.34, 10.0):
+            offset, width = activity_segment(elapsed, 300)
+            assert width > 0
+            assert offset >= 0
+            assert offset + width <= 300
+
+    def test_segment_moves_during_indeterminate_animation(self):
+        assert activity_segment(0.0, 300) != activity_segment(0.3, 300)

@@ -1,10 +1,8 @@
-"""Small, centered progress overlay for synchronous gameStop Auto SaveSync.
+"""Small, centered progress overlay for synchronous lifecycle Auto SaveSync.
 
-Real hardware context: Auto SaveSync's gameStop path is intentionally
-synchronous — ``configgen``'s gameStop hook blocks until Quick Sync (upload/
-download/journal/conflict scoping) has durably finished, which hardware
-testing shows can take 15+ seconds. Without this popup the user sees
-nothing during that window and ROMCloud appears frozen.
+gameStart's targeted pre-launch reconciliation and gameStop's final Quick
+Sync both drive this same phase-based overlay while their lifecycle hook is
+waiting.
 
 Runs under Batocera's system Python (pygame/SDL), exactly like the existing
 graphical Ports UI (see ``ports_gfx/app.py``) and the cache-miss launch
@@ -48,9 +46,13 @@ _STREAM_CLOSED_GRACE_SECONDS = 1.5
 
 _CARD_WIDTH_FRACTION = 0.42
 _CARD_MIN_WIDTH_PX = 420
-_CARD_HEIGHT_PX = 190
+_CARD_HEIGHT_PX = 220
 _SPINNER_RADIUS_PX = 16
 _SPINNER_REVOLUTION_SECONDS = 1.1
+_BAR_HEIGHT_PX = 16
+_BAR_MARGIN_PX = 24
+_ACTIVITY_SEGMENT_FRACTION = 0.28
+_ACTIVITY_TRAVERSE_SECONDS = 1.35
 
 
 @dataclass
@@ -62,6 +64,8 @@ class SaveSyncProgressState:
     done: bool = False
     ok: bool = True
     stream_closed: bool = False
+    current: Optional[int] = None
+    total: Optional[int] = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def apply(self, event: dict) -> None:
@@ -76,14 +80,38 @@ class SaveSyncProgressState:
             stage = event.get("stage")
             if stage:
                 self.stage_text = str(stage)
+                current = event.get("current")
+                total = event.get("total")
+                if (
+                    isinstance(current, int)
+                    and not isinstance(current, bool)
+                    and isinstance(total, int)
+                    and not isinstance(total, bool)
+                    and current >= 0
+                    and total > 0
+                ):
+                    self.current = min(current, total)
+                    self.total = total
+                else:
+                    self.current = None
+                    self.total = None
 
     def mark_stream_closed(self) -> None:
         with self._lock:
             self.stream_closed = True
 
-    def snapshot(self) -> tuple[str, bool, bool, bool]:
+    def snapshot(
+        self,
+    ) -> tuple[str, bool, bool, bool, Optional[int], Optional[int]]:
         with self._lock:
-            return self.stage_text, self.done, self.ok, self.stream_closed
+            return (
+                self.stage_text,
+                self.done,
+                self.ok,
+                self.stream_closed,
+                self.current,
+                self.total,
+            )
 
 
 def parse_event(line: str) -> Optional[dict]:
@@ -154,6 +182,18 @@ def spinner_angle_degrees(elapsed_seconds: float) -> float:
     """0..360 spinner rotation — pure, testable."""
     fraction = (elapsed_seconds % _SPINNER_REVOLUTION_SECONDS) / _SPINNER_REVOLUTION_SECONDS
     return fraction * 360.0
+
+
+def activity_segment(elapsed_seconds: float, track_width: int) -> tuple[int, int]:
+    """Return the moving indeterminate segment within a progress track."""
+    width = max(1, int(track_width * _ACTIVITY_SEGMENT_FRACTION))
+    travel = max(0, track_width - width)
+    if travel == 0:
+        return 0, width
+    cycle = (elapsed_seconds % _ACTIVITY_TRAVERSE_SECONDS) / _ACTIVITY_TRAVERSE_SECONDS
+    # A triangle wave remains continuous when the segment reverses direction.
+    position = cycle * 2.0 if cycle < 0.5 else (1.0 - cycle) * 2.0
+    return int(travel * position), width
 
 
 def _try_grab_window_input(pygame) -> bool:  # noqa: ANN001
@@ -271,7 +311,7 @@ def _run(pygame, state: SaveSyncProgressState, romcloud_bin: str) -> int:  # noq
                 pygame.event.get()
             except Exception:  # noqa: BLE001
                 pass
-            stage_text, done, ok, stream_closed = state.snapshot()
+            stage_text, done, ok, stream_closed, current, total = state.snapshot()
             _render(
                 pygame,
                 screen,
@@ -283,6 +323,8 @@ def _run(pygame, state: SaveSyncProgressState, romcloud_bin: str) -> int:  # noq
                 done,
                 ok,
                 time.monotonic() - started,
+                current=current,
+                total=total,
             )
             if timer.should_exit(done=done, ok=ok, stream_closed=stream_closed):
                 running = False
@@ -306,6 +348,9 @@ def _render(  # noqa: ANN001
     done: bool,
     ok: bool,
     elapsed_seconds: float,
+    *,
+    current: Optional[int] = None,
+    total: Optional[int] = None,
 ) -> None:
     screen.fill(BACKGROUND)
     x, y, w, h = card_rect(screen_w, screen_h)
@@ -341,6 +386,41 @@ def _render(  # noqa: ANN001
         rendered = font_body.render(line, True, color if done else TEXT)
         screen.blit(rendered, (x + 24, line_y))
         line_y += font_body.get_height() + 6
+
+    track_x = x + _BAR_MARGIN_PX
+    track_y = y + h - _BAR_MARGIN_PX - _BAR_HEIGHT_PX
+    track_w = w - (_BAR_MARGIN_PX * 2)
+    pygame.draw.rect(
+        screen,
+        (27, 50, 80),
+        (track_x, track_y, track_w, _BAR_HEIGHT_PX),
+        border_radius=_BAR_HEIGHT_PX // 2,
+    )
+    if done:
+        fill_x, fill_w = track_x, track_w
+        fill_color = SUCCESS if ok else ERROR
+    elif current is not None and total is not None and total > 0:
+        fill_x = track_x
+        fill_w = int(track_w * min(1.0, max(0.0, current / total)))
+        fill_color = ACCENT
+    else:
+        offset, fill_w = activity_segment(elapsed_seconds, track_w)
+        fill_x = track_x + offset
+        fill_color = ACCENT
+    if fill_w > 0:
+        pygame.draw.rect(
+            screen,
+            fill_color,
+            (fill_x, track_y, fill_w, _BAR_HEIGHT_PX),
+            border_radius=_BAR_HEIGHT_PX // 2,
+        )
+    pygame.draw.rect(
+        screen,
+        (54, 91, 133),
+        (track_x, track_y, track_w, _BAR_HEIGHT_PX),
+        width=2,
+        border_radius=_BAR_HEIGHT_PX // 2,
+    )
 
     pygame.display.flip()
 

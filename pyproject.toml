@@ -37,6 +37,10 @@ romcloud = ["web/static/*.html", "web/static/*.css", "web/static/*.js"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = ["-ra", "--tb=short"]
+markers = [
+    "hardware: requires explicitly opted-in external hardware or mounted storage",
+    "performance: reports performance measurements without enforcing brittle latency thresholds",
+]
 
 [tool.coverage.run]
 source = ["romcloud"]

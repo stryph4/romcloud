@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 
+from romcloud.infrastructure import diagnostics
 from romcloud.ui.savesync_progress import (
     NullSaveSyncProgress,
     SaveSyncProgressReporter,
@@ -81,6 +82,20 @@ class TestStartSavesyncProgress:
         assert isinstance(reporter, SaveSyncProgressReporter)
         assert seen_argv["argv"] == [str(launcher), "--savesync-progress"]
 
+    def test_operation_specific_initial_stage_uses_same_reporter(self, tmp_path):
+        launcher = tmp_path / "romcloud-ports"
+        launcher.write_text("#!/bin/bash\n")
+        proc = _FakeProcess()
+
+        reporter = start_savesync_progress(
+            launcher,
+            initial_stage="Checking save…",
+            popen=lambda *_args, **_kwargs: proc,
+        )
+
+        assert isinstance(reporter, SaveSyncProgressReporter)
+        assert proc.stdin.events == [{"stage": "Checking save…"}]
+
 
 class TestNullSaveSyncProgress:
     def test_stage_and_close_are_safe_no_ops(self):
@@ -96,6 +111,31 @@ class TestSaveSyncProgressReporter:
         reporter = SaveSyncProgressReporter(proc)
         reporter.stage("Checking save changes…")
         assert proc.stdin.events == [{"stage": "Checking save changes…"}]
+
+    def test_stage_optionally_sends_trustworthy_byte_progress(self):
+        proc = _FakeProcess()
+        reporter = SaveSyncProgressReporter(proc)
+        reporter.stage("Downloading save…", current=2048, total=8192)
+        assert proc.stdin.events == [
+            {
+                "stage": "Downloading save…",
+                "current": 2048,
+                "total": 8192,
+            }
+        ]
+
+    def test_stage_without_a_valid_total_remains_indeterminate(self):
+        proc = _FakeProcess()
+        reporter = SaveSyncProgressReporter(proc)
+        reporter.stage("Downloading save…", current=2048, total=0)
+        assert proc.stdin.events == [{"stage": "Downloading save…"}]
+
+    def test_same_text_with_new_byte_progress_is_not_deduplicated(self):
+        proc = _FakeProcess()
+        reporter = SaveSyncProgressReporter(proc)
+        reporter.stage("Downloading save…", current=1, total=2)
+        reporter.stage("Downloading save…", current=2, total=2)
+        assert [event["current"] for event in proc.stdin.events] == [1, 2]
 
     def test_close_sends_done_event_and_closes_stdin(self):
         proc = _FakeProcess()
@@ -116,6 +156,18 @@ class TestSaveSyncProgressReporter:
         reporter.close(True, "Save sync complete.")
         assert proc.wait_calls == []
         assert proc.stdin.closed
+
+    def test_game_start_can_wait_for_overlay_to_release_focus(self):
+        proc = _FakeProcess()
+        reporter = SaveSyncProgressReporter(proc)
+        with diagnostics.operation("gameStart", subsystem="savesync"):
+            reporter.close(True, "Save is current.")
+            reporter.wait_until_closed()
+            timing = diagnostics.current_timing_snapshot()
+        assert proc.wait_calls == [3.0]
+        assert timing["stages"]["progress-pipe-write"]["count"] == 1
+        assert timing["stages"]["progress-pipe-close"]["count"] == 1
+        assert timing["stages"]["progress-subprocess-wait"]["count"] == 1
 
     def test_failed_close_still_waits_so_the_message_is_readable(self):
         proc = _FakeProcess()

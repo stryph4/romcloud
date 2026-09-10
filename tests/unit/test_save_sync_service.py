@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import os
 import threading
 from pathlib import Path
@@ -24,6 +25,9 @@ from romcloud.core.models.savesync import (
 from romcloud.core.save_ownership import ManagedSaveOwnershipPolicy
 from romcloud.core.storage import StorageProvider
 from romcloud.infrastructure import mount, save_transaction, save_tree, savesync_journal
+from romcloud.infrastructure import savesync_commit
+from romcloud.infrastructure import savesync_index
+from tests.unit._savesync_protocol_helpers import strip_protocol_ownership
 from romcloud.infrastructure.config import (
     AppConfig,
     CacheConfig,
@@ -2013,6 +2017,290 @@ class TestSaveSyncFinalizationSafety:
         assert plan.uploads == ()
 
 
+class TestLegacyDatasetCommitBehavior:
+    """A dataset that has never been cut over keeps pre-protocol semantics.
+
+    Before the ownership marker exists the legacy journal is still the only
+    way peers discover a change, so a failed journal append means the commit
+    did not happen and everything must roll back — exactly as it did before
+    the commit protocol was introduced. (After cutover the index is the
+    commit point and the journal degrades instead; see
+    ``TestOwnedDatasetJournalDegradation``.)
+    """
+
+    def test_dataset_without_full_sync_is_unowned(
+        self, tmp_path: Path, service: SaveSyncService
+    ):
+        _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
+        service.reconcile()
+
+        index_root = savesync_index.default_index_root(tmp_path / "remote-saves")
+        state = savesync_index.resolve_dataset_state(index_root)
+        assert state.ownership is savesync_index.DatasetOwnership.UNOWNED
+        assert savesync_index.load_ownership(index_root) is None
+
+    def test_failed_journal_append_rolls_back_payload_and_state(
+        self, tmp_path: Path, service: SaveSyncService, monkeypatch
+    ):
+        local = tmp_path / "local-saves" / "psx" / "Game.srm"
+        remote = tmp_path / "remote-saves" / "psx" / "Game.srm"
+        _write(local, b"base")
+        service.reconcile()
+        before = service.get_state()
+        assert remote.read_bytes() == b"base"
+
+        _write(local, b"new-revision")
+        service.mark_local_dirty("psx/Game.srm")
+        monkeypatch.setattr(
+            service,
+            "_append_remote_journal",
+            lambda **_kwargs: (_ for _ in ()).throw(OSError("journal write failed")),
+        )
+
+        with pytest.raises(OSError, match="journal write failed"):
+            service.reconcile()
+
+        # Pre-cutover the journal is required discovery state, so nothing
+        # about this operation is allowed to survive.
+        assert remote.read_bytes() == b"base"
+        after = service.get_state()
+        assert after.shared_manifest == before.shared_manifest
+        assert after.quick_sync_cursor_generation == before.quick_sync_cursor_generation
+
+
+class TestOwnedDatasetJournalDegradation:
+    def test_committed_index_is_visible_to_another_client_despite_journal_failure(
+        self, tmp_path: Path, service: SaveSyncService, provider: _FakeProvider, monkeypatch
+    ):
+        """Prove the roll-forward is genuinely shared, not just local.
+
+        After the index commits, a second device reading the same remote
+        dataset must see the committed group state even though the legacy
+        journal never recorded it.
+        """
+        local = tmp_path / "local-saves" / "psx" / "Game.srm"
+        remote = tmp_path / "remote-saves" / "psx" / "Game.srm"
+        _write(local, b"base")
+        service.full_sync()
+
+        _write(local, b"new-revision")
+        service.mark_local_dirty("psx/Game.srm")
+        monkeypatch.setattr(
+            service,
+            "_append_remote_journal",
+            lambda **_kwargs: (_ for _ in ()).throw(OSError("journal write failed")),
+        )
+
+        service.reconcile()
+
+        assert remote.read_bytes() == b"new-revision"
+        index_root = savesync_index.default_index_root(tmp_path / "remote-saves")
+        # A different device, sharing only the remote dataset.
+        peer = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "rom-root"),
+            local_root=str(tmp_path / "peer-local"),
+            remote_root=str(tmp_path / "remote-saves"),
+            state_path=tmp_path / "peer-data" / "savesync-state.json",
+        )
+        dataset = savesync_index.resolve_dataset_state(index_root)
+        assert dataset.ownership is savesync_index.DatasetOwnership.OWNED
+        assert dataset.head is not None
+        shard = savesync_index.load_shard(
+            index_root, "retroarch-root-psx", dataset.head.layouts["retroarch-root-psx"]
+        )
+        group = next(iter(shard.groups))
+        assert group.artifacts[0].sha256 == hashlib.sha256(b"new-revision").hexdigest()
+        assert peer.selection_policy.group_for_path("psx/Game.srm") is not None
+        # No intent is left blocking the peer.
+        assert savesync_commit.load_intent(index_root) is None
+
+
+class TestShadowIndexPublication:
+    """Step 2: the remote current-state index is descriptive/shadow state
+    only. Full Sync builds and publishes it from verified remote content;
+    Quick Sync's own decisions must remain byte-for-byte unaffected."""
+
+    def test_full_sync_publishes_index_matching_verified_remote_state(
+        self, tmp_path: Path, service: SaveSyncService
+    ):
+        _write(tmp_path / "local-saves" / "snes" / "GameA.srm", b"a-content")
+        _write(tmp_path / "local-saves" / "gba" / "GameB.srm", b"b-content")
+
+        service.full_sync()
+
+        index_root = savesync_index.default_index_root(tmp_path / "remote-saves")
+        head = savesync_index.load_head(index_root)
+        assert head is not None
+        snes_shard = savesync_index.load_shard(
+            index_root, "retroarch-root-snes", head.layouts["retroarch-root-snes"]
+        )
+        gba_shard = savesync_index.load_shard(
+            index_root, "retroarch-root-gba", head.layouts["retroarch-root-gba"]
+        )
+        snes_group = next(g for g in snes_shard.groups if g.group_id.endswith("gamea"))
+        gba_group = next(g for g in gba_shard.groups if g.group_id.endswith("gameb"))
+        assert snes_group.artifacts == (
+            savesync_index.IndexArtifact(
+                "snes/GameA.srm", 9, hashlib.sha256(b"a-content").hexdigest()
+            ),
+        )
+        assert gba_group.artifacts == (
+            savesync_index.IndexArtifact(
+                "gba/GameB.srm", 9, hashlib.sha256(b"b-content").hexdigest()
+            ),
+        )
+        assert snes_group.tombstoned is False
+        assert snes_group.group_generation == 1
+
+    def test_full_sync_index_journal_generation_matches_committed_cursor(
+        self, tmp_path: Path, service: SaveSyncService
+    ):
+        _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
+
+        service.full_sync()
+
+        state = service.get_state()
+        index_root = savesync_index.default_index_root(tmp_path / "remote-saves")
+        head = savesync_index.load_head(index_root)
+        assert head is not None
+        assert head.journal_generation == state.quick_sync_cursor_generation
+
+    def test_repeated_full_sync_with_no_change_does_not_bump_index_generation(
+        self, tmp_path: Path, service: SaveSyncService
+    ):
+        _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
+        service.full_sync()
+        index_root = savesync_index.default_index_root(tmp_path / "remote-saves")
+        first = savesync_index.load_head(index_root)
+        assert first is not None
+
+        service.full_sync()
+
+        second = savesync_index.load_head(index_root)
+        assert second == first
+
+    def test_changed_content_bumps_layout_and_index_generation(
+        self, tmp_path: Path, service: SaveSyncService
+    ):
+        local = tmp_path / "local-saves" / "psx" / "Game.srm"
+        _write(local, b"base")
+        service.full_sync()
+        index_root = savesync_index.default_index_root(tmp_path / "remote-saves")
+        first = savesync_index.load_head(index_root)
+        assert first is not None
+
+        _write(local, b"changed")
+        service.mark_local_dirty("psx/Game.srm")
+        service.full_sync()
+
+        second = savesync_index.load_head(index_root)
+        assert second is not None
+        # A logical Full Sync publishes exactly once: its internal reconcile
+        # must not independently publish partial authoritative state.
+        assert second.index_generation == first.index_generation + 1
+        assert (
+            second.layouts["retroarch-root-psx"].generation
+            == first.layouts["retroarch-root-psx"].generation + 1
+        )
+
+    def test_deleted_group_is_recorded_as_tombstoned_not_dropped(
+        self, tmp_path: Path, service: SaveSyncService
+    ):
+        local = tmp_path / "local-saves" / "psx" / "Game.srm"
+        remote = tmp_path / "remote-saves" / "psx" / "Game.srm"
+        _write(local, b"base")
+        service.full_sync()
+
+        local.unlink()
+        remote.unlink()
+        service.full_sync()
+
+        index_root = savesync_index.default_index_root(tmp_path / "remote-saves")
+        head = savesync_index.load_head(index_root)
+        assert head is not None
+        shard = savesync_index.load_shard(
+            index_root, "retroarch-root-psx", head.layouts["retroarch-root-psx"]
+        )
+        group = next(g for g in shard.groups if g.group_id.endswith("game"))
+        assert group.tombstoned is True
+        assert group.artifacts == ()
+        assert group.group_generation == 2
+
+    def test_index_publication_failure_does_not_fail_full_sync(
+        self, tmp_path: Path, service: SaveSyncService, monkeypatch
+    ):
+        _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
+        monkeypatch.setattr(
+            savesync_index,
+            "publish_full_sync_index",
+            lambda *a, **k: (_ for _ in ()).throw(SaveSyncError("boom")),
+        )
+
+        report = service.full_sync()
+
+        assert report.uploaded == 1
+        state = service.get_state()
+        assert state.quick_sync_ready is True
+
+    def test_quick_sync_behavior_is_unaffected_by_index_publication(
+        self, tmp_path: Path, service: SaveSyncService, monkeypatch
+    ):
+        """Shadow-only boundary: the index exists on disk after Full Sync,
+        but Quick Sync's own unchanged-generation fast path must still take
+        zero filesystem scans, exactly as before this index existed."""
+        _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
+        service.full_sync()
+        index_root = savesync_index.default_index_root(tmp_path / "remote-saves")
+        assert savesync_index.load_head(index_root) is not None
+
+        def fail(*args, **kwargs):
+            raise AssertionError("quick unchanged must not scan")
+
+        monkeypatch.setattr(service, "_scan_automatic_local", fail)
+        monkeypatch.setattr(service, "_scan_automatic_remote", fail)
+        monkeypatch.setattr(service, "_scan_local_layouts", fail)
+        monkeypatch.setattr(service, "_scan_remote_layouts", fail)
+
+        result = service.quick_sync()
+
+        assert result.status == "unchanged"
+
+    def test_old_client_journal_advance_without_index_rebuild_is_detectable(
+        self, tmp_path: Path, service: SaveSyncService
+    ):
+        """An old client that only appends to the journal (never rebuilding
+        the index) leaves a detectable divergence \u2014 diagnostic only in
+        this phase, never itself a mutation authority."""
+        _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
+        service.full_sync()
+        index_root = savesync_index.default_index_root(tmp_path / "remote-saves")
+        head = savesync_index.load_head(index_root)
+        assert head is not None
+        assert savesync_index.journal_diverged(head, head.journal_generation) is False
+
+        savesync_journal.append_mutations(
+            savesync_journal.default_journal_path(tmp_path / "remote-saves"),
+            device_id="old-client",
+            revision="legacy-write",
+            timestamp="2026-08-22T00:00:00+00:00",
+            mutations=[
+                {
+                    "system": "psx",
+                    "layout_id": "retroarch-root-psx",
+                    "group_id": "retroarch-root-psx/game",
+                    "object_id": "psx/Game.srm",
+                    "operation": "update",
+                }
+            ],
+        )
+        new_journal = savesync_journal.load(
+            savesync_journal.default_journal_path(tmp_path / "remote-saves")
+        )
+
+        assert savesync_index.journal_diverged(head, int(new_journal["generation"])) is True
+
+
 class TestQuickSyncAndJournal:
     def test_full_sync_establishes_quick_sync_baseline(
         self, tmp_path: Path, service: SaveSyncService
@@ -2105,7 +2393,7 @@ class TestQuickSyncAndJournal:
         assert local.read_bytes() == b"gba-progress"
         assert remote.read_bytes() == b"gba-progress"
         assert unchanged.status == "unchanged"
-        assert unchanged.reason == "journal-current-local-materialized"
+        assert unchanged.reason == "index-current-local-materialized"
         assert "logical_save_id=retroarch-root-gba/game" in caplog.text
         assert "reconciliation_decision=download" in caplog.text
         assert "missing_physical_destinations=1" in caplog.text
@@ -2222,6 +2510,11 @@ class TestQuickSyncAndJournal:
         self, tmp_path: Path, service: SaveSyncService
     ):
         service.full_sync()
+        # Simulate an installation predating the commit protocol: legacy
+        # quick_sync_ready/cursor state exists, but the dataset itself was
+        # never cut over to OWNED. Peer discovery here is purely journal-
+        # driven, exactly as it was before Step 3/4.
+        strip_protocol_ownership(tmp_path / "remote-saves", tmp_path / "data")
         relative = "ppsspp/PSP/SAVEDATA/ULUS12345/DATA.BIN"
         remote = tmp_path / "remote-saves" / relative
         local = tmp_path / "local-saves" / relative
@@ -2309,13 +2602,13 @@ class TestQuickSyncAndJournal:
         original_local = service._scan_local_layouts
         original_remote = service._scan_remote_layouts
 
-        def scan_local(layout_ids):
+        def scan_local(layout_ids, **kwargs):
             scanned.append(("local", layout_ids))
-            return original_local(layout_ids)
+            return original_local(layout_ids, **kwargs)
 
-        def scan_remote(layout_ids):
+        def scan_remote(layout_ids, **kwargs):
             scanned.append(("remote", layout_ids))
-            return original_remote(layout_ids)
+            return original_remote(layout_ids, **kwargs)
 
         monkeypatch.setattr(service, "_scan_local_layouts", scan_local)
         monkeypatch.setattr(service, "_scan_remote_layouts", scan_remote)
@@ -2423,6 +2716,7 @@ class TestQuickSyncAndJournal:
     ):
         _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
         service.full_sync()
+        strip_protocol_ownership(tmp_path / "remote-saves", tmp_path / "data")
         journal_path = savesync_journal.default_journal_path(tmp_path / "remote-saves")
         savesync_journal.append_mutations(
             journal_path,
@@ -2458,6 +2752,7 @@ class TestQuickSyncAndJournal:
     ):
         _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
         service.full_sync()
+        strip_protocol_ownership(tmp_path / "remote-saves", tmp_path / "data")
         journal_path = savesync_journal.default_journal_path(tmp_path / "remote-saves")
         _write(tmp_path / "remote-saves" / "psx" / "Game.srm", b"v1")
         savesync_journal.append_mutations(
@@ -2503,6 +2798,7 @@ class TestQuickSyncAndJournal:
     ):
         _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
         service.full_sync()
+        strip_protocol_ownership(tmp_path / "remote-saves", tmp_path / "data")
         state = service.get_state()
         from dataclasses import replace
         from romcloud.infrastructure import savesync_state as durable_state
@@ -2542,6 +2838,7 @@ class TestQuickSyncAndJournal:
     ):
         _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
         service.full_sync()
+        strip_protocol_ownership(tmp_path / "remote-saves", tmp_path / "data")
         journal_path = savesync_journal.default_journal_path(tmp_path / "remote-saves")
         journal_path.write_text("not json", encoding="utf-8")
 
@@ -2607,6 +2904,7 @@ class TestQuickSyncAndJournal:
     ):
         _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
         service.full_sync()
+        strip_protocol_ownership(tmp_path / "remote-saves", tmp_path / "data")
         journal_path = savesync_journal.default_journal_path(tmp_path / "remote-saves")
         savesync_journal.append_mutations(
             journal_path,
@@ -2634,6 +2932,198 @@ class TestQuickSyncAndJournal:
             service.quick_sync()
 
         assert service.get_state().quick_sync_cursor_generation == cursor_before
+
+
+class TestQuickSyncRemoteScanScoping:
+    """Quick Sync's own group-only reconcile call already knows the exact
+    candidate paths for a durable, previously-tracked group (from this same
+    operation's local scan plus the last shared baseline) \u2014 it must use
+    that to narrow the remote scan instead of scanning/hashing every sibling
+    group in the same layout."""
+
+    def test_group_scope_does_not_hash_unrelated_remote_group_in_same_layout(
+        self, tmp_path: Path, service: SaveSyncService, monkeypatch
+    ):
+        game_a_local = tmp_path / "local-saves" / "snes" / "GameA.srm"
+        game_b_local = tmp_path / "local-saves" / "snes" / "GameB.srm"
+        game_a_remote = tmp_path / "remote-saves" / "snes" / "GameA.srm"
+        game_b_remote = tmp_path / "remote-saves" / "snes" / "GameB.srm"
+        _write(game_a_local, b"a-base")
+        _write(game_b_local, b"b-base")
+        service.full_sync()
+
+        _write(game_a_local, b"a-changed")
+        service.mark_local_dirty("snes/GameA.srm")
+
+        hashed: list[Path] = []
+        real_hash_file = save_tree.hash_file
+
+        def tracking_hash_file(path):
+            hashed.append(Path(path))
+            return real_hash_file(path)
+
+        monkeypatch.setattr(save_tree, "hash_file", tracking_hash_file)
+
+        result = service.quick_sync()
+
+        assert result.status == "reconciled"
+        assert result.report is not None
+        assert result.report.uploaded == 1
+        assert game_a_remote in hashed
+        assert game_b_remote not in hashed
+        assert game_a_remote.read_bytes() == b"a-changed"
+        # GameB was never disturbed.
+        assert game_b_remote.read_bytes() == b"b-base"
+
+    def test_group_scope_observes_multiple_selected_paths_correctly(
+        self, tmp_path: Path, service: SaveSyncService
+    ):
+        srm = tmp_path / "local-saves" / "snes" / "Game.srm"
+        state0 = tmp_path / "local-saves" / "snes" / "Game.state0"
+        _write(srm, b"save-base")
+        _write(state0, b"state-base")
+        service.full_sync()
+
+        _write(srm, b"save-changed")
+        _write(state0, b"state-changed")
+        service.mark_local_dirty("snes/Game.srm")
+        service.mark_local_dirty("snes/Game.state0")
+
+        result = service.quick_sync()
+
+        assert result.status == "reconciled"
+        assert result.report is not None
+        assert result.report.uploaded == 2
+        remote_srm = tmp_path / "remote-saves" / "snes" / "Game.srm"
+        remote_state0 = tmp_path / "remote-saves" / "snes" / "Game.state0"
+        assert remote_srm.read_bytes() == b"save-changed"
+        assert remote_state0.read_bytes() == b"state-changed"
+
+    def test_group_scope_detects_remote_deletion_via_baseline_not_layout_scan(
+        self, tmp_path: Path, service: SaveSyncService
+    ):
+        from romcloud.infrastructure import savesync_state as durable_state
+
+        local = tmp_path / "local-saves" / "snes" / "GameA.srm"
+        remote = tmp_path / "remote-saves" / "snes" / "GameA.srm"
+        sibling_local = tmp_path / "local-saves" / "snes" / "GameB.srm"
+        _write(local, b"base")
+        _write(sibling_local, b"sibling-base")
+        service.full_sync()
+
+        remote.unlink()
+        descriptor = service.selection_policy.group_for_path("snes/GameA.srm")
+        assert descriptor is not None
+        durable_state.SaveSyncStateStore(
+            tmp_path / "data" / "savesync-state.json"
+        ).mark_remote_dirty(
+            group_id=descriptor.group_id,
+            layout_id=descriptor.layout_id,
+            paths=("snes/GameA.srm",),
+        )
+
+        result = service.quick_sync()
+
+        assert result.status == "reconciled"
+        assert result.report is not None
+        # Remote's deletion (a one-sided change from the shared baseline)
+        # propagates to local, discovered purely from GameA's own previously
+        # baselined path \u2014 the narrow scan never lists GameB's directory
+        # entries at all beyond what this same operation's local scan saw.
+        assert result.report.downloaded == 1
+        assert not local.exists()
+        assert sibling_local.read_bytes() == b"sibling-base"
+
+    def test_container_group_is_never_narrowed(
+        self, tmp_path: Path, service: SaveSyncService, monkeypatch
+    ):
+        """Container layouts must keep whole-layout discovery/verification.
+
+        The commit protocol adds exactly one deliberately narrow remote read
+        (the index/payload cross-check). Every reconciliation scan — plan,
+        staging verification and final verification — must still be broad,
+        so this distinguishes the scans by purpose rather than merely
+        counting unnarrowed calls.
+        """
+        card = "duckstation/memcards/_usr_share_duckstation_1.mcd"
+        local = tmp_path / "local-saves" / card
+        service.full_sync()
+        _write(local, b"card-changed")
+        service.mark_local_dirty(card)
+
+        calls: list[tuple[str, object]] = []
+        in_cross_check = {"active": False}
+        original_scan_remote_layouts = service._scan_remote_layouts
+        original_cross_check = service._observe_remote_group_manifests
+
+        def spy(layout_ids, *, only_relative_paths=None):
+            purpose = "cas-cross-check" if in_cross_check["active"] else "reconcile"
+            calls.append((purpose, only_relative_paths))
+            return original_scan_remote_layouts(
+                layout_ids, only_relative_paths=only_relative_paths
+            )
+
+        def tracking_cross_check(intent_groups):
+            in_cross_check["active"] = True
+            try:
+                return original_cross_check(intent_groups)
+            finally:
+                in_cross_check["active"] = False
+
+        monkeypatch.setattr(service, "_scan_remote_layouts", spy)
+        monkeypatch.setattr(service, "_observe_remote_group_manifests", tracking_cross_check)
+
+        result = service.quick_sync()
+
+        assert result.status == "reconciled"
+        reconcile_scopes = [scope for purpose, scope in calls if purpose == "reconcile"]
+        cross_check_scopes = [
+            scope for purpose, scope in calls if purpose == "cas-cross-check"
+        ]
+        # Plan, staging-verify and final-verify all stay broad for a
+        # container layout, and none of them may be narrowed.
+        assert len(reconcile_scopes) >= 3
+        assert all(scope is None for scope in reconcile_scopes)
+        # The cross-check is the one narrow read, scoped to this card only.
+        assert len(cross_check_scopes) == 1
+        assert cross_check_scopes[0] == frozenset({card})
+
+    def test_legacy_reconcile_pending_groups_remains_full_layout_scoped(
+        self, tmp_path: Path, service: SaveSyncService, monkeypatch
+    ):
+        """The manual/legacy API never receives the trusted narrow scope,
+        so an unrelated sibling group's remote file is still observed \u2014
+        proving this pass leaves that call path's behavior unchanged."""
+        game_a_local = tmp_path / "local-saves" / "snes" / "GameA.srm"
+        game_b_local = tmp_path / "local-saves" / "snes" / "GameB.srm"
+        game_b_remote = tmp_path / "remote-saves" / "snes" / "GameB.srm"
+        _write(game_a_local, b"a-base")
+        _write(game_b_local, b"b-base")
+        service.full_sync()
+
+        _write(game_a_local, b"a-changed")
+        service.mark_local_dirty("snes/GameA.srm")
+        state = service.get_state()
+        group_id = next(
+            group.group_id
+            for group in state.groups
+            if group.layout_id == "retroarch-root-snes"
+            and group.condition is SaveGroupCondition.LOCAL_DIRTY
+        )
+
+        hashed: list[Path] = []
+        real_hash_file = save_tree.hash_file
+
+        def tracking_hash_file(path):
+            hashed.append(Path(path))
+            return real_hash_file(path)
+
+        monkeypatch.setattr(save_tree, "hash_file", tracking_hash_file)
+
+        report = service.reconcile_pending_groups(frozenset({group_id}))
+
+        assert report is not None
+        assert game_b_remote in hashed
 
 
 class TestTransitionCurrentStateSync:

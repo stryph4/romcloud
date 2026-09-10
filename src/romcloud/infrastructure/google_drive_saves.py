@@ -67,8 +67,16 @@ class GoogleDriveRemoteSaveStore(RemoteSaveStore):
         enabled_optional_groups: frozenset[str],
         operation: Optional[RemoteOperationContext] = None,
         cache: Optional[save_tree.ContentObservationCache] = None,
+        only_relative_paths: Optional[frozenset[str]] = None,
     ) -> save_tree.ScanReport:
-        del policy, enabled_optional_systems, enabled_optional_groups, operation, cache
+        del (
+            policy,
+            enabled_optional_systems,
+            enabled_optional_groups,
+            operation,
+            cache,
+            only_relative_paths,
+        )
         raise SaveSyncWriteUnavailableError(
             "Google Drive package manifests are not implemented in this phase"
         )

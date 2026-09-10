@@ -214,6 +214,25 @@ class SaveSyncVerificationError(SaveSyncError):
     changed since the preview, or the copy was corrupted."""
 
 
+class SaveSyncCasConflictError(SaveSyncError):
+    """A peer committed a newer generation for a targeted save group between
+    this operation's planning scan and its remote commit.
+
+    Nothing was mutated: the compare-and-swap check runs under the remote
+    commit lock *before* any payload promotion, so a stale decision is
+    rejected rather than applied last-writer-wins. Callers re-plan against
+    the peer's committed state and retry within a bounded attempt count."""
+
+
+class SaveSyncRecoveryEvidenceError(SaveSyncError):
+    """Remote payload for an interrupted commit matches neither its recorded
+    before-state nor its desired state.
+
+    An unknown third version means something outside this protocol wrote the
+    same paths. Evidence is preserved and no rollback or completion is
+    attempted; Full Sync is required."""
+
+
 class SaveSyncWriteUnavailableError(SaveSyncError):
     """A specific operation needs to write to remote-data, but the
     configured remote-data provider instance does not support ROMCloud's

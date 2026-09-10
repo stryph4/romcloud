@@ -200,6 +200,104 @@ def test_package_provider_is_not_required_to_expose_loose_objects() -> None:
     assert not isinstance(provider, LooseObjectRemoteDataProvider)
 
 
+class TestOnlyRelativePathsScopedScan:
+    """``only_relative_paths`` must narrow a remote scan without opening any
+    file outside that set, and without ever widening what the positive
+    SaveLayout registry already admits."""
+
+    def test_filesystem_store_skips_hashing_unrelated_files(self, tmp_path: Path, monkeypatch):
+        root = tmp_path / "remote"
+        (root / "snes").mkdir(parents=True)
+        (root / "snes" / "GameA.srm").write_bytes(b"a-content")
+        (root / "snes" / "GameB.srm").write_bytes(b"b-content")
+        store = FilesystemRemoteSaveStore(WritableLocalFilesystemProvider(), str(root), str(root))
+
+        hashed: list[Path] = []
+        real_hash_file = save_tree.hash_file
+        monkeypatch.setattr(
+            save_tree,
+            "hash_file",
+            lambda path: (hashed.append(Path(path)), real_hash_file(path))[1],
+        )
+
+        report = store.scan(
+            DEFAULT_SAVE_SELECTION_POLICY,
+            enabled_optional_systems=frozenset(),
+            enabled_optional_groups=frozenset(),
+            only_relative_paths=frozenset({"snes/GameA.srm"}),
+        )
+
+        assert set(report.artifacts) == {"snes/GameA.srm"}
+        assert hashed == [root / "snes" / "GameA.srm"]
+
+    def test_filesystem_store_multiple_selected_paths_all_observed(self, tmp_path: Path):
+        root = tmp_path / "remote"
+        (root / "snes").mkdir(parents=True)
+        (root / "snes" / "Game.srm").write_bytes(b"save")
+        (root / "snes" / "Game.state0").write_bytes(b"state")
+        (root / "snes" / "Other.srm").write_bytes(b"other")
+        store = FilesystemRemoteSaveStore(WritableLocalFilesystemProvider(), str(root), str(root))
+
+        report = store.scan(
+            DEFAULT_SAVE_SELECTION_POLICY,
+            enabled_optional_systems=frozenset(),
+            enabled_optional_groups=frozenset(),
+            only_relative_paths=frozenset({"snes/Game.srm", "snes/Game.state0"}),
+        )
+
+        assert set(report.artifacts) == {"snes/Game.srm", "snes/Game.state0"}
+
+    def test_filesystem_store_missing_selected_path_is_simply_absent(self, tmp_path: Path):
+        root = tmp_path / "remote"
+        (root / "snes").mkdir(parents=True)
+        (root / "snes" / "GameA.srm").write_bytes(b"a-content")
+        store = FilesystemRemoteSaveStore(WritableLocalFilesystemProvider(), str(root), str(root))
+
+        report = store.scan(
+            DEFAULT_SAVE_SELECTION_POLICY,
+            enabled_optional_systems=frozenset(),
+            enabled_optional_groups=frozenset(),
+            only_relative_paths=frozenset({"snes/GameA.srm", "snes/Deleted.srm"}),
+        )
+
+        assert set(report.artifacts) == {"snes/GameA.srm"}
+
+    def test_filesystem_store_cannot_use_only_relative_paths_to_escape_registry(
+        self, tmp_path: Path
+    ):
+        root = tmp_path / "remote"
+        (root / "unknown-system").mkdir(parents=True)
+        (root / "unknown-system" / "private.bin").write_bytes(b"private")
+        store = FilesystemRemoteSaveStore(WritableLocalFilesystemProvider(), str(root), str(root))
+
+        report = store.scan(
+            DEFAULT_SAVE_SELECTION_POLICY,
+            enabled_optional_systems=frozenset(),
+            enabled_optional_groups=frozenset(),
+            only_relative_paths=frozenset({"unknown-system/private.bin"}),
+        )
+
+        assert report.artifacts == {}
+
+    def test_provider_store_skips_downloading_unrelated_files(self):
+        provider = _ObjectProvider()
+        provider.files["nes/other.srm"] = b"other"
+        opened: list[str] = []
+        real_open_binary = provider.open_binary
+        provider.open_binary = lambda path: (opened.append(path[1]), real_open_binary(path))[1]
+        store = _store(provider)
+
+        report = store.scan(
+            DEFAULT_SAVE_SELECTION_POLICY,
+            enabled_optional_systems=frozenset(),
+            enabled_optional_groups=frozenset(),
+            only_relative_paths=frozenset({"nes/game.srm"}),
+        )
+
+        assert set(report.artifacts) == {"nes/game.srm"}
+        assert opened == ["nes/game.srm"]
+
+
 def test_protocol_root_never_reaches_local_recovery(tmp_path: Path) -> None:
     provider = _ObjectProvider()
     store = _store(provider)

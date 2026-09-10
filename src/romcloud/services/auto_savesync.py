@@ -17,6 +17,7 @@ from romcloud.core.exceptions import (
     SaveSyncWorkerBusyError,
 )
 from romcloud.core.models.savesync import SaveGroupCondition
+from romcloud.core.progress import ProgressEvent
 from romcloud.core.save_selection import SaveSelectionPolicy
 from romcloud.infrastructure.logging import get_logger
 from romcloud.infrastructure.diagnostics import (
@@ -65,6 +66,17 @@ class GameSession:
     rom: str
     started_at: float
     boot_id: str
+    sync_outcome: str = "not_attempted"
+    """One of: not_attempted, unsupported, skipped, synchronized, unresolved.
+
+    Records the outcome of gameStart's best-effort targeted pre-launch sync
+    attempt, if any — never a launch gate, purely informational for gameStop
+    and diagnostics. gameStop always performs its own independent, fresh
+    local/remote comparison regardless of this value.
+    """
+    sync_group_ids: tuple[str, ...] = ()
+    """The save group ID(s) gameStart resolved as this game's own targeted
+    pre-launch sync scope, regardless of the resulting outcome."""
 
 
 def layout_ids_for_session(
@@ -96,13 +108,39 @@ class ActiveSessionStore:
             started_at=time.time(),
             boot_id=_boot_id(),
         )
+        self._write(session)
+        return session
+
+    def record_sync_outcome(
+        self,
+        *,
+        system: str,
+        rom: str,
+        outcome: str,
+        group_ids: tuple[str, ...] = (),
+    ) -> None:
+        """Update the already-written session marker with gameStart's
+        best-effort pre-launch sync outcome. A missing/stale-boot marker
+        (already retired or never written) is a silent no-op — this is pure
+        diagnostics/gameStop context, never a source of truth gameStart's own
+        launch-continuation behavior depends on.
+        """
+        with stage_timer("lifecycle-session-outcome-persistence"):
+            target = self._path(system, rom)
+            session = self._read(target)
+            if session is None:
+                return
+            self._write(
+                replace(session, sync_outcome=outcome, sync_group_ids=tuple(group_ids))
+            )
+
+    def _write(self, session: GameSession) -> None:
         self._root.mkdir(parents=True, exist_ok=True)
-        target = self._path(system, rom)
+        target = self._path(session.system, session.rom)
         temporary = self._root / f".{target.name}.{uuid.uuid4().hex}.tmp"
         payload = json.dumps(session.__dict__, sort_keys=True, separators=(",", ":"))
         temporary.write_text(payload, encoding="utf-8")
         temporary.replace(target)
-        return session
 
     def stop(self, *, system: str, rom: str) -> Optional[GameSession]:
         target = self._path(system, rom)
@@ -146,6 +184,7 @@ class ActiveSessionStore:
     def _read(self, path: Path) -> Optional[GameSession]:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
+            raw_group_ids = payload.get("sync_group_ids", ())
             session = GameSession(
                 system=str(payload["system"]),
                 emulator=str(payload.get("emulator", "")),
@@ -153,6 +192,8 @@ class ActiveSessionStore:
                 rom=str(payload["rom"]),
                 started_at=float(payload["started_at"]),
                 boot_id=str(payload["boot_id"]),
+                sync_outcome=str(payload.get("sync_outcome", "not_attempted")),
+                sync_group_ids=tuple(str(value) for value in raw_group_ids),
             )
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             return None
@@ -164,14 +205,20 @@ class ActiveSessionStore:
 
 
 class SaveSyncProgressReporterLike(Protocol):
-    """Duck-typed hook for the optional gameStop graphical progress popup.
+    """Duck-typed hook for the shared lifecycle SaveSync progress popup.
 
     Deliberately independent of :mod:`romcloud.ui.savesync_progress` — this
     service layer never imports pygame/subprocess machinery directly, and
     every real implementation must already be fail-open (never raise).
     """
 
-    def stage(self, text: str) -> None: ...
+    def stage(
+        self,
+        text: str,
+        *,
+        current: Optional[int] = None,
+        total: Optional[int] = None,
+    ) -> None: ...
 
     def close(self, ok: bool, message: Optional[str] = None) -> None: ...
 
@@ -180,7 +227,13 @@ class _NullSaveSyncProgress:
     """Default no-op progress reporter — every other trigger (periodic
     menu tick, remote reconnect, drain-pending) never shows a popup."""
 
-    def stage(self, text: str) -> None:  # noqa: ARG002
+    def stage(
+        self,
+        text: str,
+        *,
+        current: Optional[int] = None,
+        total: Optional[int] = None,
+    ) -> None:  # noqa: ARG002
         return None
 
     def close(self, ok: bool, message: Optional[str] = None) -> None:  # noqa: ARG002
@@ -197,18 +250,86 @@ class _SafeProgress:
 
     def __init__(self, inner: SaveSyncProgressReporterLike) -> None:
         self._inner = inner
+        self._last_stage: Optional[tuple[str, Optional[int], Optional[int]]] = None
 
-    def stage(self, text: str) -> None:
+    def stage(
+        self,
+        text: str,
+        *,
+        current: Optional[int] = None,
+        total: Optional[int] = None,
+    ) -> None:
+        stage = (text, current, total)
+        if stage == self._last_stage:
+            return
+        self._last_stage = stage
         try:
-            self._inner.stage(text)
+            if current is None or total is None:
+                self._inner.stage(text)
+            else:
+                self._inner.stage(text, current=current, total=total)
+        except TypeError:
+            # Compatibility with older/custom presentation-only reporters.
+            # They still receive truthful phase text; only the optional byte
+            # fields are omitted.
+            try:
+                self._inner.stage(text)
+            except Exception:  # noqa: BLE001 - UI failures never affect SaveSync
+                log.warning("SaveSync progress popup stage update failed", exc_info=True)
         except Exception:  # noqa: BLE001 - UI failures must never affect SaveSync
-            log.warning("gameStop progress popup stage update failed", exc_info=True)
+            log.warning("SaveSync progress popup stage update failed", exc_info=True)
 
     def close(self, ok: bool, message: Optional[str] = None) -> None:
         try:
             self._inner.close(ok, message)
         except Exception:  # noqa: BLE001 - UI failures must never affect SaveSync
-            log.warning("gameStop progress popup close failed", exc_info=True)
+            log.warning("SaveSync progress popup close failed", exc_info=True)
+
+
+def _lifecycle_progress_sink(
+    progress: SaveSyncProgressReporterLike,
+) -> Callable[[ProgressEvent], None]:
+    """Translate service events into the shared lifecycle popup phases.
+
+    Reconciliation exposes trustworthy aggregate byte totals, but not a
+    trustworthy incremental transfer callback. Both lifecycle edges therefore
+    use the same indeterminate phase presentation instead of fabricating a
+    percentage.
+    """
+
+    def report(event: ProgressEvent) -> None:
+        byte_progress = (
+            event.current,
+            event.total,
+        ) if event.current is not None and event.total is not None else (None, None)
+        if event.stage == "preflight" and event.status == "running":
+            progress.stage(
+                "Comparing save versions…",
+                current=byte_progress[0],
+                total=byte_progress[1],
+            )
+            return
+        if event.stage == "preflight":
+            metadata = event.metadata or {}
+            uploads = int(metadata.get("uploads", 0) or 0)
+            downloads = int(metadata.get("downloads", 0) or 0)
+            if uploads and downloads:
+                progress.stage("Uploading and downloading saves…")
+            elif uploads:
+                progress.stage("Uploading save…")
+            elif downloads:
+                progress.stage("Downloading save…")
+            elif int(metadata.get("conflicts", 0) or 0):
+                progress.stage("Save conflict found.")
+            return
+        if event.stage == "verify" and event.status == "running":
+            progress.stage(
+                "Verifying save…",
+                current=byte_progress[0],
+                total=byte_progress[1],
+            )
+
+    return report
 
 
 class AutoSaveSyncCoordinator:
@@ -241,12 +362,29 @@ class AutoSaveSyncCoordinator:
         self._menu_state_path = self._data_root / "savesync-menu-pull.json"
 
     @correlated_operation("gameStart", subsystem="savesync", source="Auto gameStart")
-    def game_start(self, *, system: str, emulator: str, core: str, rom: str) -> None:
+    def game_start(
+        self,
+        *,
+        system: str,
+        emulator: str,
+        core: str,
+        rom: str,
+        progress: Optional[SaveSyncProgressReporterLike] = None,
+    ) -> tuple[str, ...]:
+        """Record the lifecycle marker, then best-effort pre-launch sync.
+
+        SaveSync must never hold the game hostage: the marker is written
+        first (pure local bookkeeping), and every step after that which
+        could touch the remote is wrapped so that any failure is recorded
+        as an outcome on the session marker and swallowed here \u2014 gameStart
+        always returns normally so the caller launches the game regardless.
+        """
         if not self._enabled:
-            return
-        session = self._sessions.start(
-            system=system, emulator=emulator, core=core, rom=rom
-        )
+            return ()
+        with stage_timer("lifecycle-session-record"):
+            session = self._sessions.start(
+                system=system, emulator=emulator, core=core, rom=rom
+            )
         session_path = self._sessions._path(system, rom)
         log.info(
             "gameStart session recorded: system=%s emulator=%s core=%s rom=%s "
@@ -275,6 +413,255 @@ class AutoSaveSyncCoordinator:
                 "boot_id": session.boot_id,
             },
         )
+        return self._game_start_sync(
+            system=system,
+            emulator=emulator,
+            core=core,
+            rom=rom,
+            progress=progress,
+        )
+
+    def game_start_eligible(
+        self, *, system: str, emulator: str, core: str, rom: str
+    ) -> bool:
+        """Return whether gameStart has a locally provable safe target."""
+        if not self._enabled:
+            return False
+        with stage_timer("lifecycle-target-resolution"):
+            layout_ids = layout_ids_for_session(self._policy, system, emulator, core)
+        if not layout_ids:
+            return False
+        try:
+            return bool(self._resolve_game_start_targets(layout_ids, rom))
+        except Exception:  # noqa: BLE001 - resolution failure remains fail-open
+            return False
+
+    def _resolve_game_start_targets(
+        self, layout_ids: frozenset[str], rom: str
+    ) -> dict[str, str]:
+        """Map each resolved layout to its provably safe pre-launch target.
+
+        A shared/container layout never gets a per-ROM guess: it only gets
+        ``shared_container_group_id``'s structural single-container
+        invariant. Every other layout only gets ``group_id_for_rom``'s
+        ROM-name-derived group. A layout resolving to neither is simply
+        absent from the result — callers must skip it, never widen to a
+        broad scan.
+        """
+        group_layout_map: dict[str, str] = {}
+        for layout_id in sorted(layout_ids):
+            layout = self._policy.layout(layout_id)
+            if layout.shared or layout.container_adapter_id:
+                group_id = self._policy.shared_container_group_id(layout_id)
+            else:
+                group_id = self._policy.group_id_for_rom(layout_id, rom)
+            if group_id is not None:
+                group_layout_map[group_id] = layout_id
+        return group_layout_map
+
+    def _game_start_sync(
+        self,
+        *,
+        system: str,
+        emulator: str,
+        core: str,
+        rom: str,
+        progress: Optional[SaveSyncProgressReporterLike] = None,
+    ) -> tuple[str, ...]:
+        layout_ids = layout_ids_for_session(self._policy, system, emulator, core)
+        if not layout_ids:
+            log.info(
+                "gameStart pre-launch sync skipped: system=%s emulator=%s core=%s "
+                "reason=unsupported-system",
+                system,
+                emulator,
+                core,
+            )
+            self._sessions.record_sync_outcome(
+                system=system, rom=rom, outcome="unsupported"
+            )
+            return ()
+
+        try:
+            with stage_timer("lifecycle-target-resolution"):
+                group_layout_map = self._resolve_game_start_targets(layout_ids, rom)
+        except Exception:  # noqa: BLE001 - gameStart must never block a launch
+            log.warning(
+                "gameStart target resolution failed; continuing launch: "
+                "system=%s emulator=%s core=%s rom=%s layout_ids=%s",
+                system,
+                emulator,
+                core,
+                rom,
+                ",".join(sorted(layout_ids)),
+                exc_info=True,
+            )
+            diagnostic_event(
+                "savesync",
+                "session.sync_unresolved",
+                "gameStart target resolution failed; launch continuing",
+                level="WARNING",
+                metadata={
+                    "raw_system": system,
+                    "emulator": emulator,
+                    "core": core,
+                    "rom": rom,
+                    "layout_ids": sorted(layout_ids),
+                },
+            )
+            self._sessions.record_sync_outcome(
+                system=system, rom=rom, outcome="unresolved"
+            )
+            return ()
+
+        if not group_layout_map:
+            # Neither a provable per-ROM target (group_id_for_rom) nor a
+            # structurally-guaranteed single shared container
+            # (shared_container_group_id) exists for any resolved layout.
+            # Never guess or widen to a broad scan here — skip pre-launch
+            # sync for this launch and continue, leaving full reconciliation
+            # to gameStop as before.
+            log.info(
+                "gameStart pre-launch sync skipped: system=%s emulator=%s core=%s "
+                "rom=%s layout_ids=%s reason=no-safe-target",
+                system,
+                emulator,
+                core,
+                rom,
+                ",".join(sorted(layout_ids)),
+            )
+            diagnostic_event(
+                "savesync",
+                "session.sync_skipped",
+                "gameStart pre-launch sync skipped: no safe target",
+                metadata={
+                    "raw_system": system,
+                    "emulator": emulator,
+                    "core": core,
+                    "rom": rom,
+                    "layout_ids": sorted(layout_ids),
+                },
+            )
+            self._sessions.record_sync_outcome(
+                system=system, rom=rom, outcome="skipped"
+            )
+            return ()
+
+        target_group_ids = tuple(sorted(group_layout_map))
+        progress = _SafeProgress(
+            progress if progress is not None else _NullSaveSyncProgress()
+        )
+        progress.stage("Checking save…")
+        progress.stage("Checking remote state…")
+        progress.stage("Comparing save versions…")
+        try:
+            with stage_timer("targeted-gameStart-service"):
+                result = self._service.targeted_game_start_sync(
+                    group_layout_map,
+                    progress=_lifecycle_progress_sink(progress),
+                )
+        except Exception:  # noqa: BLE001 - gameStart must never block a launch
+            log.warning(
+                "gameStart pre-launch sync attempt failed; continuing launch: "
+                "system=%s emulator=%s core=%s rom=%s group_ids=%s",
+                system,
+                emulator,
+                core,
+                rom,
+                ",".join(target_group_ids),
+                exc_info=True,
+            )
+            diagnostic_event(
+                "savesync",
+                "session.sync_unresolved",
+                "gameStart pre-launch sync failed; launch continuing",
+                level="WARNING",
+                metadata={
+                    "raw_system": system,
+                    "emulator": emulator,
+                    "core": core,
+                    "rom": rom,
+                    "group_ids": list(target_group_ids),
+                },
+            )
+            self._sessions.record_sync_outcome(
+                system=system,
+                rom=rom,
+                outcome="unresolved",
+                group_ids=target_group_ids,
+            )
+            progress.close(
+                False,
+                "Save sync unavailable.\nLaunching with your local save.",
+            )
+            return ()
+
+        conflict_ids: tuple[str, ...] = ()
+        if result.status == "unresolved" and result.reason == "conflict":
+            try:
+                conflict_ids = tuple(
+                    sorted(
+                        conflict.conflict_id
+                        for conflict in self._service.get_state().active_conflicts
+                        if conflict.group_id in target_group_ids
+                    )
+                )
+                if conflict_ids:
+                    savesync_prompts.enqueue(self._data_root, conflict_ids)
+                    log.info(
+                        "Persisted %d gameStart conflict prompt(s): queue=%s ids=%s",
+                        len(conflict_ids),
+                        savesync_prompts.queue_path(self._data_root),
+                        ",".join(conflict_ids),
+                    )
+            except Exception:  # noqa: BLE001 - launch remains fail-open
+                log.warning(
+                    "Could not persist gameStart conflict prompt queue; "
+                    "conflict evidence remains in SaveSync state",
+                    exc_info=True,
+                )
+
+        log.info(
+            "gameStart pre-launch sync outcome: system=%s emulator=%s core=%s "
+            "rom=%s group_ids=%s status=%s reason=%s",
+            system,
+            emulator,
+            core,
+            rom,
+            ",".join(target_group_ids),
+            result.status,
+            result.reason,
+        )
+        diagnostic_event(
+            "savesync",
+            "session.sync_completed",
+            "gameStart pre-launch sync completed",
+            metadata={
+                "raw_system": system,
+                "emulator": emulator,
+                "core": core,
+                "rom": rom,
+                "group_ids": list(target_group_ids),
+                "status": result.status,
+                "reason": result.reason,
+            },
+        )
+        self._sessions.record_sync_outcome(
+            system=system,
+            rom=rom,
+            outcome=result.status,
+            group_ids=target_group_ids,
+        )
+        if conflict_ids:
+            progress.close(True, "Save conflict found.")
+        elif result.status == "unresolved":
+            progress.close(
+                False,
+                "Save sync needs attention.\nLaunching with your local save.",
+            )
+        else:
+            progress.close(True, "Save is current.")
+        return conflict_ids
 
     def game_stop_eligible(self, *, system: str, emulator: str, core: str) -> bool:
         """Return whether a stop owns a code-supported automatic layout."""
@@ -747,6 +1134,11 @@ class AutoSaveSyncCoordinator:
                         try:
                             with stage_timer("quick-sync"):
                                 result = self._service.quick_sync(
+                                    progress=(
+                                        _lifecycle_progress_sink(progress)
+                                        if progress is not None
+                                        else None
+                                    ),
                                     is_group_active=is_group_active,
                                     is_layout_active=is_layout_active,
                                     exclude_layout_ids=(
@@ -804,18 +1196,10 @@ class AutoSaveSyncCoordinator:
                         new_conflict_ids, enqueue=collect_new_conflicts
                     )
                 if progress is not None:
-                    uploaded = result.report.uploaded if result.report is not None else 0
-                    downloaded = (
-                        result.report.downloaded if result.report is not None else 0
-                    )
                     if result.status == "unchanged":
                         progress.stage("No save changes detected.")
-                    elif uploaded and not downloaded:
-                        progress.stage("Uploading changed save…")
-                    elif downloaded and not uploaded:
-                        progress.stage("Downloading newer save…")
-                    elif uploaded or downloaded:
-                        progress.stage("Finalizing sync…")
+                    elif result.report is not None and result.report.conflicts:
+                        progress.stage("Save conflict found.")
                     else:
                         progress.stage("Save sync complete.")
                 log.info(

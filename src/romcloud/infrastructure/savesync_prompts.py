@@ -1,4 +1,4 @@
-"""Durable exact-ID handoff for game-stop SaveSync conflict prompts."""
+"""Durable exact-ID handoff for lifecycle SaveSync conflict prompts."""
 
 from __future__ import annotations
 
@@ -60,7 +60,7 @@ def popup_process_lock(data_root: Path) -> Iterator[bool]:
     with lock_path.open("a+b") as handle:
         try:
             _lock(handle, nonblocking=True)
-        except BlockingIOError:
+        except (BlockingIOError, PermissionError):
             yield False
             return
         try:

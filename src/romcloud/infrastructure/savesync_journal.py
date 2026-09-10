@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Iterator
 
 from romcloud.core.exceptions import SaveSyncError
+from romcloud.infrastructure.diagnostics import increment_operation_counter
 
 SCHEMA_VERSION = 1
 MAX_HISTORY = 512
@@ -117,14 +118,20 @@ def append_mutations(
 
 @contextmanager
 def journal_lock(path: Path) -> Iterator[None]:
+    """Hold the shared remote SaveSync lock guarding this journal.
+
+    Since the commit protocol widened this same lock file to cover a whole
+    remote commit (see :mod:`romcloud.infrastructure.savesync_commit`), this
+    must be re-entrant: the commit sequence holds it across the journal
+    read/append helpers below. Cross-process and cross-device exclusion is
+    unchanged and still provided entirely by the underlying ``flock``.
+    """
+    from romcloud.infrastructure import savesync_commit
+
     lock_path = Path(path).with_name(".savesync-journal.lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+b") as handle:
-        _lock_handle(handle)
-        try:
-            yield
-        finally:
-            _unlock_handle(handle)
+    with savesync_commit.exclusive_lock(lock_path):
+        increment_operation_counter("journal_lock_acquisitions")
+        yield
 
 
 def _validate_document(payload: object, *, path: Path) -> dict[str, object]:

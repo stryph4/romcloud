@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import os
 import shutil
 import tempfile
@@ -36,8 +37,10 @@ from romcloud.core.save_containers import (
 )
 from romcloud.core.exceptions import (
     ROMCloudError,
+    SaveSyncCasConflictError,
     SaveSyncConnectivityError,
     SaveSyncError,
+    SaveSyncRecoveryEvidenceError,
     SaveSyncVerificationError,
     SaveSyncWriteUnavailableError,
 )
@@ -60,6 +63,7 @@ from romcloud.core.models.savesync import (
     SaveRemoteAvailability,
     SaveRemoteObservation,
     SaveQuickSyncResult,
+    SaveGameStartSyncResult,
 )
 from romcloud.core.progress import ProgressSink, emit_progress
 from romcloud.core.save_selection import (
@@ -79,10 +83,13 @@ from romcloud.infrastructure.diagnostics import (
     correlated_operation,
     current_operation_id,
     event as diagnostic_event,
+    increment_operation_counter,
     stage_timer,
 )
 from romcloud.infrastructure import savesync_state as durable_state
 from romcloud.infrastructure import savesync_journal
+from romcloud.infrastructure import savesync_index
+from romcloud.infrastructure import savesync_commit
 from romcloud.infrastructure.remote_saves import RemoteSaveStore, build_remote_save_store
 from romcloud.infrastructure.save_container_registry import (
     DEFAULT_SAVE_CONTAINER_REGISTRY,
@@ -92,6 +99,8 @@ from romcloud.infrastructure.save_container_registry import (
 log = get_logger("saves")
 _RPCS3_CANONICAL_PREFIX = f"ps3/{RPCS3_DEV_HDD0_PREFIX}"
 _QUICK_SYNC_HISTORY_REQUIRED = 1
+_MAX_COMMIT_CAS_ATTEMPTS = 3
+_MAX_JOURNAL_APPEND_ATTEMPTS = 3
 
 _FILE_TIMESTAMP_KIND = "file"
 _CONTAINER_TIMESTAMP_KIND = "container"
@@ -148,6 +157,23 @@ class _LocalMaterializationStatus:
     missing: int
 
 
+@dataclass(frozen=True)
+class _IndexWatermark:
+    """This device's last-observed generations for an OWNED remote index.
+
+    Device-local only (a side file beside ``savesync-state.json``), never
+    shared and never reconciliation authority — it exists purely to let
+    Quick Sync skip re-fetching a layout shard whose committed content this
+    device already compared against its own durable per-group
+    ``remote_observed`` snapshots. ``dataset_id`` guards against comparing
+    generations across an unrelated/rebuilt dataset.
+    """
+
+    dataset_id: str
+    index_generation: int
+    layout_generations: dict[str, int]
+
+
 @dataclass
 class _ContainerWork:
     handled_paths: set[str]
@@ -178,6 +204,208 @@ class _ContainerWork:
         if self.scratch is not None:
             shutil.rmtree(self.scratch, ignore_errors=True)
             self.scratch = None
+
+
+class _RemoteCommit:
+    """The one protected remote publication primitive.
+
+    Ordinary reconciliation, force upload and conflict resolution all drive
+    this object through the same sequence, so none of them can acquire a
+    weaker guarantee than the others:
+
+    ``begin`` (lock, resolve any abandoned intent, CAS, index/payload
+    cross-check, write intent) → ``promoting`` → ``publish`` (the shared
+    commit point) → ``append_compatibility_journal`` → ``close``.
+
+    ``index_committed`` is the rollback boundary. Before it, a failure rolls
+    the transaction back and retires the intent. After it, the change is
+    published for every peer and must be recovered *forward* — rolling back
+    would delete save data another device is already entitled to read.
+    """
+
+    def __init__(
+        self,
+        service: "SaveSyncService",
+        *,
+        operation_id: str,
+        device_id: str,
+        intent_groups: tuple[savesync_commit.IntentGroup, ...],
+        operation: str,
+    ) -> None:
+        self._service = service
+        self._operation_id = operation_id
+        self._device_id = device_id
+        self._groups = intent_groups
+        self._operation = operation
+        self._intent: Optional[savesync_commit.CommitIntent] = None
+        self._owned = False
+        self._deferred = False
+        self._dataset_id: Optional[str] = None
+        self._base_journal_generation = 0
+        self.index_committed = False
+
+    @property
+    def owned(self) -> bool:
+        return self._owned
+
+    def begin(self) -> None:
+        service = self._service
+        service._enter_remote_commit()
+        dataset = service._require_commit_ready_dataset(operation=self._operation)
+        self._owned = dataset.is_owned
+        self._deferred = service._defer_index_publication
+        service._resolve_shared_intent(
+            owned=self._owned and not self._deferred, repairing=self._deferred
+        )
+        self._base_journal_generation = service._current_journal_generation()
+        if not self._groups or not self._owned:
+            if self._groups and not self._owned:
+                # Legacy dataset: the protocol does not own it, so it must
+                # not pretend to offer CAS or publish authoritative state
+                # here. Only a Full Sync cutover may promote this dataset.
+                log.info(
+                    "SaveSync commit running without protocol ownership: "
+                    "operation_id=%s reason=dataset-not-cut-over cas=unavailable",
+                    self._operation_id,
+                )
+            return
+        index_root = service._index_root
+        assert index_root is not None
+        head = savesync_index.load_head_strict(index_root)
+        self._dataset_id = head.dataset_id
+        layout_for_group = {group.group_id: group.layout_id for group in self._groups}
+        if not self._deferred:
+            # Full Sync is the operation that *repairs* a stale index, and it
+            # holds the commit lock for its whole run, so it neither needs
+            # CAS nor may be blocked by the staleness it exists to fix.
+            expectations = savesync_index.read_group_expectations(
+                index_root, head, frozenset(layout_for_group), layout_for_group
+            )
+            service._assert_cas(expectations, operation_id=self._operation_id)
+            observed = service._observe_remote_group_manifests(self._groups)
+            service._assert_index_matches_payload(
+                expectations, observed, operation_id=self._operation_id
+            )
+        self._intent = savesync_commit.CommitIntent(
+            schema_version=savesync_commit.SCHEMA_VERSION,
+            operation_id=self._operation_id,
+            origin_device=self._device_id,
+            dataset_id=head.dataset_id,
+            base_index_generation=head.index_generation,
+            base_journal_generation=self._base_journal_generation,
+            phase=savesync_commit.IntentPhase.PREPARED.value,
+            started_at=datetime.now(timezone.utc).isoformat(),
+            groups=self._groups,
+            publication_scope=(
+                savesync_commit.PublicationScope.FULL_SYNC.value
+                if self._deferred
+                else savesync_commit.PublicationScope.GROUP.value
+            ),
+        )
+        savesync_commit.write_intent(index_root, self._intent)
+
+    def _advance(self, phase: savesync_commit.IntentPhase) -> None:
+        index_root = self._service._index_root
+        if self._intent is None or index_root is None:
+            return
+        self._intent = self._intent.with_phase(phase)
+        savesync_commit.write_intent(index_root, self._intent)
+
+    def promoting(self) -> None:
+        self._advance(savesync_commit.IntentPhase.PROMOTING)
+
+    def publish(self) -> None:
+        """Publish verified payload. This is the cross-device commit point.
+
+        Skipped when a logical Full Sync owns the publication: that run
+        rebuilds and publishes the complete index exactly once at its own
+        defined point, so an internal reconcile must not also publish
+        partial authoritative state.
+        """
+        if not self._owned or not self._groups:
+            return
+        self._advance(savesync_commit.IntentPhase.PAYLOAD_VERIFIED)
+        if self._deferred:
+            return
+        self._service._publish_index_for_groups(
+            self._groups,
+            operation_id=self._operation_id,
+            origin_device=self._device_id,
+            dataset_id_hint=self._dataset_id,
+            journal_generation=self._base_journal_generation,
+        )
+        self.index_committed = True
+        self._advance(savesync_commit.IntentPhase.INDEX_PUBLISHED)
+
+    def append_compatibility_journal(
+        self, *, revision: str, timestamp: str, mutations: list[dict[str, object]]
+    ) -> Optional[int]:
+        """Append legacy history, retried boundedly, never fatal after commit.
+
+        After the ownership cutover the journal is compatibility/history
+        only. A failure here cannot be allowed to undo an already published
+        commit, so it degrades loudly instead: peers on the current protocol
+        still discover the change through the index, while an old reader
+        will not see it until a Full Sync.
+        """
+        if not mutations:
+            return None
+        service = self._service
+        last_error: Optional[BaseException] = None
+        for attempt in range(_MAX_JOURNAL_APPEND_ATTEMPTS):
+            try:
+                generation = service._append_remote_journal(
+                    revision=revision, timestamp=timestamp, mutations=mutations
+                )
+            except (SaveSyncError, OSError) as exc:
+                last_error = exc
+                log.warning(
+                    "SaveSync compatibility journal append failed: operation_id=%s "
+                    "attempt=%d/%d reason=%s",
+                    self._operation_id,
+                    attempt + 1,
+                    _MAX_JOURNAL_APPEND_ATTEMPTS,
+                    type(exc).__name__,
+                )
+                continue
+            service._record_committed_journal_generation(generation)
+            self._advance(savesync_commit.IntentPhase.JOURNALED)
+            return generation
+        if not self.index_committed:
+            assert last_error is not None
+            raise last_error
+        log.error(
+            "SaveSync compatibility journal is degraded: operation_id=%s "
+            "remote_commit=published legacy_discovery=unavailable rollback=refused",
+            self._operation_id,
+        )
+        diagnostic_event(
+            "savesync", "journal.compatibility_degraded",
+            "SaveSync committed a save the legacy journal could not record",
+            level="ERROR",
+            metadata={
+                "operation_id": self._operation_id,
+                "reason": type(last_error).__name__ if last_error else "unknown",
+                "legacy_discovery": "requires-full-sync",
+                "rollback": "refused",
+            },
+        )
+        return None
+
+    def close(self) -> None:
+        index_root = self._service._index_root
+        if self._intent is None or index_root is None or self._deferred:
+            # A deferred intent stays until the enclosing Full Sync publishes,
+            # so an interruption in between is still recoverable.
+            return
+        savesync_commit.clear_intent(index_root)
+        self._intent = None
+
+    def abandon(self) -> None:
+        """Retire an intent for a commit that never reached publication."""
+        if self.index_committed:
+            return
+        self.close()
 
 
 class SaveSyncService:
@@ -258,6 +486,9 @@ class SaveSyncService:
         self._capabilities = capability_policy or CapabilityPolicy("smart_cache")
         self._active_read_scratch: Optional[_ScratchDir] = None
         self._observation_cache: Optional[save_tree.ContentObservationCache] = None
+        self._commit_lock_stack: Optional[contextlib.ExitStack] = None
+        self._commit_lock_held = False
+        self._defer_index_publication = False
         self._container_registry = container_registry
 
     # ── connectivity and settings ────────────────────────────────────────
@@ -410,7 +641,8 @@ class SaveSyncService:
 
     def get_state(self) -> SaveSyncState:
         """Return locked local state, creating/migrating it durably as needed."""
-        return durable_state.load_state(self._state_path)
+        with stage_timer("local-state-load"):
+            return durable_state.load_state(self._state_path)
 
     def _get_state_unlocked(self) -> SaveSyncState:
         """Read state while the caller owns :meth:`_operation_lock`."""
@@ -866,7 +1098,7 @@ class SaveSyncService:
         if direction == "upload":
             self._require_durable_remote("Upload Local Save")
         self._require_remote()
-        with self._locked_operation():
+        with self._locked_operation(), self._remote_commit_scope():
             if not self.is_remote_reachable():
                 raise SaveSyncConnectivityError(
                     f"Remote save location is not reachable: {self._connectivity_root}"
@@ -929,6 +1161,16 @@ class SaveSyncService:
             # Diagnostic correlation IDs and durable transaction IDs have
             # different contracts. The latter is always an independent UUID.
             operation_id = uuid.uuid4().hex
+            remote_commit: Optional[_RemoteCommit] = None
+            if direction == "upload":
+                remote_commit = self._open_remote_commit(
+                    operation_id=operation_id,
+                    device_id=state.device_id,
+                    before=remote,
+                    desired=desired,
+                    operation="Upload Local Save",
+                )
+                remote_commit.begin()
             transaction = self._prepare_selected_transaction(
                 destination_views,
                 current=destination,
@@ -942,6 +1184,8 @@ class SaveSyncService:
                     raise SaveSyncVerificationError(
                         "Save data changed while staging; no replacement was kept."
                     )
+                if remote_commit is not None:
+                    remote_commit.promoting()
                 if transaction is not None:
                     self._apply_selected_transaction(transaction, destination_views)
                 final_local, final_remote = self._scan_conflict_sides(conflict)
@@ -949,9 +1193,15 @@ class SaveSyncService:
                     raise SaveSyncVerificationError(
                         "Resolved save group failed post-commit verification."
                     )
+                if remote_commit is not None:
+                    remote_commit.publish()
             except BaseException:
+                if remote_commit is not None and remote_commit.index_committed:
+                    raise
                 if transaction is not None:
                     transaction.rollback()
+                if remote_commit is not None:
+                    remote_commit.abandon()
                 raise
 
             record = SaveSyncRecord(
@@ -969,20 +1219,31 @@ class SaveSyncService:
                     operation_id=operation_id,
                 )
             except BaseException:
+                if remote_commit is not None and remote_commit.index_committed:
+                    raise
                 if transaction is not None:
                     transaction.rollback()
+                if remote_commit is not None:
+                    remote_commit.abandon()
                 raise
-            if direction == "upload":
+            if direction == "upload" and remote_commit is not None:
                 mutations = self._journal_mutations_for_remote_transition(
                     before=remote,
                     after=desired,
                 )
-                if mutations:
-                    generation = self._append_remote_journal(
+                try:
+                    generation = remote_commit.append_compatibility_journal(
                         revision=record.revision,
                         timestamp=record.timestamp,
                         mutations=mutations,
                     )
+                except BaseException:
+                    # Pre-cutover only: see the same guard in _reconcile_once.
+                    if transaction is not None:
+                        transaction.rollback()
+                    remote_commit.abandon()
+                    raise
+                if generation is not None:
                     next_state = self._get_state_unlocked()
                     if next_state.quick_sync_ready:
                         _write_state(
@@ -992,6 +1253,7 @@ class SaveSyncService:
                                 quick_sync_cursor_generation=generation,
                             ),
                         )
+                remote_commit.close()
             if transaction is not None:
                 try:
                     transaction.finalize()
@@ -1171,7 +1433,10 @@ class SaveSyncService:
         remote provider lacks filesystem semantics, provides a scratch
         directory for :meth:`_remote_path` to fetch into — always cleaned
         up when the operation ends, success or failure."""
-        with self._operation_lock():
+        with contextlib.ExitStack() as lock_stack:
+            with stage_timer("state-lock-wait"):
+                lock_stack.enter_context(self._operation_lock())
+            increment_operation_counter("state_lock_acquisitions")
             scratch = _ScratchDir(self._state_path.parent)
             previous = self._active_read_scratch
             self._active_read_scratch = scratch
@@ -1376,6 +1641,7 @@ class SaveSyncService:
         self, layout_ids: frozenset[str]
     ) -> save_tree.ScanReport:
         """Scan only explicit registry roots associated with a game session."""
+        increment_operation_counter("local_manifest_observations")
         layouts = tuple(
             layout
             for layout in self._policy.layouts
@@ -1426,9 +1692,10 @@ class SaveSyncService:
         )
 
     def _scan_remote_layouts(
-        self, layout_ids: frozenset[str]
+        self, layout_ids: frozenset[str], *, only_relative_paths: Optional[frozenset[str]] = None
     ) -> save_tree.ScanReport:
         assert self._remote_store is not None
+        increment_operation_counter("remote_manifest_observations")
         layouts = tuple(
             layout
             for layout in self._policy.layouts
@@ -1442,6 +1709,7 @@ class SaveSyncService:
             selected_policy,
             enabled_optional_systems=self._enabled_optional_systems(),
             enabled_optional_groups=self._enabled_optional_groups(),
+            only_relative_paths=only_relative_paths,
         )
 
     def _automatic_report(self, report: save_tree.ScanReport) -> save_tree.ScanReport:
@@ -1461,6 +1729,59 @@ class SaveSyncService:
             for path, artifact in _baseline_manifest(state).items()
             if self._path_enabled(path)
         }
+
+    def _has_container_layout(self, layout_ids: frozenset[str]) -> bool:
+        return any(
+            layout.container_adapter_id
+            for layout in self._policy.layouts
+            if layout.layout_id in layout_ids
+        )
+
+    def _trusted_group_remote_scope(
+        self,
+        group_ids: frozenset[str],
+        local_report: save_tree.ScanReport,
+        state: SaveSyncState,
+        *,
+        indexed_paths: Optional[dict[str, frozenset[str]]] = None,
+    ) -> frozenset[str]:
+        """Exact remote candidate paths for group IDs Quick Sync already tracks.
+
+        Callers must only pass group IDs that a fresh journal/dirty-hint scope
+        resolution already resolved to *known* durable groups \u2014
+        :meth:`_quick_sync_scope` always widens an unknown or ambiguous
+        journal group ID to a full layout scan instead of a bare group ID, so
+        every group ID reaching this helper already has a durable baseline.
+
+        The result is every path this device has already observed for these
+        groups, either in the local scan just completed for this same
+        operation or in the last shared baseline, plus any paths the remote
+        index itself declares for the group when *indexed_paths* is given
+        (index-driven Quick Sync on an OWNED dataset). That closes the one
+        gap the local/baseline union alone cannot: a brand-new remote-only
+        file for an already-tracked group that this device has never
+        locally held nor previously shared. This is why callers unrelated
+        to Quick Sync's own trusted scope (e.g. :meth:`reconcile_pending_groups`)
+        must never pass either.
+        """
+        local_paths = frozenset(
+            path
+            for path in local_report.artifacts
+            if _group_id(self._policy, path) in group_ids
+        )
+        baseline_paths = frozenset(
+            _manifest_for_groups(self._automatic_baseline(state), group_ids, self._policy)
+        )
+        # Index-driven Quick Sync supplies exact paths the remote index
+        # already names for a group, so a brand-new remote-only file is
+        # never guessed from local/baseline knowledge alone.
+        index_paths = frozenset(
+            path
+            for group_id in group_ids
+            for path in (indexed_paths or {}).get(group_id, frozenset())
+        )
+        return local_paths | baseline_paths | index_paths
+
 
     def _local_path(self, relative_path: str) -> Path:
         """Resolve a canonical save path through the local destination views.
@@ -1693,44 +2014,1373 @@ class SaveSyncService:
 
     @correlated_operation("Full Sync", subsystem="savesync", source="Full Sync")
     def full_sync(self, *, progress: ProgressSink = None) -> SaveReconcileReport:
-        """Run authoritative reconciliation and establish Quick Sync baseline."""
+        """Run authoritative reconciliation and establish Quick Sync baseline.
+
+        Also the *only* path that may create or refresh authoritative shared
+        protocol state: it is the one operation that scans, reconciles and
+        verifies the whole remote dataset, so it is the one operation whose
+        index describes complete filesystem truth. The whole run is held
+        under the remote commit lock (the repair/cutover form of the
+        protocol lock) and publishes exactly once, at the end.
+        """
         self._require_remote()
         self._require_filesystem_remote("Full Sync")
         self._require_durable_remote("Full Sync")
-        self._load_remote_journal(reset_on_error=True)
-        report = self.reconcile(progress=progress)
-        journal = self._load_remote_journal(reset_on_error=True)
-        observed_generation = int(journal["generation"])
-        with self._locked_operation():
-            state = self._get_state_unlocked()
-            cursor_before = state.quick_sync_cursor_generation
-            _write_state(
-                self._state_path,
-                replace(
-                    state,
-                    quick_sync_ready=True,
-                    quick_sync_cursor_generation=observed_generation,
-                ),
-            )
-            log.info(
-                "Full SaveSync cursor committed: cursor_before=%s cursor_after=%d "
-                "baseline_artifacts=%d report_revision=%s",
-                cursor_before if cursor_before is not None else "none",
-                observed_generation,
-                len(state.shared_manifest),
-                report.revision,
+        with self._remote_commit_scope():
+            self._enter_remote_commit()
+            self._load_remote_journal(reset_on_error=True)
+            self._defer_index_publication = True
+            try:
+                report = self.reconcile(progress=progress)
+            finally:
+                self._defer_index_publication = False
+            journal = self._load_remote_journal(reset_on_error=True)
+            observed_generation = int(journal["generation"])
+            with self._locked_operation():
+                state = self._get_state_unlocked()
+                cursor_before = state.quick_sync_cursor_generation
+                _write_state(
+                    self._state_path,
+                    replace(
+                        state,
+                        quick_sync_ready=True,
+                        quick_sync_cursor_generation=observed_generation,
+                    ),
+                )
+                log.info(
+                    "Full SaveSync cursor committed: cursor_before=%s cursor_after=%d "
+                    "baseline_artifacts=%d report_revision=%s",
+                    cursor_before if cursor_before is not None else "none",
+                    observed_generation,
+                    len(state.shared_manifest),
+                    report.revision,
+                )
+                diagnostic_event(
+                    "savesync", "cursor.advanced", "Full SaveSync cursor advanced",
+                    metadata={
+                        "cursor_before": cursor_before,
+                        "cursor_after": observed_generation,
+                        "baseline_artifacts": len(state.shared_manifest),
+                        "revision": report.revision,
+                        "reason": "full-sync-complete",
+                    },
+                )
+                self._publish_authoritative_index(
+                    state=state, journal_generation=observed_generation
+                )
+        return report
+
+    def _publish_authoritative_index(
+        self, *, state: SaveSyncState, journal_generation: int
+    ) -> None:
+        """Full Sync's single publication point and the only route to OWNED.
+
+        Publishes the complete verified index built from freshly scanned
+        remote content, then writes the ownership marker. Ordinary
+        reconciliation never reaches here, so a partial index can never
+        become authoritative.
+        """
+        index_root = self._index_root
+        if index_root is None:
+            return
+        try:
+            layout_groups = self._collect_index_layout_groups(index_root, state)
+            with stage_timer("index-bootstrap") as timing:
+                head = savesync_index.publish_authoritative_index(
+                    index_root,
+                    dataset_id_hint=None,
+                    journal_generation=journal_generation,
+                    layout_groups=layout_groups,
+                    device_id=state.device_id,
+                    established_at=datetime.now(timezone.utc).isoformat(),
+                )
+                timing["index_generation"] = head.index_generation
+                timing["layout_count"] = len(layout_groups)
+        except (SaveSyncError, OSError):
+            log.warning(
+                "SaveSync authoritative index publication failed; the dataset keeps "
+                "its previous protocol state",
+                exc_info=True,
             )
             diagnostic_event(
-                "savesync", "cursor.advanced", "Full SaveSync cursor advanced",
+                "savesync", "index.publish_failed",
+                "SaveSync authoritative index publication failed",
+                level="WARNING",
+            )
+            return
+        savesync_commit.clear_intent(index_root)
+        self._remember_dataset_ownership(
+            savesync_index.OwnershipMarker(
+                schema_version=savesync_index.SCHEMA_VERSION,
+                protocol_version=savesync_index.PROTOCOL_VERSION,
+                dataset_id=head.dataset_id,
+                established_at=datetime.now(timezone.utc).isoformat(),
+                established_by_device=state.device_id,
+            )
+        )
+        log.info(
+            "SaveSync authoritative index published: dataset_id=%s index_generation=%d "
+            "journal_generation=%d layout_count=%d ownership=owned",
+            head.dataset_id,
+            head.index_generation,
+            head.journal_generation,
+            len(head.layouts),
+        )
+        diagnostic_event(
+            "savesync", "index.published", "SaveSync authoritative index published",
+            metadata={
+                "dataset_id": head.dataset_id,
+                "index_generation": head.index_generation,
+                "journal_generation": head.journal_generation,
+                "layout_count": len(head.layouts),
+                "ownership": "owned",
+            },
+        )
+
+    def _collect_index_layout_groups(
+        self, index_root: Path, state: SaveSyncState
+    ) -> dict[str, tuple[savesync_index.IndexGroup, ...]]:
+        """Build every registered layout's verified current group set.
+
+        Reads actual freshly-scanned remote content — never the journal.
+        Per-group ``group_generation`` is derived by diffing against the
+        previously published shard for that layout (absent/unreadable
+        counts as generation 1, i.e. first-ever observation).
+        """
+        with self._fresh_observations():
+            remote_manifest = dict(self._scan_automatic_remote().artifacts)
+        grouped = _grouped_manifest(remote_manifest, self._policy)
+        known_group_layouts = {group.group_id: group.layout_id for group in state.groups}
+        registered_layout_ids = {layout.layout_id for layout in self._policy.layouts}
+        all_group_ids = frozenset(grouped) | frozenset(known_group_layouts)
+        previous_head = savesync_index.load_head_safe(index_root)
+        previous_groups_cache: dict[str, dict[str, savesync_index.IndexGroup]] = {}
+
+        def previous_groups(layout_id: str) -> dict[str, savesync_index.IndexGroup]:
+            if layout_id not in previous_groups_cache:
+                groups: dict[str, savesync_index.IndexGroup] = {}
+                layout_head = (
+                    previous_head.layouts.get(layout_id) if previous_head is not None else None
+                )
+                if layout_head is not None:
+                    try:
+                        shard = savesync_index.load_shard(index_root, layout_id, layout_head)
+                        groups = {group.group_id: group for group in shard.groups}
+                    except SaveSyncError:
+                        groups = {}
+                previous_groups_cache[layout_id] = groups
+            return previous_groups_cache[layout_id]
+
+        layout_groups: dict[str, list[savesync_index.IndexGroup]] = {}
+        for group_id in sorted(all_group_ids):
+            if group_id.startswith("unsupported:"):
+                continue
+            artifacts_tuple = grouped.get(group_id, ())
+            descriptor = (
+                self._policy.group_for_path(artifacts_tuple[0].relative_path)
+                if artifacts_tuple
+                else None
+            )
+            if descriptor is not None:
+                layout_id = descriptor.layout_id
+                system = descriptor.system
+                container_head = descriptor.container_adapter_id or None
+            else:
+                layout_id = known_group_layouts.get(group_id)
+                if layout_id is None or layout_id not in registered_layout_ids:
+                    continue  # never a registered group, or its layout was retired
+                system = self._policy.layout(layout_id).system
+                container_head = None
+            artifacts = tuple(
+                savesync_index.IndexArtifact(
+                    artifact.relative_path, artifact.size_bytes, artifact.content_hash
+                )
+                for artifact in artifacts_tuple
+            )
+            tombstoned = not artifacts
+            if tombstoned and group_id not in known_group_layouts:
+                continue  # never previously tracked and currently empty
+            previous_group = previous_groups(layout_id).get(group_id)
+            if previous_group is not None and previous_group.artifacts == artifacts:
+                group_generation = previous_group.group_generation
+            else:
+                group_generation = (
+                    previous_group.group_generation + 1 if previous_group is not None else 1
+                )
+            if container_head is None and previous_group is not None:
+                container_head = previous_group.container_head
+            layout_groups.setdefault(layout_id, []).append(
+                savesync_index.IndexGroup(
+                    group_id=group_id,
+                    layout_id=layout_id,
+                    system=system,
+                    group_generation=group_generation,
+                    artifacts=artifacts,
+                    tombstoned=tombstoned,
+                    origin_device=state.device_id,
+                    completed_transaction_id=None,
+                    container_head=container_head,
+                )
+            )
+        return {
+            layout_id: tuple(groups) for layout_id, groups in layout_groups.items()
+        }
+
+    # ── remote commit protocol: lock, CAS, shared intent ─────────────────
+
+    @property
+    def _remote_data_root(self) -> Optional[Path]:
+        """Directory holding the legacy journal and the shared index."""
+        if self._remote_root is None:
+            return None
+        return self._remote_root.parent
+
+    @property
+    def _index_root(self) -> Optional[Path]:
+        if self._remote_root is None:
+            return None
+        return savesync_index.default_index_root(self._remote_root)
+
+    @contextlib.contextmanager
+    def _remote_commit_scope(self):  # noqa: ANN202
+        """Bound the lifetime of a remote commit lock acquired mid-operation.
+
+        The lock is taken lazily by :meth:`_enter_remote_commit` only once an
+        operation actually knows it will mutate remote payload, so planning
+        and pure-download work never serialize devices against each other.
+        Entering this scope guarantees the lock is released on every exit
+        path, including an exception raised between promotion and
+        publication.
+        """
+        stack = contextlib.ExitStack()
+        previous = getattr(self, "_commit_lock_stack", None)
+        self._commit_lock_stack = stack
+        self._commit_lock_held = False
+        try:
+            with stack:
+                yield
+        finally:
+            self._commit_lock_stack = previous
+            self._commit_lock_held = False
+
+    def _enter_remote_commit(self) -> None:
+        """Serialize this device's whole remote commit against every peer.
+
+        This is the existing remote ``.savesync-journal.lock`` widened from
+        guarding a journal rewrite to guarding the full sequence: fresh state
+        reload, CAS validation, staging, promotion, verification, index
+        publication and journal publication. Waiting here can never turn a
+        stale decision into a last-writer-wins overwrite, because the CAS
+        check is re-evaluated *after* the wait and before any mutation.
+        """
+        stack = getattr(self, "_commit_lock_stack", None)
+        root = self._remote_data_root
+        if stack is None or root is None or self._commit_lock_held:
+            return
+        with stage_timer("commit-lock-wait"):
+            stack.enter_context(savesync_commit.commit_lock(root))
+        increment_operation_counter("remote_commit_lock_acquisitions")
+        self._commit_lock_held = True
+
+    def _changed_remote_groups(
+        self,
+        before: dict[str, SaveArtifact],
+        after: dict[str, SaveArtifact],
+    ) -> dict[str, tuple[tuple[SaveArtifact, ...], tuple[SaveArtifact, ...]]]:
+        """Ownership groups whose remote manifest this operation would change."""
+        grouped_before = _grouped_manifest(before, self._policy)
+        grouped_after = _grouped_manifest(after, self._policy)
+        changed: dict[str, tuple[tuple[SaveArtifact, ...], tuple[SaveArtifact, ...]]] = {}
+        for group_id in sorted(set(grouped_before) | set(grouped_after)):
+            if group_id.startswith("unsupported:"):
+                continue
+            before_group = grouped_before.get(group_id, ())
+            after_group = grouped_after.get(group_id, ())
+            if before_group != after_group:
+                changed[group_id] = (before_group, after_group)
+        return changed
+
+    def _protocol_record_path(self) -> Path:
+        """Local note that this device has seen this dataset under the protocol."""
+        return self._state_path.with_name("savesync-protocol.json")
+
+    def _remember_dataset_ownership(self, marker: savesync_index.OwnershipMarker) -> None:
+        record = {
+            "protocol_version": marker.protocol_version,
+            "dataset_id": marker.dataset_id,
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            durable_state.write_json_document(self._protocol_record_path(), record)
+        except (OSError, SaveSyncError):
+            log.warning("Could not record SaveSync protocol ownership locally", exc_info=True)
+
+    def _previously_observed_ownership(self) -> Optional[dict]:
+        path = self._protocol_record_path()
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _resolve_dataset_state(self) -> savesync_index.DatasetState:
+        """Classify protocol ownership, refusing a silent downgrade.
+
+        A dataset this device previously used under the protocol must not
+        quietly fall back to legacy behavior because its ownership marker
+        vanished: that would disable CAS exactly when something has gone
+        wrong with the shared state.
+        """
+        index_root = self._index_root
+        if index_root is None:
+            return savesync_index.DatasetState(
+                savesync_index.DatasetOwnership.UNOWNED, detail="no filesystem remote"
+            )
+        state = savesync_index.resolve_dataset_state(index_root)
+        if state.ownership is savesync_index.DatasetOwnership.OWNED:
+            assert state.marker is not None
+            self._remember_dataset_ownership(state.marker)
+            return state
+        if state.ownership is savesync_index.DatasetOwnership.UNOWNED:
+            remembered = self._previously_observed_ownership()
+            if remembered is not None:
+                return savesync_index.DatasetState(
+                    savesync_index.DatasetOwnership.DAMAGED,
+                    detail=(
+                        "this device previously used dataset "
+                        f"{remembered.get('dataset_id')!r} under the SaveSync commit "
+                        "protocol, but its ownership marker is gone"
+                    ),
+                )
+        return state
+
+    def _require_commit_ready_dataset(
+        self, *, operation: str
+    ) -> savesync_index.DatasetState:
+        state = self._resolve_dataset_state()
+        if state.ownership is savesync_index.DatasetOwnership.DAMAGED:
+            diagnostic_event(
+                "savesync", "protocol.dataset_damaged",
+                "SaveSync remote protocol state is damaged",
+                level="ERROR",
+                metadata={"operation": operation, "detail": state.detail},
+            )
+            raise SaveSyncVerificationError(
+                f"{operation}: the shared SaveSync protocol state on remote-data is "
+                f"damaged ({state.detail}). No save data was changed. Run a Full Sync "
+                "to rebuild it from the actual files on disk."
+            )
+        return state
+
+    # ── index-driven Quick Sync (OWNED datasets) ─────────────────────────
+
+    def _index_watermark_path(self) -> Path:
+        return self._state_path.with_name("savesync-index-watermark.json")
+
+    def _load_index_watermark(self, *, dataset_id: str) -> _IndexWatermark:
+        """This device's last-compared index generations, or a fresh start.
+
+        A missing/corrupt file, or one naming a different dataset (rebuilt
+        cutover), is treated identically to "never observed" — conservative
+        and self-correcting: it only costs re-fetching shards once, never a
+        false claim of already-observed content.
+        """
+        empty = _IndexWatermark(dataset_id=dataset_id, index_generation=0, layout_generations={})
+        path = self._index_watermark_path()
+        with stage_timer("local-watermark-load"):
+            if not path.exists():
+                return empty
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return empty
+        if not isinstance(payload, dict) or payload.get("dataset_id") != dataset_id:
+            return empty
+        raw_layouts = payload.get("layout_generations")
+        layout_generations = (
+            {
+                str(layout_id): int(generation)
+                for layout_id, generation in raw_layouts.items()
+                if isinstance(generation, int) and not isinstance(generation, bool)
+            }
+            if isinstance(raw_layouts, dict)
+            else {}
+        )
+        index_generation = payload.get("index_generation")
+        return _IndexWatermark(
+            dataset_id=dataset_id,
+            index_generation=(
+                index_generation
+                if isinstance(index_generation, int) and not isinstance(index_generation, bool)
+                else 0
+            ),
+            layout_generations=layout_generations,
+        )
+
+    def _save_index_watermark(self, watermark: _IndexWatermark) -> None:
+        try:
+            with stage_timer("local-state-persistence"):
+                durable_state.write_json_document(
+                    self._index_watermark_path(),
+                    {
+                        "dataset_id": watermark.dataset_id,
+                        "index_generation": watermark.index_generation,
+                        "layout_generations": watermark.layout_generations,
+                    },
+                )
+        except (OSError, SaveSyncError):
+            log.warning("Could not persist SaveSync index watermark", exc_info=True)
+
+    def _advance_index_watermark(
+        self,
+        previous: _IndexWatermark,
+        head: savesync_index.IndexHead,
+        *,
+        excluded_layouts: frozenset[str],
+    ) -> None:
+        """Record everything this pass actually compared, and nothing else.
+
+        An excluded layout's generation is deliberately left behind even if
+        the global generation advances, so a still-outstanding change in a
+        temporarily excluded layout (e.g. an active game session) is not
+        silently forgotten by the cheap "unchanged" fast path once the
+        exclusion lifts and nothing else happens to change afterward.
+        """
+        layout_generations = dict(previous.layout_generations)
+        layout_generations.update(
+            {
+                layout_id: layout_head.generation
+                for layout_id, layout_head in head.layouts.items()
+                if layout_id not in excluded_layouts
+            }
+        )
+        excluded_outstanding = any(
+            layout_id in excluded_layouts
+            and layout_head.generation > previous.layout_generations.get(layout_id, 0)
+            for layout_id, layout_head in head.layouts.items()
+        )
+        self._save_index_watermark(
+            _IndexWatermark(
+                dataset_id=head.dataset_id,
+                index_generation=(
+                    previous.index_generation if excluded_outstanding else head.index_generation
+                ),
+                layout_generations=layout_generations,
+            )
+        )
+
+    def _advance_index_watermark_layouts(
+        self,
+        previous: _IndexWatermark,
+        head: savesync_index.IndexHead,
+        layout_ids: frozenset[str],
+    ) -> None:
+        """Narrow watermark update for targeted pre-launch synchronization.
+
+        Unlike :meth:`_advance_index_watermark`'s full-sweep update, this
+        only ever records the specific layouts actually examined here, and
+        never touches the global ``index_generation`` — that field is Quick
+        Sync's own signal that *every* layout was checked on that pass, which
+        a narrowly-targeted gameStart pass never proves. Leaving it
+        untouched guarantees Quick Sync still performs its own full sweep
+        (cheap, correctness-preserving) rather than risking a missed change
+        in a layout this pass never looked at.
+        """
+        layout_generations = dict(previous.layout_generations)
+        for layout_id in layout_ids:
+            layout_head = head.layouts.get(layout_id)
+            if layout_head is not None:
+                layout_generations[layout_id] = layout_head.generation
+        self._save_index_watermark(
+            _IndexWatermark(
+                dataset_id=head.dataset_id,
+                index_generation=previous.index_generation,
+                layout_generations=layout_generations,
+            )
+        )
+
+    def _remote_observed_manifest_hash(
+        self, snapshot: Optional[SaveGroupSnapshot]
+    ) -> Optional[str]:
+        """``None`` means this device has never observed this group's remote
+        content at all — distinct from a verified-empty observation, which
+        hashes identically to an index-side tombstoned group."""
+        if snapshot is None:
+            return None
+        return savesync_index.compute_manifest_hash(self._index_artifacts(snapshot.artifacts))
+
+    # ── targeted gameStart synchronization ───────────────────────────────
+
+    def targeted_game_start_sync(
+        self,
+        group_layout_map: dict[str, str],
+        *,
+        progress: ProgressSink = None,
+    ) -> SaveGameStartSyncResult:
+        """Best-effort, narrowly-scoped synchronization for one launched game.
+
+        ``group_layout_map`` maps each already-resolved target save group ID
+        to its owning layout ID (see
+        :meth:`~romcloud.core.save_selection.SaveSelectionPolicy.group_id_for_rom`).
+        This never rediscovers candidates the way Quick Sync does — only the
+        layout(s) housing the given groups are ever consulted, and no other
+        group in those layouts is ever touched or reconciled.
+
+        This is a best-effort pre-launch pass, never a hard gate: every
+        exception raised here must be treated by the caller (
+        :class:`~romcloud.services.auto_savesync.AutoSaveSyncCoordinator`) as
+        "continue the launch anyway" — SaveSync must never hold a game
+        hostage.
+        """
+        with self.observation_scope():
+            return self._targeted_game_start_sync(
+                group_layout_map,
+                progress=progress,
+            )
+
+    def _targeted_game_start_sync(
+        self,
+        group_layout_map: dict[str, str],
+        *,
+        progress: ProgressSink = None,
+    ) -> SaveGameStartSyncResult:
+        group_ids = frozenset(group_layout_map)
+        if not group_ids:
+            return SaveGameStartSyncResult(status="skipped", reason="no-target-group")
+
+        self._capabilities.require(Capability.SAVE_SYNC, "Targeted gameStart sync")
+        with stage_timer("remote-readiness"):
+            self._require_remote()
+            self._require_filesystem_remote("Targeted gameStart sync")
+            self._require_durable_remote("Targeted gameStart sync")
+            if not self.is_remote_reachable():
+                raise SaveSyncConnectivityError(
+                    f"Remote save location is not reachable: {self._connectivity_root}"
+                )
+
+        with stage_timer("protocol-ownership-resolution"):
+            dataset = self._require_commit_ready_dataset(
+                operation="Targeted gameStart sync"
+            )
+        if dataset.ownership is savesync_index.DatasetOwnership.OWNED:
+            return self._targeted_game_start_sync_owned(
+                dataset,
+                group_layout_map,
+                progress=progress,
+            )
+        return self._targeted_game_start_sync_legacy(
+            group_layout_map,
+            progress=progress,
+        )
+
+    def _targeted_game_start_sync_legacy(
+        self,
+        group_layout_map: dict[str, str],
+        *,
+        progress: ProgressSink = None,
+    ) -> SaveGameStartSyncResult:
+        """UNOWNED dataset: only ever touch a group already known in durable
+        local state — the exact safe precondition
+        :meth:`_trusted_group_remote_scope` already requires. A legacy
+        dataset cannot prove a brand-new, never-tracked group is fresh
+        without a broad scan, so that case is skipped rather than guessed.
+        """
+        with self._locked_operation():
+            state = self._get_state_unlocked()
+            known_group_ids = {group.group_id for group in state.groups}
+        target_group_ids = frozenset(group_layout_map) & known_group_ids
+        unknown_group_ids = frozenset(group_layout_map) - known_group_ids
+        if unknown_group_ids:
+            log.info(
+                "gameStart pre-launch sync: skipping never-tracked legacy group(s) %s "
+                "(cannot prove freshness without a broad scan)",
+                ",".join(sorted(unknown_group_ids)),
+            )
+        if not target_group_ids:
+            return SaveGameStartSyncResult(
+                status="skipped",
+                reason="legacy-dataset-untracked-group",
+                group_ids=frozenset(group_layout_map),
+            )
+
+        report = self._reconcile(
+            progress=progress,
+            selected_group_ids=target_group_ids,
+            upload_only=False,
+            trusted_group_scope=True,
+            group_layout_hints={
+                group_id: group_layout_map[group_id] for group_id in target_group_ids
+            },
+        )
+        if report is None:
+            return SaveGameStartSyncResult(
+                status="unresolved", reason="active-session", group_ids=target_group_ids
+            )
+        return SaveGameStartSyncResult(
+            status="unresolved" if report.conflicts else "synchronized",
+            reason="conflict" if report.conflicts else "reconciled",
+            group_ids=target_group_ids,
+            report=report,
+        )
+
+    def _targeted_game_start_sync_owned(
+        self,
+        dataset: savesync_index.DatasetState,
+        group_layout_map: dict[str, str],
+        *,
+        progress: ProgressSink = None,
+    ) -> SaveGameStartSyncResult:
+        assert dataset.head is not None
+        index_root = self._index_root
+        assert index_root is not None
+        head = dataset.head
+        target_group_ids = frozenset(group_layout_map)
+        target_layout_ids = frozenset(group_layout_map.values())
+
+        with stage_timer("game-start-sync-index") as timing, self._locked_operation():
+            state = self._get_state_unlocked()
+            watermark = self._load_index_watermark(dataset_id=head.dataset_id)
+
+            # Same cheap, unconditional divergence check Quick Sync performs
+            # even on its empty fast path — proof an old, non-participating
+            # writer touched the dataset without a matching index rebuild.
+            with stage_timer("journal-generation-check"):
+                journal_generation = self._current_journal_generation()
+            if savesync_index.journal_diverged(head, journal_generation):
+                log.warning(
+                    "gameStart pre-launch sync found journal/index divergence: "
+                    "journal_generation=%d index_journal_generation=%d",
+                    journal_generation,
+                    head.journal_generation,
+                )
+                diagnostic_event(
+                    "savesync", "commit.journal_index_divergence",
+                    "SaveSync journal advanced without a matching index rebuild",
+                    level="WARNING",
+                    metadata={
+                        "operation": "gameStart",
+                        "journal_generation": journal_generation,
+                        "index_journal_generation": head.journal_generation,
+                    },
+                )
+                return SaveGameStartSyncResult(
+                    status="unresolved",
+                    reason="journal-index-divergence",
+                    group_ids=target_group_ids,
+                )
+
+            local_observed_by_group = {
+                group.group_id: group.remote_observed for group in state.groups
+            }
+            pending_groups = frozenset(
+                group.group_id
+                for group in state.groups
+                if group.group_id in target_group_ids
+                and (
+                    group.condition
+                    in {
+                        SaveGroupCondition.LOCAL_DIRTY,
+                        SaveGroupCondition.REMOTE_DIRTY,
+                        SaveGroupCondition.CONFLICT,
+                    }
+                    or bool(group.dirty_path_hints)
+                )
+            )
+
+            remote_advanced_groups: set[str] = set()
+            indexed_remote_paths: dict[str, frozenset[str]] = {}
+            known_generations = watermark.layout_generations
+            shards_fetched = 0
+            for layout_id in target_layout_ids:
+                layout_head = head.layouts.get(layout_id)
+                if layout_head is None:
+                    continue  # never published; nothing remote to discover yet
+                if known_generations.get(layout_id, 0) >= layout_head.generation:
+                    continue  # this device already knows this layout's committed state
+                try:
+                    shard = savesync_index.load_shard(index_root, layout_id, layout_head)
+                except SaveSyncError:
+                    log.warning(
+                        "gameStart pre-launch sync could not load layout shard %s",
+                        layout_id,
+                        exc_info=True,
+                    )
+                    return SaveGameStartSyncResult(
+                        status="unresolved",
+                        reason="index-shard-unreadable",
+                        group_ids=target_group_ids,
+                    )
+                shards_fetched += 1
+                for group in shard.groups:
+                    if group.group_id not in target_group_ids:
+                        continue  # never widen to another group in this layout
+                    previous_hash = self._remote_observed_manifest_hash(
+                        local_observed_by_group.get(group.group_id)
+                    )
+                    if previous_hash is None or previous_hash != group.manifest_hash:
+                        remote_advanced_groups.add(group.group_id)
+                        indexed_remote_paths[group.group_id] = frozenset(
+                            artifact.path for artifact in group.artifacts
+                        )
+            timing["shards_fetched"] = shards_fetched
+
+            candidate_groups = pending_groups | remote_advanced_groups
+            timing["groups_selected"] = len(candidate_groups)
+            if not candidate_groups:
+                self._advance_index_watermark_layouts(watermark, head, target_layout_ids)
+                return SaveGameStartSyncResult(
+                    status="synchronized",
+                    reason="already-current",
+                    group_ids=target_group_ids,
+                )
+
+        report = self._reconcile(
+            progress=progress,
+            selected_group_ids=frozenset(candidate_groups),
+            upload_only=False,
+            trusted_group_scope=True,
+            group_layout_hints=dict(group_layout_map),
+            indexed_remote_paths=indexed_remote_paths,
+        )
+        if report is None:
+            return SaveGameStartSyncResult(
+                status="unresolved", reason="active-session", group_ids=target_group_ids
+            )
+
+        with self._locked_operation():
+            fresh_head = savesync_index.load_head_strict(index_root)
+            self._advance_index_watermark_layouts(watermark, fresh_head, target_layout_ids)
+
+        return SaveGameStartSyncResult(
+            status="unresolved" if report.conflicts else "synchronized",
+            reason="conflict" if report.conflicts else "reconciled",
+            group_ids=target_group_ids,
+            report=report,
+        )
+
+    def _quick_sync_owned(
+        self,
+        dataset: savesync_index.DatasetState,
+        *,
+        progress: ProgressSink,
+        is_group_active: Optional[Callable[[str], bool]],
+        is_layout_active: Optional[Callable[[str], bool]],
+        exclude_layout_ids: Optional[frozenset[str]],
+    ) -> SaveQuickSyncResult:
+        """Candidate discovery driven by the authoritative remote index.
+
+        ``local known pending work + remotely advanced indexed groups ->
+        reconcile exactly those groups``. The bounded legacy journal is
+        never consulted for peer-change *candidates* here; its generation
+        number alone is read on every call (including the empty fast path)
+        purely to detect divergence — evidence that an old, non-participating
+        writer touched the dataset without publishing a matching index
+        rebuild. Journal entries/history are never inspected or trusted as
+        candidate authority.
+        """
+        assert dataset.head is not None and dataset.ownership is savesync_index.DatasetOwnership.OWNED
+        index_root = self._index_root
+        assert index_root is not None
+        excluded_layouts = exclude_layout_ids or frozenset()
+        head = dataset.head
+
+        with stage_timer("quick-sync-index") as timing, self._locked_operation():
+            state = self._get_state_unlocked()
+            watermark = self._load_index_watermark(dataset_id=head.dataset_id)
+            cursor_before = watermark.index_generation
+            obsolete_conflicts = self._obsolete_whole_layout_conflicts(
+                state, excluded_layout_ids=excluded_layouts
+            )
+            obsolete_layouts = frozenset(conflict.layout_id for conflict in obsolete_conflicts)
+            materialization_gaps = self._local_materialization_gaps(
+                state, excluded_layout_ids=excluded_layouts
+            )
+            materialization_groups = frozenset(status.group_id for status in materialization_gaps)
+            pending_groups = frozenset(
+                group.group_id
+                for group in state.groups
+                if group.layout_id not in excluded_layouts
+                and self._layout_enabled(group.layout_id)
+                and (
+                    group.condition
+                    in {SaveGroupCondition.LOCAL_DIRTY, SaveGroupCondition.REMOTE_DIRTY}
+                    or bool(group.dirty_path_hints)
+                )
+            ).union(materialization_groups)
+
+            timing["index_generation"] = head.index_generation
+            timing["watermark_generation"] = watermark.index_generation
+
+            # Minimum metadata check required even on the empty fast path: a
+            # generation-level mismatch alone is enough to prove an old,
+            # non-participating writer touched the dataset without
+            # publishing a matching index rebuild. This never inspects
+            # journal entries/history and never treats the journal as
+            # candidate authority — only its generation number is read.
+            journal_generation = self._current_journal_generation()
+            if savesync_index.journal_diverged(head, journal_generation):
+                log.warning(
+                    "Quick SaveSync (index) found journal/index divergence: "
+                    "journal_generation=%d index_journal_generation=%d",
+                    journal_generation,
+                    head.journal_generation,
+                )
+                diagnostic_event(
+                    "savesync", "commit.journal_index_divergence",
+                    "SaveSync journal advanced without a matching index rebuild",
+                    level="WARNING",
+                    metadata={
+                        "journal_generation": journal_generation,
+                        "index_journal_generation": head.journal_generation,
+                    },
+                )
+                return SaveQuickSyncResult(
+                    status="requires-full-sync",
+                    remote_generation=head.index_generation,
+                    cursor_before=cursor_before,
+                    cursor_after=cursor_before,
+                    reason="journal-index-divergence",
+                )
+
+            if (
+                head.index_generation == watermark.index_generation
+                and not pending_groups
+                and not obsolete_conflicts
+            ):
+                # Empty fast path: no shard fetch, no SaveLayout scan, no
+                # payload enumeration, no hashing, no staging. The journal
+                # generation check above already ran (cheap metadata only).
+                timing["shards_fetched"] = 0
+                timing["groups_selected"] = 0
+                log.info(
+                    "Quick SaveSync (index) early return: reason=index-current-local-materialized "
+                    "index_generation=%d",
+                    head.index_generation,
+                )
+                return SaveQuickSyncResult(
+                    status="unchanged",
+                    remote_generation=head.index_generation,
+                    cursor_before=cursor_before,
+                    cursor_after=cursor_before,
+                    reason="index-current-local-materialized",
+                )
+
+            known_generations = watermark.layout_generations
+            changed_shards: dict[str, savesync_index.IndexShard] = {}
+            for layout_id, layout_head in head.layouts.items():
+                if layout_id in excluded_layouts:
+                    continue
+                if known_generations.get(layout_id, 0) >= layout_head.generation:
+                    continue
+                try:
+                    changed_shards[layout_id] = savesync_index.load_shard(
+                        index_root, layout_id, layout_head
+                    )
+                except SaveSyncError:
+                    log.warning(
+                        "Quick SaveSync (index) could not load layout shard %s",
+                        layout_id,
+                        exc_info=True,
+                    )
+                    return SaveQuickSyncResult(
+                        status="requires-full-sync",
+                        remote_generation=head.index_generation,
+                        cursor_before=cursor_before,
+                        cursor_after=cursor_before,
+                        reason="index-shard-unreadable",
+                    )
+            timing["shards_fetched"] = len(changed_shards)
+
+            local_observed_by_group = {group.group_id: group.remote_observed for group in state.groups}
+            group_layout_hints: dict[str, str] = {}
+            indexed_remote_paths: dict[str, frozenset[str]] = {}
+            remote_advanced_groups: set[str] = set()
+            for layout_id, shard in changed_shards.items():
+                if not self._layout_enabled(layout_id):
+                    continue
+                for group in shard.groups:
+                    group_layout_hints[group.group_id] = group.layout_id
+                    previous_hash = self._remote_observed_manifest_hash(
+                        local_observed_by_group.get(group.group_id)
+                    )
+                    if previous_hash is None or previous_hash != group.manifest_hash:
+                        remote_advanced_groups.add(group.group_id)
+                        indexed_remote_paths[group.group_id] = frozenset(
+                            artifact.path for artifact in group.artifacts
+                        )
+
+            candidate_groups = frozenset(pending_groups) | frozenset(remote_advanced_groups)
+            selected_groups: Optional[frozenset[str]] = candidate_groups
+            selected_layouts: Optional[frozenset[str]] = None
+            if obsolete_layouts:
+                # A stale whole-layout conflict cannot safely be reconciled by
+                # its obsolete group ID; promote the affected current layouts
+                # (and anything else already selected) to a full layout scan.
+                layout_for = {
+                    **group_layout_hints,
+                    **{group.group_id: group.layout_id for group in state.groups},
+                }
+                selected_layouts = frozenset(obsolete_layouts).union(
+                    layout_for[group_id] for group_id in candidate_groups if group_id in layout_for
+                )
+                selected_groups = None
+                indexed_remote_paths = {}
+                group_layout_hints = {}
+
+            timing["groups_selected"] = len(candidate_groups)
+            timing["remote_advanced_groups"] = len(remote_advanced_groups)
+            timing["local_pending_groups"] = len(pending_groups)
+
+            if selected_groups == frozenset() and selected_layouts is None:
+                self._advance_index_watermark(watermark, head, excluded_layouts=excluded_layouts)
+                log.info(
+                    "Quick SaveSync (index) no eligible changes: index_generation=%d "
+                    "shards_fetched=%d",
+                    head.index_generation,
+                    len(changed_shards),
+                )
+                return SaveQuickSyncResult(
+                    status="unchanged",
+                    remote_generation=head.index_generation,
+                    cursor_before=cursor_before,
+                    cursor_after=head.index_generation,
+                    reason="index-no-eligible-changes",
+                )
+
+        report = self._reconcile(
+            progress=progress,
+            selected_group_ids=selected_groups,
+            selected_layout_ids=selected_layouts,
+            upload_only=False,
+            is_group_active=is_group_active,
+            is_layout_active=is_layout_active,
+            obsolete_conflict_ids=frozenset(
+                conflict.conflict_id for conflict in obsolete_conflicts
+            ),
+            trusted_group_scope=True,
+            group_layout_hints=group_layout_hints,
+            indexed_remote_paths=indexed_remote_paths,
+        )
+        if report is None:
+            return SaveQuickSyncResult(
+                status="deferred",
+                remote_generation=head.index_generation,
+                cursor_before=cursor_before,
+                cursor_after=cursor_before,
+                processed_groups=tuple(sorted(candidate_groups)),
+                reason="active-session",
+            )
+
+        with self._locked_operation():
+            fresh_head = savesync_index.load_head_strict(index_root)
+            self._advance_index_watermark(watermark, fresh_head, excluded_layouts=excluded_layouts)
+        log.info(
+            "Quick SaveSync (index) cursor committed: cursor_before=%s cursor_after=%d "
+            "report_revision=%s",
+            cursor_before,
+            fresh_head.index_generation,
+            report.revision,
+        )
+        return SaveQuickSyncResult(
+            status="reconciled",
+            remote_generation=fresh_head.index_generation,
+            cursor_before=cursor_before,
+            cursor_after=fresh_head.index_generation,
+            processed_groups=tuple(sorted(candidate_groups)),
+            report=report,
+        )
+
+    def _group_descriptor_for(
+        self, artifacts: tuple[SaveArtifact, ...]
+    ) -> Optional[SaveGroupDescriptor]:
+        for artifact in artifacts:
+            descriptor = self._policy.group_for_path(artifact.relative_path)
+            if descriptor is not None:
+                return descriptor
+        return None
+
+    @staticmethod
+    def _index_artifacts(
+        artifacts: tuple[SaveArtifact, ...]
+    ) -> tuple[savesync_index.IndexArtifact, ...]:
+        return tuple(
+            savesync_index.IndexArtifact(
+                artifact.relative_path, artifact.size_bytes, artifact.content_hash
+            )
+            for artifact in sorted(artifacts, key=lambda item: item.relative_path)
+        )
+
+    def _open_remote_commit(
+        self,
+        *,
+        operation_id: str,
+        device_id: str,
+        before: dict[str, SaveArtifact],
+        desired: dict[str, SaveArtifact],
+        operation: str,
+    ) -> "_RemoteCommit":
+        """Build the one protected publication primitive every writer uses.
+
+        Ordinary reconciliation, force upload and conflict resolution all go
+        through this object, so CAS, shared intent, index publication,
+        rollback eligibility and compatibility journaling have exactly one
+        implementation and cannot drift apart.
+        """
+        changed = self._changed_remote_groups(before, desired)
+        layout_for_group: dict[str, str] = {}
+        systems: dict[str, str] = {}
+        for group_id, (before_group, after_group) in changed.items():
+            descriptor = self._group_descriptor_for(after_group or before_group)
+            if descriptor is None:
+                continue
+            layout_for_group[group_id] = descriptor.layout_id
+            systems[group_id] = descriptor.system
+        intent_groups = tuple(
+            savesync_commit.IntentGroup(
+                group_id=group_id,
+                layout_id=layout_for_group[group_id],
+                system=systems[group_id],
+                expected_group_generation=0,
+                before=self._index_artifacts(changed[group_id][0]),
+                desired=self._index_artifacts(changed[group_id][1]),
+            )
+            for group_id in sorted(layout_for_group)
+        )
+        return _RemoteCommit(
+            self,
+            operation_id=operation_id,
+            device_id=device_id,
+            intent_groups=intent_groups,
+            operation=operation,
+        )
+
+    def _current_journal_generation(self) -> int:
+        """Legacy journal generation as observed right now, or 0."""
+        try:
+            journal = self._load_remote_journal(reset_on_error=False)
+        except SaveSyncError:
+            return 0
+        return int(journal["generation"]) if journal is not None else 0
+
+    def _assert_cas(
+        self,
+        expectations: dict[str, savesync_index.GroupExpectation],
+        *,
+        operation_id: str,
+    ) -> None:
+        """Reject a stale decision before anything is mutated."""
+        index_root = self._index_root
+        assert index_root is not None
+        head = savesync_index.load_head_strict(index_root)
+        conflicts = savesync_index.validate_group_cas(index_root, head, expectations)
+        if not conflicts:
+            return
+        detail = ", ".join(
+            f"{conflict.group_id} (expected generation {conflict.expected_generation}, "
+            f"found {conflict.actual_generation})"
+            for conflict in conflicts
+        )
+        log.warning(
+            "SaveSync commit CAS rejected: operation_id=%s conflicting_groups=%d "
+            "detail=%s payload_mutated=false",
+            operation_id,
+            len(conflicts),
+            detail,
+        )
+        diagnostic_event(
+            "savesync", "commit.cas_conflict",
+            "SaveSync commit rejected by compare-and-swap",
+            level="WARNING",
+            metadata={
+                "operation_id": operation_id,
+                "conflicting_groups": [conflict.group_id for conflict in conflicts],
+                "payload_mutated": False,
+            },
+        )
+        raise SaveSyncCasConflictError(
+            f"A peer committed newer save data for {detail}; this device re-plans "
+            "against the peer's committed state instead of overwriting it."
+        )
+
+    def _assert_index_matches_payload(
+        self,
+        expectations: dict[str, savesync_index.GroupExpectation],
+        observed: dict[str, str],
+        *,
+        operation_id: str,
+    ) -> None:
+        """Refuse to let index metadata authorize a write it cannot justify."""
+        mismatches = savesync_index.verify_index_matches_payload(expectations, observed)
+        if not mismatches:
+            return
+        detail = ", ".join(mismatch.group_id for mismatch in mismatches)
+        log.error(
+            "SaveSync index does not describe actual remote payload: operation_id=%s "
+            "groups=%s payload_mutated=false",
+            operation_id,
+            detail,
+        )
+        diagnostic_event(
+            "savesync", "commit.index_payload_mismatch",
+            "SaveSync index does not match actual remote payload",
+            level="ERROR",
+            metadata={
+                "operation_id": operation_id,
+                "group_ids": [mismatch.group_id for mismatch in mismatches],
+                "payload_mutated": False,
+            },
+        )
+        raise SaveSyncVerificationError(
+            "The shared SaveSync index no longer describes the save data actually "
+            f"stored on remote-data for {detail}. Nothing was changed. Run a Full Sync "
+            "to rebuild the index from the real files."
+        )
+
+    def _record_committed_journal_generation(self, generation: int) -> None:
+        """Close the index's journal-generation loop after a legacy append.
+
+        The index is published before the journal append (it is the commit
+        point), so this records the resulting generation afterwards. Purely
+        a divergence-detection signal: a failure here is swallowed because
+        the conservative outcome is simply "report divergence".
+        """
+        index_root = self._index_root
+        if index_root is None:
+            return
+        try:
+            savesync_index.update_journal_generation(index_root, generation)
+        except (SaveSyncError, OSError):
+            log.warning(
+                "Could not record journal generation %d in the SaveSync index",
+                generation,
+                exc_info=True,
+            )
+
+    def _observe_remote_group_manifests(
+        self, intent_groups: tuple[savesync_commit.IntentGroup, ...]
+    ) -> dict[str, str]:
+        """Fresh manifest hash per targeted group, straight from remote bytes."""
+        if not intent_groups or self._remote_store is None:
+            return {}
+        paths = frozenset(
+            artifact.path
+            for group in intent_groups
+            for artifact in (*group.before, *group.desired)
+        )
+        layouts = frozenset(group.layout_id for group in intent_groups)
+        if not paths:
+            return {group.group_id: savesync_index.EMPTY_MANIFEST_HASH for group in intent_groups}
+        with self._fresh_observations():
+            report = self._scan_remote_layouts(layouts, only_relative_paths=paths)
+        observed: dict[str, list[savesync_index.IndexArtifact]] = {
+            group.group_id: [] for group in intent_groups
+        }
+        for path, artifact in report.artifacts.items():
+            group_id = _group_id(self._policy, path)
+            if group_id in observed:
+                observed[group_id].append(
+                    savesync_index.IndexArtifact(
+                        artifact.relative_path, artifact.size_bytes, artifact.content_hash
+                    )
+                )
+        return {
+            group_id: savesync_index.compute_manifest_hash(tuple(artifacts))
+            for group_id, artifacts in observed.items()
+        }
+
+    def _observe_intent_payload(
+        self, intent: savesync_commit.CommitIntent
+    ) -> dict[str, savesync_index.IndexArtifact]:
+        """Fresh, cache-bypassing observation of exactly an intent's paths."""
+        paths = intent.before_paths | intent.desired_paths
+        if not paths or self._remote_store is None:
+            return {}
+        with self._fresh_observations():
+            report = self._scan_remote_layouts(
+                intent.affected_layout_ids, only_relative_paths=paths
+            )
+        return {
+            path: savesync_index.IndexArtifact(
+                artifact.relative_path, artifact.size_bytes, artifact.content_hash
+            )
+            for path, artifact in report.artifacts.items()
+        }
+
+    def _resolve_shared_intent(self, *, owned: bool, repairing: bool = False) -> None:
+        """Classify and resolve another device's interrupted commit.
+
+        Runs under the remote commit lock, so the intent it finds is never
+        an operation still in flight. Three outcomes, decided from actual
+        payload rather than from the recorded phase:
+
+        * payload still at the before-state — the commit never landed;
+          retire the intent and let normal reconciliation proceed.
+        * payload exactly at the desired-state — the payload commit
+          succeeded. If the index already carries the receipt the commit is
+          complete; otherwise finish publication forward. Never rolled back.
+        * anything else — an unknown third version wrote these paths.
+          Evidence is preserved and the operation fails closed.
+        """
+        index_root = self._index_root
+        if index_root is None:
+            return
+        try:
+            intent = savesync_commit.load_intent(index_root)
+        except SaveSyncError:
+            log.warning(
+                "SaveSync shared intent is unreadable; leaving it in place for Full Sync",
+                exc_info=True,
+            )
+            return
+        if intent is None:
+            return
+        head = savesync_index.load_head_safe(index_root)
+        receipts = savesync_index.committed_transaction_ids(index_root, head)
+        observed = self._observe_intent_payload(intent)
+        payload_state = savesync_commit.classify_payload(intent, observed)
+        log.info(
+            "SaveSync shared intent found: operation_id=%s origin_device=%s phase=%s "
+            "groups=%d payload_state=%s index_receipt=%s",
+            intent.operation_id,
+            intent.origin_device,
+            intent.phase,
+            len(intent.groups),
+            payload_state.value,
+            intent.operation_id in receipts,
+        )
+        if payload_state is savesync_commit.PayloadState.UNKNOWN:
+            preserved = savesync_commit.preserve_unresolved_intent(index_root, intent)
+            diagnostic_event(
+                "savesync", "commit.recovery_blocked",
+                "SaveSync interrupted commit found an unknown third payload version",
+                level="ERROR",
                 metadata={
-                    "cursor_before": cursor_before,
-                    "cursor_after": observed_generation,
-                    "baseline_artifacts": len(state.shared_manifest),
-                    "revision": report.revision,
-                    "reason": "full-sync-complete",
+                    "operation_id": intent.operation_id,
+                    "origin_device": intent.origin_device,
+                    "phase": intent.phase,
+                    "evidence_path": str(preserved),
                 },
             )
-        return report
+            raise SaveSyncRecoveryEvidenceError(
+                "An interrupted SaveSync commit left remote save data matching neither "
+                "its recorded previous state nor its intended result. Nothing was "
+                f"changed and the evidence was preserved at {preserved}. Run a Full "
+                "Sync to repair this dataset."
+            )
+        if payload_state is savesync_commit.PayloadState.DESIRED:
+            if not intent.publishable_by_recovery:
+                # A deferred Full Sync intent covers only the groups that run
+                # happened to mutate. Publishing from it would fabricate a
+                # partial authoritative index, so recovery may classify it
+                # but never complete it: only a complete Full Sync
+                # reconstruction may republish authoritative state.
+                if repairing:
+                    savesync_commit.clear_intent(index_root)
+                    return
+                diagnostic_event(
+                    "savesync", "commit.recovery_requires_full_sync",
+                    "SaveSync found an interrupted Full Sync commit",
+                    level="WARNING",
+                    metadata={
+                        "operation_id": intent.operation_id,
+                        "origin_device": intent.origin_device,
+                        "phase": intent.phase,
+                        "publication_scope": intent.publication_scope,
+                    },
+                )
+                raise SaveSyncVerificationError(
+                    "A Full Sync was interrupted after it changed remote save data but "
+                    "before it published the shared index. The save data itself is "
+                    "intact and nothing was changed here. Run a Full Sync to rebuild "
+                    "the shared index from the real files."
+                )
+            if owned and intent.operation_id not in receipts:
+                # Payload is durably committed but the shared index never
+                # recorded it. Finish forward: rolling a verified peer commit
+                # back would destroy save data another device already treats
+                # as published.
+                self._publish_index_for_groups(
+                    intent.groups,
+                    operation_id=intent.operation_id,
+                    origin_device=intent.origin_device,
+                    dataset_id_hint=intent.dataset_id,
+                    journal_generation=intent.base_journal_generation,
+                )
+                diagnostic_event(
+                    "savesync", "commit.recovery_completed",
+                    "SaveSync finished another device's verified remote commit",
+                    metadata={
+                        "operation_id": intent.operation_id,
+                        "origin_device": intent.origin_device,
+                        "phase": intent.phase,
+                    },
+                )
+            savesync_commit.clear_intent(index_root)
+            return
+        diagnostic_event(
+            "savesync", "commit.recovery_discarded",
+            "SaveSync discarded an interrupted commit that never mutated payload",
+            metadata={
+                "operation_id": intent.operation_id,
+                "origin_device": intent.origin_device,
+                "phase": intent.phase,
+            },
+        )
+        savesync_commit.clear_intent(index_root)
+
+    def _publish_index_for_groups(
+        self,
+        groups: tuple[savesync_commit.IntentGroup, ...],
+        *,
+        operation_id: str,
+        origin_device: str,
+        dataset_id_hint: Optional[str],
+        journal_generation: int,
+    ) -> savesync_index.IndexHead:
+        index_root = self._index_root
+        assert index_root is not None
+        updates = tuple(
+            savesync_index.IndexGroup(
+                group_id=group.group_id,
+                layout_id=group.layout_id,
+                system=group.system,
+                group_generation=0,  # recomputed from committed state on publish
+                artifacts=group.desired,
+                tombstoned=not group.desired,
+                origin_device=origin_device,
+                completed_transaction_id=operation_id,
+            )
+            for group in groups
+        )
+        with stage_timer("index-publish") as timing:
+            head = savesync_index.publish_group_updates(
+                index_root,
+                dataset_id_hint=dataset_id_hint,
+                journal_generation=journal_generation,
+                updated_groups=updates,
+                operation_id=operation_id,
+                origin_device=origin_device,
+            )
+            timing["index_generation"] = head.index_generation
+            timing["group_count"] = len(updates)
+        log.info(
+            "SaveSync remote index committed: operation_id=%s index_generation=%d groups=%d",
+            operation_id,
+            head.index_generation,
+            len(updates),
+        )
+        diagnostic_event(
+            "savesync", "commit.index_published",
+            "SaveSync remote index committed",
+            metadata={
+                "operation_id": operation_id,
+                "index_generation": head.index_generation,
+                "group_ids": [group.group_id for group in groups],
+            },
+        )
+        return head
 
     @correlated_operation("Quick Sync", subsystem="savesync", source="Quick Sync")
     def quick_sync(
@@ -1891,6 +3541,24 @@ class SaveSyncService:
                 reason="forced-current-state",
             )
 
+        # Ownership resolution reads only the small ownership marker (and,
+        # for OWNED datasets, the small HEAD document) — never a filesystem
+        # scan. DAMAGED fails closed here rather than silently continuing
+        # into legacy journal-based discovery.
+        dataset = self._require_commit_ready_dataset(operation="Quick SaveSync")
+        if dataset.ownership is savesync_index.DatasetOwnership.OWNED:
+            return self._quick_sync_owned(
+                dataset,
+                progress=progress,
+                is_group_active=is_group_active,
+                is_layout_active=is_layout_active,
+                exclude_layout_ids=exclude_layout_ids,
+            )
+
+        # UNOWNED: this dataset has not been cut over to the commit protocol.
+        # Preserve the existing journal/cursor/dirty-hint mechanism exactly
+        # until a successful Full Sync performs the cutover — never force a
+        # migration merely because the new code exists.
         excluded_layouts = exclude_layout_ids or frozenset()
         with self._locked_operation():
             state = self._get_state_unlocked()
@@ -2163,6 +3831,7 @@ class SaveSyncService:
             obsolete_conflict_ids=frozenset(
                 conflict.conflict_id for conflict in obsolete_conflicts
             ),
+            trusted_group_scope=True,
         )
         if report is None:
             return SaveQuickSyncResult(
@@ -2782,8 +4451,81 @@ class SaveSyncService:
         is_group_active: Optional[Callable[[str], bool]] = None,
         is_layout_active: Optional[Callable[[str], bool]] = None,
         obsolete_conflict_ids: frozenset[str] = frozenset(),
+        trusted_group_scope: bool = False,
+        group_layout_hints: Optional[dict[str, str]] = None,
+        indexed_remote_paths: Optional[dict[str, frozenset[str]]] = None,
     ) -> Optional[SaveReconcileReport]:
-        with self._locked_operation():
+        """Reconcile, re-planning against a peer's commit on a CAS rejection.
+
+        A rejected compare-and-swap means a peer committed newer content for
+        a group this attempt targeted, *before* this attempt mutated
+        anything. The only correct response is to discard the stale decision
+        and reconcile again from the peer's committed state, which may now
+        legitimately resolve to an upload, a download, or a conflict. Retries
+        are bounded; exhausting them surfaces the contention rather than
+        forcing a winner.
+        """
+        last_conflict: Optional[SaveSyncCasConflictError] = None
+        for attempt in range(_MAX_COMMIT_CAS_ATTEMPTS):
+            try:
+                return self._reconcile_once(
+                    progress=progress,
+                    selected_group_ids=selected_group_ids,
+                    selected_layout_ids=selected_layout_ids,
+                    upload_only=upload_only,
+                    bootstrap=bootstrap,
+                    is_group_active=is_group_active,
+                    is_layout_active=is_layout_active,
+                    obsolete_conflict_ids=obsolete_conflict_ids,
+                    trusted_group_scope=trusted_group_scope,
+                    group_layout_hints=group_layout_hints,
+                    indexed_remote_paths=indexed_remote_paths,
+                )
+            except SaveSyncCasConflictError as exc:
+                last_conflict = exc
+                log.info(
+                    "SaveSync reconciliation re-planning after peer commit: "
+                    "attempt=%d/%d payload_mutated=false",
+                    attempt + 1,
+                    _MAX_COMMIT_CAS_ATTEMPTS,
+                )
+        assert last_conflict is not None
+        raise SaveSyncVerificationError(
+            "Another device kept committing save changes for the same group while this "
+            f"sync was running ({_MAX_COMMIT_CAS_ATTEMPTS} attempts). Nothing was "
+            "overwritten and pending work was retained; try again."
+        ) from last_conflict
+
+    def _reconcile_once(
+        self,
+        *,
+        progress: ProgressSink = None,
+        selected_group_ids: Optional[frozenset[str]] = None,
+        selected_layout_ids: Optional[frozenset[str]] = None,
+        upload_only: bool = False,
+        bootstrap: bool = False,
+        is_group_active: Optional[Callable[[str], bool]] = None,
+        is_layout_active: Optional[Callable[[str], bool]] = None,
+        obsolete_conflict_ids: frozenset[str] = frozenset(),
+        trusted_group_scope: bool = False,
+        group_layout_hints: Optional[dict[str, str]] = None,
+        indexed_remote_paths: Optional[dict[str, frozenset[str]]] = None,
+    ) -> Optional[SaveReconcileReport]:
+        """*trusted_group_scope* narrows the remote scan for a group-only call
+        to paths already known from this operation's own local scan plus the
+        last shared baseline, instead of scanning the whole containing
+        layout. Only Quick Sync's own group-only reconcile call may set this
+        — see :meth:`_trusted_group_remote_scope`. Legacy/manual callers such
+        as :meth:`reconcile_pending_groups` must leave it ``False``.
+
+        *group_layout_hints* maps a group ID to its layout for groups that
+        may not yet exist in local durable state (index-driven discovery of
+        a remote-only group this device has never tracked before).
+        *indexed_remote_paths* is the analogous per-group path hint sourced
+        from the remote index rather than local/baseline knowledge — see
+        :meth:`_trusted_group_remote_scope`.
+        """
+        with self._locked_operation(), self._remote_commit_scope():
             if selected_group_ids is not None and selected_layout_ids is not None:
                 selected_layout_ids = frozenset(selected_layout_ids)
             if selected_group_ids is not None:
@@ -2857,6 +4599,7 @@ class SaveSyncService:
                 )
             )
             verification_layout_ids: Optional[frozenset[str]] = None
+            verification_remote_scope_paths: Optional[frozenset[str]] = None
             if selected_layout_ids is not None:
                 # Keep every safety and finalization scan on the exact layout
                 # scope used to build the transition plan.  Comparing this
@@ -2871,7 +4614,8 @@ class SaveSyncService:
                 remote_report = self._automatic_report(remote_report)
             elif selected_group_ids is not None:
                 group_layout_map = {
-                    group.group_id: group.layout_id for group in state.groups
+                    **(group_layout_hints or {}),
+                    **{group.group_id: group.layout_id for group in state.groups},
                 }
                 scoped_layouts = frozenset(
                     layout_id
@@ -2885,9 +4629,31 @@ class SaveSyncService:
                         local_report = self._automatic_report(
                             self._scan_local_layouts(scoped_layouts)
                         )
-                    with stage_timer("scan-remote"):
+                    if trusted_group_scope and not self._has_container_layout(
+                        scoped_layouts
+                    ):
+                        verification_remote_scope_paths = self._trusted_group_remote_scope(
+                            selected_group_ids,
+                            local_report,
+                            state,
+                            indexed_paths=indexed_remote_paths,
+                        )
+                    with stage_timer("scan-remote") as timing:
                         remote_report = self._automatic_report(
-                            self._scan_remote_layouts(scoped_layouts)
+                            self._scan_remote_layouts(
+                                scoped_layouts,
+                                only_relative_paths=verification_remote_scope_paths,
+                            )
+                        )
+                        timing["scope"] = (
+                            "narrow"
+                            if verification_remote_scope_paths is not None
+                            else "layout"
+                        )
+                        timing["candidate_paths"] = (
+                            len(verification_remote_scope_paths)
+                            if verification_remote_scope_paths is not None
+                            else -1
                         )
                 else:
                     local_report = save_tree.ScanReport({})
@@ -2922,49 +4688,50 @@ class SaveSyncService:
             original_local = dict(local_report.artifacts)
             original_remote = dict(remote_report.artifacts)
             physical_baseline = dict(baseline)
-            container_work = self._prepare_container_reconciliation(
-                local=original_local,
-                remote=original_remote,
-                state=state,
-                upload_only=upload_only,
-                repair_local_group_ids=repair_local_group_ids,
-            )
-            if container_work.handled_paths:
-                local_report = replace(
+            with stage_timer("reconciliation-planning"):
+                container_work = self._prepare_container_reconciliation(
+                    local=original_local,
+                    remote=original_remote,
+                    state=state,
+                    upload_only=upload_only,
+                    repair_local_group_ids=repair_local_group_ids,
+                )
+                if container_work.handled_paths:
+                    local_report = replace(
+                        local_report,
+                        artifacts={
+                            path: artifact
+                            for path, artifact in local_report.artifacts.items()
+                            if path not in container_work.handled_paths
+                        },
+                    )
+                    remote_report = replace(
+                        remote_report,
+                        artifacts={
+                            path: artifact
+                            for path, artifact in remote_report.artifacts.items()
+                            if path not in container_work.handled_paths
+                        },
+                    )
+                    baseline = {
+                        path: artifact
+                        for path, artifact in baseline.items()
+                        if path not in container_work.handled_paths
+                    }
+                plan = _reconcile_plan(
                     local_report,
-                    artifacts={
-                        path: artifact
-                        for path, artifact in local_report.artifacts.items()
-                        if path not in container_work.handled_paths
-                    },
-                )
-                remote_report = replace(
                     remote_report,
-                    artifacts={
-                        path: artifact
-                        for path, artifact in remote_report.artifacts.items()
-                        if path not in container_work.handled_paths
-                    },
+                    baseline,
+                    policy=self._policy,
+                    scope=(
+                        "pending_dirty"
+                        if selected_group_ids is not None
+                        else "journal-layout"
+                        if selected_layout_ids is not None
+                        else "all_eligible"
+                    ),
+                    repair_local_group_ids=repair_local_group_ids,
                 )
-                baseline = {
-                    path: artifact
-                    for path, artifact in baseline.items()
-                    if path not in container_work.handled_paths
-                }
-            plan = _reconcile_plan(
-                local_report,
-                remote_report,
-                baseline,
-                policy=self._policy,
-                scope=(
-                    "pending_dirty"
-                    if selected_group_ids is not None
-                    else "journal-layout"
-                    if selected_layout_ids is not None
-                    else "all_eligible"
-                ),
-                repair_local_group_ids=repair_local_group_ids,
-            )
             decision_counts = {
                 action.value: len(
                     {
@@ -3016,9 +4783,20 @@ class SaveSyncService:
             operation_id = uuid.uuid4().hex
             destination_views: list[_DestinationView] = []
             selected_views: list[save_transaction.SelectedView] = []
+            index_committed = False
+            remote_commit: Optional[_RemoteCommit] = None
             try:
                 remote_changed = desired_remote != remote
                 local_changed = desired_local != local
+                if remote_changed:
+                    remote_commit = self._open_remote_commit(
+                        operation_id=operation_id,
+                        device_id=state.device_id,
+                        before=remote,
+                        desired=desired_remote,
+                        operation="Save/state reconciliation",
+                    )
+                    remote_commit.begin()
                 if remote_changed:
                     # Only this branch writes to remote-data; a plan with no
                     # uploads (pure download/no-op) must remain available
@@ -3056,15 +4834,16 @@ class SaveSyncService:
                         )
                     )
                 self._log_transaction_root_collisions(selected_views)
-                transaction = (
-                    save_transaction.prepare_transaction(
-                        self._transaction_journal_path,
-                        selected_views,
-                        operation_id=operation_id,
+                with stage_timer("staging"):
+                    transaction = (
+                        save_transaction.prepare_transaction(
+                            self._transaction_journal_path,
+                            selected_views,
+                            operation_id=operation_id,
+                        )
+                        if selected_views
+                        else None
                     )
-                    if selected_views
-                    else None
-                )
                 log.info(
                     "SaveSync transaction start: operation_id=%s correlation_id=%s scope=%s "
                     "remote_write=%s local_write=%s destination_views=%d "
@@ -3086,18 +4865,43 @@ class SaveSyncService:
                         for view in selected_views
                     ),
                 )
+                emit_progress(
+                    progress,
+                    "savesync",
+                    "verify",
+                    "running",
+                    "Verifying save/state data",
+                    metadata={
+                        "upload_bytes": plan.upload_bytes
+                        + container_work.upload_bytes,
+                        "download_bytes": (
+                            0
+                            if upload_only
+                            else plan.download_bytes + container_work.download_bytes
+                        ),
+                    },
+                )
                 if verification_layout_ids is None:
                     with stage_timer("staging-verify"):
-                        current_local = self._scan_automatic_local()
-                        current_remote = self._scan_automatic_remote()
+                        increment_operation_counter("verification_passes")
+                        with stage_timer("staging-verify-local"):
+                            current_local = self._scan_automatic_local()
+                        with stage_timer("staging-verify-remote"):
+                            current_remote = self._scan_automatic_remote()
                 else:
                     with stage_timer("staging-verify"):
-                        current_local = self._automatic_report(
-                            self._scan_local_layouts(verification_layout_ids)
-                        )
-                        current_remote = self._automatic_report(
-                            self._scan_remote_layouts(verification_layout_ids)
-                        )
+                        increment_operation_counter("verification_passes")
+                        with stage_timer("staging-verify-local"):
+                            current_local = self._automatic_report(
+                                self._scan_local_layouts(verification_layout_ids)
+                            )
+                        with stage_timer("staging-verify-remote"):
+                            current_remote = self._automatic_report(
+                                self._scan_remote_layouts(
+                                    verification_layout_ids,
+                                    only_relative_paths=verification_remote_scope_paths,
+                                )
+                            )
                 if (
                     current_local.artifacts != complete_local
                     or current_remote.artifacts != complete_remote
@@ -3127,6 +4931,8 @@ class SaveSyncService:
                     if transaction is not None:
                         transaction.rollback()
                     return None
+                if remote_commit is not None:
+                    remote_commit.promoting()
                 if transaction is not None:
                     with stage_timer("transaction-apply"):
                         self._apply_selected_transaction(
@@ -3136,16 +4942,24 @@ class SaveSyncService:
                 # Post-mutation proof must read the real bytes now on disk, so
                 # this scan deliberately bypasses observation reuse entirely.
                 with self._fresh_observations(), stage_timer("final-verify"):
+                    increment_operation_counter("verification_passes")
                     if verification_layout_ids is None:
-                        final_local_report = self._scan_automatic_local()
-                        final_remote_report = self._scan_automatic_remote()
+                        with stage_timer("final-verify-local"):
+                            final_local_report = self._scan_automatic_local()
+                        with stage_timer("final-verify-remote"):
+                            final_remote_report = self._scan_automatic_remote()
                     else:
-                        final_local_report = self._automatic_report(
-                            self._scan_local_layouts(verification_layout_ids)
-                        )
-                        final_remote_report = self._automatic_report(
-                            self._scan_remote_layouts(verification_layout_ids)
-                        )
+                        with stage_timer("final-verify-local"):
+                            final_local_report = self._automatic_report(
+                                self._scan_local_layouts(verification_layout_ids)
+                            )
+                        with stage_timer("final-verify-remote"):
+                            final_remote_report = self._automatic_report(
+                                self._scan_remote_layouts(
+                                    verification_layout_ids,
+                                    only_relative_paths=verification_remote_scope_paths,
+                                )
+                            )
                 if (
                     final_local_report.artifacts
                     != (
@@ -3169,6 +4983,12 @@ class SaveSyncService:
                     raise SaveSyncVerificationError(
                         "Save/state data changed before reconciliation completed."
                     )
+                if remote_commit is not None:
+                    # Desired payload is now proven on disk. Publishing the
+                    # shared index is the cross-device commit point, so it
+                    # happens here and never on the strength of a plan alone.
+                    remote_commit.publish()
+                    index_committed = remote_commit.index_committed
                 log.info(
                     "SaveSync transaction materialization committed: "
                     "operation_id=%s remote_write=%s local_write=%s",
@@ -3178,9 +4998,36 @@ class SaveSyncService:
                 )
             except BaseException as exc:
                 transaction = locals().get("transaction")
+                if index_committed:
+                    # The shared index already records this operation as
+                    # committed, so the payload is durably published for
+                    # every peer. Rolling back here would delete save data
+                    # another device is entitled to read. Leave the intent
+                    # in place: whichever device next holds the commit lock
+                    # verifies the receipt and finishes forward.
+                    log.error(
+                        "SaveSync failed after the remote commit point: operation_id=%s "
+                        "reason=%s remote_commit=published rollback=refused",
+                        operation_id,
+                        type(exc).__name__,
+                    )
+                    diagnostic_event(
+                        "savesync", "commit.post_publication_failure",
+                        "SaveSync failed after publishing the remote commit",
+                        level="ERROR",
+                        metadata={
+                            "operation_id": operation_id,
+                            "reason": type(exc).__name__,
+                            "rollback": "refused",
+                        },
+                    )
+                    container_work.cleanup()
+                    raise
                 if transaction is not None:
                     transaction.rollback()
                 container_work.cleanup()
+                if remote_commit is not None:
+                    remote_commit.abandon()
                 log.warning(
                     "SaveSync transaction aborted: operation_id=%s "
                     "reason=%s baseline_advanced=false cursor_advanced=false",
@@ -3476,42 +5323,44 @@ class SaveSyncService:
                     transaction.rollback()
                 container_work.cleanup()
                 raise
-            if desired_remote != remote:
+            if desired_remote != remote and remote_commit is not None:
                 mutations = self._journal_mutations_for_remote_transition(
                     before=remote,
                     after=desired_remote,
                 )
-                if mutations:
-                    try:
-                        generation = self._append_remote_journal(
-                            revision=report.revision,
-                            timestamp=timestamp,
-                            mutations=mutations,
-                        )
-                    except BaseException as exc:
-                        # A remote write is not a completed incremental commit
-                        # until peers can discover it through the journal. The
-                        # journal writer is atomic, so a raised append leaves
-                        # the previous generation intact; roll the materialized
-                        # bytes and local baseline back to the preflight state.
-                        if transaction is not None:
-                            transaction.rollback()
-                        _write_state(self._state_path, state)
-                        container_work.cleanup()
-                        log.warning(
-                            "SaveSync transaction aborted: operation_id=%s "
-                            "reason=%s stage=remote-journal "
-                            "baseline_advanced=false cursor_advanced=false",
-                            operation_id,
-                            type(exc).__name__,
-                        )
-                        raise
-                    if next_state.quick_sync_ready:
-                        next_state = replace(
-                            next_state,
-                            quick_sync_cursor_generation=generation,
-                        )
-                        _write_state(self._state_path, next_state)
+                try:
+                    generation = remote_commit.append_compatibility_journal(
+                        revision=report.revision,
+                        timestamp=timestamp,
+                        mutations=mutations,
+                    )
+                except BaseException as exc:
+                    # Only reachable before the ownership cutover, where the
+                    # journal is still the sole way peers discover a change:
+                    # an un-appendable journal means the commit did not
+                    # happen. On an OWNED dataset the index already published
+                    # it, so the primitive degrades instead of raising.
+                    if transaction is not None:
+                        transaction.rollback()
+                    _write_state(self._state_path, state)
+                    container_work.cleanup()
+                    remote_commit.abandon()
+                    log.warning(
+                        "SaveSync transaction aborted: operation_id=%s reason=%s "
+                        "stage=remote-journal baseline_advanced=false "
+                        "cursor_advanced=false",
+                        operation_id,
+                        type(exc).__name__,
+                    )
+                    raise
+                if generation is not None and next_state.quick_sync_ready:
+                    next_state = replace(
+                        next_state,
+                        quick_sync_cursor_generation=generation,
+                    )
+                    _write_state(self._state_path, next_state)
+            if remote_commit is not None:
+                remote_commit.close()
             if obsolete_conflicts:
                 log.info(
                     "SaveSync ownership migration committed: revision=%s "
@@ -3675,7 +5524,7 @@ class SaveSyncService:
         destination_views: tuple[_DestinationView, ...],
         progress: ProgressSink,
     ) -> SaveSyncRecord:
-        with self._locked_operation():
+        with self._locked_operation(), self._remote_commit_scope():
             if not self.is_remote_reachable():
                 raise SaveSyncConnectivityError(
                     f"Remote save location is not reachable: {self._connectivity_root}"
@@ -3701,6 +5550,16 @@ class SaveSyncService:
             )
             # Keep transaction/recovery identity independent from diagnostics.
             operation_id = uuid.uuid4().hex
+            remote_commit: Optional[_RemoteCommit] = None
+            if diff.direction == "upload":
+                remote_commit = self._open_remote_commit(
+                    operation_id=operation_id,
+                    device_id=self._get_state_unlocked().device_id,
+                    before=remote,
+                    desired=source,
+                    operation="SaveSync force upload",
+                )
+                remote_commit.begin()
             transaction = self._prepare_selected_transaction(
                 destination_views,
                 current=destination,
@@ -3726,15 +5585,23 @@ class SaveSyncService:
                     raise SaveSyncVerificationError(
                         "Save/state data changed while staging; review the operation again."
                     )
+                if remote_commit is not None:
+                    remote_commit.promoting()
                 if transaction is not None:
                     self._apply_selected_transaction(transaction, destination_views)
                 if source_scan().artifacts != source:
                     raise SaveSyncVerificationError(
                         "Save/state source changed before commit completed; no replacement was kept."
                     )
+                if remote_commit is not None:
+                    remote_commit.publish()
             except BaseException:
+                if remote_commit is not None and remote_commit.index_committed:
+                    raise
                 if transaction is not None:
                     transaction.rollback()
+                if remote_commit is not None:
+                    remote_commit.abandon()
                 raise
 
             record = SaveSyncRecord(
@@ -3752,20 +5619,31 @@ class SaveSyncService:
                     operation_id=operation_id,
                 )
             except BaseException:
+                if remote_commit is not None and remote_commit.index_committed:
+                    raise
                 if transaction is not None:
                     transaction.rollback()
+                if remote_commit is not None:
+                    remote_commit.abandon()
                 raise
-            if diff.direction == "upload":
+            if diff.direction == "upload" and remote_commit is not None:
                 mutations = self._journal_mutations_for_remote_transition(
                     before=remote,
                     after=source,
                 )
-                if mutations:
-                    generation = self._append_remote_journal(
+                try:
+                    generation = remote_commit.append_compatibility_journal(
                         revision=record.revision,
                         timestamp=record.timestamp,
                         mutations=mutations,
                     )
+                except BaseException:
+                    # Pre-cutover only: see the same guard in _reconcile_once.
+                    if transaction is not None:
+                        transaction.rollback()
+                    remote_commit.abandon()
+                    raise
+                if generation is not None:
                     state = self._get_state_unlocked()
                     if state.quick_sync_ready:
                         _write_state(
@@ -3775,6 +5653,7 @@ class SaveSyncService:
                                 quick_sync_cursor_generation=generation,
                             ),
                         )
+                remote_commit.close()
             if transaction is not None:
                 try:
                     transaction.finalize()
@@ -4869,11 +6748,13 @@ def _merge_optional_groups(*reports: save_tree.ScanReport) -> tuple[tuple[str, i
 
 
 def _read_state(path: Path) -> SaveSyncState:
-    return durable_state.read_state(path)
+    with stage_timer("local-state-load"):
+        return durable_state.read_state(path)
 
 
 def _write_state(path: Path, state: SaveSyncState) -> None:
-    durable_state.write_state(path, state)
+    with stage_timer("local-state-persistence"):
+        durable_state.write_state(path, state)
 
 
 def _baseline_manifest(state: SaveSyncState) -> dict[str, SaveArtifact]:
