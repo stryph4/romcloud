@@ -2785,12 +2785,17 @@ def test_auto_stability_and_verification_do_not_scan_unrelated_layouts(
 def test_active_game_group_is_deferred_then_processed_after_exit(tmp_path: Path):
     provider = _Provider()
     service = _service(tmp_path, provider)
-    local = tmp_path / "local" / "psx" / "Game.srm"
-    remote = tmp_path / "remote" / "psx" / "Game.srm"
+    # A pending edit for a *different* game than the one being launched.
+    # gameStart's own targeted pre-launch sync only ever covers its own
+    # resolved group ("retroarch-root-psx/game", from rom="Game.chd"), which
+    # has no local file here and is therefore a no-op — it must never widen
+    # to touch this unrelated group's pending edit.
+    local = tmp_path / "local" / "psx" / "OtherGame.srm"
+    remote = tmp_path / "remote" / "psx" / "OtherGame.srm"
     _write(local, b"base")
     service.full_sync()
     _write(local, b"changed")
-    service.mark_local_dirty("psx/Game.srm")
+    service.mark_local_dirty("psx/OtherGame.srm")
     coordinator = _coordinator(tmp_path, service)
     coordinator.game_start(system="psx", emulator="libretro", core="pcsx", rom="Game.chd")
 
@@ -2803,6 +2808,7 @@ def test_active_game_group_is_deferred_then_processed_after_exit(tmp_path: Path)
         system="psx", emulator="libretro", core="pcsx", rom="Game.chd"
     )
     assert remote.read_bytes() == b"changed"
+
 
 
 def test_unavailable_remote_preserves_durable_dirty_state(tmp_path: Path):

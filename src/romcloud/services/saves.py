@@ -63,6 +63,7 @@ from romcloud.core.models.savesync import (
     SaveRemoteAvailability,
     SaveRemoteObservation,
     SaveQuickSyncResult,
+    SaveGameStartSyncResult,
 )
 from romcloud.core.progress import ProgressSink, emit_progress
 from romcloud.core.save_selection import (
@@ -2460,6 +2461,36 @@ class SaveSyncService:
             )
         )
 
+    def _advance_index_watermark_layouts(
+        self,
+        previous: _IndexWatermark,
+        head: savesync_index.IndexHead,
+        layout_ids: frozenset[str],
+    ) -> None:
+        """Narrow watermark update for targeted pre-launch synchronization.
+
+        Unlike :meth:`_advance_index_watermark`'s full-sweep update, this
+        only ever records the specific layouts actually examined here, and
+        never touches the global ``index_generation`` — that field is Quick
+        Sync's own signal that *every* layout was checked on that pass, which
+        a narrowly-targeted gameStart pass never proves. Leaving it
+        untouched guarantees Quick Sync still performs its own full sweep
+        (cheap, correctness-preserving) rather than risking a missed change
+        in a layout this pass never looked at.
+        """
+        layout_generations = dict(previous.layout_generations)
+        for layout_id in layout_ids:
+            layout_head = head.layouts.get(layout_id)
+            if layout_head is not None:
+                layout_generations[layout_id] = layout_head.generation
+        self._save_index_watermark(
+            _IndexWatermark(
+                dataset_id=head.dataset_id,
+                index_generation=previous.index_generation,
+                layout_generations=layout_generations,
+            )
+        )
+
     def _remote_observed_manifest_hash(
         self, snapshot: Optional[SaveGroupSnapshot]
     ) -> Optional[str]:
@@ -2469,6 +2500,223 @@ class SaveSyncService:
         if snapshot is None:
             return None
         return savesync_index.compute_manifest_hash(self._index_artifacts(snapshot.artifacts))
+
+    # ── targeted gameStart synchronization ───────────────────────────────
+
+    def targeted_game_start_sync(
+        self, group_layout_map: dict[str, str]
+    ) -> SaveGameStartSyncResult:
+        """Best-effort, narrowly-scoped synchronization for one launched game.
+
+        ``group_layout_map`` maps each already-resolved target save group ID
+        to its owning layout ID (see
+        :meth:`~romcloud.core.save_selection.SaveSelectionPolicy.group_id_for_rom`).
+        This never rediscovers candidates the way Quick Sync does — only the
+        layout(s) housing the given groups are ever consulted, and no other
+        group in those layouts is ever touched or reconciled.
+
+        This is a best-effort pre-launch pass, never a hard gate: every
+        exception raised here must be treated by the caller (
+        :class:`~romcloud.services.auto_savesync.AutoSaveSyncCoordinator`) as
+        "continue the launch anyway" — SaveSync must never hold a game
+        hostage.
+        """
+        with self.observation_scope():
+            return self._targeted_game_start_sync(group_layout_map)
+
+    def _targeted_game_start_sync(
+        self, group_layout_map: dict[str, str]
+    ) -> SaveGameStartSyncResult:
+        group_ids = frozenset(group_layout_map)
+        if not group_ids:
+            return SaveGameStartSyncResult(status="skipped", reason="no-target-group")
+
+        self._capabilities.require(Capability.SAVE_SYNC, "Targeted gameStart sync")
+        self._require_remote()
+        self._require_filesystem_remote("Targeted gameStart sync")
+        self._require_durable_remote("Targeted gameStart sync")
+        if not self.is_remote_reachable():
+            raise SaveSyncConnectivityError(
+                f"Remote save location is not reachable: {self._connectivity_root}"
+            )
+
+        dataset = self._require_commit_ready_dataset(operation="Targeted gameStart sync")
+        if dataset.ownership is savesync_index.DatasetOwnership.OWNED:
+            return self._targeted_game_start_sync_owned(dataset, group_layout_map)
+        return self._targeted_game_start_sync_legacy(group_layout_map)
+
+    def _targeted_game_start_sync_legacy(
+        self, group_layout_map: dict[str, str]
+    ) -> SaveGameStartSyncResult:
+        """UNOWNED dataset: only ever touch a group already known in durable
+        local state — the exact safe precondition
+        :meth:`_trusted_group_remote_scope` already requires. A legacy
+        dataset cannot prove a brand-new, never-tracked group is fresh
+        without a broad scan, so that case is skipped rather than guessed.
+        """
+        with self._locked_operation():
+            state = self._get_state_unlocked()
+            known_group_ids = {group.group_id for group in state.groups}
+        target_group_ids = frozenset(group_layout_map) & known_group_ids
+        unknown_group_ids = frozenset(group_layout_map) - known_group_ids
+        if unknown_group_ids:
+            log.info(
+                "gameStart pre-launch sync: skipping never-tracked legacy group(s) %s "
+                "(cannot prove freshness without a broad scan)",
+                ",".join(sorted(unknown_group_ids)),
+            )
+        if not target_group_ids:
+            return SaveGameStartSyncResult(
+                status="skipped",
+                reason="legacy-dataset-untracked-group",
+                group_ids=frozenset(group_layout_map),
+            )
+
+        report = self._reconcile(
+            selected_group_ids=target_group_ids,
+            upload_only=False,
+            trusted_group_scope=True,
+            group_layout_hints={
+                group_id: group_layout_map[group_id] for group_id in target_group_ids
+            },
+        )
+        if report is None:
+            return SaveGameStartSyncResult(
+                status="unresolved", reason="active-session", group_ids=target_group_ids
+            )
+        return SaveGameStartSyncResult(
+            status="synchronized",
+            reason="reconciled",
+            group_ids=target_group_ids,
+            report=report,
+        )
+
+    def _targeted_game_start_sync_owned(
+        self,
+        dataset: savesync_index.DatasetState,
+        group_layout_map: dict[str, str],
+    ) -> SaveGameStartSyncResult:
+        assert dataset.head is not None
+        index_root = self._index_root
+        assert index_root is not None
+        head = dataset.head
+        target_group_ids = frozenset(group_layout_map)
+        target_layout_ids = frozenset(group_layout_map.values())
+
+        with stage_timer("game-start-sync-index") as timing, self._locked_operation():
+            state = self._get_state_unlocked()
+            watermark = self._load_index_watermark(dataset_id=head.dataset_id)
+
+            # Same cheap, unconditional divergence check Quick Sync performs
+            # even on its empty fast path — proof an old, non-participating
+            # writer touched the dataset without a matching index rebuild.
+            journal_generation = self._current_journal_generation()
+            if savesync_index.journal_diverged(head, journal_generation):
+                log.warning(
+                    "gameStart pre-launch sync found journal/index divergence: "
+                    "journal_generation=%d index_journal_generation=%d",
+                    journal_generation,
+                    head.journal_generation,
+                )
+                diagnostic_event(
+                    "savesync", "commit.journal_index_divergence",
+                    "SaveSync journal advanced without a matching index rebuild",
+                    level="WARNING",
+                    metadata={
+                        "operation": "gameStart",
+                        "journal_generation": journal_generation,
+                        "index_journal_generation": head.journal_generation,
+                    },
+                )
+                return SaveGameStartSyncResult(
+                    status="unresolved",
+                    reason="journal-index-divergence",
+                    group_ids=target_group_ids,
+                )
+
+            local_observed_by_group = {
+                group.group_id: group.remote_observed for group in state.groups
+            }
+            pending_groups = frozenset(
+                group.group_id
+                for group in state.groups
+                if group.group_id in target_group_ids
+                and (
+                    group.condition
+                    in {SaveGroupCondition.LOCAL_DIRTY, SaveGroupCondition.REMOTE_DIRTY}
+                    or bool(group.dirty_path_hints)
+                )
+            )
+
+            remote_advanced_groups: set[str] = set()
+            indexed_remote_paths: dict[str, frozenset[str]] = {}
+            known_generations = watermark.layout_generations
+            shards_fetched = 0
+            for layout_id in target_layout_ids:
+                layout_head = head.layouts.get(layout_id)
+                if layout_head is None:
+                    continue  # never published; nothing remote to discover yet
+                if known_generations.get(layout_id, 0) >= layout_head.generation:
+                    continue  # this device already knows this layout's committed state
+                try:
+                    shard = savesync_index.load_shard(index_root, layout_id, layout_head)
+                except SaveSyncError:
+                    log.warning(
+                        "gameStart pre-launch sync could not load layout shard %s",
+                        layout_id,
+                        exc_info=True,
+                    )
+                    return SaveGameStartSyncResult(
+                        status="unresolved",
+                        reason="index-shard-unreadable",
+                        group_ids=target_group_ids,
+                    )
+                shards_fetched += 1
+                for group in shard.groups:
+                    if group.group_id not in target_group_ids:
+                        continue  # never widen to another group in this layout
+                    previous_hash = self._remote_observed_manifest_hash(
+                        local_observed_by_group.get(group.group_id)
+                    )
+                    if previous_hash is None or previous_hash != group.manifest_hash:
+                        remote_advanced_groups.add(group.group_id)
+                        indexed_remote_paths[group.group_id] = frozenset(
+                            artifact.path for artifact in group.artifacts
+                        )
+            timing["shards_fetched"] = shards_fetched
+
+            candidate_groups = pending_groups | remote_advanced_groups
+            timing["groups_selected"] = len(candidate_groups)
+            if not candidate_groups:
+                self._advance_index_watermark_layouts(watermark, head, target_layout_ids)
+                return SaveGameStartSyncResult(
+                    status="synchronized",
+                    reason="already-current",
+                    group_ids=target_group_ids,
+                )
+
+        report = self._reconcile(
+            selected_group_ids=frozenset(candidate_groups),
+            upload_only=False,
+            trusted_group_scope=True,
+            group_layout_hints=dict(group_layout_map),
+            indexed_remote_paths=indexed_remote_paths,
+        )
+        if report is None:
+            return SaveGameStartSyncResult(
+                status="unresolved", reason="active-session", group_ids=target_group_ids
+            )
+
+        with self._locked_operation():
+            fresh_head = savesync_index.load_head_strict(index_root)
+            self._advance_index_watermark_layouts(watermark, fresh_head, target_layout_ids)
+
+        return SaveGameStartSyncResult(
+            status="synchronized",
+            reason="reconciled",
+            group_ids=target_group_ids,
+            report=report,
+        )
 
     def _quick_sync_owned(
         self,

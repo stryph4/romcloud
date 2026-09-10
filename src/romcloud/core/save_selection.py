@@ -741,6 +741,9 @@ def _root_stem(filename: str) -> str:
     return PurePosixPath(filename).stem.casefold()
 
 
+_ROM_STEM_DETERMINISTIC_GROUPINGS = frozenset({"root_stem", "n64_title", "dolphin_state"})
+
+
 def _group_key(layout: SaveLayout, root: tuple[str, ...], remainder: tuple[str, ...]) -> str:
     if layout.group_by == "layout":
         return "dataset"
@@ -988,6 +991,33 @@ class SaveSelectionPolicy:
 
     def is_canonical_path_supported(self, canonical_path: str) -> bool:
         return self.group_for_path(canonical_path) is not None
+
+    def group_id_for_rom(self, layout_id: str, rom_filename: str) -> Optional[str]:
+        """The exact save group a launched ROM's own name would occupy.
+
+        Returns a value only when the group is fully determined by the ROM's
+        filename alone, using the same grouping key ``group_for_path`` would
+        compute for a real save artifact named after it. This is the
+        narrowest provably safe pre-launch sync target: ``None`` for an
+        unknown layout, a shared or container layout (a per-ROM save cannot
+        be attributed without inspecting a real artifact — see
+        ``SaveGroupDescriptor.container_id``), or any grouping strategy
+        (``root``, ``root_file``, ``first_descendant``, ``layout``) whose
+        key additionally depends on an observed root/file rather than the
+        ROM name alone. Callers must never widen or guess ownership in
+        those cases; skip targeted synchronization instead.
+        """
+        layout = self._by_id.get(layout_id)
+        if layout is None or layout.shared or layout.container_adapter_id:
+            return None
+        if layout.group_by not in _ROM_STEM_DETERMINISTIC_GROUPINGS:
+            return None
+        stem = PurePosixPath(rom_filename).stem.casefold()
+        if layout.group_by == "n64_title":
+            stem = re.sub(r"\.\d+$", "", stem)
+        elif layout.group_by == "dolphin_state":
+            stem = re.sub(r"\.s\d{2}(?:\.dtm)?$", "", stem, flags=re.I)
+        return f"{layout_id}/{stem}"
 
     def group_for_path(self, canonical_path: str) -> SaveGroupDescriptor | None:
         if (

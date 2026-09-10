@@ -65,6 +65,17 @@ class GameSession:
     rom: str
     started_at: float
     boot_id: str
+    sync_outcome: str = "not_attempted"
+    """One of: not_attempted, unsupported, skipped, synchronized, unresolved.
+
+    Records the outcome of gameStart's best-effort targeted pre-launch sync
+    attempt, if any — never a launch gate, purely informational for gameStop
+    and diagnostics. gameStop always performs its own independent, fresh
+    local/remote comparison regardless of this value.
+    """
+    sync_group_ids: tuple[str, ...] = ()
+    """The save group ID(s) gameStart resolved as this game's own targeted
+    pre-launch sync scope, regardless of the resulting outcome."""
 
 
 def layout_ids_for_session(
@@ -96,13 +107,38 @@ class ActiveSessionStore:
             started_at=time.time(),
             boot_id=_boot_id(),
         )
-        self._root.mkdir(parents=True, exist_ok=True)
+        self._write(session)
+        return session
+
+    def record_sync_outcome(
+        self,
+        *,
+        system: str,
+        rom: str,
+        outcome: str,
+        group_ids: tuple[str, ...] = (),
+    ) -> None:
+        """Update the already-written session marker with gameStart's
+        best-effort pre-launch sync outcome. A missing/stale-boot marker
+        (already retired or never written) is a silent no-op — this is pure
+        diagnostics/gameStop context, never a source of truth gameStart's own
+        launch-continuation behavior depends on.
+        """
         target = self._path(system, rom)
+        session = self._read(target)
+        if session is None:
+            return
+        self._write(
+            replace(session, sync_outcome=outcome, sync_group_ids=tuple(group_ids))
+        )
+
+    def _write(self, session: GameSession) -> None:
+        self._root.mkdir(parents=True, exist_ok=True)
+        target = self._path(session.system, session.rom)
         temporary = self._root / f".{target.name}.{uuid.uuid4().hex}.tmp"
         payload = json.dumps(session.__dict__, sort_keys=True, separators=(",", ":"))
         temporary.write_text(payload, encoding="utf-8")
         temporary.replace(target)
-        return session
 
     def stop(self, *, system: str, rom: str) -> Optional[GameSession]:
         target = self._path(system, rom)
@@ -146,6 +182,7 @@ class ActiveSessionStore:
     def _read(self, path: Path) -> Optional[GameSession]:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
+            raw_group_ids = payload.get("sync_group_ids", ())
             session = GameSession(
                 system=str(payload["system"]),
                 emulator=str(payload.get("emulator", "")),
@@ -153,6 +190,8 @@ class ActiveSessionStore:
                 rom=str(payload["rom"]),
                 started_at=float(payload["started_at"]),
                 boot_id=str(payload["boot_id"]),
+                sync_outcome=str(payload.get("sync_outcome", "not_attempted")),
+                sync_group_ids=tuple(str(value) for value in raw_group_ids),
             )
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             return None
@@ -242,6 +281,14 @@ class AutoSaveSyncCoordinator:
 
     @correlated_operation("gameStart", subsystem="savesync", source="Auto gameStart")
     def game_start(self, *, system: str, emulator: str, core: str, rom: str) -> None:
+        """Record the lifecycle marker, then best-effort pre-launch sync.
+
+        SaveSync must never hold the game hostage: the marker is written
+        first (pure local bookkeeping), and every step after that which
+        could touch the remote is wrapped so that any failure is recorded
+        as an outcome on the session marker and swallowed here \u2014 gameStart
+        always returns normally so the caller launches the game regardless.
+        """
         if not self._enabled:
             return
         session = self._sessions.start(
@@ -274,6 +321,129 @@ class AutoSaveSyncCoordinator:
                 "started_at": session.started_at,
                 "boot_id": session.boot_id,
             },
+        )
+        self._game_start_sync(system=system, emulator=emulator, core=core, rom=rom)
+
+    def _game_start_sync(
+        self, *, system: str, emulator: str, core: str, rom: str
+    ) -> None:
+        layout_ids = layout_ids_for_session(self._policy, system, emulator, core)
+        if not layout_ids:
+            log.info(
+                "gameStart pre-launch sync skipped: system=%s emulator=%s core=%s "
+                "reason=unsupported-system",
+                system,
+                emulator,
+                core,
+            )
+            self._sessions.record_sync_outcome(
+                system=system, rom=rom, outcome="unsupported"
+            )
+            return
+
+        group_layout_map: dict[str, str] = {}
+        for layout_id in sorted(layout_ids):
+            group_id = self._policy.group_id_for_rom(layout_id, rom)
+            if group_id is not None:
+                group_layout_map[group_id] = layout_id
+
+        if not group_layout_map:
+            # A shared/container layout (or a grouping strategy that depends
+            # on an observed root/file) cannot be safely attributed to this
+            # ROM from its name alone. Never guess or widen to a broad scan
+            # here \u2014 skip pre-launch sync for this launch and continue,
+            # leaving full reconciliation to gameStop as before.
+            log.info(
+                "gameStart pre-launch sync skipped: system=%s emulator=%s core=%s "
+                "rom=%s layout_ids=%s reason=no-safe-per-game-target",
+                system,
+                emulator,
+                core,
+                rom,
+                ",".join(sorted(layout_ids)),
+            )
+            diagnostic_event(
+                "savesync",
+                "session.sync_skipped",
+                "gameStart pre-launch sync skipped: no safe per-game target",
+                metadata={
+                    "raw_system": system,
+                    "emulator": emulator,
+                    "core": core,
+                    "rom": rom,
+                    "layout_ids": sorted(layout_ids),
+                },
+            )
+            self._sessions.record_sync_outcome(
+                system=system, rom=rom, outcome="skipped"
+            )
+            return
+
+        target_group_ids = tuple(sorted(group_layout_map))
+        try:
+            result = self._service.targeted_game_start_sync(group_layout_map)
+        except Exception:  # noqa: BLE001 - gameStart must never block a launch
+            log.warning(
+                "gameStart pre-launch sync attempt failed; continuing launch: "
+                "system=%s emulator=%s core=%s rom=%s group_ids=%s",
+                system,
+                emulator,
+                core,
+                rom,
+                ",".join(target_group_ids),
+                exc_info=True,
+            )
+            diagnostic_event(
+                "savesync",
+                "session.sync_unresolved",
+                "gameStart pre-launch sync failed; launch continuing",
+                level="WARNING",
+                metadata={
+                    "raw_system": system,
+                    "emulator": emulator,
+                    "core": core,
+                    "rom": rom,
+                    "group_ids": list(target_group_ids),
+                },
+            )
+            self._sessions.record_sync_outcome(
+                system=system,
+                rom=rom,
+                outcome="unresolved",
+                group_ids=target_group_ids,
+            )
+            return
+
+        log.info(
+            "gameStart pre-launch sync outcome: system=%s emulator=%s core=%s "
+            "rom=%s group_ids=%s status=%s reason=%s",
+            system,
+            emulator,
+            core,
+            rom,
+            ",".join(target_group_ids),
+            result.status,
+            result.reason,
+        )
+        diagnostic_event(
+            "savesync",
+            "session.sync_completed",
+            "gameStart pre-launch sync completed",
+            metadata={
+                "raw_system": system,
+                "emulator": emulator,
+                "core": core,
+                "rom": rom,
+                "group_ids": list(target_group_ids),
+                "status": result.status,
+                "reason": result.reason,
+            },
+        )
+        self._sessions.record_sync_outcome(
+            system=system,
+            rom=rom,
+            outcome=result.status,
+            group_ids=target_group_ids,
         )
 
     def game_stop_eligible(self, *, system: str, emulator: str, core: str) -> bool:
