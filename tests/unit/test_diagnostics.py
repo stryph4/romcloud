@@ -100,7 +100,12 @@ def test_stage_timer_and_counters_share_one_operation_scoped_summary(
             diagnostics.increment_operation_counter("head_reads")
         snapshot = diagnostics.current_timing_snapshot()
         assert snapshot["stages"]["head-read"]["count"] == 1
-        assert snapshot["counters"] == {"head_reads": 1}
+        assert snapshot["counters"]["head_reads"] == 1
+        assert snapshot["counters"]["diagnostic_write_attempts"] >= 2
+        assert snapshot["counters"]["diagnostic_writes"] >= 2
+        assert snapshot["stages"]["diagnostics-write"]["count"] >= 2
+        assert 0 <= snapshot["covered_ms"] <= snapshot["total_ms"]
+        assert snapshot["unattributed_ms"] >= 0
 
     summary = next(
         event
@@ -108,8 +113,32 @@ def test_stage_timer_and_counters_share_one_operation_scoped_summary(
         if event["event_code"] == "operation.timing_summary"
     )
     assert summary["metadata"]["total_ms"] >= 0
+    assert summary["metadata"]["covered_ms"] >= 0
+    assert summary["metadata"]["unattributed_ms"] >= 0
     assert summary["metadata"]["stages"]["head-read"]["count"] == 1
-    assert summary["metadata"]["counters"] == {"head_reads": 1}
+    assert summary["metadata"]["counters"]["head_reads"] == 1
+    assert summary["metadata"]["counters"]["diagnostic_write_attempts"] >= 3
+    assert summary["metadata"]["counters"]["diagnostic_writes"] >= 3
+
+
+def test_operation_coverage_merges_nested_intervals_without_double_counting() -> None:
+    millisecond = 1_000_000
+    timing = diagnostics.OperationTiming(
+        started_ns=0,
+        stages={},
+        counters={},
+        intervals=[
+            (0, 10 * millisecond),
+            (2 * millisecond, 8 * millisecond),
+            (15 * millisecond, 20 * millisecond),
+        ],
+        total_ms=20.0,
+    )
+
+    snapshot = timing.snapshot()
+
+    assert snapshot["covered_ms"] == 15.0
+    assert snapshot["unattributed_ms"] == 5.0
 
 
 def test_operation_can_emit_one_concise_timing_log(caplog) -> None:

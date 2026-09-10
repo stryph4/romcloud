@@ -27,6 +27,8 @@ import subprocess
 from pathlib import Path
 from typing import Optional, Protocol
 
+from romcloud.infrastructure.diagnostics import stage_timer
+
 SAVESYNC_PROGRESS_ARG = "--savesync-progress"
 
 _SUBPROCESS_EXIT_GRACE_SECONDS = 3.0
@@ -131,15 +133,17 @@ class SaveSyncProgressReporter:
         try:
             if self._proc.stdin is None:
                 return
-            self._proc.stdin.write(json.dumps(event) + "\n")
-            self._proc.stdin.flush()
+            with stage_timer("progress-pipe-write"):
+                self._proc.stdin.write(json.dumps(event) + "\n")
+                self._proc.stdin.flush()
         except (BrokenPipeError, ValueError, OSError):
             pass  # UI process gone — SaveSync itself must still proceed
 
     def _close_subprocess(self, *, ok: bool) -> None:
         try:
             if self._proc.stdin:
-                self._proc.stdin.close()
+                with stage_timer("progress-pipe-close"):
+                    self._proc.stdin.close()
         except Exception:  # noqa: BLE001
             pass
         if ok:
@@ -156,11 +160,13 @@ class SaveSyncProgressReporter:
 
     def _wait_or_terminate(self, timeout: float) -> None:
         try:
-            self._proc.wait(timeout=timeout)
+            with stage_timer("progress-subprocess-wait"):
+                self._proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             try:
-                self._proc.terminate()
-                self._proc.wait(timeout=2)
+                with stage_timer("progress-subprocess-terminate"):
+                    self._proc.terminate()
+                    self._proc.wait(timeout=2)
             except Exception:  # noqa: BLE001
                 try:
                     self._proc.kill()

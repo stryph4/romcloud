@@ -283,7 +283,8 @@ def _run_enabled_game_start(
     ctx: click.Context, system: str, emulator: str, core: str, rom: str
 ) -> None:
     """Run the timed, popup-owning portion of an eligible gameStart hook."""
-    coordinator = _coordinator(ctx)
+    with stage_timer("lifecycle-coordinator-initialization"):
+        coordinator = _coordinator(ctx)
     kwargs = {
         "system": system,
         "emulator": emulator,
@@ -303,7 +304,8 @@ def _run_enabled_game_start(
     progress = _start_lifecycle_progress(data_root, operation="gameStart")
     conflict_ids: tuple[str, ...] = ()
     try:
-        conflict_ids = coordinator.game_start(**kwargs, progress=progress)
+        with stage_timer("targeted-gameStart-coordinator"):
+            conflict_ids = coordinator.game_start(**kwargs, progress=progress)
     except Exception:  # noqa: BLE001 - lifecycle hooks never block Batocera
         log.warning("Could not record Batocera game start", exc_info=True)
         try:

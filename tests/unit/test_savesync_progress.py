@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 
+from romcloud.infrastructure import diagnostics
 from romcloud.ui.savesync_progress import (
     NullSaveSyncProgress,
     SaveSyncProgressReporter,
@@ -159,9 +160,14 @@ class TestSaveSyncProgressReporter:
     def test_game_start_can_wait_for_overlay_to_release_focus(self):
         proc = _FakeProcess()
         reporter = SaveSyncProgressReporter(proc)
-        reporter.close(True, "Save is current.")
-        reporter.wait_until_closed()
+        with diagnostics.operation("gameStart", subsystem="savesync"):
+            reporter.close(True, "Save is current.")
+            reporter.wait_until_closed()
+            timing = diagnostics.current_timing_snapshot()
         assert proc.wait_calls == [3.0]
+        assert timing["stages"]["progress-pipe-write"]["count"] == 1
+        assert timing["stages"]["progress-pipe-close"]["count"] == 1
+        assert timing["stages"]["progress-subprocess-wait"]["count"] == 1
 
     def test_failed_close_still_waits_so_the_message_is_readable(self):
         proc = _FakeProcess()

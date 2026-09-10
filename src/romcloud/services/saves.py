@@ -641,7 +641,8 @@ class SaveSyncService:
 
     def get_state(self) -> SaveSyncState:
         """Return locked local state, creating/migrating it durably as needed."""
-        return durable_state.load_state(self._state_path)
+        with stage_timer("local-state-load"):
+            return durable_state.load_state(self._state_path)
 
     def _get_state_unlocked(self) -> SaveSyncState:
         """Read state while the caller owns :meth:`_operation_lock`."""
@@ -1432,7 +1433,9 @@ class SaveSyncService:
         remote provider lacks filesystem semantics, provides a scratch
         directory for :meth:`_remote_path` to fetch into — always cleaned
         up when the operation ends, success or failure."""
-        with self._operation_lock():
+        with contextlib.ExitStack() as lock_stack:
+            with stage_timer("state-lock-wait"):
+                lock_stack.enter_context(self._operation_lock())
             increment_operation_counter("state_lock_acquisitions")
             scratch = _ScratchDir(self._state_path.parent)
             previous = self._active_read_scratch
@@ -2386,12 +2389,13 @@ class SaveSyncService:
         """
         empty = _IndexWatermark(dataset_id=dataset_id, index_generation=0, layout_generations={})
         path = self._index_watermark_path()
-        if not path.exists():
-            return empty
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return empty
+        with stage_timer("local-watermark-load"):
+            if not path.exists():
+                return empty
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return empty
         if not isinstance(payload, dict) or payload.get("dataset_id") != dataset_id:
             return empty
         raw_layouts = payload.get("layout_generations")
@@ -6744,7 +6748,8 @@ def _merge_optional_groups(*reports: save_tree.ScanReport) -> tuple[tuple[str, i
 
 
 def _read_state(path: Path) -> SaveSyncState:
-    return durable_state.read_state(path)
+    with stage_timer("local-state-load"):
+        return durable_state.read_state(path)
 
 
 def _write_state(path: Path, state: SaveSyncState) -> None:

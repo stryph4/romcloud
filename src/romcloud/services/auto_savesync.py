@@ -125,13 +125,14 @@ class ActiveSessionStore:
         diagnostics/gameStop context, never a source of truth gameStart's own
         launch-continuation behavior depends on.
         """
-        target = self._path(system, rom)
-        session = self._read(target)
-        if session is None:
-            return
-        self._write(
-            replace(session, sync_outcome=outcome, sync_group_ids=tuple(group_ids))
-        )
+        with stage_timer("lifecycle-session-outcome-persistence"):
+            target = self._path(system, rom)
+            session = self._read(target)
+            if session is None:
+                return
+            self._write(
+                replace(session, sync_outcome=outcome, sync_group_ids=tuple(group_ids))
+            )
 
     def _write(self, session: GameSession) -> None:
         self._root.mkdir(parents=True, exist_ok=True)
@@ -554,10 +555,11 @@ class AutoSaveSyncCoordinator:
         progress.stage("Checking remote state…")
         progress.stage("Comparing save versions…")
         try:
-            result = self._service.targeted_game_start_sync(
-                group_layout_map,
-                progress=_lifecycle_progress_sink(progress),
-            )
+            with stage_timer("targeted-gameStart-service"):
+                result = self._service.targeted_game_start_sync(
+                    group_layout_map,
+                    progress=_lifecycle_progress_sink(progress),
+                )
         except Exception:  # noqa: BLE001 - gameStart must never block a launch
             log.warning(
                 "gameStart pre-launch sync attempt failed; continuing launch: "

@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 from functools import wraps
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
@@ -127,6 +127,7 @@ SAFE_METADATA_KEYS = frozenset(
         "transaction_root", "transaction_view", "trigger", "unchanged",
         "uploaded", "worker_state", "quick_ready", "duration_ms", "count",
         "examined", "total_ms", "stages", "counters",
+        "covered_ms", "unattributed_ms",
         "attempts", "cache_hits", "hashed_files", "observations", "scanned_files",
         "sleep_ms", "stage_scope",
         "current_hash", "desired_hash", "previous_hash", "size_bytes", "detail",
@@ -181,14 +182,36 @@ class OperationTiming:
     started_ns: int
     stages: dict[str, dict[str, float | int]]
     counters: dict[str, int]
+    intervals: list[tuple[int, int]] = field(default_factory=list)
     total_ms: Optional[float] = None
 
     def snapshot(self) -> dict[str, Any]:
         total_ms = self.total_ms
         if total_ms is None:
             total_ms = round((time.monotonic_ns() - self.started_ns) / 1_000_000, 3)
+        ended_ns = (
+            self.started_ns + int(total_ms * 1_000_000)
+            if self.total_ms is not None
+            else time.monotonic_ns()
+        )
+        covered_ns = 0
+        merged_end = self.started_ns
+        for start_ns, end_ns in sorted(self.intervals):
+            start_ns = max(self.started_ns, start_ns)
+            end_ns = min(ended_ns, end_ns)
+            if end_ns <= start_ns:
+                continue
+            if start_ns > merged_end:
+                covered_ns += end_ns - start_ns
+                merged_end = end_ns
+            elif end_ns > merged_end:
+                covered_ns += end_ns - merged_end
+                merged_end = end_ns
+        covered_ms = round(covered_ns / 1_000_000, 3)
         return {
             "total_ms": total_ms,
+            "covered_ms": covered_ms,
+            "unattributed_ms": round(max(0.0, total_ms - covered_ms), 3),
             "stages": {
                 name: {
                     "duration_ms": round(float(values["duration_ms"]), 3),
@@ -205,6 +228,34 @@ _operation_timing: contextvars.ContextVar[Optional[OperationTiming]] = (
 )
 _active_store: Optional["DiagnosticStore"] = None
 _active_store_lock = threading.RLock()
+
+
+def _record_operation_stage(stage: str, started_ns: int, ended_ns: int) -> None:
+    """Add an already-measured interval without causing diagnostic I/O."""
+    timing = _operation_timing.get()
+    if timing is None:
+        return
+    with contextlib.suppress(Exception):
+        duration_ms = (ended_ns - started_ns) / 1_000_000
+        accumulated = timing.stages.setdefault(
+            stage, {"duration_ms": 0.0, "count": 0}
+        )
+        accumulated["duration_ms"] = float(accumulated["duration_ms"]) + duration_ms
+        accumulated["count"] = int(accumulated["count"]) + 1
+        timing.intervals.append((started_ns, ended_ns))
+
+
+def _write_diagnostic_store(store: "DiagnosticStore", **kwargs: Any) -> bool:
+    """Time an existing SQLite write without emitting another event."""
+    started_ns = time.monotonic_ns()
+    increment_operation_counter("diagnostic_write_attempts")
+    try:
+        written = store.write(**kwargs)
+    finally:
+        _record_operation_stage("diagnostics-write", started_ns, time.monotonic_ns())
+    if written:
+        increment_operation_counter("diagnostic_writes")
+    return written
 
 
 def _utc_now() -> str:
@@ -728,7 +779,8 @@ class SQLiteDiagnosticHandler(logging.Handler):
                 exc_type = type(record.exc_info[1]).__name__
                 exc_message = str(record.exc_info[1])
             metadata = getattr(record, "diagnostic_metadata", None)
-            self.store.write(
+            _write_diagnostic_store(
+                self.store,
                 level=record.levelname,
                 subsystem=record.name.removeprefix("romcloud."),
                 event_code=getattr(record, "event_code", "log"),
@@ -772,7 +824,8 @@ def event(
     store = active_store()
     if store is None:
         return False
-    return store.write(
+    return _write_diagnostic_store(
+        store,
         level=level, subsystem=subsystem, event_code=event_code, message=message,
         metadata=metadata, operation_id=operation_id,
         parent_operation_id=parent_operation_id,
@@ -831,14 +884,19 @@ def operation(
                     "total_ms": summary["total_ms"],
                     "stages": summary["stages"],
                     "counters": summary["counters"],
+                    "covered_ms": summary["covered_ms"],
+                    "unattributed_ms": summary["unattributed_ms"],
                 },
             )
         if timing_logger is not None:
             with contextlib.suppress(Exception):
                 timing_logger.info(
-                    "SaveSync timing summary: operation=%s total_ms=%.3f stages=%s counters=%s",
+                    "SaveSync timing summary: operation=%s total_ms=%.3f covered_ms=%.3f "
+                    "unattributed_ms=%.3f stages=%s counters=%s",
                     timing_label or name,
                     summary["total_ms"],
+                    summary["covered_ms"],
+                    summary["unattributed_ms"],
                     json.dumps(summary["stages"], sort_keys=True, separators=(",", ":")),
                     json.dumps(summary["counters"], sort_keys=True, separators=(",", ":")),
                 )
@@ -856,6 +914,8 @@ def current_timing_snapshot() -> dict[str, Any]:
     timing = _operation_timing.get()
     return timing.snapshot() if timing is not None else {
         "total_ms": 0.0,
+        "covered_ms": 0.0,
+        "unattributed_ms": 0.0,
         "stages": {},
         "counters": {},
     }
@@ -893,17 +953,9 @@ def stage_timer(
     try:
         yield fields
     finally:
-        duration_ms = round((time.monotonic_ns() - started) / 1_000_000, 3)
-        timing = _operation_timing.get()
-        if timing is not None:
-            with contextlib.suppress(Exception):
-                accumulated = timing.stages.setdefault(
-                    stage, {"duration_ms": 0.0, "count": 0}
-                )
-                accumulated["duration_ms"] = (
-                    float(accumulated["duration_ms"]) + duration_ms
-                )
-                accumulated["count"] = int(accumulated["count"]) + 1
+        ended = time.monotonic_ns()
+        duration_ms = round((ended - started) / 1_000_000, 3)
+        _record_operation_stage(stage, started, ended)
         with contextlib.suppress(Exception):
             event(
                 subsystem,
