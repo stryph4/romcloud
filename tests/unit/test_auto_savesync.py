@@ -1907,14 +1907,14 @@ class TestGameStopObservationCost:
         remote_scans = {"count": 0}
         original_scan_remote_layouts = service._scan_remote_layouts
 
-        def injecting_scan_remote_layouts(layout_ids):
+        def injecting_scan_remote_layouts(layout_ids, **kwargs):
             remote_scans["count"] += 1
             if remote_scans["count"] == 2:
                 # Simulate another client's write landing mid-operation, after
                 # this operation's own plan scan already observed the old
                 # remote bytes.
                 remote.write_bytes(b"same-size-bytes-from-elsewhere")
-            return original_scan_remote_layouts(layout_ids)
+            return original_scan_remote_layouts(layout_ids, **kwargs)
 
         monkeypatch.setattr(
             service, "_scan_remote_layouts", injecting_scan_remote_layouts

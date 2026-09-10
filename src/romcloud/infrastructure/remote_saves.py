@@ -76,6 +76,7 @@ class RemoteSaveStore(ABC):
         enabled_optional_groups: frozenset[str],
         operation: Optional[RemoteOperationContext] = None,
         cache: Optional[save_tree.ContentObservationCache] = None,
+        only_relative_paths: Optional[frozenset[str]] = None,
     ) -> save_tree.ScanReport:
         """Return the provider's current logical save-artifact manifest.
 
@@ -88,6 +89,13 @@ class RemoteSaveStore(ABC):
         since an earlier observation, so it always re-reads regardless of
         what is passed here; protocol-only stores have no local stat to
         memoize against in the first place.
+
+        *only_relative_paths*, when given, narrows the result to exactly
+        those canonical paths — every other file is skipped before it is
+        opened/hashed. A caller must only pass a set it already knows is
+        the exhaustive current membership for what it is scanning; this
+        never widens discovery, so any narrower set silently hides content
+        this call would otherwise have found.
         """
 
     @abstractmethod
@@ -145,6 +153,7 @@ class FilesystemRemoteSaveStore(RemoteSaveStore):
         enabled_optional_groups: frozenset[str],
         operation: Optional[RemoteOperationContext] = None,
         cache: Optional[save_tree.ContentObservationCache] = None,
+        only_relative_paths: Optional[frozenset[str]] = None,
     ) -> save_tree.ScanReport:
         if operation is not None:
             operation.check()
@@ -154,6 +163,7 @@ class FilesystemRemoteSaveStore(RemoteSaveStore):
             policy,
             enabled_optional_systems=enabled_optional_systems,
             enabled_optional_groups=enabled_optional_groups,
+            only_relative_paths=only_relative_paths,
         )
 
     def materialize(
@@ -224,6 +234,7 @@ class ProviderRemoteSaveStore(RemoteSaveStore):
         enabled_optional_groups: frozenset[str],
         operation: Optional[RemoteOperationContext] = None,
         cache: Optional[save_tree.ContentObservationCache] = None,
+        only_relative_paths: Optional[frozenset[str]] = None,
     ) -> save_tree.ScanReport:
         # A protocol-only provider exposes no device/inode identity, so there
         # is nothing this store may safely reuse: it always re-reads.
@@ -234,6 +245,7 @@ class ProviderRemoteSaveStore(RemoteSaveStore):
             enabled_optional_systems=enabled_optional_systems,
             enabled_optional_groups=enabled_optional_groups,
             operation=operation,
+            only_relative_paths=only_relative_paths,
         )
 
     def materialize(

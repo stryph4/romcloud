@@ -83,6 +83,7 @@ from romcloud.infrastructure.diagnostics import (
 )
 from romcloud.infrastructure import savesync_state as durable_state
 from romcloud.infrastructure import savesync_journal
+from romcloud.infrastructure import savesync_index
 from romcloud.infrastructure.remote_saves import RemoteSaveStore, build_remote_save_store
 from romcloud.infrastructure.save_container_registry import (
     DEFAULT_SAVE_CONTAINER_REGISTRY,
@@ -1426,7 +1427,7 @@ class SaveSyncService:
         )
 
     def _scan_remote_layouts(
-        self, layout_ids: frozenset[str]
+        self, layout_ids: frozenset[str], *, only_relative_paths: Optional[frozenset[str]] = None
     ) -> save_tree.ScanReport:
         assert self._remote_store is not None
         layouts = tuple(
@@ -1442,6 +1443,7 @@ class SaveSyncService:
             selected_policy,
             enabled_optional_systems=self._enabled_optional_systems(),
             enabled_optional_groups=self._enabled_optional_groups(),
+            only_relative_paths=only_relative_paths,
         )
 
     def _automatic_report(self, report: save_tree.ScanReport) -> save_tree.ScanReport:
@@ -1461,6 +1463,47 @@ class SaveSyncService:
             for path, artifact in _baseline_manifest(state).items()
             if self._path_enabled(path)
         }
+
+    def _has_container_layout(self, layout_ids: frozenset[str]) -> bool:
+        return any(
+            layout.container_adapter_id
+            for layout in self._policy.layouts
+            if layout.layout_id in layout_ids
+        )
+
+    def _trusted_group_remote_scope(
+        self,
+        group_ids: frozenset[str],
+        local_report: save_tree.ScanReport,
+        state: SaveSyncState,
+    ) -> frozenset[str]:
+        """Exact remote candidate paths for group IDs Quick Sync already tracks.
+
+        Callers must only pass group IDs that a fresh journal/dirty-hint scope
+        resolution already resolved to *known* durable groups \u2014
+        :meth:`_quick_sync_scope` always widens an unknown or ambiguous
+        journal group ID to a full layout scan instead of a bare group ID, so
+        every group ID reaching this helper already has a durable baseline.
+
+        The result is every path this device has already observed for these
+        groups, either in the local scan just completed for this same
+        operation or in the last shared baseline. A brand-new remote-only
+        file for an already-tracked group that this device has never locally
+        held nor previously shared is the one case this cannot discover; Full
+        Sync and journal-ambiguous layout escalation remain the paths that
+        find it. This is why callers unrelated to Quick Sync's own trusted
+        scope (e.g. :meth:`reconcile_pending_groups`) must never pass this.
+        """
+        local_paths = frozenset(
+            path
+            for path in local_report.artifacts
+            if _group_id(self._policy, path) in group_ids
+        )
+        baseline_paths = frozenset(
+            _manifest_for_groups(self._automatic_baseline(state), group_ids, self._policy)
+        )
+        return local_paths | baseline_paths
+
 
     def _local_path(self, relative_path: str) -> Path:
         """Resolve a canonical save path through the local destination views.
@@ -1730,7 +1773,149 @@ class SaveSyncService:
                     "reason": "full-sync-complete",
                 },
             )
+            self._publish_shadow_index(state=state, journal_generation=observed_generation)
         return report
+
+    def _publish_shadow_index(
+        self, *, state: SaveSyncState, journal_generation: int
+    ) -> None:
+        """Full Sync only: publish the shadow remote current-state index.
+
+        Strictly descriptive in this phase — see
+        :mod:`romcloud.infrastructure.savesync_index`. Never consulted by
+        Quick Sync/gameStart/gameStop, and never allowed to fail an
+        otherwise successful Full Sync: any error here is logged and
+        swallowed rather than raised.
+        """
+        if self._remote_root is None:
+            return
+        try:
+            index_root = savesync_index.default_index_root(self._remote_root)
+            layout_groups = self._collect_shadow_index_layout_groups(index_root, state)
+            with stage_timer("index-build") as timing:
+                head = savesync_index.publish_full_sync_index(
+                    index_root,
+                    dataset_id_hint=None,
+                    journal_generation=journal_generation,
+                    layout_groups=layout_groups,
+                )
+                timing["published"] = head is not None
+                timing["layout_count"] = len(layout_groups)
+        except (SaveSyncError, OSError):
+            log.warning("SaveSync shadow index publication failed", exc_info=True)
+            diagnostic_event(
+                "savesync", "index.publish_failed",
+                "SaveSync shadow index publication failed",
+                level="WARNING",
+            )
+            return
+        if head is not None:
+            log.info(
+                "SaveSync shadow index published: dataset_id=%s index_generation=%d "
+                "journal_generation=%d layout_count=%d",
+                head.dataset_id,
+                head.index_generation,
+                head.journal_generation,
+                len(head.layouts),
+            )
+            diagnostic_event(
+                "savesync", "index.published", "SaveSync shadow index published",
+                metadata={
+                    "dataset_id": head.dataset_id,
+                    "index_generation": head.index_generation,
+                    "journal_generation": head.journal_generation,
+                    "layout_count": len(head.layouts),
+                },
+            )
+
+    def _collect_shadow_index_layout_groups(
+        self, index_root: Path, state: SaveSyncState
+    ) -> dict[str, tuple[savesync_index.IndexGroup, ...]]:
+        """Build every registered layout's verified current group set.
+
+        Reads actual freshly-scanned remote content — never the journal.
+        Per-group ``group_generation`` is derived by diffing against the
+        previously published shard for that layout (absent/unreadable
+        counts as generation 1, i.e. first-ever observation).
+        """
+        with self._fresh_observations():
+            remote_manifest = dict(self._scan_automatic_remote().artifacts)
+        grouped = _grouped_manifest(remote_manifest, self._policy)
+        known_group_layouts = {group.group_id: group.layout_id for group in state.groups}
+        registered_layout_ids = {layout.layout_id for layout in self._policy.layouts}
+        all_group_ids = frozenset(grouped) | frozenset(known_group_layouts)
+        previous_head = savesync_index.load_head_safe(index_root)
+        previous_groups_cache: dict[str, dict[str, savesync_index.IndexGroup]] = {}
+
+        def previous_groups(layout_id: str) -> dict[str, savesync_index.IndexGroup]:
+            if layout_id not in previous_groups_cache:
+                groups: dict[str, savesync_index.IndexGroup] = {}
+                layout_head = (
+                    previous_head.layouts.get(layout_id) if previous_head is not None else None
+                )
+                if layout_head is not None:
+                    try:
+                        shard = savesync_index.load_shard(index_root, layout_id, layout_head)
+                        groups = {group.group_id: group for group in shard.groups}
+                    except SaveSyncError:
+                        groups = {}
+                previous_groups_cache[layout_id] = groups
+            return previous_groups_cache[layout_id]
+
+        layout_groups: dict[str, list[savesync_index.IndexGroup]] = {}
+        for group_id in sorted(all_group_ids):
+            if group_id.startswith("unsupported:"):
+                continue
+            artifacts_tuple = grouped.get(group_id, ())
+            descriptor = (
+                self._policy.group_for_path(artifacts_tuple[0].relative_path)
+                if artifacts_tuple
+                else None
+            )
+            if descriptor is not None:
+                layout_id = descriptor.layout_id
+                system = descriptor.system
+                container_head = descriptor.container_adapter_id or None
+            else:
+                layout_id = known_group_layouts.get(group_id)
+                if layout_id is None or layout_id not in registered_layout_ids:
+                    continue  # never a registered group, or its layout was retired
+                system = self._policy.layout(layout_id).system
+                container_head = None
+            artifacts = tuple(
+                savesync_index.IndexArtifact(
+                    artifact.relative_path, artifact.size_bytes, artifact.content_hash
+                )
+                for artifact in artifacts_tuple
+            )
+            tombstoned = not artifacts
+            if tombstoned and group_id not in known_group_layouts:
+                continue  # never previously tracked and currently empty
+            previous_group = previous_groups(layout_id).get(group_id)
+            if previous_group is not None and previous_group.artifacts == artifacts:
+                group_generation = previous_group.group_generation
+            else:
+                group_generation = (
+                    previous_group.group_generation + 1 if previous_group is not None else 1
+                )
+            if container_head is None and previous_group is not None:
+                container_head = previous_group.container_head
+            layout_groups.setdefault(layout_id, []).append(
+                savesync_index.IndexGroup(
+                    group_id=group_id,
+                    layout_id=layout_id,
+                    system=system,
+                    group_generation=group_generation,
+                    artifacts=artifacts,
+                    tombstoned=tombstoned,
+                    origin_device=state.device_id,
+                    completed_transaction_id=None,
+                    container_head=container_head,
+                )
+            )
+        return {
+            layout_id: tuple(groups) for layout_id, groups in layout_groups.items()
+        }
 
     @correlated_operation("Quick Sync", subsystem="savesync", source="Quick Sync")
     def quick_sync(
@@ -2163,6 +2348,7 @@ class SaveSyncService:
             obsolete_conflict_ids=frozenset(
                 conflict.conflict_id for conflict in obsolete_conflicts
             ),
+            trusted_group_scope=True,
         )
         if report is None:
             return SaveQuickSyncResult(
@@ -2782,7 +2968,15 @@ class SaveSyncService:
         is_group_active: Optional[Callable[[str], bool]] = None,
         is_layout_active: Optional[Callable[[str], bool]] = None,
         obsolete_conflict_ids: frozenset[str] = frozenset(),
+        trusted_group_scope: bool = False,
     ) -> Optional[SaveReconcileReport]:
+        """*trusted_group_scope* narrows the remote scan for a group-only call
+        to paths already known from this operation's own local scan plus the
+        last shared baseline, instead of scanning the whole containing
+        layout. Only Quick Sync's own group-only reconcile call may set this
+        — see :meth:`_trusted_group_remote_scope`. Legacy/manual callers such
+        as :meth:`reconcile_pending_groups` must leave it ``False``.
+        """
         with self._locked_operation():
             if selected_group_ids is not None and selected_layout_ids is not None:
                 selected_layout_ids = frozenset(selected_layout_ids)
@@ -2857,6 +3051,7 @@ class SaveSyncService:
                 )
             )
             verification_layout_ids: Optional[frozenset[str]] = None
+            verification_remote_scope_paths: Optional[frozenset[str]] = None
             if selected_layout_ids is not None:
                 # Keep every safety and finalization scan on the exact layout
                 # scope used to build the transition plan.  Comparing this
@@ -2885,9 +3080,28 @@ class SaveSyncService:
                         local_report = self._automatic_report(
                             self._scan_local_layouts(scoped_layouts)
                         )
-                    with stage_timer("scan-remote"):
+                    if trusted_group_scope and not self._has_container_layout(
+                        scoped_layouts
+                    ):
+                        verification_remote_scope_paths = self._trusted_group_remote_scope(
+                            selected_group_ids, local_report, state
+                        )
+                    with stage_timer("scan-remote") as timing:
                         remote_report = self._automatic_report(
-                            self._scan_remote_layouts(scoped_layouts)
+                            self._scan_remote_layouts(
+                                scoped_layouts,
+                                only_relative_paths=verification_remote_scope_paths,
+                            )
+                        )
+                        timing["scope"] = (
+                            "narrow"
+                            if verification_remote_scope_paths is not None
+                            else "layout"
+                        )
+                        timing["candidate_paths"] = (
+                            len(verification_remote_scope_paths)
+                            if verification_remote_scope_paths is not None
+                            else -1
                         )
                 else:
                     local_report = save_tree.ScanReport({})
@@ -3096,7 +3310,10 @@ class SaveSyncService:
                             self._scan_local_layouts(verification_layout_ids)
                         )
                         current_remote = self._automatic_report(
-                            self._scan_remote_layouts(verification_layout_ids)
+                            self._scan_remote_layouts(
+                                verification_layout_ids,
+                                only_relative_paths=verification_remote_scope_paths,
+                            )
                         )
                 if (
                     current_local.artifacts != complete_local
@@ -3144,7 +3361,10 @@ class SaveSyncService:
                             self._scan_local_layouts(verification_layout_ids)
                         )
                         final_remote_report = self._automatic_report(
-                            self._scan_remote_layouts(verification_layout_ids)
+                            self._scan_remote_layouts(
+                                verification_layout_ids,
+                                only_relative_paths=verification_remote_scope_paths,
+                            )
                         )
                 if (
                     final_local_report.artifacts

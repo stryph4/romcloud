@@ -386,6 +386,7 @@ def scan_provider_tree_report(
     enabled_optional_systems: frozenset[str] = frozenset(),
     enabled_optional_groups: frozenset[str] = frozenset(),
     operation: Optional[RemoteOperationContext] = None,
+    only_relative_paths: Optional[frozenset[str]] = None,
 ) -> ScanReport:
     """Provider-generic twin of :func:`scan_tree_report`.
 
@@ -397,6 +398,10 @@ def scan_provider_tree_report(
     :meth:`~romcloud.core.storage.StorageProvider.open_binary` — never via
     a raw local :class:`~pathlib.Path`. Eligibility rules are identical to
     the local scanner; only the I/O primitives differ.
+
+    *only_relative_paths*, when given, is a set of canonical paths (as
+    returned in :attr:`ScanReport.artifacts`); any other file is skipped
+    before it is hashed, so narrowing here still saves a provider read.
     """
     context = operation or RemoteOperationContext()
     index = ProviderTreeIndex(provider, root, context)
@@ -422,6 +427,8 @@ def scan_provider_tree_report(
                 trusted_layout_id=watch.layout_id,
             )
             if not decision.included or not policy.is_canonical_path_supported(canonical):
+                continue
+            if only_relative_paths is not None and canonical not in only_relative_paths:
                 continue
             if canonical in artifacts:
                 raise SaveSyncError(f"SaveSync found duplicate canonical path: {canonical}")
