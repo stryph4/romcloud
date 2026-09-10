@@ -21,6 +21,11 @@ from romcloud.core.storage import StorageProvider
 from romcloud.infrastructure import savesync_prompts
 from romcloud.services.saves import SaveSyncService
 
+from tests.unit._savesync_protocol_helpers import (
+    mutate_remote_out_of_band,
+    seed_peer_commit,
+)
+
 
 class _Provider(StorageProvider):
     @property
@@ -74,11 +79,19 @@ def _write(path: Path, content: bytes) -> None:
 def _conflict(tmp_path: Path) -> tuple[SaveSyncService, str]:
     service = _service(tmp_path)
     local = tmp_path / "local" / "psx" / "Game.srm"
-    remote = tmp_path / "remote" / "psx" / "Game.srm"
     _write(local, b"base")
     service.full_sync()
     _write(local, b"local-progress")
-    _write(remote, b"remote-progress")
+    # The remote divergence is another upgraded device's committed upload,
+    # so payload and authoritative index agree — the ordinary precondition
+    # for resolving a conflict. Manual/out-of-band divergence is a different
+    # scenario and is covered by TestOutOfBandRemoteMutation.
+    seed_peer_commit(
+        service,
+        remote_root=tmp_path / "remote",
+        relative_path="psx/Game.srm",
+        content=b"remote-progress",
+    )
     service.reconcile()
     conflict = service.get_state().active_conflicts[0]
     return service, conflict.conflict_id
@@ -144,7 +157,12 @@ def test_targeted_local_wins_can_verify_and_commit_group_deletion(tmp_path: Path
     _write(local, b"base")
     service.full_sync()
     local.unlink()
-    remote.write_bytes(b"remote-progress")
+    seed_peer_commit(
+        service,
+        remote_root=tmp_path / "remote",
+        relative_path="psx/Game.srm",
+        content=b"remote-progress",
+    )
     service.reconcile()
     conflict_id = service.get_state().active_conflicts[0].conflict_id
 
@@ -168,6 +186,108 @@ def test_targeted_resolution_refuses_changed_conflict_content(tmp_path: Path):
 
     assert (tmp_path / "remote" / "psx" / "Game.srm").read_bytes() == b"remote-progress"
     assert service.get_state().active_conflicts[0].conflict_id == conflict_id
+
+
+class TestOutOfBandRemoteMutation:
+    """Manual filesystem divergence on an OWNED dataset requires Full Sync.
+
+    Once the commit protocol owns a dataset, its index is the shared record
+    of what is committed. If remote bytes change without the index changing,
+    that record is provably stale and must not be allowed to authorize an
+    overwrite or a deletion: the operation fails closed and Full Sync
+    re-establishes truth from the actual files.
+    """
+
+    def test_conflict_resolution_refuses_and_changes_nothing(self, tmp_path: Path):
+        """Conflict resolution has its own earlier guard for this case.
+
+        The stored conflict snapshot is rescanned before staging, so a hand
+        edit is refused there rather than reaching the index cross-check.
+        Both are fail-closed and non-destructive; what matters is that no
+        side is mutated and the conflict evidence survives.
+        """
+        service, conflict_id = _conflict(tmp_path)
+        remote = tmp_path / "remote" / "psx" / "Game.srm"
+        local = tmp_path / "local" / "psx" / "Game.srm"
+        mutate_remote_out_of_band(
+            tmp_path / "remote", "psx/Game.srm", b"edited-by-hand"
+        )
+
+        with pytest.raises(SaveSyncVerificationError):
+            service.resolve_conflict(conflict_id, SaveConflictResolution.KEEP_LOCAL)
+
+        assert remote.read_bytes() == b"edited-by-hand"
+        assert local.read_bytes() == b"local-progress"
+        active = service.get_state().active_conflicts
+        assert [item.conflict_id for item in active] == [conflict_id]
+
+    def test_force_upload_refuses_against_a_stale_index(self, tmp_path: Path):
+        service = _service(tmp_path)
+        local = tmp_path / "local" / "psx" / "Game.srm"
+        remote = tmp_path / "remote" / "psx" / "Game.srm"
+        _write(local, b"base")
+        service.full_sync()
+        seed_peer_commit(
+            service,
+            remote_root=tmp_path / "remote",
+            relative_path="psx/Game.srm",
+            content=b"peer-v2",
+        )
+        mutate_remote_out_of_band(tmp_path / "remote", "psx/Game.srm", b"base")
+        _write(local, b"forced-local")
+
+        preview = service.preview_upload()
+        with pytest.raises(SaveSyncVerificationError, match="Run a Full Sync"):
+            service.commit_upload(preview)
+
+        assert remote.read_bytes() == b"base"
+        assert local.read_bytes() == b"forced-local"
+
+    def test_reconcile_upload_refuses_when_index_is_stale(self, tmp_path: Path):
+        """A peer commit later reverted by hand leaves the index ahead of
+        the bytes; an upload planned against those bytes must not proceed."""
+        service = _service(tmp_path)
+        local = tmp_path / "local" / "psx" / "Game.srm"
+        remote = tmp_path / "remote" / "psx" / "Game.srm"
+        _write(local, b"base")
+        service.full_sync()
+        seed_peer_commit(
+            service,
+            remote_root=tmp_path / "remote",
+            relative_path="psx/Game.srm",
+            content=b"peer-v2",
+        )
+        # Someone restores the previous file behind the protocol's back.
+        mutate_remote_out_of_band(tmp_path / "remote", "psx/Game.srm", b"base")
+        _write(local, b"local-v3")
+        service.mark_local_dirty("psx/Game.srm")
+
+        with pytest.raises(SaveSyncVerificationError, match="Run a Full Sync"):
+            service.reconcile()
+
+        assert remote.read_bytes() == b"base"
+        assert local.read_bytes() == b"local-v3"
+
+    def test_full_sync_repairs_the_dataset_and_unblocks_mutation(self, tmp_path: Path):
+        service, conflict_id = _conflict(tmp_path)
+        mutate_remote_out_of_band(
+            tmp_path / "remote", "psx/Game.srm", b"edited-by-hand"
+        )
+        with pytest.raises(SaveSyncVerificationError):
+            service.resolve_conflict(conflict_id, SaveConflictResolution.KEEP_LOCAL)
+
+        service.full_sync()
+
+        # Full Sync is the truth-discovery operation, so it re-establishes an
+        # index that matches the real bytes and mutation is possible again.
+        current = service.get_state().active_conflicts
+        assert current, "the hand edit still diverges from local"
+        service.resolve_conflict(
+            current[0].conflict_id, SaveConflictResolution.KEEP_LOCAL
+        )
+        assert (
+            tmp_path / "remote" / "psx" / "Game.srm"
+        ).read_bytes() == b"local-progress"
 
 
 def _popup() -> ConflictPopupState:

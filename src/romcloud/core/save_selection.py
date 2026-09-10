@@ -741,6 +741,9 @@ def _root_stem(filename: str) -> str:
     return PurePosixPath(filename).stem.casefold()
 
 
+_ROM_STEM_DETERMINISTIC_GROUPINGS = frozenset({"root_stem", "n64_title"})
+
+
 def _group_key(layout: SaveLayout, root: tuple[str, ...], remainder: tuple[str, ...]) -> str:
     if layout.group_by == "layout":
         return "dataset"
@@ -988,6 +991,56 @@ class SaveSelectionPolicy:
 
     def is_canonical_path_supported(self, canonical_path: str) -> bool:
         return self.group_for_path(canonical_path) is not None
+
+    def group_id_for_rom(self, layout_id: str, rom_filename: str) -> Optional[str]:
+        """The exact save group a launched ROM's own name would occupy.
+
+        Returns a value only when the group is fully determined by the ROM's
+        filename alone, using the same grouping key ``group_for_path`` would
+        compute for a real save artifact named after it. This is the
+        narrowest provably safe pre-launch sync target: ``None`` for an
+        unknown layout, a shared or container layout (see
+        :meth:`shared_container_group_id` instead), or any grouping
+        strategy whose key additionally depends on something other than the
+        ROM name alone. ``dolphin_state`` is deliberately excluded even
+        though it is a non-shared, non-container layout: Dolphin state-slot
+        filenames are keyed by the emulator's internal six-character game
+        ID, not by the ROM's own filename, so that relationship is not
+        provable from the ROM name and must never be guessed. Callers must
+        never widen or guess ownership in any excluded case; skip targeted
+        synchronization instead.
+        """
+        layout = self._by_id.get(layout_id)
+        if layout is None or layout.shared or layout.container_adapter_id:
+            return None
+        if layout.group_by not in _ROM_STEM_DETERMINISTIC_GROUPINGS:
+            return None
+        stem = PurePosixPath(rom_filename).stem.casefold()
+        if layout.group_by == "n64_title":
+            stem = re.sub(r"\.\d+$", "", stem)
+        return f"{layout_id}/{stem}"
+
+    def shared_container_group_id(self, layout_id: str) -> Optional[str]:
+        """The one save group a shared/container layout structurally
+        guarantees for every session, or ``None`` to skip.
+
+        This is never inferred from what happens to be on disk right now —
+        a root directory containing exactly one card/container file today is
+        not an ownership invariant: that could be unrelated to the launched
+        session, and the container actually relevant to it may exist only
+        remotely. Only ``group_by="layout"`` is a structural guarantee from
+        the ``SaveLayout`` contract itself (the whole layout is *defined* as
+        one save group, regardless of how many physical files exist). Every
+        other grouping strategy a shared/container layout can use
+        (``root_file``, ``root``, ``root_stem``, ``first_descendant``)
+        permits more than one card/container to exist for the same layout,
+        so callers must skip a launch's targeted sync there rather than
+        picking one of several possible candidates.
+        """
+        layout = self._by_id.get(layout_id)
+        if layout is None or layout.group_by != "layout":
+            return None
+        return f"{layout_id}/dataset"
 
     def group_for_path(self, canonical_path: str) -> SaveGroupDescriptor | None:
         if (

@@ -31,12 +31,15 @@ import re
 import tempfile
 import uuid
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional
 
 from romcloud.core.exceptions import SaveSyncError
 
 SCHEMA_VERSION = 1
+PROTOCOL_VERSION = 1
+OWNERSHIP_BASENAME = "OWNED.json"
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 _SAFE_LAYOUT_ID = re.compile(r"[A-Za-z0-9_-]+")
 _EMPTY_MANIFEST_HASH = hashlib.sha256(b"").hexdigest()
@@ -470,11 +473,168 @@ def load_head(index_root: Path) -> Optional[IndexHead]:
 
 
 def load_head_safe(index_root: Path) -> Optional[IndexHead]:
-    """Never destructive: a corrupt/unreadable HEAD is treated as absent."""
+    """Non-authoritative read for diagnostics and shadow inspection only.
+
+    A corrupt HEAD is reported as absent, which is safe for *describing*
+    state and unsafe for *deciding* anything. Every mutation and
+    compare-and-swap path must use :func:`load_head_strict` instead so that
+    corruption fails closed rather than disabling the guard it is supposed
+    to be checked against.
+    """
     try:
         return load_head(index_root)
     except SaveSyncError:
         return None
+
+
+def load_head_strict(index_root: Path) -> IndexHead:
+    """Authoritative read: a missing or corrupt HEAD is an error."""
+    head = load_head(index_root)
+    if head is None:
+        raise SaveSyncError(
+            f"SaveSync index HEAD is missing: {head_path(index_root)}"
+        )
+    return head
+
+
+# ── protocol ownership ──────────────────────────────────────────────────────
+
+
+class DatasetOwnership(Enum):
+    """Whether the new commit protocol owns this remote dataset."""
+
+    UNOWNED = "unowned"
+    """No ownership marker. Shadow index files may exist but carry no
+    authority; legacy behavior continues and no CAS guard is available."""
+
+    OWNED = "owned"
+    """Marker present and consistent with a strictly validated HEAD. The
+    new protocol is required for every mutation."""
+
+    DAMAGED = "damaged"
+    """Marker present but the index it names is missing, corrupt,
+    incompatible, or mismatched. Fail closed and require Full Sync."""
+
+
+@dataclass(frozen=True)
+class OwnershipMarker:
+    schema_version: int
+    protocol_version: int
+    dataset_id: str
+    established_at: str
+    established_by_device: str
+
+
+@dataclass(frozen=True)
+class DatasetState:
+    ownership: DatasetOwnership
+    marker: Optional[OwnershipMarker] = None
+    head: Optional[IndexHead] = None
+    detail: str = ""
+
+    @property
+    def is_owned(self) -> bool:
+        return self.ownership is DatasetOwnership.OWNED
+
+
+def ownership_path(index_root: Path) -> Path:
+    return Path(index_root) / OWNERSHIP_BASENAME
+
+
+def ownership_to_dict(marker: OwnershipMarker) -> dict:
+    return {
+        "schema_version": marker.schema_version,
+        "protocol_version": marker.protocol_version,
+        "dataset_id": marker.dataset_id,
+        "established_at": marker.established_at,
+        "established_by_device": marker.established_by_device,
+    }
+
+
+def validate_ownership_document(payload: object, *, path: Path) -> OwnershipMarker:
+    if not isinstance(payload, dict):
+        raise SaveSyncError(f"SaveSync ownership marker is invalid: {path}")
+    version = payload.get("schema_version")
+    if version != SCHEMA_VERSION:
+        raise SaveSyncError(
+            f"SaveSync ownership marker schema version {version!r} is not supported: {path}"
+        )
+    protocol_version = payload.get("protocol_version")
+    if (
+        isinstance(protocol_version, bool)
+        or not isinstance(protocol_version, int)
+        or protocol_version < 1
+    ):
+        raise SaveSyncError(f"SaveSync ownership marker protocol_version is invalid: {path}")
+    if protocol_version > PROTOCOL_VERSION:
+        raise SaveSyncError(
+            f"SaveSync remote dataset uses protocol version {protocol_version}, newer than "
+            f"this build's {PROTOCOL_VERSION}: {path}"
+        )
+
+    def _text(key: str) -> str:
+        value = payload.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise SaveSyncError(f"SaveSync ownership marker {key} must be non-empty text")
+        return value
+
+    return OwnershipMarker(
+        schema_version=version,
+        protocol_version=protocol_version,
+        dataset_id=_text("dataset_id"),
+        established_at=_text("established_at"),
+        established_by_device=_text("established_by_device"),
+    )
+
+
+def load_ownership(index_root: Path) -> Optional[OwnershipMarker]:
+    """Read the ownership marker. Absent is ``None``; corrupt raises."""
+    path = ownership_path(index_root)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SaveSyncError(f"SaveSync ownership marker is corrupt: {path}") from exc
+    return validate_ownership_document(payload, path=path)
+
+
+def write_ownership(index_root: Path, marker: OwnershipMarker) -> None:
+    _durable_atomic_write_text(
+        ownership_path(index_root), _canonical_json(ownership_to_dict(marker))
+    )
+
+
+def resolve_dataset_state(index_root: Path) -> DatasetState:
+    """Classify this dataset's protocol ownership.
+
+    Deliberately does not treat the mere existence of ``savesync-index/`` as
+    ownership: Step 2 publishes a descriptive shadow index into that same
+    directory without conferring any authority. Only the explicit marker,
+    written once by a successful Full Sync cutover, promotes a dataset to
+    ``OWNED``.
+    """
+    try:
+        marker = load_ownership(index_root)
+    except SaveSyncError as exc:
+        return DatasetState(DatasetOwnership.DAMAGED, detail=str(exc))
+    if marker is None:
+        return DatasetState(DatasetOwnership.UNOWNED, detail="no ownership marker")
+    try:
+        head = load_head_strict(index_root)
+    except SaveSyncError as exc:
+        return DatasetState(DatasetOwnership.DAMAGED, marker=marker, detail=str(exc))
+    if head.dataset_id != marker.dataset_id:
+        return DatasetState(
+            DatasetOwnership.DAMAGED,
+            marker=marker,
+            head=head,
+            detail=(
+                f"ownership marker names dataset {marker.dataset_id!r} but HEAD "
+                f"names {head.dataset_id!r}"
+            ),
+        )
+    return DatasetState(DatasetOwnership.OWNED, marker=marker, head=head)
 
 
 def load_previous_head_safe(index_root: Path) -> Optional[IndexHead]:
@@ -592,9 +752,11 @@ def publish_full_sync_index(
 ) -> Optional[IndexHead]:
     """Full Sync's one entry point: build, write, and publish the index.
 
-    Returns ``None`` (no publication) when nothing changed relative to the
-    current HEAD, i.e. this Full Sync's verified remote content is identical
-    to what the index already describes.
+    Returns ``None`` (no publication) when nothing at all changed — neither
+    any layout's content nor the observed ``journal_generation``. A journal
+    generation that advanced without any content change is still published,
+    because that value is the old-client divergence signal and must not be
+    left permanently stale by an otherwise no-op Full Sync.
     """
     previous_head = load_head_safe(index_root)
 
@@ -608,7 +770,11 @@ def publish_full_sync_index(
         layout_groups=layout_groups,
         load_previous_shard=_load_previous,
     )
-    if not shards_to_write:
+    journal_generation_stale = (
+        previous_head is not None
+        and previous_head.journal_generation != journal_generation
+    )
+    if not shards_to_write and not journal_generation_stale and previous_head is not None:
         return None
     published_layouts = dict(head.layouts)
     for layout_id, shard in shards_to_write.items():
@@ -622,4 +788,329 @@ def publish_full_sync_index(
     )
     write_head(index_root, head)
     return head
+
+
+# ── per-group compare-and-swap and incremental commit publication ───────────
+
+
+@dataclass(frozen=True)
+class GroupExpectation:
+    """What one operation believes is currently committed for a group.
+
+    ``generation`` 0 with the empty-manifest hash means "not present in the
+    index" — the normal state before any Full Sync has published this group.
+    """
+
+    group_id: str
+    layout_id: str
+    generation: int
+    manifest_hash: str
+
+
+@dataclass(frozen=True)
+class CasConflict:
+    group_id: str
+    layout_id: str
+    expected_generation: int
+    actual_generation: int
+    expected_manifest_hash: str
+    actual_manifest_hash: str
+
+
+EMPTY_MANIFEST_HASH = _EMPTY_MANIFEST_HASH
+
+
+def read_group_expectations(
+    index_root: Path,
+    head: IndexHead,
+    group_ids: frozenset[str],
+    layout_for_group: dict[str, str],
+) -> dict[str, GroupExpectation]:
+    """Snapshot the currently committed generation/manifest for *group_ids*.
+
+    Requires a strictly validated *head*: "no index" is absence of knowledge
+    and must never be encoded as an expectation. Within a valid index a
+    group with no entry does yield generation 0 and the empty-manifest hash,
+    which is a genuine positive assertion ("no peer has published this
+    group") that a later peer publication correctly invalidates.
+
+    A shard that cannot be loaded or validated raises rather than degrading
+    to an empty expectation, so a damaged index can never silently widen
+    what this operation is allowed to overwrite.
+    """
+    expectations: dict[str, GroupExpectation] = {}
+    shards: dict[str, dict[str, IndexGroup]] = {}
+    for group_id in sorted(group_ids):
+        layout_id = layout_for_group.get(group_id, "")
+        indexed: Optional[IndexGroup] = None
+        if layout_id and layout_id in head.layouts:
+            if layout_id not in shards:
+                shard = load_shard(index_root, layout_id, head.layouts[layout_id])
+                shards[layout_id] = {group.group_id: group for group in shard.groups}
+            indexed = shards[layout_id].get(group_id)
+        expectations[group_id] = GroupExpectation(
+            group_id=group_id,
+            layout_id=layout_id,
+            generation=indexed.group_generation if indexed is not None else 0,
+            manifest_hash=indexed.manifest_hash if indexed is not None else _EMPTY_MANIFEST_HASH,
+        )
+    return expectations
+
+
+def validate_group_cas(
+    index_root: Path,
+    head: IndexHead,
+    expectations: dict[str, GroupExpectation],
+) -> tuple[CasConflict, ...]:
+    """Re-read committed state and report every targeted group that moved.
+
+    Only the *targeted* groups are compared. A peer that advanced an
+    unrelated group (and therefore the global index generation) produces no
+    conflict here — that is what lets a disjoint-group operation rebase onto
+    the peer's commit instead of being rejected for no reason.
+    """
+    current = read_group_expectations(
+        index_root,
+        head,
+        frozenset(expectations),
+        {group_id: value.layout_id for group_id, value in expectations.items()},
+    )
+    conflicts: list[CasConflict] = []
+    for group_id, expected in expectations.items():
+        actual = current[group_id]
+        if (
+            actual.generation != expected.generation
+            or actual.manifest_hash != expected.manifest_hash
+        ):
+            conflicts.append(
+                CasConflict(
+                    group_id=group_id,
+                    layout_id=expected.layout_id,
+                    expected_generation=expected.generation,
+                    actual_generation=actual.generation,
+                    expected_manifest_hash=expected.manifest_hash,
+                    actual_manifest_hash=actual.manifest_hash,
+                )
+            )
+    return tuple(conflicts)
+
+
+@dataclass(frozen=True)
+class PayloadMismatch:
+    group_id: str
+    indexed_manifest_hash: str
+    observed_manifest_hash: str
+
+
+def verify_index_matches_payload(
+    expectations: dict[str, GroupExpectation],
+    observed: dict[str, str],
+) -> tuple[PayloadMismatch, ...]:
+    """Prove the index still describes the bytes actually on the remote.
+
+    *observed* maps group ID to the manifest hash of freshly scanned remote
+    payload for that group. Index metadata alone must never authorize an
+    overwrite or a deletion: if what the index claims is committed differs
+    from what is really stored, this operation performs no mutation and the
+    dataset needs Full Sync to re-establish truth from the filesystem.
+    """
+    mismatches: list[PayloadMismatch] = []
+    for group_id, expected in expectations.items():
+        actual = observed.get(group_id, _EMPTY_MANIFEST_HASH)
+        if actual != expected.manifest_hash:
+            mismatches.append(
+                PayloadMismatch(
+                    group_id=group_id,
+                    indexed_manifest_hash=expected.manifest_hash,
+                    observed_manifest_hash=actual,
+                )
+            )
+    return tuple(mismatches)
+
+
+def publish_group_updates(
+    index_root: Path,
+    *,
+    dataset_id_hint: Optional[str],
+    journal_generation: int,
+    updated_groups: tuple[IndexGroup, ...],
+    operation_id: str,
+    origin_device: str,
+) -> IndexHead:
+    """Commit verified per-group state onto the *current* HEAD.
+
+    Rebasing, not replacing: HEAD is re-read here (the caller holds the
+    commit lock), each affected layout's existing shard is loaded and only
+    the named groups are overlaid, and every untouched group and untouched
+    layout is carried forward byte-identically. A peer's concurrently
+    committed unrelated group therefore survives this publication intact.
+
+    Each updated group's ``group_generation`` is derived from what is
+    actually committed now (previous + 1), never from what the caller
+    planned against, so a generation can only ever advance once per real
+    content commit.
+    """
+    previous_head = load_head_safe(index_root)
+    dataset_id = (
+        previous_head.dataset_id if previous_head is not None else None
+    ) or dataset_id_hint or uuid.uuid4().hex
+    by_layout: dict[str, list[IndexGroup]] = {}
+    for group in updated_groups:
+        by_layout.setdefault(group.layout_id, []).append(group)
+
+    published_layouts = dict(previous_head.layouts) if previous_head is not None else {}
+    for layout_id, groups in by_layout.items():
+        existing: dict[str, IndexGroup] = {}
+        previous_layout_head = published_layouts.get(layout_id)
+        if previous_layout_head is not None:
+            try:
+                shard = load_shard(index_root, layout_id, previous_layout_head)
+                existing = {group.group_id: group for group in shard.groups}
+            except SaveSyncError:
+                existing = {}
+        for group in groups:
+            previous_group = existing.get(group.group_id)
+            existing[group.group_id] = IndexGroup(
+                group_id=group.group_id,
+                layout_id=group.layout_id,
+                system=group.system,
+                group_generation=(
+                    previous_group.group_generation + 1 if previous_group is not None else 1
+                ),
+                artifacts=group.artifacts,
+                tombstoned=group.tombstoned,
+                origin_device=origin_device,
+                completed_transaction_id=operation_id,
+                container_head=group.container_head,
+            )
+        next_generation = (
+            previous_layout_head.generation + 1 if previous_layout_head is not None else 1
+        )
+        published_layouts[layout_id] = write_shard(
+            index_root,
+            IndexShard(
+                schema_version=SCHEMA_VERSION,
+                dataset_id=dataset_id,
+                layout_id=layout_id,
+                generation=next_generation,
+                groups=tuple(sorted(existing.values(), key=lambda item: item.group_id)),
+            ),
+        )
+    head = IndexHead(
+        schema_version=SCHEMA_VERSION,
+        dataset_id=dataset_id,
+        index_generation=(
+            previous_head.index_generation + 1 if previous_head is not None else 1
+        ),
+        journal_generation=journal_generation,
+        layouts=published_layouts,
+    )
+    write_head(index_root, head)
+    return head
+
+
+def update_journal_generation(index_root: Path, journal_generation: int) -> Optional[IndexHead]:
+    """Record the legacy journal generation without touching committed content.
+
+    The index is published *before* the compatibility journal append (the
+    index is the commit point), so this closes the loop afterwards. No shard
+    is rewritten and ``index_generation`` does not advance: nothing about
+    committed payload changed. A failure here is non-destructive and simply
+    leaves the divergence signal conservative (it reports divergence, which
+    only ever costs a Full Sync, never data).
+    """
+    head = load_head_safe(index_root)
+    if head is None or head.journal_generation == journal_generation:
+        return head
+    updated = IndexHead(
+        schema_version=head.schema_version,
+        dataset_id=head.dataset_id,
+        index_generation=head.index_generation,
+        journal_generation=journal_generation,
+        layouts=head.layouts,
+    )
+    write_head(index_root, updated, keep_previous=False)
+    return updated
+
+
+def publish_authoritative_index(
+    index_root: Path,
+    *,
+    dataset_id_hint: Optional[str],
+    journal_generation: int,
+    layout_groups: dict[str, tuple[IndexGroup, ...]],
+    device_id: str,
+    established_at: str,
+) -> IndexHead:
+    """Full Sync's single publication point, and the only path to ``OWNED``.
+
+    Publishes the complete verified index and then writes the ownership
+    marker, in that order: a marker must never name an index that does not
+    yet exist. Called exactly once per logical Full Sync, after the whole
+    remote dataset has been scanned, reconciled and verified under the
+    commit lock. Ordinary reconciliation never calls this — it may only
+    update groups within an index that is already authoritative.
+    """
+    previous_head = load_head_safe(index_root)
+
+    def _load_previous(layout_id: str, layout_head: IndexLayoutHead) -> Optional[IndexShard]:
+        return load_shard(index_root, layout_id, layout_head)
+
+    head, shards_to_write = build_index(
+        previous_head=previous_head,
+        dataset_id=dataset_id_hint,
+        journal_generation=journal_generation,
+        layout_groups=layout_groups,
+        load_previous_shard=_load_previous,
+    )
+    published_layouts = dict(head.layouts)
+    for layout_id, shard in shards_to_write.items():
+        published_layouts[layout_id] = write_shard(index_root, shard)
+    head = IndexHead(
+        schema_version=head.schema_version,
+        dataset_id=head.dataset_id,
+        index_generation=head.index_generation,
+        journal_generation=head.journal_generation,
+        layouts=published_layouts,
+    )
+    write_head(index_root, head)
+    # The marker must never name an index that has not been proven readable:
+    # re-load HEAD and every shard it references before conferring ownership.
+    verified = load_head_strict(index_root)
+    for layout_id, layout_head in verified.layouts.items():
+        load_shard(index_root, layout_id, layout_head)
+    write_ownership(
+        index_root,
+        OwnershipMarker(
+            schema_version=SCHEMA_VERSION,
+            protocol_version=PROTOCOL_VERSION,
+            dataset_id=verified.dataset_id,
+            established_at=established_at,
+            established_by_device=device_id,
+        ),
+    )
+    return verified
+
+
+def committed_transaction_ids(index_root: Path, head: Optional[IndexHead]) -> frozenset[str]:
+    """Every operation ID the index records as having committed a group.
+
+    This is the shared completion receipt: a device that finds an abandoned
+    intent whose operation ID appears here knows the remote commit point was
+    reached, so it must finish forward rather than roll a valid shared
+    commit back.
+    """
+    if head is None:
+        return frozenset()
+    receipts: set[str] = set()
+    for layout_id, layout_head in head.layouts.items():
+        try:
+            shard = load_shard(index_root, layout_id, layout_head)
+        except SaveSyncError:
+            continue
+        for group in shard.groups:
+            if group.completed_transaction_id:
+                receipts.add(group.completed_transaction_id)
+    return frozenset(receipts)
+
 

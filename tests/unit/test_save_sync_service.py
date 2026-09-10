@@ -25,7 +25,9 @@ from romcloud.core.models.savesync import (
 from romcloud.core.save_ownership import ManagedSaveOwnershipPolicy
 from romcloud.core.storage import StorageProvider
 from romcloud.infrastructure import mount, save_transaction, save_tree, savesync_journal
+from romcloud.infrastructure import savesync_commit
 from romcloud.infrastructure import savesync_index
+from tests.unit._savesync_protocol_helpers import strip_protocol_ownership
 from romcloud.infrastructure.config import (
     AppConfig,
     CacheConfig,
@@ -2015,6 +2017,105 @@ class TestSaveSyncFinalizationSafety:
         assert plan.uploads == ()
 
 
+class TestLegacyDatasetCommitBehavior:
+    """A dataset that has never been cut over keeps pre-protocol semantics.
+
+    Before the ownership marker exists the legacy journal is still the only
+    way peers discover a change, so a failed journal append means the commit
+    did not happen and everything must roll back — exactly as it did before
+    the commit protocol was introduced. (After cutover the index is the
+    commit point and the journal degrades instead; see
+    ``TestOwnedDatasetJournalDegradation``.)
+    """
+
+    def test_dataset_without_full_sync_is_unowned(
+        self, tmp_path: Path, service: SaveSyncService
+    ):
+        _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
+        service.reconcile()
+
+        index_root = savesync_index.default_index_root(tmp_path / "remote-saves")
+        state = savesync_index.resolve_dataset_state(index_root)
+        assert state.ownership is savesync_index.DatasetOwnership.UNOWNED
+        assert savesync_index.load_ownership(index_root) is None
+
+    def test_failed_journal_append_rolls_back_payload_and_state(
+        self, tmp_path: Path, service: SaveSyncService, monkeypatch
+    ):
+        local = tmp_path / "local-saves" / "psx" / "Game.srm"
+        remote = tmp_path / "remote-saves" / "psx" / "Game.srm"
+        _write(local, b"base")
+        service.reconcile()
+        before = service.get_state()
+        assert remote.read_bytes() == b"base"
+
+        _write(local, b"new-revision")
+        service.mark_local_dirty("psx/Game.srm")
+        monkeypatch.setattr(
+            service,
+            "_append_remote_journal",
+            lambda **_kwargs: (_ for _ in ()).throw(OSError("journal write failed")),
+        )
+
+        with pytest.raises(OSError, match="journal write failed"):
+            service.reconcile()
+
+        # Pre-cutover the journal is required discovery state, so nothing
+        # about this operation is allowed to survive.
+        assert remote.read_bytes() == b"base"
+        after = service.get_state()
+        assert after.shared_manifest == before.shared_manifest
+        assert after.quick_sync_cursor_generation == before.quick_sync_cursor_generation
+
+
+class TestOwnedDatasetJournalDegradation:
+    def test_committed_index_is_visible_to_another_client_despite_journal_failure(
+        self, tmp_path: Path, service: SaveSyncService, provider: _FakeProvider, monkeypatch
+    ):
+        """Prove the roll-forward is genuinely shared, not just local.
+
+        After the index commits, a second device reading the same remote
+        dataset must see the committed group state even though the legacy
+        journal never recorded it.
+        """
+        local = tmp_path / "local-saves" / "psx" / "Game.srm"
+        remote = tmp_path / "remote-saves" / "psx" / "Game.srm"
+        _write(local, b"base")
+        service.full_sync()
+
+        _write(local, b"new-revision")
+        service.mark_local_dirty("psx/Game.srm")
+        monkeypatch.setattr(
+            service,
+            "_append_remote_journal",
+            lambda **_kwargs: (_ for _ in ()).throw(OSError("journal write failed")),
+        )
+
+        service.reconcile()
+
+        assert remote.read_bytes() == b"new-revision"
+        index_root = savesync_index.default_index_root(tmp_path / "remote-saves")
+        # A different device, sharing only the remote dataset.
+        peer = SaveSyncService(
+            provider=provider,
+            connectivity_root=str(tmp_path / "rom-root"),
+            local_root=str(tmp_path / "peer-local"),
+            remote_root=str(tmp_path / "remote-saves"),
+            state_path=tmp_path / "peer-data" / "savesync-state.json",
+        )
+        dataset = savesync_index.resolve_dataset_state(index_root)
+        assert dataset.ownership is savesync_index.DatasetOwnership.OWNED
+        assert dataset.head is not None
+        shard = savesync_index.load_shard(
+            index_root, "retroarch-root-psx", dataset.head.layouts["retroarch-root-psx"]
+        )
+        group = next(iter(shard.groups))
+        assert group.artifacts[0].sha256 == hashlib.sha256(b"new-revision").hexdigest()
+        assert peer.selection_policy.group_for_path("psx/Game.srm") is not None
+        # No intent is left blocking the peer.
+        assert savesync_commit.load_intent(index_root) is None
+
+
 class TestShadowIndexPublication:
     """Step 2: the remote current-state index is descriptive/shadow state
     only. Full Sync builds and publishes it from verified remote content;
@@ -2095,6 +2196,8 @@ class TestShadowIndexPublication:
 
         second = savesync_index.load_head(index_root)
         assert second is not None
+        # A logical Full Sync publishes exactly once: its internal reconcile
+        # must not independently publish partial authoritative state.
         assert second.index_generation == first.index_generation + 1
         assert (
             second.layouts["retroarch-root-psx"].generation
@@ -2290,7 +2393,7 @@ class TestQuickSyncAndJournal:
         assert local.read_bytes() == b"gba-progress"
         assert remote.read_bytes() == b"gba-progress"
         assert unchanged.status == "unchanged"
-        assert unchanged.reason == "journal-current-local-materialized"
+        assert unchanged.reason == "index-current-local-materialized"
         assert "logical_save_id=retroarch-root-gba/game" in caplog.text
         assert "reconciliation_decision=download" in caplog.text
         assert "missing_physical_destinations=1" in caplog.text
@@ -2407,6 +2510,11 @@ class TestQuickSyncAndJournal:
         self, tmp_path: Path, service: SaveSyncService
     ):
         service.full_sync()
+        # Simulate an installation predating the commit protocol: legacy
+        # quick_sync_ready/cursor state exists, but the dataset itself was
+        # never cut over to OWNED. Peer discovery here is purely journal-
+        # driven, exactly as it was before Step 3/4.
+        strip_protocol_ownership(tmp_path / "remote-saves", tmp_path / "data")
         relative = "ppsspp/PSP/SAVEDATA/ULUS12345/DATA.BIN"
         remote = tmp_path / "remote-saves" / relative
         local = tmp_path / "local-saves" / relative
@@ -2608,6 +2716,7 @@ class TestQuickSyncAndJournal:
     ):
         _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
         service.full_sync()
+        strip_protocol_ownership(tmp_path / "remote-saves", tmp_path / "data")
         journal_path = savesync_journal.default_journal_path(tmp_path / "remote-saves")
         savesync_journal.append_mutations(
             journal_path,
@@ -2643,6 +2752,7 @@ class TestQuickSyncAndJournal:
     ):
         _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
         service.full_sync()
+        strip_protocol_ownership(tmp_path / "remote-saves", tmp_path / "data")
         journal_path = savesync_journal.default_journal_path(tmp_path / "remote-saves")
         _write(tmp_path / "remote-saves" / "psx" / "Game.srm", b"v1")
         savesync_journal.append_mutations(
@@ -2688,6 +2798,7 @@ class TestQuickSyncAndJournal:
     ):
         _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
         service.full_sync()
+        strip_protocol_ownership(tmp_path / "remote-saves", tmp_path / "data")
         state = service.get_state()
         from dataclasses import replace
         from romcloud.infrastructure import savesync_state as durable_state
@@ -2727,6 +2838,7 @@ class TestQuickSyncAndJournal:
     ):
         _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
         service.full_sync()
+        strip_protocol_ownership(tmp_path / "remote-saves", tmp_path / "data")
         journal_path = savesync_journal.default_journal_path(tmp_path / "remote-saves")
         journal_path.write_text("not json", encoding="utf-8")
 
@@ -2792,6 +2904,7 @@ class TestQuickSyncAndJournal:
     ):
         _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
         service.full_sync()
+        strip_protocol_ownership(tmp_path / "remote-saves", tmp_path / "data")
         journal_path = savesync_journal.default_journal_path(tmp_path / "remote-saves")
         savesync_journal.append_mutations(
             journal_path,
@@ -2924,28 +3037,56 @@ class TestQuickSyncRemoteScanScoping:
     def test_container_group_is_never_narrowed(
         self, tmp_path: Path, service: SaveSyncService, monkeypatch
     ):
+        """Container layouts must keep whole-layout discovery/verification.
+
+        The commit protocol adds exactly one deliberately narrow remote read
+        (the index/payload cross-check). Every reconciliation scan — plan,
+        staging verification and final verification — must still be broad,
+        so this distinguishes the scans by purpose rather than merely
+        counting unnarrowed calls.
+        """
         card = "duckstation/memcards/_usr_share_duckstation_1.mcd"
         local = tmp_path / "local-saves" / card
         service.full_sync()
         _write(local, b"card-changed")
         service.mark_local_dirty(card)
 
-        scope_paths: list[object] = []
+        calls: list[tuple[str, object]] = []
+        in_cross_check = {"active": False}
         original_scan_remote_layouts = service._scan_remote_layouts
+        original_cross_check = service._observe_remote_group_manifests
 
         def spy(layout_ids, *, only_relative_paths=None):
-            scope_paths.append(only_relative_paths)
+            purpose = "cas-cross-check" if in_cross_check["active"] else "reconcile"
+            calls.append((purpose, only_relative_paths))
             return original_scan_remote_layouts(
                 layout_ids, only_relative_paths=only_relative_paths
             )
 
+        def tracking_cross_check(intent_groups):
+            in_cross_check["active"] = True
+            try:
+                return original_cross_check(intent_groups)
+            finally:
+                in_cross_check["active"] = False
+
         monkeypatch.setattr(service, "_scan_remote_layouts", spy)
+        monkeypatch.setattr(service, "_observe_remote_group_manifests", tracking_cross_check)
 
         result = service.quick_sync()
 
         assert result.status == "reconciled"
-        assert scope_paths
-        assert all(scope is None for scope in scope_paths)
+        reconcile_scopes = [scope for purpose, scope in calls if purpose == "reconcile"]
+        cross_check_scopes = [
+            scope for purpose, scope in calls if purpose == "cas-cross-check"
+        ]
+        # Plan, staging-verify and final-verify all stay broad for a
+        # container layout, and none of them may be narrowed.
+        assert len(reconcile_scopes) >= 3
+        assert all(scope is None for scope in reconcile_scopes)
+        # The cross-check is the one narrow read, scoped to this card only.
+        assert len(cross_check_scopes) == 1
+        assert cross_check_scopes[0] == frozenset({card})
 
     def test_legacy_reconcile_pending_groups_remains_full_layout_scoped(
         self, tmp_path: Path, service: SaveSyncService, monkeypatch
