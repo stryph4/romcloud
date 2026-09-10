@@ -40,6 +40,8 @@ from romcloud.services.auto_savesync import (
 from romcloud.infrastructure.diagnostics import DiagnosticQuery
 from romcloud.services.saves import SaveSyncService
 
+from tests.unit._savesync_protocol_helpers import seed_peer_commit
+
 
 class _Provider(StorageProvider):
     def __init__(self) -> None:
@@ -1405,14 +1407,12 @@ def test_two_client_snes_existing_save_game_stop_quick_and_full_converge(
         "layout_ids=retroarch-root-snes",
         "candidate_groups=1",
         "classification=changed reason=manifest-diff-from-baseline",
-        "Quick SaveSync preflight: quick_ready=True",
-        "Quick SaveSync scope: mode=group selected_groups=1",
         "decision=upload reason=local-diverged-remote-matches-baseline",
         "SaveSync transaction start:",
         "SaveSync transaction materialization committed:",
         "SaveSync baseline committed:",
         "SaveSync remote journal committed:",
-        "Quick SaveSync cursor committed:",
+        "Quick SaveSync (index) cursor committed:",
         "Auto SaveSync final result: trigger=game stop status=reconciled",
     ):
         assert evidence in trace
@@ -1469,7 +1469,7 @@ def test_game_stop_normal_uncontended_path_traces_every_required_step(
         "decision=upload reason=local-diverged-remote-matches-baseline",
         "SaveSync transaction materialization committed:",
         "SaveSync remote journal committed:",
-        "Quick SaveSync cursor committed:",
+        "Quick SaveSync (index) cursor committed:",
         "Auto SaveSync final result: trigger=game stop status=reconciled",
     ):
         assert evidence in trace, f"missing required trace evidence: {evidence!r}"
@@ -2244,7 +2244,7 @@ def test_manual_quick_sync_is_hint_driven_for_unmarked_gba_change(tmp_path: Path
     result = service.quick_sync()
 
     assert result.status == "unchanged"
-    assert result.reason == "journal-current-local-materialized"
+    assert result.reason == "index-no-eligible-changes"
     assert remote.read_bytes() == b"baseline"
 
     full = service.full_sync()
@@ -2487,19 +2487,13 @@ def test_game_exit_remote_dirty_downloads_through_quick_sync(tmp_path: Path):
     coordinator.game_start(
         system="psx", emulator="libretro", core="pcsx", rom="Game.chd"
     )
-    _write(remote, b"peer-progress")
-    service._append_remote_journal(  # type: ignore[attr-defined]
-        revision="peer-game-stop",
-        timestamp="2026-01-01T00:00:00+00:00",
-        mutations=[
-            {
-                "system": "psx",
-                "layout_id": "retroarch-root-psx",
-                "group_id": "retroarch-root-psx:psx/Game",
-                "object_id": "psx/Game.srm",
-                "operation": "update",
-            }
-        ],
+    # A peer device committed through the protocol while this session ran.
+    seed_peer_commit(
+        service,
+        remote_root=tmp_path / "remote",
+        relative_path="psx/Game.srm",
+        content=b"peer-progress",
+        device_id="peer",
     )
 
     coordinator.game_stop(
@@ -2523,19 +2517,12 @@ def test_game_exit_both_dirty_preserves_conflict(tmp_path: Path):
         system="psx", emulator="libretro", core="pcsx", rom="Game.chd"
     )
     _write(local, b"local-progress")
-    _write(remote, b"peer-progress")
-    service._append_remote_journal(  # type: ignore[attr-defined]
-        revision="peer-conflict",
-        timestamp="2026-01-01T00:00:00+00:00",
-        mutations=[
-            {
-                "system": "psx",
-                "layout_id": "retroarch-root-psx",
-                "group_id": "retroarch-root-psx:psx/Game",
-                "object_id": "psx/Game.srm",
-                "operation": "update",
-            }
-        ],
+    seed_peer_commit(
+        service,
+        remote_root=tmp_path / "remote",
+        relative_path="psx/Game.srm",
+        content=b"peer-progress",
+        device_id="peer",
     )
 
     new_conflicts = coordinator.game_stop(
@@ -2565,19 +2552,12 @@ def test_only_game_stop_collects_new_conflict_ids(tmp_path: Path):
     service.full_sync()
     _write(local, b"local-progress")
     service.mark_local_dirty("psx/Game.srm")
-    _write(remote, b"remote-progress")
-    service._append_remote_journal(  # type: ignore[attr-defined]
-        revision="peer-menu-conflict",
-        timestamp="2026-01-01T00:00:00+00:00",
-        mutations=[
-            {
-                "system": "psx",
-                "layout_id": "retroarch-root-psx",
-                "group_id": "retroarch-root-psx:psx/Game",
-                "object_id": "psx/Game.srm",
-                "operation": "update",
-            }
-        ],
+    seed_peer_commit(
+        service,
+        remote_root=tmp_path / "remote",
+        relative_path="psx/Game.srm",
+        content=b"remote-progress",
+        device_id="peer",
     )
 
     coordinator.menu_tick(force=True)
@@ -2596,25 +2576,16 @@ def test_game_stop_queues_multiple_new_conflicts_by_exact_identity(tmp_path: Pat
     coordinator.game_start(
         system="psx", emulator="libretro", core="pcsx", rom="Collection.chd"
     )
-    mutations = []
     for name in ("Alpha", "Beta"):
         path = f"psx/{name}.srm"
         _write(tmp_path / "local" / path, f"local-{name}".encode())
-        _write(tmp_path / "remote" / path, f"remote-{name}".encode())
-        mutations.append(
-            {
-                "system": "psx",
-                "layout_id": "retroarch-root-psx",
-                "group_id": f"retroarch-root-psx:{name.lower()}",
-                "object_id": path,
-                "operation": "update",
-            }
+        seed_peer_commit(
+            service,
+            remote_root=tmp_path / "remote",
+            relative_path=path,
+            content=f"remote-{name}".encode(),
+            device_id="peer",
         )
-    service._append_remote_journal(  # type: ignore[attr-defined]
-        revision="peer-multiple-conflicts",
-        timestamp="2026-01-01T00:00:00+00:00",
-        mutations=mutations,
-    )
 
     new_conflicts = coordinator.game_stop(
         system="psx", emulator="libretro", core="pcsx", rom="Collection.chd"
@@ -3524,23 +3495,15 @@ def test_periodic_menu_tick_remote_only_change_auto_pulls(tmp_path: Path):
     service = _service(tmp_path, provider)
     coordinator = _coordinator(tmp_path, service)
     local = tmp_path / "local" / "psx" / "Game.srm"
-    remote = tmp_path / "remote" / "psx" / "Game.srm"
     _write(local, b"base")
     service.full_sync()
 
-    _write(remote, b"remote-new")
-    service._append_remote_journal(  # type: ignore[attr-defined]
-        revision="peer-r1",
-        timestamp="2026-01-01T00:00:00+00:00",
-        mutations=[
-            {
-                "system": "psx",
-                "layout_id": "retroarch-root-psx",
-                "group_id": "retroarch-root-psx:psx/Game",
-                "object_id": "psx/Game.srm",
-                "operation": "update",
-            }
-        ],
+    seed_peer_commit(
+        service,
+        remote_root=tmp_path / "remote",
+        relative_path="psx/Game.srm",
+        content=b"remote-new",
+        device_id="peer",
     )
 
     coordinator.menu_tick(force=True)
@@ -3944,19 +3907,12 @@ def test_periodic_menu_tick_both_changed_becomes_conflict(tmp_path: Path):
     _write(local, b"base")
     service.full_sync()
     _write(local, b"local")
-    _write(remote, b"remote")
-    service._append_remote_journal(  # type: ignore[attr-defined]
-        revision="peer-r2",
-        timestamp="2026-01-01T00:00:01+00:00",
-        mutations=[
-            {
-                "system": "psx",
-                "layout_id": "retroarch-root-psx",
-                "group_id": "retroarch-root-psx:psx/Game",
-                "object_id": "psx/Game.srm",
-                "operation": "update",
-            }
-        ],
+    seed_peer_commit(
+        service,
+        remote_root=tmp_path / "remote",
+        relative_path="psx/Game.srm",
+        content=b"remote",
+        device_id="peer",
     )
 
     coordinator.menu_tick(force=True)
@@ -4271,19 +4227,12 @@ class TestGameStopProgressPopup:
             system="psx", emulator="libretro", core="pcsx", rom="Game.chd"
         )
         _write(local, b"local-progress")
-        _write(remote, b"peer-progress")
-        service._append_remote_journal(  # type: ignore[attr-defined]
-            revision="peer-conflict",
-            timestamp="2026-01-01T00:00:00+00:00",
-            mutations=[
-                {
-                    "system": "psx",
-                    "layout_id": "retroarch-root-psx",
-                    "group_id": "retroarch-root-psx:psx/Game",
-                    "object_id": "psx/Game.srm",
-                    "operation": "update",
-                }
-            ],
+        seed_peer_commit(
+            service,
+            remote_root=tmp_path / "remote",
+            relative_path="psx/Game.srm",
+            content=b"peer-progress",
+            device_id="peer",
         )
 
         progress = _FakeProgress()

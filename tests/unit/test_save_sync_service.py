@@ -27,6 +27,7 @@ from romcloud.core.storage import StorageProvider
 from romcloud.infrastructure import mount, save_transaction, save_tree, savesync_journal
 from romcloud.infrastructure import savesync_commit
 from romcloud.infrastructure import savesync_index
+from tests.unit._savesync_protocol_helpers import strip_protocol_ownership
 from romcloud.infrastructure.config import (
     AppConfig,
     CacheConfig,
@@ -2392,7 +2393,7 @@ class TestQuickSyncAndJournal:
         assert local.read_bytes() == b"gba-progress"
         assert remote.read_bytes() == b"gba-progress"
         assert unchanged.status == "unchanged"
-        assert unchanged.reason == "journal-current-local-materialized"
+        assert unchanged.reason == "index-current-local-materialized"
         assert "logical_save_id=retroarch-root-gba/game" in caplog.text
         assert "reconciliation_decision=download" in caplog.text
         assert "missing_physical_destinations=1" in caplog.text
@@ -2509,6 +2510,11 @@ class TestQuickSyncAndJournal:
         self, tmp_path: Path, service: SaveSyncService
     ):
         service.full_sync()
+        # Simulate an installation predating the commit protocol: legacy
+        # quick_sync_ready/cursor state exists, but the dataset itself was
+        # never cut over to OWNED. Peer discovery here is purely journal-
+        # driven, exactly as it was before Step 3/4.
+        strip_protocol_ownership(tmp_path / "remote-saves", tmp_path / "data")
         relative = "ppsspp/PSP/SAVEDATA/ULUS12345/DATA.BIN"
         remote = tmp_path / "remote-saves" / relative
         local = tmp_path / "local-saves" / relative
@@ -2710,6 +2716,7 @@ class TestQuickSyncAndJournal:
     ):
         _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
         service.full_sync()
+        strip_protocol_ownership(tmp_path / "remote-saves", tmp_path / "data")
         journal_path = savesync_journal.default_journal_path(tmp_path / "remote-saves")
         savesync_journal.append_mutations(
             journal_path,
@@ -2745,6 +2752,7 @@ class TestQuickSyncAndJournal:
     ):
         _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
         service.full_sync()
+        strip_protocol_ownership(tmp_path / "remote-saves", tmp_path / "data")
         journal_path = savesync_journal.default_journal_path(tmp_path / "remote-saves")
         _write(tmp_path / "remote-saves" / "psx" / "Game.srm", b"v1")
         savesync_journal.append_mutations(
@@ -2790,6 +2798,7 @@ class TestQuickSyncAndJournal:
     ):
         _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
         service.full_sync()
+        strip_protocol_ownership(tmp_path / "remote-saves", tmp_path / "data")
         state = service.get_state()
         from dataclasses import replace
         from romcloud.infrastructure import savesync_state as durable_state
@@ -2829,6 +2838,7 @@ class TestQuickSyncAndJournal:
     ):
         _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
         service.full_sync()
+        strip_protocol_ownership(tmp_path / "remote-saves", tmp_path / "data")
         journal_path = savesync_journal.default_journal_path(tmp_path / "remote-saves")
         journal_path.write_text("not json", encoding="utf-8")
 
@@ -2894,6 +2904,7 @@ class TestQuickSyncAndJournal:
     ):
         _write(tmp_path / "local-saves" / "psx" / "Game.srm", b"base")
         service.full_sync()
+        strip_protocol_ownership(tmp_path / "remote-saves", tmp_path / "data")
         journal_path = savesync_journal.default_journal_path(tmp_path / "remote-saves")
         savesync_journal.append_mutations(
             journal_path,

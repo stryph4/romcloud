@@ -155,6 +155,23 @@ class _LocalMaterializationStatus:
     missing: int
 
 
+@dataclass(frozen=True)
+class _IndexWatermark:
+    """This device's last-observed generations for an OWNED remote index.
+
+    Device-local only (a side file beside ``savesync-state.json``), never
+    shared and never reconciliation authority — it exists purely to let
+    Quick Sync skip re-fetching a layout shard whose committed content this
+    device already compared against its own durable per-group
+    ``remote_observed`` snapshots. ``dataset_id`` guards against comparing
+    generations across an unrelated/rebuilt dataset.
+    """
+
+    dataset_id: str
+    index_generation: int
+    layout_generations: dict[str, int]
+
+
 @dataclass
 class _ContainerWork:
     handled_paths: set[str]
@@ -1717,6 +1734,8 @@ class SaveSyncService:
         group_ids: frozenset[str],
         local_report: save_tree.ScanReport,
         state: SaveSyncState,
+        *,
+        indexed_paths: Optional[dict[str, frozenset[str]]] = None,
     ) -> frozenset[str]:
         """Exact remote candidate paths for group IDs Quick Sync already tracks.
 
@@ -1728,12 +1747,14 @@ class SaveSyncService:
 
         The result is every path this device has already observed for these
         groups, either in the local scan just completed for this same
-        operation or in the last shared baseline. A brand-new remote-only
-        file for an already-tracked group that this device has never locally
-        held nor previously shared is the one case this cannot discover; Full
-        Sync and journal-ambiguous layout escalation remain the paths that
-        find it. This is why callers unrelated to Quick Sync's own trusted
-        scope (e.g. :meth:`reconcile_pending_groups`) must never pass this.
+        operation or in the last shared baseline, plus any paths the remote
+        index itself declares for the group when *indexed_paths* is given
+        (index-driven Quick Sync on an OWNED dataset). That closes the one
+        gap the local/baseline union alone cannot: a brand-new remote-only
+        file for an already-tracked group that this device has never
+        locally held nor previously shared. This is why callers unrelated
+        to Quick Sync's own trusted scope (e.g. :meth:`reconcile_pending_groups`)
+        must never pass either.
         """
         local_paths = frozenset(
             path
@@ -1743,7 +1764,15 @@ class SaveSyncService:
         baseline_paths = frozenset(
             _manifest_for_groups(self._automatic_baseline(state), group_ids, self._policy)
         )
-        return local_paths | baseline_paths
+        # Index-driven Quick Sync supplies exact paths the remote index
+        # already names for a group, so a brand-new remote-only file is
+        # never guessed from local/baseline knowledge alone.
+        index_paths = frozenset(
+            path
+            for group_id in group_ids
+            for path in (indexed_paths or {}).get(group_id, frozenset())
+        )
+        return local_paths | baseline_paths | index_paths
 
 
     def _local_path(self, relative_path: str) -> Path:
@@ -2336,6 +2365,343 @@ class SaveSyncService:
             )
         return state
 
+    # ── index-driven Quick Sync (OWNED datasets) ─────────────────────────
+
+    def _index_watermark_path(self) -> Path:
+        return self._state_path.with_name("savesync-index-watermark.json")
+
+    def _load_index_watermark(self, *, dataset_id: str) -> _IndexWatermark:
+        """This device's last-compared index generations, or a fresh start.
+
+        A missing/corrupt file, or one naming a different dataset (rebuilt
+        cutover), is treated identically to "never observed" — conservative
+        and self-correcting: it only costs re-fetching shards once, never a
+        false claim of already-observed content.
+        """
+        empty = _IndexWatermark(dataset_id=dataset_id, index_generation=0, layout_generations={})
+        path = self._index_watermark_path()
+        if not path.exists():
+            return empty
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return empty
+        if not isinstance(payload, dict) or payload.get("dataset_id") != dataset_id:
+            return empty
+        raw_layouts = payload.get("layout_generations")
+        layout_generations = (
+            {
+                str(layout_id): int(generation)
+                for layout_id, generation in raw_layouts.items()
+                if isinstance(generation, int) and not isinstance(generation, bool)
+            }
+            if isinstance(raw_layouts, dict)
+            else {}
+        )
+        index_generation = payload.get("index_generation")
+        return _IndexWatermark(
+            dataset_id=dataset_id,
+            index_generation=(
+                index_generation
+                if isinstance(index_generation, int) and not isinstance(index_generation, bool)
+                else 0
+            ),
+            layout_generations=layout_generations,
+        )
+
+    def _save_index_watermark(self, watermark: _IndexWatermark) -> None:
+        try:
+            durable_state.write_json_document(
+                self._index_watermark_path(),
+                {
+                    "dataset_id": watermark.dataset_id,
+                    "index_generation": watermark.index_generation,
+                    "layout_generations": watermark.layout_generations,
+                },
+            )
+        except (OSError, SaveSyncError):
+            log.warning("Could not persist SaveSync index watermark", exc_info=True)
+
+    def _advance_index_watermark(
+        self,
+        previous: _IndexWatermark,
+        head: savesync_index.IndexHead,
+        *,
+        excluded_layouts: frozenset[str],
+    ) -> None:
+        """Record everything this pass actually compared, and nothing else.
+
+        An excluded layout's generation is deliberately left behind even if
+        the global generation advances, so a still-outstanding change in a
+        temporarily excluded layout (e.g. an active game session) is not
+        silently forgotten by the cheap "unchanged" fast path once the
+        exclusion lifts and nothing else happens to change afterward.
+        """
+        layout_generations = dict(previous.layout_generations)
+        layout_generations.update(
+            {
+                layout_id: layout_head.generation
+                for layout_id, layout_head in head.layouts.items()
+                if layout_id not in excluded_layouts
+            }
+        )
+        excluded_outstanding = any(
+            layout_id in excluded_layouts
+            and layout_head.generation > previous.layout_generations.get(layout_id, 0)
+            for layout_id, layout_head in head.layouts.items()
+        )
+        self._save_index_watermark(
+            _IndexWatermark(
+                dataset_id=head.dataset_id,
+                index_generation=(
+                    previous.index_generation if excluded_outstanding else head.index_generation
+                ),
+                layout_generations=layout_generations,
+            )
+        )
+
+    def _remote_observed_manifest_hash(
+        self, snapshot: Optional[SaveGroupSnapshot]
+    ) -> Optional[str]:
+        """``None`` means this device has never observed this group's remote
+        content at all — distinct from a verified-empty observation, which
+        hashes identically to an index-side tombstoned group."""
+        if snapshot is None:
+            return None
+        return savesync_index.compute_manifest_hash(self._index_artifacts(snapshot.artifacts))
+
+    def _quick_sync_owned(
+        self,
+        dataset: savesync_index.DatasetState,
+        *,
+        progress: ProgressSink,
+        is_group_active: Optional[Callable[[str], bool]],
+        is_layout_active: Optional[Callable[[str], bool]],
+        exclude_layout_ids: Optional[frozenset[str]],
+    ) -> SaveQuickSyncResult:
+        """Candidate discovery driven by the authoritative remote index.
+
+        ``local known pending work + remotely advanced indexed groups ->
+        reconcile exactly those groups``. The bounded legacy journal is
+        never consulted for peer-change *candidates* here; its generation
+        number alone is read on every call (including the empty fast path)
+        purely to detect divergence — evidence that an old, non-participating
+        writer touched the dataset without publishing a matching index
+        rebuild. Journal entries/history are never inspected or trusted as
+        candidate authority.
+        """
+        assert dataset.head is not None and dataset.ownership is savesync_index.DatasetOwnership.OWNED
+        index_root = self._index_root
+        assert index_root is not None
+        excluded_layouts = exclude_layout_ids or frozenset()
+        head = dataset.head
+
+        with stage_timer("quick-sync-index") as timing, self._locked_operation():
+            state = self._get_state_unlocked()
+            watermark = self._load_index_watermark(dataset_id=head.dataset_id)
+            cursor_before = watermark.index_generation
+            obsolete_conflicts = self._obsolete_whole_layout_conflicts(
+                state, excluded_layout_ids=excluded_layouts
+            )
+            obsolete_layouts = frozenset(conflict.layout_id for conflict in obsolete_conflicts)
+            materialization_gaps = self._local_materialization_gaps(
+                state, excluded_layout_ids=excluded_layouts
+            )
+            materialization_groups = frozenset(status.group_id for status in materialization_gaps)
+            pending_groups = frozenset(
+                group.group_id
+                for group in state.groups
+                if group.layout_id not in excluded_layouts
+                and self._layout_enabled(group.layout_id)
+                and (
+                    group.condition
+                    in {SaveGroupCondition.LOCAL_DIRTY, SaveGroupCondition.REMOTE_DIRTY}
+                    or bool(group.dirty_path_hints)
+                )
+            ).union(materialization_groups)
+
+            timing["index_generation"] = head.index_generation
+            timing["watermark_generation"] = watermark.index_generation
+
+            # Minimum metadata check required even on the empty fast path: a
+            # generation-level mismatch alone is enough to prove an old,
+            # non-participating writer touched the dataset without
+            # publishing a matching index rebuild. This never inspects
+            # journal entries/history and never treats the journal as
+            # candidate authority — only its generation number is read.
+            journal_generation = self._current_journal_generation()
+            if savesync_index.journal_diverged(head, journal_generation):
+                log.warning(
+                    "Quick SaveSync (index) found journal/index divergence: "
+                    "journal_generation=%d index_journal_generation=%d",
+                    journal_generation,
+                    head.journal_generation,
+                )
+                diagnostic_event(
+                    "savesync", "commit.journal_index_divergence",
+                    "SaveSync journal advanced without a matching index rebuild",
+                    level="WARNING",
+                    metadata={
+                        "journal_generation": journal_generation,
+                        "index_journal_generation": head.journal_generation,
+                    },
+                )
+                return SaveQuickSyncResult(
+                    status="requires-full-sync",
+                    remote_generation=head.index_generation,
+                    cursor_before=cursor_before,
+                    cursor_after=cursor_before,
+                    reason="journal-index-divergence",
+                )
+
+            if (
+                head.index_generation == watermark.index_generation
+                and not pending_groups
+                and not obsolete_conflicts
+            ):
+                # Empty fast path: no shard fetch, no SaveLayout scan, no
+                # payload enumeration, no hashing, no staging. The journal
+                # generation check above already ran (cheap metadata only).
+                timing["shards_fetched"] = 0
+                timing["groups_selected"] = 0
+                log.info(
+                    "Quick SaveSync (index) early return: reason=index-current-local-materialized "
+                    "index_generation=%d",
+                    head.index_generation,
+                )
+                return SaveQuickSyncResult(
+                    status="unchanged",
+                    remote_generation=head.index_generation,
+                    cursor_before=cursor_before,
+                    cursor_after=cursor_before,
+                    reason="index-current-local-materialized",
+                )
+
+            known_generations = watermark.layout_generations
+            changed_shards: dict[str, savesync_index.IndexShard] = {}
+            for layout_id, layout_head in head.layouts.items():
+                if layout_id in excluded_layouts:
+                    continue
+                if known_generations.get(layout_id, 0) >= layout_head.generation:
+                    continue
+                try:
+                    changed_shards[layout_id] = savesync_index.load_shard(
+                        index_root, layout_id, layout_head
+                    )
+                except SaveSyncError:
+                    log.warning(
+                        "Quick SaveSync (index) could not load layout shard %s",
+                        layout_id,
+                        exc_info=True,
+                    )
+                    return SaveQuickSyncResult(
+                        status="requires-full-sync",
+                        remote_generation=head.index_generation,
+                        cursor_before=cursor_before,
+                        cursor_after=cursor_before,
+                        reason="index-shard-unreadable",
+                    )
+            timing["shards_fetched"] = len(changed_shards)
+
+            local_observed_by_group = {group.group_id: group.remote_observed for group in state.groups}
+            group_layout_hints: dict[str, str] = {}
+            indexed_remote_paths: dict[str, frozenset[str]] = {}
+            remote_advanced_groups: set[str] = set()
+            for layout_id, shard in changed_shards.items():
+                if not self._layout_enabled(layout_id):
+                    continue
+                for group in shard.groups:
+                    group_layout_hints[group.group_id] = group.layout_id
+                    previous_hash = self._remote_observed_manifest_hash(
+                        local_observed_by_group.get(group.group_id)
+                    )
+                    if previous_hash is None or previous_hash != group.manifest_hash:
+                        remote_advanced_groups.add(group.group_id)
+                        indexed_remote_paths[group.group_id] = frozenset(
+                            artifact.path for artifact in group.artifacts
+                        )
+
+            candidate_groups = frozenset(pending_groups) | frozenset(remote_advanced_groups)
+            selected_groups: Optional[frozenset[str]] = candidate_groups
+            selected_layouts: Optional[frozenset[str]] = None
+            if obsolete_layouts:
+                # A stale whole-layout conflict cannot safely be reconciled by
+                # its obsolete group ID; promote the affected current layouts
+                # (and anything else already selected) to a full layout scan.
+                layout_for = {
+                    **group_layout_hints,
+                    **{group.group_id: group.layout_id for group in state.groups},
+                }
+                selected_layouts = frozenset(obsolete_layouts).union(
+                    layout_for[group_id] for group_id in candidate_groups if group_id in layout_for
+                )
+                selected_groups = None
+                indexed_remote_paths = {}
+                group_layout_hints = {}
+
+            timing["groups_selected"] = len(candidate_groups)
+            timing["remote_advanced_groups"] = len(remote_advanced_groups)
+            timing["local_pending_groups"] = len(pending_groups)
+
+            if selected_groups == frozenset() and selected_layouts is None:
+                self._advance_index_watermark(watermark, head, excluded_layouts=excluded_layouts)
+                log.info(
+                    "Quick SaveSync (index) no eligible changes: index_generation=%d "
+                    "shards_fetched=%d",
+                    head.index_generation,
+                    len(changed_shards),
+                )
+                return SaveQuickSyncResult(
+                    status="unchanged",
+                    remote_generation=head.index_generation,
+                    cursor_before=cursor_before,
+                    cursor_after=head.index_generation,
+                    reason="index-no-eligible-changes",
+                )
+
+        report = self._reconcile(
+            progress=progress,
+            selected_group_ids=selected_groups,
+            selected_layout_ids=selected_layouts,
+            upload_only=False,
+            is_group_active=is_group_active,
+            is_layout_active=is_layout_active,
+            obsolete_conflict_ids=frozenset(
+                conflict.conflict_id for conflict in obsolete_conflicts
+            ),
+            trusted_group_scope=True,
+            group_layout_hints=group_layout_hints,
+            indexed_remote_paths=indexed_remote_paths,
+        )
+        if report is None:
+            return SaveQuickSyncResult(
+                status="deferred",
+                remote_generation=head.index_generation,
+                cursor_before=cursor_before,
+                cursor_after=cursor_before,
+                processed_groups=tuple(sorted(candidate_groups)),
+                reason="active-session",
+            )
+
+        with self._locked_operation():
+            fresh_head = savesync_index.load_head_strict(index_root)
+            self._advance_index_watermark(watermark, fresh_head, excluded_layouts=excluded_layouts)
+        log.info(
+            "Quick SaveSync (index) cursor committed: cursor_before=%s cursor_after=%d "
+            "report_revision=%s",
+            cursor_before,
+            fresh_head.index_generation,
+            report.revision,
+        )
+        return SaveQuickSyncResult(
+            status="reconciled",
+            remote_generation=fresh_head.index_generation,
+            cursor_before=cursor_before,
+            cursor_after=fresh_head.index_generation,
+            processed_groups=tuple(sorted(candidate_groups)),
+            report=report,
+        )
+
     def _group_descriptor_for(
         self, artifacts: tuple[SaveArtifact, ...]
     ) -> Optional[SaveGroupDescriptor]:
@@ -2885,6 +3251,24 @@ class SaveSyncService:
                 reason="forced-current-state",
             )
 
+        # Ownership resolution reads only the small ownership marker (and,
+        # for OWNED datasets, the small HEAD document) — never a filesystem
+        # scan. DAMAGED fails closed here rather than silently continuing
+        # into legacy journal-based discovery.
+        dataset = self._require_commit_ready_dataset(operation="Quick SaveSync")
+        if dataset.ownership is savesync_index.DatasetOwnership.OWNED:
+            return self._quick_sync_owned(
+                dataset,
+                progress=progress,
+                is_group_active=is_group_active,
+                is_layout_active=is_layout_active,
+                exclude_layout_ids=exclude_layout_ids,
+            )
+
+        # UNOWNED: this dataset has not been cut over to the commit protocol.
+        # Preserve the existing journal/cursor/dirty-hint mechanism exactly
+        # until a successful Full Sync performs the cutover — never force a
+        # migration merely because the new code exists.
         excluded_layouts = exclude_layout_ids or frozenset()
         with self._locked_operation():
             state = self._get_state_unlocked()
@@ -3778,6 +4162,8 @@ class SaveSyncService:
         is_layout_active: Optional[Callable[[str], bool]] = None,
         obsolete_conflict_ids: frozenset[str] = frozenset(),
         trusted_group_scope: bool = False,
+        group_layout_hints: Optional[dict[str, str]] = None,
+        indexed_remote_paths: Optional[dict[str, frozenset[str]]] = None,
     ) -> Optional[SaveReconcileReport]:
         """Reconcile, re-planning against a peer's commit on a CAS rejection.
 
@@ -3802,6 +4188,8 @@ class SaveSyncService:
                     is_layout_active=is_layout_active,
                     obsolete_conflict_ids=obsolete_conflict_ids,
                     trusted_group_scope=trusted_group_scope,
+                    group_layout_hints=group_layout_hints,
+                    indexed_remote_paths=indexed_remote_paths,
                 )
             except SaveSyncCasConflictError as exc:
                 last_conflict = exc
@@ -3830,6 +4218,8 @@ class SaveSyncService:
         is_layout_active: Optional[Callable[[str], bool]] = None,
         obsolete_conflict_ids: frozenset[str] = frozenset(),
         trusted_group_scope: bool = False,
+        group_layout_hints: Optional[dict[str, str]] = None,
+        indexed_remote_paths: Optional[dict[str, frozenset[str]]] = None,
     ) -> Optional[SaveReconcileReport]:
         """*trusted_group_scope* narrows the remote scan for a group-only call
         to paths already known from this operation's own local scan plus the
@@ -3837,6 +4227,13 @@ class SaveSyncService:
         layout. Only Quick Sync's own group-only reconcile call may set this
         — see :meth:`_trusted_group_remote_scope`. Legacy/manual callers such
         as :meth:`reconcile_pending_groups` must leave it ``False``.
+
+        *group_layout_hints* maps a group ID to its layout for groups that
+        may not yet exist in local durable state (index-driven discovery of
+        a remote-only group this device has never tracked before).
+        *indexed_remote_paths* is the analogous per-group path hint sourced
+        from the remote index rather than local/baseline knowledge — see
+        :meth:`_trusted_group_remote_scope`.
         """
         with self._locked_operation(), self._remote_commit_scope():
             if selected_group_ids is not None and selected_layout_ids is not None:
@@ -3927,7 +4324,8 @@ class SaveSyncService:
                 remote_report = self._automatic_report(remote_report)
             elif selected_group_ids is not None:
                 group_layout_map = {
-                    group.group_id: group.layout_id for group in state.groups
+                    **(group_layout_hints or {}),
+                    **{group.group_id: group.layout_id for group in state.groups},
                 }
                 scoped_layouts = frozenset(
                     layout_id
@@ -3945,7 +4343,10 @@ class SaveSyncService:
                         scoped_layouts
                     ):
                         verification_remote_scope_paths = self._trusted_group_remote_scope(
-                            selected_group_ids, local_report, state
+                            selected_group_ids,
+                            local_report,
+                            state,
+                            indexed_paths=indexed_remote_paths,
                         )
                     with stage_timer("scan-remote") as timing:
                         remote_report = self._automatic_report(
