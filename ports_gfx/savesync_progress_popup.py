@@ -1,10 +1,8 @@
-"""Small, centered progress overlay for synchronous gameStop Auto SaveSync.
+"""Small, centered progress overlay for synchronous lifecycle Auto SaveSync.
 
-Real hardware context: Auto SaveSync's gameStop path is intentionally
-synchronous — ``configgen``'s gameStop hook blocks until Quick Sync (upload/
-download/journal/conflict scoping) has durably finished, which hardware
-testing shows can take 15+ seconds. Without this popup the user sees
-nothing during that window and ROMCloud appears frozen.
+gameStart's targeted pre-launch reconciliation and gameStop's final Quick
+Sync both drive this same phase-based overlay while their lifecycle hook is
+waiting.
 
 Runs under Batocera's system Python (pygame/SDL), exactly like the existing
 graphical Ports UI (see ``ports_gfx/app.py``) and the cache-miss launch

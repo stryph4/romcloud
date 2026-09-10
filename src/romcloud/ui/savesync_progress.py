@@ -1,11 +1,8 @@
-"""Graphical (pygame, system-Python) progress popup for gameStop Auto SaveSync.
+"""Graphical (pygame, system-Python) progress popup for lifecycle SaveSync.
 
-Auto SaveSync's gameStop path is intentionally synchronous: the Batocera
-lifecycle hook waits for Quick Sync (discovery, stability, upload/download,
-journal/conflict scoping) to durably finish before returning control to
-EmulationStation. Hardware testing shows this can take 15+ seconds with no
-visible feedback. This module makes that wait observable without changing
-any of its correctness properties.
+Both gameStart's targeted pre-launch reconciliation and gameStop's final
+Quick Sync are synchronous lifecycle work. This module makes those waits
+observable without changing any SaveSync correctness properties.
 
 Same subprocess+NDJSON boundary already used by the cache-miss launch
 progress screen (:mod:`romcloud.ui.graphical_progress` /
@@ -40,6 +37,8 @@ class SaveSyncProgressLike(Protocol):
 
     def close(self, ok: bool, message: Optional[str] = None) -> None: ...
 
+    def wait_until_closed(self) -> None: ...
+
 
 class NullSaveSyncProgress:
     """No-op reporter used whenever the graphical popup is unavailable."""
@@ -48,6 +47,9 @@ class NullSaveSyncProgress:
         return None
 
     def close(self, ok: bool, message: Optional[str] = None) -> None:  # noqa: ARG002
+        return None
+
+    def wait_until_closed(self) -> None:
         return None
 
 
@@ -62,8 +64,12 @@ class SaveSyncProgressReporter:
     def __init__(self, proc: "subprocess.Popen[str]") -> None:
         self._proc = proc
         self._closed = False
+        self._last_stage: Optional[str] = None
 
     def stage(self, text: str) -> None:
+        if text == self._last_stage:
+            return
+        self._last_stage = text
         self._send({"stage": text})
 
     def close(self, ok: bool, message: Optional[str] = None) -> None:
@@ -75,6 +81,17 @@ class SaveSyncProgressReporter:
             event["message"] = message
         self._send(event)
         self._close_subprocess(ok=bool(ok))
+
+    def wait_until_closed(self) -> None:
+        """Boundedly wait for the shared overlay to release display/input.
+
+        gameStart uses this after ``close`` so the overlay is gone before a
+        conflict resolver or emulator takes focus. gameStop deliberately does
+        not wait for its cosmetic success fade.
+        """
+        if not self._closed:
+            return
+        self._wait_or_terminate(_SUBPROCESS_EXIT_GRACE_SECONDS)
 
     def _send(self, event: dict) -> None:
         try:
@@ -101,8 +118,11 @@ class SaveSyncProgressReporter:
             # wrong. Nothing about the sync itself is deferred here.
             return
         # A failure message must actually be readable before control returns.
+        self._wait_or_terminate(_SUBPROCESS_EXIT_GRACE_SECONDS)
+
+    def _wait_or_terminate(self, timeout: float) -> None:
         try:
-            self._proc.wait(timeout=_SUBPROCESS_EXIT_GRACE_SECONDS)
+            self._proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             try:
                 self._proc.terminate()
@@ -119,9 +139,10 @@ class SaveSyncProgressReporter:
 def start_savesync_progress(
     launcher: Optional[Path],
     *,
+    initial_stage: Optional[str] = None,
     popen=subprocess.Popen,
 ) -> SaveSyncProgressLike:
-    """Best-effort launch of the gameStop progress popup.
+    """Best-effort launch of the shared lifecycle SaveSync progress popup.
 
     Never raises. Returns :class:`NullSaveSyncProgress` if *launcher* is
     ``None``/missing or the subprocess cannot be started — the caller
@@ -140,4 +161,7 @@ def start_savesync_progress(
         )
     except OSError:
         return NullSaveSyncProgress()
-    return SaveSyncProgressReporter(proc)
+    reporter = SaveSyncProgressReporter(proc)
+    if initial_stage:
+        reporter.stage(initial_stage)
+    return reporter

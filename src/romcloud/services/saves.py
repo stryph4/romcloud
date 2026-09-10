@@ -2504,7 +2504,10 @@ class SaveSyncService:
     # ── targeted gameStart synchronization ───────────────────────────────
 
     def targeted_game_start_sync(
-        self, group_layout_map: dict[str, str]
+        self,
+        group_layout_map: dict[str, str],
+        *,
+        progress: ProgressSink = None,
     ) -> SaveGameStartSyncResult:
         """Best-effort, narrowly-scoped synchronization for one launched game.
 
@@ -2522,10 +2525,16 @@ class SaveSyncService:
         hostage.
         """
         with self.observation_scope():
-            return self._targeted_game_start_sync(group_layout_map)
+            return self._targeted_game_start_sync(
+                group_layout_map,
+                progress=progress,
+            )
 
     def _targeted_game_start_sync(
-        self, group_layout_map: dict[str, str]
+        self,
+        group_layout_map: dict[str, str],
+        *,
+        progress: ProgressSink = None,
     ) -> SaveGameStartSyncResult:
         group_ids = frozenset(group_layout_map)
         if not group_ids:
@@ -2542,11 +2551,21 @@ class SaveSyncService:
 
         dataset = self._require_commit_ready_dataset(operation="Targeted gameStart sync")
         if dataset.ownership is savesync_index.DatasetOwnership.OWNED:
-            return self._targeted_game_start_sync_owned(dataset, group_layout_map)
-        return self._targeted_game_start_sync_legacy(group_layout_map)
+            return self._targeted_game_start_sync_owned(
+                dataset,
+                group_layout_map,
+                progress=progress,
+            )
+        return self._targeted_game_start_sync_legacy(
+            group_layout_map,
+            progress=progress,
+        )
 
     def _targeted_game_start_sync_legacy(
-        self, group_layout_map: dict[str, str]
+        self,
+        group_layout_map: dict[str, str],
+        *,
+        progress: ProgressSink = None,
     ) -> SaveGameStartSyncResult:
         """UNOWNED dataset: only ever touch a group already known in durable
         local state — the exact safe precondition
@@ -2573,6 +2592,7 @@ class SaveSyncService:
             )
 
         report = self._reconcile(
+            progress=progress,
             selected_group_ids=target_group_ids,
             upload_only=False,
             trusted_group_scope=True,
@@ -2585,8 +2605,8 @@ class SaveSyncService:
                 status="unresolved", reason="active-session", group_ids=target_group_ids
             )
         return SaveGameStartSyncResult(
-            status="synchronized",
-            reason="reconciled",
+            status="unresolved" if report.conflicts else "synchronized",
+            reason="conflict" if report.conflicts else "reconciled",
             group_ids=target_group_ids,
             report=report,
         )
@@ -2595,6 +2615,8 @@ class SaveSyncService:
         self,
         dataset: savesync_index.DatasetState,
         group_layout_map: dict[str, str],
+        *,
+        progress: ProgressSink = None,
     ) -> SaveGameStartSyncResult:
         assert dataset.head is not None
         index_root = self._index_root
@@ -2643,7 +2665,11 @@ class SaveSyncService:
                 if group.group_id in target_group_ids
                 and (
                     group.condition
-                    in {SaveGroupCondition.LOCAL_DIRTY, SaveGroupCondition.REMOTE_DIRTY}
+                    in {
+                        SaveGroupCondition.LOCAL_DIRTY,
+                        SaveGroupCondition.REMOTE_DIRTY,
+                        SaveGroupCondition.CONFLICT,
+                    }
                     or bool(group.dirty_path_hints)
                 )
             )
@@ -2696,6 +2722,7 @@ class SaveSyncService:
                 )
 
         report = self._reconcile(
+            progress=progress,
             selected_group_ids=frozenset(candidate_groups),
             upload_only=False,
             trusted_group_scope=True,
@@ -2712,8 +2739,8 @@ class SaveSyncService:
             self._advance_index_watermark_layouts(watermark, fresh_head, target_layout_ids)
 
         return SaveGameStartSyncResult(
-            status="synchronized",
-            reason="reconciled",
+            status="unresolved" if report.conflicts else "synchronized",
+            reason="conflict" if report.conflicts else "reconciled",
             group_ids=target_group_ids,
             report=report,
         )
@@ -4820,6 +4847,22 @@ class SaveSyncService:
                         )
                         for view in selected_views
                     ),
+                )
+                emit_progress(
+                    progress,
+                    "savesync",
+                    "verify",
+                    "running",
+                    "Verifying save/state data",
+                    metadata={
+                        "upload_bytes": plan.upload_bytes
+                        + container_work.upload_bytes,
+                        "download_bytes": (
+                            0
+                            if upload_only
+                            else plan.download_bytes + container_work.download_bytes
+                        ),
+                    },
                 )
                 if verification_layout_ids is None:
                     with stage_timer("staging-verify"):

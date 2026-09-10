@@ -366,6 +366,137 @@ def test_ineligible_lifecycle_cli_returns_before_starting_progress_popup(
     ]
 
 
+def test_game_start_skips_progress_popup_when_no_safe_target(
+    tmp_path: Path, monkeypatch
+):
+    from romcloud.cli.commands import autosync as autosync_commands
+    from romcloud.cli.main import cli
+
+    config_path = tmp_path / "romcloud.toml"
+    config = AppConfig(
+        source=SourceConfig("local", (tmp_path / "roms").as_posix()),
+        cache=CacheConfig((tmp_path / "cache").as_posix()),
+        local_roms_path=(tmp_path / "local-roms").as_posix(),
+        data_path=(tmp_path / "data").as_posix(),
+        saves=SavesConfig(
+            local_path=(tmp_path / "saves").as_posix(), auto_sync_enabled=True
+        ),
+    )
+    write_config(config, str(config_path))
+    calls = []
+    coordinator = type(
+        "Coordinator",
+        (),
+        {
+            "game_start_eligible": lambda self, **_kwargs: False,
+            "game_start": lambda self, **kwargs: calls.append(kwargs) or (),
+        },
+    )()
+    monkeypatch.setattr(autosync_commands, "_auto_sync_enabled", lambda _config: True)
+    monkeypatch.setattr(autosync_commands, "_coordinator", lambda _ctx: coordinator)
+    monkeypatch.setattr(
+        autosync_commands,
+        "_start_lifecycle_progress",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("no-target launch started progress UI")
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config",
+            str(config_path),
+            "_autosync",
+            "game-start",
+            "ports",
+            "pygame",
+            "pygame",
+            "Application.sh",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls and "progress" not in calls[0]
+
+
+def test_game_start_progress_closes_before_existing_conflict_popup(
+    tmp_path: Path, monkeypatch
+):
+    from romcloud.cli.commands import autosync as autosync_commands
+    from romcloud.cli.main import cli
+
+    config_path = tmp_path / "romcloud.toml"
+    config = AppConfig(
+        source=SourceConfig("local", (tmp_path / "roms").as_posix()),
+        cache=CacheConfig((tmp_path / "cache").as_posix()),
+        local_roms_path=(tmp_path / "local-roms").as_posix(),
+        data_path=(tmp_path / "data").as_posix(),
+        saves=SavesConfig(
+            local_path=(tmp_path / "saves").as_posix(), auto_sync_enabled=True
+        ),
+    )
+    write_config(config, str(config_path))
+    events = []
+
+    class Progress:
+        def close(self, ok, message=None):
+            events.append(("close", ok, message))
+
+        def wait_until_closed(self):
+            events.append(("progress-closed",))
+
+    progress = Progress()
+
+    class Coordinator:
+        def game_start_eligible(self, **_kwargs):
+            return True
+
+        def game_start(self, **kwargs):
+            assert kwargs["progress"] is progress
+            kwargs["progress"].close(True, "Save conflict found.")
+            events.append(("sync-result", "conflict-id"))
+            return ("conflict-id",)
+
+    monkeypatch.setattr(autosync_commands, "_auto_sync_enabled", lambda _config: True)
+    monkeypatch.setattr(autosync_commands, "_coordinator", lambda _ctx: Coordinator())
+    monkeypatch.setattr(
+        autosync_commands,
+        "_start_lifecycle_progress",
+        lambda root, **kwargs: events.append(("progress-start", root, kwargs))
+        or progress,
+    )
+    monkeypatch.setattr(
+        autosync_commands,
+        "_launch_pending_conflict_popup",
+        lambda root, **kwargs: events.append(("conflict-popup", root, kwargs)),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config",
+            str(config_path),
+            "_autosync",
+            "game-start",
+            "snes",
+            "libretro",
+            "snes9x",
+            "Super Metroid.sfc",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [event[0] for event in events] == [
+        "progress-start",
+        "close",
+        "sync-result",
+        "progress-closed",
+        "conflict-popup",
+    ]
+    assert events[-1][2]["wait_for_frontend"] is False
+
+
 def test_conflict_popup_worker_passes_exact_lifecycle_caller(
     tmp_path: Path, monkeypatch
 ):
@@ -4091,7 +4222,10 @@ class TestGameStopProgressPopup:
             "Checking save changes…",
             "Waiting for save data to settle…",
             "Preparing save sync…",
-            "Uploading changed save…",
+            "Comparing save versions…",
+            "Uploading save…",
+            "Verifying save…",
+            "Save sync complete.",
         ]
         assert progress.calls[-1] == ("close", True, None)
 
@@ -4252,9 +4386,9 @@ class TestGameStopProgressPopup:
 
         assert conflict_ids != ()
         assert service.get_state().groups[0].condition is SaveGroupCondition.CONFLICT
-        # The popup itself only ever shows sync-progress text — never a
-        # conflict-resolution UI.
-        assert not any("conflict" in text.lower() for text in progress.stages)
+        # The shared progress result announces the transition, while the
+        # existing focused popup still owns all resolution controls.
+        assert "Save conflict found." in progress.stages
 
     def test_no_duplicate_quick_sync_operation_is_introduced_by_the_popup(
         self, tmp_path: Path, caplog

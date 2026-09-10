@@ -19,7 +19,7 @@ from romcloud.core.capabilities import CapabilityPolicy, OperatingMode
 from romcloud.core.exceptions import SaveSyncError
 from romcloud.core.save_selection import DEFAULT_SAVE_SELECTION_POLICY, SaveSelectionPolicy
 from romcloud.core.storage import ProviderCapabilities, StorageProvider
-from romcloud.infrastructure import savesync_index
+from romcloud.infrastructure import savesync_index, savesync_prompts
 from romcloud.infrastructure.ps1_memory_card import (
     BLOCK_SIZE,
     CARD_SIZE,
@@ -177,7 +177,140 @@ def _session_payload(tmp_path: Path, *, system: str, rom: str) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+class _Progress:
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def stage(self, text: str) -> None:
+        self.calls.append(("stage", text))
+
+    def close(self, ok: bool, message=None) -> None:
+        self.calls.append(("close", ok, message))
+
+    @property
+    def stages(self) -> list[str]:
+        return [call[1] for call in self.calls if call[0] == "stage"]
+
+
 class TestGameStartOwnedDataset:
+    def test_targeted_download_uses_shared_lifecycle_progress_phases(
+        self, tmp_path: Path
+    ):
+        provider = _Provider()
+        service = _service(tmp_path, provider)
+        local = tmp_path / "local" / "snes" / "Super Metroid.srm"
+        _write(local, b"base")
+        service.full_sync()
+        seed_peer_commit(
+            service,
+            remote_root=tmp_path / "remote",
+            relative_path="snes/Super Metroid.srm",
+            content=b"remote-edit",
+        )
+        progress = _Progress()
+
+        conflict_ids = _coordinator(tmp_path, service).game_start(
+            system="snes",
+            emulator="libretro",
+            core="snes9x",
+            rom="Super Metroid.sfc",
+            progress=progress,
+        )
+
+        assert conflict_ids == ()
+        assert progress.stages == [
+            "Checking save…",
+            "Checking remote state…",
+            "Comparing save versions…",
+            "Downloading save…",
+            "Verifying save…",
+        ]
+        assert progress.calls[-1] == ("close", True, "Save is current.")
+
+    def test_absent_baseline_divergence_is_unresolved_conflict(
+        self, tmp_path: Path, caplog
+    ):
+        """A successful reconcile operation can still leave a conflict."""
+        provider = _Provider()
+        service = _service(tmp_path, provider)
+        # Establish protocol ownership while this target group is absent, so
+        # its three-way baseline is genuinely absent on both devices.
+        service.full_sync()
+        local = tmp_path / "local" / "snes" / "Super Metroid.srm"
+        remote = tmp_path / "remote" / "snes" / "Super Metroid.srm"
+        _write(local, b"local-without-baseline")
+        service.mark_local_dirty("snes/Super Metroid.srm")
+        seed_peer_commit(
+            service,
+            remote_root=tmp_path / "remote",
+            relative_path="snes/Super Metroid.srm",
+            content=b"remote-without-baseline",
+        )
+
+        coordinator = _coordinator(tmp_path, service)
+        with caplog.at_level("INFO"):
+            conflict_ids = coordinator.game_start(
+                system="snes",
+                emulator="libretro",
+                core="snes9x",
+                rom="Super Metroid.sfc",
+            )
+
+        report = service.get_state().last_reconcile
+        assert report is not None
+        assert (report.uploaded, report.downloaded, report.conflicts) == (0, 0, 1)
+        assert local.read_bytes() == b"local-without-baseline"
+        assert remote.read_bytes() == b"remote-without-baseline"
+        payload = _session_payload(
+            tmp_path, system="snes", rom="Super Metroid.sfc"
+        )
+        assert payload["sync_outcome"] == "unresolved"
+        assert "status=unresolved reason=conflict" in caplog.text
+        assert conflict_ids == tuple(
+            item.conflict_id for item in service.get_state().active_conflicts
+        )
+
+    def test_old_target_conflict_is_requeued_and_presentable_on_each_launch(
+        self, tmp_path: Path
+    ):
+        provider = _Provider()
+        service = _service(tmp_path, provider)
+        local = tmp_path / "local" / "snes" / "Super Metroid.srm"
+        remote = tmp_path / "remote" / "snes" / "Super Metroid.srm"
+        _write(local, b"base")
+        service.full_sync()
+        _write(local, b"local-edit")
+        service.mark_local_dirty("snes/Super Metroid.srm")
+        seed_peer_commit(
+            service,
+            remote_root=tmp_path / "remote",
+            relative_path="snes/Super Metroid.srm",
+            content=b"remote-edit",
+        )
+        service.quick_sync()
+        conflict_id = service.get_state().active_conflicts[0].conflict_id
+        assert savesync_prompts.pending_ids(tmp_path / "data") == ()
+
+        coordinator = _coordinator(tmp_path, service)
+        assert coordinator.game_start(
+            system="snes",
+            emulator="libretro",
+            core="snes9x",
+            rom="Super Metroid.sfc",
+        ) == (conflict_id,)
+        assert savesync_prompts.pending_ids(tmp_path / "data") == (conflict_id,)
+
+        # Resolve Later removes presentation bookkeeping only. The next
+        # launch restores the same unresolved conflict to the exact-ID queue.
+        savesync_prompts.complete(tmp_path / "data", conflict_id)
+        assert coordinator.game_start(
+            system="snes",
+            emulator="libretro",
+            core="snes9x",
+            rom="Super Metroid.sfc",
+        ) == (conflict_id,)
+        assert savesync_prompts.pending_ids(tmp_path / "data") == (conflict_id,)
+
     def test_current_state_is_minimal_metadata_only(self, tmp_path: Path, monkeypatch):
         provider = _Provider()
         service = _service(tmp_path, provider)

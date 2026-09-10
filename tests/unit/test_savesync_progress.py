@@ -81,6 +81,20 @@ class TestStartSavesyncProgress:
         assert isinstance(reporter, SaveSyncProgressReporter)
         assert seen_argv["argv"] == [str(launcher), "--savesync-progress"]
 
+    def test_operation_specific_initial_stage_uses_same_reporter(self, tmp_path):
+        launcher = tmp_path / "romcloud-ports"
+        launcher.write_text("#!/bin/bash\n")
+        proc = _FakeProcess()
+
+        reporter = start_savesync_progress(
+            launcher,
+            initial_stage="Checking save…",
+            popen=lambda *_args, **_kwargs: proc,
+        )
+
+        assert isinstance(reporter, SaveSyncProgressReporter)
+        assert proc.stdin.events == [{"stage": "Checking save…"}]
+
 
 class TestNullSaveSyncProgress:
     def test_stage_and_close_are_safe_no_ops(self):
@@ -116,6 +130,13 @@ class TestSaveSyncProgressReporter:
         reporter.close(True, "Save sync complete.")
         assert proc.wait_calls == []
         assert proc.stdin.closed
+
+    def test_game_start_can_wait_for_overlay_to_release_focus(self):
+        proc = _FakeProcess()
+        reporter = SaveSyncProgressReporter(proc)
+        reporter.close(True, "Save is current.")
+        reporter.wait_until_closed()
+        assert proc.wait_calls == [3.0]
 
     def test_failed_close_still_waits_so_the_message_is_readable(self):
         proc = _FakeProcess()

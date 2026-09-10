@@ -1107,7 +1107,7 @@ def uidata_savesync_conflicts(ctx: click.Context) -> None:
 @uidata_group.command("savesync-conflict-action")
 @click.pass_context
 def uidata_savesync_conflict_action(ctx: click.Context) -> None:
-    """Apply or defer one queued game-stop conflict inside SaveSync."""
+    """Apply or defer one queued lifecycle conflict inside SaveSync."""
 
     def run(request, progress=None):
         from romcloud.core.models.savesync import SaveConflictResolution
