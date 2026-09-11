@@ -85,6 +85,8 @@ from romcloud.cli.commands.update import update_cmd
 from romcloud.cli.commands.es import es_group
 from romcloud.cli.commands.mount import mount_group
 from romcloud.cli.commands.uidata import uidata_group
+# Import for side-effect registration of provider-specific uidata commands.
+from romcloud.cli.commands import uidata_library_pull as _uidata_library_pull  # noqa: F401
 from romcloud.cli.commands.reconcile import reconcile_install_cmd
 from romcloud.cli.commands.lifecycle import repair_cmd, uninstall_cmd, purge_cmd
 from romcloud.cli.commands.autosync import autosync_group
