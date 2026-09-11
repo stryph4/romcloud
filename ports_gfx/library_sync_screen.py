@@ -29,6 +29,7 @@ class LibrarySyncScreenState:
     result: dict[str, Any] = field(default_factory=dict)
     error: str = ""
     cancelled: bool = False
+    pull_only: bool = False
     confirm: HoldToConfirmState = field(default_factory=HoldToConfirmState)
     latest_progress: ActivityEvent | None = None
     popen: Optional[PopenFunc] = None
@@ -38,7 +39,7 @@ class LibrarySyncScreenState:
         self.error = ""
         self.cancelled = False
         self.latest_progress = None
-        self._start_operation("library-sync-preview", {})
+        self._start_operation("library-sync-operation-preview", {})
         self.step = PREFLIGHTING
 
     def begin_confirm(self) -> None:
@@ -47,6 +48,8 @@ class LibrarySyncScreenState:
 
     @property
     def sync_label(self) -> str:
+        if self.pull_only:
+            return "Full Pull" if self.sync_mode == "full" else "Quick Pull"
         return "Full Sync" if self.sync_mode == "full" else "Quick Sync"
 
     @property
@@ -57,7 +60,10 @@ class LibrarySyncScreenState:
         self.error = ""
         self.cancelled = False
         self.latest_progress = None
-        action = "library-sync-full" if self.is_full else "library-sync"
+        if self.pull_only:
+            action = "library-sync-pull-full" if self.is_full else "library-sync-pull"
+        else:
+            action = "library-sync-full" if self.is_full else "library-sync"
         self._start_operation(action, {})
         self.step = IMPORTING
 
@@ -105,6 +111,7 @@ class LibrarySyncScreenState:
         if self.step == PREFLIGHTING:
             if outcome.ok:
                 self.preview = outcome.data
+                self.pull_only = bool(outcome.data.get("read_only", False))
                 self.step = PREFLIGHT
             else:
                 self.error = outcome.error
