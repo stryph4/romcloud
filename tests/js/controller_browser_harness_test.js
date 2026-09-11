@@ -6,9 +6,28 @@
     Object.defineProperty(event, "gamepad", {value: window.testPad});
     return event;
   };
+  const setRect = (id, left, top, width, height) => {
+    const element = document.getElementById(id);
+    element.getBoundingClientRect = () => ({
+      left, top, width, height,
+      right: left + width,
+      bottom: top + height,
+      x: left,
+      y: top,
+      toJSON: () => ({}),
+    });
+  };
   try {
     let activated = 0;
     let pageDelta = 0;
+    setRect("system-0", 20, 100, 180, 40);
+    setRect("system-1", 20, 150, 180, 40);
+    setRect("tab-0", 300, 80, 180, 40);
+    setRect("search", 300, 150, 300, 40);
+    setRect("game-0", 300, 230, 500, 60);
+    setRect("close", 300, 150, 100, 40);
+    setRect("confirm", 420, 150, 100, 40);
+
     document.getElementById("system-1").addEventListener("click", () => { activated += 1; });
     window.addEventListener("romcloud:page-jump", (event) => { pageDelta += event.detail.delta; });
     window.testButton(0, true);
@@ -28,11 +47,18 @@
     window.testButton(0, false); window.testTick(336);
     assert(activated === 1, "South button did not activate focused control");
 
-    window.testButton(5, true); window.testTick(400);
+    window.testButton(15, true); window.testTick(350);
+    window.testButton(15, false); window.testTick(366);
+    assert(document.activeElement.id === "search", "D-pad right did not choose the spatially adjacent content control");
+    window.testButton(14, true); window.testTick(380);
+    window.testButton(14, false); window.testTick(396);
+    assert(document.activeElement.id === "system-1", "D-pad left did not return to the spatially adjacent system");
+
+    window.testButton(5, true); window.testTick(420);
     assert(pageDelta === 1, "RB initial page jump failed");
-    window.testTick(2100);
+    window.testTick(2120);
     assert(pageDelta === 3, "RB sustained acceleration failed");
-    window.testButton(5, false); window.testTick(2110);
+    window.testButton(5, false); window.testTick(2130);
     window.testTick(5000);
     assert(pageDelta === 3, "RB navigation continued after release");
 
