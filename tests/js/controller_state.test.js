@@ -2,7 +2,9 @@
 
 const assert = require("assert");
 const path = require("path");
-const controller = require(path.resolve(process.argv[2]));
+const controllerPath = path.resolve(process.argv[2]);
+const controller = require(controllerPath);
+const spatial = require(path.join(path.dirname(controllerPath), "spatial_navigation.js"));
 
 const mapper = new controller.StandardGamepadMapper();
 const buttons = Array.from({length: 16}, () => ({pressed: false, value: 0}));
@@ -120,5 +122,37 @@ model.setLayout({dialog: [3, 2]});
 assert.deepStrictEqual(model.current, {zone: "dialog", row: 0, col: 0});
 assert.deepStrictEqual(model.moveHorizontal(1), {zone: "dialog", row: 0, col: 1});
 assert.deepStrictEqual(model.moveVertical(1), {zone: "dialog", row: 1, col: 1});
+
+function fakeElement(id, left, top, width, height) {
+  return {
+    id,
+    getBoundingClientRect: () => ({
+      left, top, width, height,
+      right: left + width,
+      bottom: top + height,
+    }),
+  };
+}
+
+const search = fakeElement("search", 300, 150, 300, 40);
+const system = fakeElement("system", 20, 150, 180, 40);
+const header = fakeElement("header", 160, 20, 120, 40);
+const tab = fakeElement("tab", 300, 80, 180, 40);
+const state = fakeElement("state", 620, 150, 160, 40);
+const spatialEntries = new Map([
+  ["controls:0:0", search],
+  ["systems:1:0", system],
+  ["global:0:0", header],
+  ["tabs:0:0", tab],
+  ["controls:0:1", state],
+]);
+let spatialTarget = spatial.chooseSpatialTarget(search, spatialEntries, "left");
+assert.strictEqual(spatialTarget.element, system, "left should prefer the aligned sidebar control");
+assert.deepStrictEqual(spatialTarget.descriptor, {zone: "systems", row: 1, col: 0});
+spatialTarget = spatial.chooseSpatialTarget(search, spatialEntries, "up");
+assert.strictEqual(spatialTarget.element, tab, "up should prefer the control physically above");
+spatialTarget = spatial.chooseSpatialTarget(search, spatialEntries, "right");
+assert.strictEqual(spatialTarget.element, state, "right should prefer the adjacent toolbar control");
+assert.strictEqual(spatial.chooseSpatialTarget(search, new Map([["controls:0:0", search]]), "left"), null);
 
 console.log("controller state tests passed");
