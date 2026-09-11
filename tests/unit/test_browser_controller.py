@@ -14,11 +14,15 @@ STATIC = ROOT / "src" / "romcloud" / "web" / "static"
 def test_controller_assets_wire_all_required_inputs_and_focus_scopes() -> None:
     html = (STATIC / "index.html").read_text(encoding="utf-8")
     javascript = (STATIC / "controller.js").read_text(encoding="utf-8")
+    spatial = (STATIC / "spatial_navigation.js").read_text(encoding="utf-8")
     app = (STATIC / "app.js").read_text(encoding="utf-8")
     diagnostics = (STATIC / "diagnostics.js").read_text(encoding="utf-8")
     css = (STATIC / "app.css").read_text(encoding="utf-8")
+    server = (ROOT / "src" / "romcloud" / "web" / "server.py").read_text(encoding="utf-8")
 
-    assert html.index('/controller.js') < html.index('/app.js')
+    assert html.index('/controller.js') < html.index('/spatial_navigation.js') < html.index('/app.js')
+    assert '"/spatial_navigation.js"' in server
+    assert "chooseSpatialTarget" in spatial
     for zone in ("systems", "tabs", "controls", "games", "dialog", "pager"):
         assert zone in javascript or f'data-controller-zone="{zone}"' in html
     assert "navigator.getGamepads" in javascript
