@@ -1,10 +1,9 @@
 """SFTP storage provider — a genuine protocol-level :class:`StorageProvider`.
 
-Role-agnostic: the exact same class is used whether SFTP is configured as
-the ROM source or as remote-data (see
-:mod:`romcloud.bootstrap.container`). Only the *validated target state*
-differs per configured instance/credentials/path — see
-``probe_writable`` below and :class:`~romcloud.core.storage.StorageAccessResult`.
+SFTP is intentionally read-only in ROMCloud. The same provider is used for
+remote ROM browsing/caching and for reading existing Library Sync metadata or
+media. ROMCloud never mutates an SFTP target; SaveSync and Library Sync publish
+operations are gated elsewhere by provider/capability policy.
 
 No local mount/filesystem is involved (unlike SMB, which is a real CIFS
 kernel mount read through :class:`~romcloud.infrastructure.providers.local.LocalFilesystemProvider`).
@@ -179,15 +178,12 @@ class _PinnedHostKeyPolicy(paramiko.MissingHostKeyPolicy):
 
 
 class SFTPProvider(StorageProvider):
-    """Storage provider backed directly by an SFTP account.
+    """Read-only storage provider backed directly by an SFTP account.
 
-    ``probe_writable`` governs :meth:`validate_access`: a source-role
-    instance (the default) never probes writes; a remote-data instance is
-    constructed with ``probe_writable=True`` so its write-dependent
-    subsystem (SaveSync/Library Sync) can validate the exact target before
-    enabling write-dependent operations. This mirrors
-    :class:`~romcloud.infrastructure.providers.local.WritableLocalFilesystemProvider`
-    without needing a parallel class hierarchy.
+    ``probe_writable`` remains accepted for configuration/API compatibility
+    with older builds, but it is intentionally ignored. Validation performs
+    read access only and ROMCloud never creates, updates, or deletes remote
+    SFTP objects.
     """
 
     PROVIDER_ID = "sftp"
@@ -213,7 +209,10 @@ class SFTPProvider(StorageProvider):
         self._private_key_path = private_key_path
         self._private_key_passphrase = private_key_passphrase
         self._trusted_fingerprint = trusted_host_key_fingerprint
-        self._probe_writable = probe_writable
+        # Kept only so older callers can pass the argument without breaking;
+        # SFTP is a read-only ROMCloud provider regardless of this value.
+        self._probe_writable = False
+        _ = probe_writable
         self._connect_timeout = connect_timeout
         self._operation_timeout = operation_timeout
         self._catalog_scan_state: contextvars.ContextVar[
@@ -469,6 +468,7 @@ class SFTPProvider(StorageProvider):
             return False
 
     def validate_access(self, root: str) -> StorageAccessResult:
+        """Validate SFTP connectivity and read permission without mutating it."""
         try:
             with self._session() as sftp:
                 try:
@@ -481,9 +481,11 @@ class SFTPProvider(StorageProvider):
                     return StorageAccessResult(
                         True, False, detail="read access denied to the configured remote path"
                     )
-                if not self._probe_writable:
-                    return StorageAccessResult(True, True)
-                return self._probe_write(sftp, root)
+                return StorageAccessResult(
+                    True,
+                    True,
+                    detail="SFTP is read-only in ROMCloud; write operations are disabled.",
+                )
         except ProviderHostKeyUnknownError as exc:
             return StorageAccessResult(False, False, detail=str(exc))
         except ProviderHostKeyMismatchError as exc:
@@ -494,8 +496,8 @@ class SFTPProvider(StorageProvider):
             return StorageAccessResult(False, False, detail=str(exc))
 
     def _probe_write(self, sftp: paramiko.SFTPClient, root: str) -> StorageAccessResult:
-        """Create/write/flush/stat/read-back/delete a ROMCloud-owned probe
-        object inside *root* — never touches any pre-existing file."""
+        """Legacy helper retained for compatibility tests; production SFTP
+        validation never calls this method because SFTP is read-only in ROMCloud."""
         probe = posixpath.join(root.rstrip("/"), f".romcloud-write-probe-{uuid.uuid4().hex}")
         created = False
         write_verified = False
