@@ -581,25 +581,29 @@ class TestCatalogScanPerformance:
         assert metrics.file_opens == metrics.content_reads == 1
 
 
-class TestWriteValidation:
+class TestReadOnlyValidation:
     def test_read_only_probe_never_writes(self, sftp_server):
         server, root = sftp_server
         provider = _provider(server, probe_writable=False)
         result = provider.validate_access(root.as_posix())
         assert result.connected and result.read_verified
         assert result.write_verified is None
+        assert result.cleanup_verified is None
+        assert result.writable is False
         assert list(root.iterdir()) == []
 
-    def test_writable_probe_creates_verifies_and_cleans_up(self, sftp_server):
+    def test_legacy_writable_probe_flag_stays_read_only(self, sftp_server):
         server, root = sftp_server
         provider = _provider(server, probe_writable=True)
         result = provider.validate_access(root.as_posix())
         assert result.ok
-        assert result.write_verified is True
-        assert result.cleanup_verified is True
+        assert result.write_verified is None
+        assert result.cleanup_verified is None
+        assert result.writable is False
+        assert "read-only" in result.detail.lower()
         assert list(root.iterdir()) == []
 
-    def test_probe_never_touches_existing_files(self, sftp_server):
+    def test_validation_never_touches_existing_files(self, sftp_server):
         server, root = sftp_server
         (root / "existing.sav").write_bytes(b"do-not-touch")
         provider = _provider(server, probe_writable=True)
