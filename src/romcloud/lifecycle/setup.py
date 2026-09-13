@@ -894,7 +894,15 @@ def apply_setup(
                     "Configured ROMCloud data location failed validation: "
                     f"{remote_probe.detail}"
                 )
-            if remote_probe.ok:
+            if config.remote_data.provider == "sftp":
+                emit_progress(
+                    progress,
+                    "configure",
+                    "read_only",
+                    "success",
+                    "SFTP data access verified — read-only; Library Sync pull is available, SaveSync and publishing are disabled",
+                )
+            elif remote_probe.writable:
                 emit_progress(progress, "configure", "write", "success", "Write test created")
                 emit_progress(progress, "configure", "read_back", "success", "Read-back verified")
                 emit_progress(progress, "configure", "cleanup", "success", "Test file removed")
