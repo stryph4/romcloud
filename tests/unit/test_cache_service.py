@@ -226,7 +226,7 @@ class TestCacheGameCancellation:
             )
 
         entry = cache_repo.get(game_with_file.id)
-        staging = cache_dir / ".partial" / "ps2" / "Final Fantasy X.iso"
+        staging = cache_dir / ".partial" / "ps2" / "Final Fantasy X.iso.part"
         final = cache_dir / "ps2" / "Final Fantasy X.iso"
         assert entry.status is CacheStatus.INCOMPLETE
         assert entry.is_evictable

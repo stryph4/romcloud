@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,6 +40,11 @@ from romcloud.infrastructure.logging import get_logger
 from romcloud.infrastructure.repositories.cache import CacheRepository
 from romcloud.infrastructure.repositories.game import GameRepository
 from romcloud.services.dependencies import DependencyResolverRegistry
+from romcloud.infrastructure.cache_coordination import (
+    CacheStorageCoordinator,
+    FileLockLease,
+    LockUnavailable,
+)
 
 log = get_logger("cache")
 
@@ -87,6 +93,7 @@ class CacheService:
         policy: CachePolicy,
         capability_policy: Optional[CapabilityPolicy] = None,
         dependency_resolver: Optional[DependencyResolverRegistry] = None,
+        storage_coordinator: Optional[CacheStorageCoordinator] = None,
     ) -> None:
         self._cache_repo = cache_repo
         self._game_repo = game_repo
@@ -95,6 +102,7 @@ class CacheService:
         self._policy = policy
         self._capabilities = capability_policy or CapabilityPolicy("smart_cache")
         self._dependencies = dependency_resolver
+        self._storage = storage_coordinator
         if self._dependencies is None and hasattr(transfer_service, "provider"):
             self._dependencies = DependencyResolverRegistry(
                 transfer_service.provider,
@@ -276,6 +284,11 @@ class CacheService:
         game_id: str,
         on_progress: Optional[Callable[[int, int], None]] = None,
         cancellation: Optional[TransferCancellationToken] = None,
+        *,
+        owner_kind: str = "cli",
+        owner_instance_id: Optional[str] = None,
+        download_item_id: Optional[str] = None,
+        _asset_lock: Optional[FileLockLease] = None,
     ) -> str:
         """Ensure *game_id* is cached and return its launch path.
 
@@ -312,6 +325,27 @@ class CacheService:
 
         existing = self._cache_repo.get(game_id)
         resolved_game = self._resolved_game(game, existing)
+
+        # Physical destination ownership is process-wide and keyed by the
+        # resolved asset closure, so shared playlist dependencies collide.
+        if self._storage is not None and _asset_lock is None:
+            paths = [
+                resolve_cache_path(self._cache_root, resolved_game.system, asset.relative_path)
+                for asset in resolved_game.assets
+            ]
+            with self._storage.assets.acquire(paths, blocking=True) as lease:
+                # Re-check after waiting: a background owner may have completed
+                # the exact same physical transfer while this process waited.
+                return self.cache_game(
+                    game_id,
+                    on_progress,
+                    cancellation,
+                    owner_kind=owner_kind,
+                    owner_instance_id=owner_instance_id,
+                    download_item_id=download_item_id,
+                    _asset_lock=lease,
+                )
+
         actual_before = self._existing_member_sizes(existing, resolved_game)
         needed = sum(
             asset.size_bytes or 0
@@ -328,7 +362,22 @@ class CacheService:
                 self._transfer.estimate_size(resolved_game)
                 - sum(actual_before.values()),
             )
-        self._ensure_space(needed, protected_game_id=game_id)
+        staged_before = self._transfer.staging_size(resolved_game)
+        needed = max(0, needed - staged_before)
+        reservation = None
+        if self._storage is not None:
+            reservation = self._storage.admit(
+                requested_growth=needed,
+                game_id=game_id,
+                owner_kind=owner_kind,
+                owner_instance_id=owner_instance_id or uuid.uuid4().hex,
+                download_item_id=download_item_id,
+                evict=lambda amount: self.evict(
+                    amount, protected_game_ids={game_id}
+                ),
+            )
+        else:
+            self._ensure_space(needed, protected_game_id=game_id)
         if cancellation is not None:
             cancellation.raise_if_cancelled()
 
@@ -352,11 +401,20 @@ class CacheService:
         )
 
         try:
+            initial_present = staged_before + sum(actual_before.values())
+
+            def coordinated_progress(done: int, total: int) -> None:
+                if reservation is not None:
+                    reservation.shrink_to(max(0, needed - max(0, done - initial_present)))
+                if on_progress is not None:
+                    on_progress(done, total)
+
+            progress = coordinated_progress if reservation is not None else on_progress
             if cancellation is None:
-                final_path = self._transfer.transfer(resolved_game, on_progress)
+                final_path = self._transfer.transfer(resolved_game, progress)
             else:
                 final_path = self._transfer.transfer(
-                    resolved_game, on_progress, cancellation=cancellation
+                    resolved_game, progress, cancellation=cancellation
                 )
                 cancellation.raise_if_cancelled()
             # Size recorded against the quota must cover *every* asset of
@@ -376,23 +434,26 @@ class CacheService:
             actual_size = sum(actual_sizes.values())
             if cancellation is not None:
                 cancellation.raise_if_cancelled()
-            self._cache_repo.update_member_sizes(game_id, actual_sizes)
-            self._cache_repo.update_cache_path(game_id, final_path)
-            self._cache_repo.update_status(game_id, CacheStatus.COMPLETE)
-            self._cache_repo.update_size(game_id, actual_size)
-            self._touch_accessed(game_id)
-            if cancellation is not None:
-                cancellation.raise_if_cancelled()
-
-            updated_entry = self._cache_repo.get(game_id)
-            assert updated_entry is not None
-            launch_path = self._launch_asset_path(updated_entry, resolved_game)
+            launch_asset = resolved_game.primary_asset
+            launch_path = (
+                resolve_cache_path(
+                    self._cache_root, resolved_game.system, launch_asset.relative_path
+                )
+                if launch_asset is not None else None
+            )
             if launch_path is None or not launch_path.exists():
                 raise CacheError(
                     f"Cache completed but the primary launch asset could not be resolved for {game_id}"
                 )
             if cancellation is not None:
                 cancellation.raise_if_cancelled()
+            self._cache_repo.finalize_transfer(
+                game_id=game_id,
+                cache_path=final_path,
+                sizes=actual_sizes,
+                staging_assets=[asset.relative_path for asset in resolved_game.assets],
+                download_item_id=download_item_id,
+            )
             return str(launch_path)
 
         except TransferCancelledError:
@@ -403,8 +464,92 @@ class CacheService:
         except Exception:
             self._cache_repo.update_status(game_id, CacheStatus.FAILED)
             raise
+        finally:
+            if reservation is not None:
+                reservation.release()
 
-    def remove(self, game_id: str, force: bool = False) -> None:
+    def resolved_asset_paths(self, game_id: str) -> list[Path]:
+        """Return canonical final physical destinations for worker claiming."""
+        game = self._game_repo.get(game_id)
+        if game is None:
+            raise GameNotFoundError(f"Game not found in catalog: {game_id}")
+        resolved = self._resolved_game(game, self._cache_repo.get(game_id))
+        return [
+            resolve_cache_path(self._cache_root, resolved.system, asset.relative_path)
+            for asset in resolved.assets
+        ]
+
+    def try_asset_locks(self, game_id: str) -> Optional[FileLockLease]:
+        if self._storage is None:
+            return FileLockLease([])
+        try:
+            return self._storage.assets.acquire(
+                self.resolved_asset_paths(game_id), blocking=False
+            )
+        except LockUnavailable:
+            return None
+
+    def retained_staging_size(self, game_id: str) -> int:
+        game = self._game_repo.get(game_id)
+        if game is None:
+            return 0
+        resolved = self._resolved_game(game, self._cache_repo.get(game_id))
+        return self._transfer.staging_size(resolved)
+
+    def prepare_download_membership(self, game_id: str) -> None:
+        """Persist the physical closure before queueing for shared ownership."""
+        game = self._game_repo.get(game_id)
+        if game is None:
+            raise GameNotFoundError(f"Game not found in catalog: {game_id}")
+        existing = self._cache_repo.get(game_id)
+        resolved = self._resolved_game(game, existing)
+        actual = self._existing_member_sizes(existing, resolved)
+        if existing is None:
+            primary = resolved.primary_asset
+            if primary is None:
+                raise CacheError(f"Game {game_id!r} has no cacheable assets")
+            entry = CacheEntry.create(
+                game_id,
+                str(resolve_cache_path(
+                    self._cache_root, resolved.system, primary.relative_path
+                )),
+            )
+            entry.status = CacheStatus.INCOMPLETE
+            self._cache_repo.save(entry)
+        self._cache_repo.replace_membership(game_id, resolved.assets, actual)
+
+    def discard_staging(self, game_id: str) -> None:
+        """Discard resumable bytes while protecting shared physical assets."""
+        game = self._game_repo.get(game_id)
+        if game is None:
+            return
+        resolved = self._resolved_game(game, self._cache_repo.get(game_id))
+        paths = [
+            resolve_cache_path(self._cache_root, resolved.system, asset.relative_path)
+            for asset in resolved.assets
+        ]
+        lease = (
+            self._storage.assets.acquire(paths, blocking=False)
+            if self._storage is not None
+            else FileLockLease([])
+        )
+        with lease:
+            preserve = {
+                asset.relative_path
+                for asset in resolved.assets
+                if self._cache_repo.owner_count(asset.relative_path) > 1
+            }
+            self._transfer.discard_staging(
+                resolved, preserve_relative_paths=preserve
+            )
+
+    def remove(
+        self,
+        game_id: str,
+        force: bool = False,
+        *,
+        _asset_lock: Optional[FileLockLease] = None,
+    ) -> None:
         """Remove the cached copy of a game.
 
         Raises :class:`~romcloud.core.exceptions.GamePinnedError` if the
@@ -423,6 +568,23 @@ class CacheService:
             )
 
         game = self._game_repo.get(game_id)
+        resolved = self._resolved_game(game, entry) if game is not None else None
+        if self._storage is not None and _asset_lock is None and resolved is not None:
+            paths = [
+                resolve_cache_path(self._cache_root, resolved.system, asset.relative_path)
+                for asset in resolved.assets
+            ]
+            with self._storage.assets.acquire(paths, blocking=True) as lease:
+                return self.remove(game_id, force=force, _asset_lock=lease)
+        if resolved is not None and entry.status is not CacheStatus.COMPLETE:
+            preserve = {
+                asset.relative_path
+                for asset in resolved.assets
+                if self._cache_repo.owner_count(asset.relative_path) > 1
+            }
+            self._transfer.discard_staging(
+                resolved, preserve_relative_paths=preserve
+            )
         self._remove_files(entry, game)
         self._cache_repo.delete(game_id)
         log.info("Removed cache entry %s", game_id)
@@ -596,10 +758,29 @@ class CacheService:
                 continue
 
             game = self._game_repo.get(entry.game_id)
-            self._remove_files(entry, game)
-            self._cache_repo.delete(entry.game_id)
-            evicted.append(entry.game_id)
-            log.info("Evicted %s (LRU)", entry.game_id)
+            lock = None
+            if self._storage is not None and game is not None:
+                try:
+                    resolved = self._resolved_game(game, entry)
+                    lock = self._storage.assets.acquire(
+                        [
+                            resolve_cache_path(
+                                self._cache_root, resolved.system, asset.relative_path
+                            )
+                            for asset in resolved.assets
+                        ],
+                        blocking=False,
+                    )
+                except LockUnavailable:
+                    continue
+            try:
+                self._remove_files(entry, game)
+                self._cache_repo.delete(entry.game_id)
+                evicted.append(entry.game_id)
+                log.info("Evicted %s (LRU)", entry.game_id)
+            finally:
+                if lock is not None:
+                    lock.release()
 
         return evicted
 

@@ -49,7 +49,7 @@ class CacheEntry:
     @property
     def is_evictable(self) -> bool:
         """True when the entry may be removed by automatic eviction policy."""
-        return self.status is not CacheStatus.TRANSFERRING and not self.is_pinned
+        return self.status is CacheStatus.COMPLETE and not self.is_pinned
 
     # ── factory ───────────────────────────────────────────────────────────────
 

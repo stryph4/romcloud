@@ -40,6 +40,11 @@ from romcloud.integrations.batocera.catalog import CatalogService
 from romcloud.infrastructure.repositories.cache import CacheRepository
 from romcloud.infrastructure.repositories.game import GameRepository
 from romcloud.infrastructure.repositories.proxy import ProxyRepository
+from romcloud.infrastructure.repositories.download import (
+    DownloadRepository,
+    StagingRepository,
+)
+from romcloud.infrastructure.cache_coordination import CacheStorageCoordinator
 from romcloud.services.cache import CacheService
 from romcloud.services.saves import SaveSyncService
 from romcloud.infrastructure.remote_saves import build_remote_save_store
@@ -248,6 +253,9 @@ class Container:
         self._saves: Optional[SaveSyncService] = None
         self._library_sync: Optional[LibrarySyncService] = None
         self._library_manager = None
+        self._download_repo: Optional[DownloadRepository] = None
+        self._storage_coordinator: Optional[CacheStorageCoordinator] = None
+        self._download_manager = None
 
     def _policy(self) -> CapabilityPolicy:
         """Resolve mode policy only for services that actually consume it."""
@@ -290,6 +298,29 @@ class Container:
         if self._proxy_repo is None:
             self._proxy_repo = ProxyRepository(self.database)
         return self._proxy_repo
+
+    @property
+    def download_repo(self) -> DownloadRepository:
+        if self._download_repo is None:
+            self._download_repo = DownloadRepository(self.database)
+        return self._download_repo
+
+    @property
+    def storage_coordinator(self) -> CacheStorageCoordinator:
+        if self._storage_coordinator is None:
+            policy = CachePolicy.from_gb(
+                max_size_gb=self._config.cache.max_size_gb,
+                min_free_gb=self._config.cache.min_free_gb,
+            )
+            self._storage_coordinator = CacheStorageCoordinator(
+                db=self.database,
+                cache_repo=self.cache_repo,
+                cache_root=self._config.cache.path,
+                lock_root=Path(self._config.data_path) / "locks",
+                max_size_bytes=policy.max_size_bytes,
+                min_free_bytes=policy.min_free_bytes,
+            )
+        return self._storage_coordinator
 
     @property
     def system_registry(self):  # noqa: ANN201
@@ -344,6 +375,7 @@ class Container:
                 provider=self.provider,
                 cache_root=self._config.cache.path,
                 source_root=self._config.source.rom_root,
+                staging_repository=StagingRepository(self.database),
             )
         return self._transfer
 
@@ -361,6 +393,7 @@ class Container:
                 cache_root=self._config.cache.path,
                 policy=policy,
                 capability_policy=self._policy(),
+                storage_coordinator=self.storage_coordinator,
             )
         return self._cache
 
@@ -520,8 +553,23 @@ class Container:
                 source_reachable=lambda: self.provider.is_reachable(
                     self._config.source.rom_root
                 ),
+                downloads=self.download_manager,
             )
         return self._library_manager
+
+    @property
+    def download_manager(self):  # noqa: ANN201
+        if self._download_manager is None:
+            from romcloud.services.download_manager import DownloadManagerService
+
+            self._download_manager = DownloadManagerService(
+                repository=self.download_repo,
+                staging_repository=StagingRepository(self.database),
+                game_repo=self.game_repo,
+                cache=self.cache,
+                cache_root=self._config.cache.path,
+            )
+        return self._download_manager
 
     # ── helpers ───────────────────────────────────────────────────────────────
 

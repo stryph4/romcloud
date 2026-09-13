@@ -146,11 +146,22 @@ dialog::backdrop { background: rgba(1,4,12,.84); backdrop-filter: blur(5px); }
 .metric span { color: var(--muted); font-size: .74rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
 .metric b { margin-top: 4px; font-size: 1.08rem; font-weight: 750; }
 
-.job { position: fixed; right: 18px; bottom: 18px; z-index: 5; width: min(430px,calc(100% - 36px)); padding: 15px; border: 1px solid #2c638f; border-radius: var(--radius-card); background: #0c1d34; box-shadow: var(--shadow-raised); }
+.job { position: fixed; right: 18px; bottom: 18px; z-index: 5; width: min(430px,calc(100% - 36px)); padding: 15px; border: 1px solid #2c638f; border-radius: var(--radius-card); background: #0c1d34; box-shadow: var(--shadow-raised); text-align: left; }
 .job div { display: flex; justify-content: space-between; gap: 8px; }
 .job b { font-weight: 750; }
 .job span { color: var(--muted); font-size: .82rem; }
 .job progress { width: 100%; height: 10px; margin-top: 11px; accent-color: var(--accent); }
+.downloads-list { display: flex; flex-direction: column; gap: 9px; margin-top: 22px; }
+.download-section-title { margin: 20px 0 1px; color: var(--muted); font-size: .75rem; letter-spacing: .12em; text-transform: uppercase; }
+.download-item { padding: 14px; border: 1px solid var(--border-subtle); border-radius: var(--radius-card); background: var(--surface); }
+.download-main { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.download-item progress { width: 100%; height: 10px; margin-top: 11px; accent-color: var(--accent); }
+.download-stats { display: block; margin: 5px 0 10px; color: var(--muted); }
+.download-item .row-actions { justify-content: flex-end; margin-top: 10px; }
+.badge.running, .badge.verifying, .badge.queued { border-color: #806329; background: #3b2b10; color: #ffda7c; }
+.badge.paused, .badge.interrupted { border-color: #795b9d; background: #2a1941; color: #d7b7ff; }
+.badge.failed, .badge.cancelled { border-color: #934252; background: #30151e; color: #ffc2ca; }
+.badge.complete { border-color: #28704b; background: #103723; color: #8eebb2; }
 code { color: #7aeafb; font-family: "Cascadia Mono","DejaVu Sans Mono",Consolas,monospace; }
 .controller-help { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: 0 0 10px; color: var(--muted); font-size: .78rem; }
 .controller-help b { margin-right: .25rem; color: var(--accent); }

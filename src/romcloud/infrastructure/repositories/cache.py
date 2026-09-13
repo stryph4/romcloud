@@ -165,6 +165,51 @@ class CacheRepository:
                 [(size, game_id, path) for path, size in sizes.items()],
             )
 
+    def finalize_transfer(
+        self,
+        *,
+        game_id: str,
+        cache_path: str,
+        sizes: dict[str, int],
+        staging_assets: Iterable[str],
+        download_item_id: Optional[str] = None,
+    ) -> None:
+        """Atomically publish cache ownership and optional queue completion."""
+        now = _fmt_dt(datetime.now(timezone.utc))
+        total = sum(sizes.values())
+        with self._db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.executemany(
+                "UPDATE cache_members SET size_bytes=? WHERE game_id=? AND relative_path=?",
+                [(size, game_id, path) for path, size in sizes.items()],
+            )
+            conn.execute(
+                """
+                UPDATE cache_entries
+                SET cache_path=?, status=?, size_bytes=?, last_accessed=?
+                WHERE game_id=?
+                """,
+                (cache_path, CacheStatus.COMPLETE.value, total, now, game_id),
+            )
+            conn.executemany(
+                "DELETE FROM cache_staging_assets WHERE relative_path=?",
+                [(path,) for path in staging_assets],
+            )
+            if download_item_id is not None:
+                conn.execute(
+                    """
+                    UPDATE download_items SET state='complete', worker_instance_id=NULL,
+                        bytes_present=CASE WHEN bytes_total > 0 THEN bytes_total ELSE ? END,
+                        updated_at=?, finished_at=?, error_code=NULL, error_message=NULL
+                    WHERE id=? AND state IN ('running','verifying')
+                    """,
+                    (total, now, now, download_item_id),
+                )
+                conn.execute(
+                    "DELETE FROM cache_reservations WHERE download_item_id=?",
+                    (download_item_id,),
+                )
+
     def membership_resolved(self, game_id: str) -> bool:
         with self._db.connect() as conn:
             row = conn.execute(
@@ -361,10 +406,10 @@ class CacheRepository:
             rows = conn.execute(
                 """
                 SELECT * FROM cache_entries
-                WHERE status != ? AND is_pinned = 0
+                WHERE status = ? AND is_pinned = 0
                 ORDER BY last_accessed ASC
                 """,
-                (CacheStatus.TRANSFERRING.value,),
+                (CacheStatus.COMPLETE.value,),
             ).fetchall()
             return [self._row_to_entry(r) for r in rows]
 

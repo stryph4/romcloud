@@ -617,4 +617,4 @@ class TestCapabilities:
         provider = _provider(server)
         assert provider.capabilities.has_filesystem_semantics is False
         assert provider.capabilities.supports_durable_transactions is False
-        assert provider.capabilities.can_resume_download is False
+        assert provider.capabilities.can_resume_download is True

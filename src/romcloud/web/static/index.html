@@ -24,12 +24,13 @@
     <header>
       <div class="brand"><span class="brand-mark">RC</span><span><b>ROMCloud</b><small id="app-section-title">Library Manager</small></span></div>
       <button id="nav-library" class="icon-button" data-controller-zone="global" data-controller-row="0" data-controller-col="0">Library</button>
-      <button id="nav-diagnostics" class="icon-button" data-controller-zone="global" data-controller-row="0" data-controller-col="1">Diagnostics / Logs</button>
+      <button id="nav-downloads" class="icon-button" data-controller-zone="global" data-controller-row="0" data-controller-col="1">Downloads</button>
+      <button id="nav-diagnostics" class="icon-button" data-controller-zone="global" data-controller-row="0" data-controller-col="2">Diagnostics / Logs</button>
       <div id="controller-status" class="controller-status hidden" aria-live="polite">Controller connected</div>
       <div id="mode" class="mode">Connecting…</div>
-      <button id="controller-menu-button" class="icon-button local-only hidden" data-controller-zone="global" data-controller-row="0" data-controller-col="2">Help / Exit</button>
-      <button id="logout" class="icon-button" title="Forget access token" data-controller-zone="global" data-controller-row="0" data-controller-col="3">Sign out</button>
-      <button id="trusted-devices" class="icon-button" data-controller-zone="global" data-controller-row="0" data-controller-col="4">Trusted Devices</button>
+      <button id="controller-menu-button" class="icon-button local-only hidden" data-controller-zone="global" data-controller-row="0" data-controller-col="3">Help / Exit</button>
+      <button id="logout" class="icon-button" title="Forget access token" data-controller-zone="global" data-controller-row="0" data-controller-col="4">Sign out</button>
+      <button id="trusted-devices" class="icon-button" data-controller-zone="global" data-controller-row="0" data-controller-col="5">Trusted Devices</button>
     </header>
     <div id="offline-banner" class="banner hidden"><b>Offline</b> — showing local content only. Remote-only games and downloads are unavailable.</div>
 
@@ -63,6 +64,22 @@
         <div class="list-head"><label><input id="select-page" type="checkbox" data-controller-zone="select" data-controller-row="0" data-controller-col="0"> Select page</label><span id="result-count"></span></div>
         <div id="games" class="games"><div class="empty">Choose a system to browse its library.</div></div>
         <nav class="pager"><button id="previous" data-controller-zone="pager" data-controller-row="0" data-controller-col="0">Previous</button><span id="page-label">Page 0 of 0</span><label>Jump to <input id="jump" type="number" min="1" value="1" data-controller-zone="pager" data-controller-row="0" data-controller-col="1"></label><button id="next" data-controller-zone="pager" data-controller-row="0" data-controller-col="2">Next</button></nav>
+      </section>
+    </main>
+
+    <main id="downloads-main" class="hidden downloads-main">
+      <aside>
+        <h2>Download actions</h2>
+        <div class="systems">
+          <button id="downloads-cancel-all" class="system danger-text" data-controller-zone="download-bulk" data-controller-row="0" data-controller-col="0">Cancel All</button>
+          <button id="downloads-retry-all" class="system" data-controller-zone="download-bulk" data-controller-row="1" data-controller-col="0">Retry All Failed</button>
+          <button id="downloads-cleanup" class="system" data-controller-zone="download-bulk" data-controller-row="2" data-controller-col="0">Cleanup Stale Partials</button>
+        </div>
+      </aside>
+      <section class="content">
+        <div class="content-head"><div><p class="eyebrow">Persistent queue and history</p><h1>Downloads</h1></div><div id="partial-usage" class="mode">0 B retained</div></div>
+        <div id="downloads-notice" class="notice hidden"></div>
+        <div id="downloads-list" class="downloads-list"><div class="empty">Loading downloads…</div></div>
       </section>
     </main>
 
@@ -113,7 +130,7 @@
     </form>
   </dialog>
 
-  <div id="job" class="job hidden"><div><b id="job-title">Downloading pinned games</b><span id="job-detail"></span></div><progress id="job-progress"></progress></div>
+  <button id="job" class="job hidden" type="button"><div><b id="job-title">Active download</b><span id="job-detail"></span></div><progress id="job-progress"></progress></button>
   <dialog id="devices-dialog">
     <div class="dialog-card">
       <div class="dialog-head"><h2>Trusted Remote Devices</h2><button id="close-devices" class="icon-button" data-controller-zone="dialog" data-controller-row="0" data-controller-col="0">Close</button></div>

@@ -3,6 +3,7 @@ const state = {token: "", localSession: false, controllerFirst: false, system: "
 let contentUpdateScheduled = false;
 let oskSession = null;
 let diagnosticsBrowser = null;
+let downloadsTimer = null;
 
 function contentUpdated() {
   if (contentUpdateScheduled) return;
@@ -165,20 +166,113 @@ function ensureDiagnosticsBrowser() {
   return diagnosticsBrowser;
 }
 
-function setViewNav(diagnosticsActive) {
-  $("nav-library").classList.toggle("active", !diagnosticsActive);
-  $("nav-diagnostics").classList.toggle("active", diagnosticsActive);
+function setViewNav(view) {
+  $("nav-library").classList.toggle("active", view === "library");
+  $("nav-downloads").classList.toggle("active", view === "downloads");
+  $("nav-diagnostics").classList.toggle("active", view === "diagnostics");
 }
 
 async function openDiagnostics() {
   if (diagnosticsBrowser && diagnosticsBrowser.active) return;
-  setViewNav(true);
+  $("downloads-main").classList.add("hidden");
+  setViewNav("diagnostics");
   await ensureDiagnosticsBrowser().open();
 }
 
 function showLibrary() {
   if (diagnosticsBrowser && diagnosticsBrowser.active) diagnosticsBrowser.close();
-  setViewNav(false);
+  $("diagnostics-main").classList.add("hidden");
+  $("downloads-main").classList.add("hidden");
+  $("library-main").classList.remove("hidden");
+  $("app-section-title").textContent = "Library Manager";
+  setViewNav("library");
+  contentUpdated();
+}
+
+async function openDownloads() {
+  if (diagnosticsBrowser && diagnosticsBrowser.active) diagnosticsBrowser.close();
+  $("library-main").classList.add("hidden");
+  $("diagnostics-main").classList.add("hidden");
+  $("downloads-main").classList.remove("hidden");
+  $("app-section-title").textContent = "Downloads";
+  setViewNav("downloads");
+  await loadDownloads();
+}
+
+function downloadControl(text, item, action, row, col, danger = false) {
+  const button = el("button", danger ? "danger-text" : "", text);
+  button.dataset.controllerZone = "downloads";
+  button.dataset.controllerRow = String(row);
+  button.dataset.controllerCol = String(col);
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      await api(`/api/downloads/${item.id}/${action}`, {method: "POST", body: "{}"});
+      await loadDownloads();
+    } catch (error) { showDownloadsNotice(error.message, true); }
+    finally { button.disabled = false; }
+  });
+  return button;
+}
+
+function showDownloadsNotice(message, error = false) {
+  const node = $("downloads-notice");
+  node.textContent = message; node.classList.remove("hidden"); node.classList.toggle("error", error);
+}
+
+async function loadDownloads() {
+  try {
+    const data = await api("/api/downloads");
+    $("partial-usage").textContent = `${formatBytes(data.retained_partial_bytes)} retained`;
+    const root = $("downloads-list"); root.replaceChildren();
+    const groups = [
+      ["Active", ["running", "verifying"]], ["Queued", ["queued"]],
+      ["Paused", ["paused"]], ["Interrupted", ["interrupted"]],
+      ["Failed", ["failed"]], ["History", ["cancelled", "complete"]],
+    ];
+    let row = 0;
+    groups.forEach(([heading, states]) => {
+      const items = data.items.filter((item) => states.includes(item.state));
+      if (!items.length) return;
+      root.append(el("h2", "download-section-title", heading));
+      items.forEach((item) => {
+        const card = el("article", "download-item");
+        const main = el("div", "download-main");
+        const detail = el("div", "game-title");
+        detail.append(el("b", "", item.game_title), el("small", "", `${item.system} · ${title(item.state)} · ${formatBytes(item.bytes_present)} of ${formatBytes(item.bytes_total)}`));
+        const badge = el("span", `badge ${item.state}`, title(item.state));
+        main.append(detail, badge);
+        if (["running", "verifying"].includes(item.state)) {
+          const progress = document.createElement("progress");
+          if (item.bytes_total) { progress.max = item.bytes_total; progress.value = item.bytes_present; }
+          const speed = item.speed_bytes_per_second ? `${formatBytes(item.speed_bytes_per_second)}/s` : "Calculating speed";
+          const eta = item.eta_seconds != null ? ` · ${formatDuration(item.eta_seconds)} remaining` : "";
+          card.append(main, progress, el("small", "download-stats", `${speed}${eta}`));
+        } else card.append(main);
+        if (item.error_message) card.append(el("div", "error", item.error_message));
+        if (item.total_files > 1) card.append(el("small", "download-stats", `${number(item.retained_files)} files retained · ${number(item.interrupted_files)} interrupted file${item.interrupted_files === 1 ? "" : "s"} being verified · ${number(item.remaining_files)} files remaining`));
+        const actions = el("div", "row-actions"); let col = 0;
+        if (["running", "verifying"].includes(item.state)) actions.append(downloadControl("Pause", item, "pause", row, col++), downloadControl("Cancel", item, "cancel", row, col++, true));
+        if (["paused", "interrupted", "cancelled"].includes(item.state) && (item.state !== "cancelled" || item.has_partial)) actions.append(downloadControl("Resume", item, "resume", row, col++));
+        if (item.state === "failed") actions.append(downloadControl("Retry", item, "retry", row, col++));
+        if (["paused", "interrupted", "failed", "cancelled"].includes(item.state) && item.has_partial) actions.append(downloadControl("Discard Partial", item, "discard", row, col++, true));
+        if (item.state === "queued") actions.append(downloadControl("Cancel", item, "cancel", row, col++, true), downloadControl("Remove", item, "remove", row, col++));
+        card.append(actions); root.append(card); row++;
+      });
+    });
+    if (!root.children.length) root.append(el("div", "empty", "No downloads yet."));
+    const active = data.active;
+    $("job").classList.toggle("hidden", !active);
+    if (active) {
+      $("job-title").textContent = active.state === "verifying" ? `Verifying ${active.game_title}` : `Downloading ${active.game_title}`;
+      $("job-detail").textContent = `${formatBytes(active.bytes_present)} / ${formatBytes(active.bytes_total)}`;
+      if (active.bytes_total) { $("job-progress").max = active.bytes_total; $("job-progress").value = active.bytes_present; }
+      else $("job-progress").removeAttribute("value");
+    }
+    contentUpdated();
+  } catch (error) {
+    $("downloads-list").replaceChildren(el("div", "empty error", error.message));
+  }
 }
 
 async function runAction(action, ids, button = null) {
@@ -186,7 +280,7 @@ async function runAction(action, ids, button = null) {
   showNotice(`${title(action)} in progress…`);
   try {
     await api("/api/actions", {method: "POST", body: JSON.stringify({action, game_ids: ids})});
-    ids.forEach((id) => state.selected.delete(id)); updateBulk(); showNotice(`${title(action)} completed for ${ids.length} game${ids.length === 1 ? "" : "s"}.`); await loadSystems(); await loadGames();
+    ids.forEach((id) => state.selected.delete(id)); updateBulk(); showNotice(action === "cache" ? `Queued ${ids.length} download${ids.length === 1 ? "" : "s"}.` : `${title(action)} completed for ${ids.length} game${ids.length === 1 ? "" : "s"}.`); await loadSystems(); await loadGames(); await loadDownloads();
   } catch (error) { showNotice(error.message, true); }
   finally { if (button) button.disabled = false; }
 }
@@ -207,17 +301,8 @@ async function showPreflight() {
 
 async function startDownload() {
   $("start-download").disabled = true;
-  try { const job = await api("/api/download-pinned", {method: "POST", body: "{}"}); $("preflight").close(); $("job").classList.remove("hidden"); pollJob(job.id); }
+  try { await api("/api/download-pinned", {method: "POST", body: "{}"}); $("preflight").close(); await loadDownloads(); showNotice("Pinned downloads queued."); }
   catch (error) { $("preflight-error").textContent = error.message; $("start-download").disabled = false; }
-}
-
-async function pollJob(id) {
-  try {
-    const job = await api(`/api/jobs/${id}`); $("job-detail").textContent = `${job.current_game}/${job.total_games}`;
-    const progress = $("job-progress"); if (job.bytes_total) { progress.max = job.bytes_total; progress.value = job.bytes_done; } else { progress.removeAttribute("value"); }
-    if (["queued", "running"].includes(job.state)) return setTimeout(() => pollJob(id), 750);
-    $("job").classList.add("hidden"); showNotice(job.state === "complete" ? `Downloaded ${job.completed_game_ids.length} pinned games.` : job.error, job.state !== "complete"); await loadSystems(); await loadGames();
-  } catch (error) { $("job").classList.add("hidden"); showNotice(error.message, true); }
 }
 
 function updateBulk() { $("bulk").classList.toggle("hidden", !state.selected.size); $("selected-count").textContent = `${state.selected.size} selected`; contentUpdated(); }
@@ -228,6 +313,7 @@ function title(value) { return String(value || "").replaceAll("_", " ").replace(
 function labelState(value) { return {remote_only: "Remote Only", cached: "Cached", pinned: "Pinned", incomplete: "Incomplete", transferring: "Transferring"}[value] || title(value); }
 function number(value) { return new Intl.NumberFormat().format(value || 0); }
 function formatBytes(value) { if (value == null) return "Size unknown"; if (value === 0) return "0 B"; const units = ["B", "KB", "MB", "GB", "TB"]; const power = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1); return `${(value / 1024 ** power).toFixed(power ? 1 : 0)} ${units[power]}`; }
+function formatDuration(seconds) { const value = Math.max(0, Math.round(seconds)); if (value < 60) return `${value}s`; if (value < 3600) return `${Math.ceil(value / 60)}m`; return `${(value / 3600).toFixed(1)}h`; }
 
 function renderOskPreview() {
   const preview = $("osk-preview"); preview.replaceChildren();
@@ -326,6 +412,10 @@ $("select-page").addEventListener("change", (event) => { document.querySelectorA
 $("clear-selection").addEventListener("click", () => { state.selected.clear(); updateBulk(); loadGames(); });
 $("bulk").querySelectorAll("[data-action]").forEach((button) => button.addEventListener("click", () => runAction(button.dataset.action, [...state.selected], button)));
 $("download-pinned").addEventListener("click", showPreflight); $("start-download").addEventListener("click", startDownload);
+$("job").addEventListener("click", openDownloads);
+$("downloads-cancel-all").addEventListener("click", async () => { await api("/api/downloads/cancel-all", {method: "POST", body: "{}"}); await loadDownloads(); });
+$("downloads-retry-all").addEventListener("click", async () => { await api("/api/downloads/retry-all-failed", {method: "POST", body: "{}"}); await loadDownloads(); });
+$("downloads-cleanup").addEventListener("click", async () => { const result = await api("/api/downloads/cleanup", {method: "POST", body: "{}"}); showDownloadsNotice(`Cleaned ${result.cleaned} stale download${result.cleaned === 1 ? "" : "s"}.`); await loadDownloads(); });
 
 window.addEventListener("romcloud:page-jump", (event) => {
   if (diagnosticsBrowser && diagnosticsBrowser.active) {
@@ -380,12 +470,17 @@ window.addEventListener("romcloud:controller-status", (event) => {
   buildOsk();
   state.token = tokenFromStorage();
   $("nav-library").addEventListener("click", showLibrary);
+  $("nav-downloads").addEventListener("click", openDownloads);
   $("nav-diagnostics").addEventListener("click", openDiagnostics);
   await connect(state.token || "");
+  downloadsTimer = setInterval(loadDownloads, 1000);
+  const requestedView = new URLSearchParams(location.search).get("view");
   if (new URLSearchParams(location.search).get("view") === "diagnostics") {
     await openDiagnostics();
+  } else if (requestedView === "downloads") {
+    await openDownloads();
   } else {
-    setViewNav(false);
+    setViewNav("library");
   }
 })();
 window.romcloudGamepad = window.ROMCloudController.startBrowserController(

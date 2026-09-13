@@ -163,7 +163,7 @@ class TestTransferService:
         with pytest.raises(TransferCancelledError):
             service.transfer(game, cancel_after_first_chunk, cancellation)
 
-        staging = cache_dir / ".partial" / "ps2" / "Test Game.iso"
+        staging = cache_dir / ".partial" / "ps2" / "Test Game.iso.part"
         final = cache_dir / "ps2" / "Test Game.iso"
         assert 0 < staging.stat().st_size < game.total_size_bytes
         assert not final.exists()
@@ -246,7 +246,7 @@ class TestTransferService:
 
         final = Path(service.transfer(game))
         assert final.read_bytes() == b"rom_content" * 100
-        assert not (cache_dir / ".partial" / "ps2" / "Test Game.iso").exists()
+        assert not (cache_dir / ".partial" / "ps2" / "Test Game.iso.part").exists()
 
     def test_estimates_unknown_directory_size_only_when_requested(
         self, dir_game, cache_dir
@@ -345,7 +345,7 @@ class TestTransferService:
             svc.transfer(game)
 
         # Staging must still exist for resume
-        staging = cache_dir / ".partial" / "ps2" / "game.iso"
+        staging = cache_dir / ".partial" / "ps2" / "game.iso.part"
         assert staging.exists()
 
     def test_transfers_directory(self, dir_game, cache_dir):

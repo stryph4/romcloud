@@ -66,7 +66,7 @@ _CONNECT_RETRY_DELAY = 1.0
 _PROBE_CONTENT = b"ROMCloud writable storage probe\n"
 
 _SFTP_CAPABILITIES = ProviderCapabilities(
-    has_filesystem_semantics=False, can_resume_download=False
+    has_filesystem_semantics=False, can_resume_download=True
 )
 
 

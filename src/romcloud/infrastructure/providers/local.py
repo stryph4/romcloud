@@ -67,7 +67,7 @@ __all__ = [
 
 _LOCAL_CAPABILITIES = ProviderCapabilities(
     has_filesystem_semantics=True,
-    can_resume_download=False,
+    can_resume_download=True,
     supports_durable_transactions=True,
     supports_remote_data_writes=True,
 )

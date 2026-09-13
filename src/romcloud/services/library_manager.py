@@ -12,6 +12,7 @@ from romcloud.infrastructure.repositories.cache import CacheRepository
 from romcloud.infrastructure.repositories.game import GameRepository
 from romcloud.infrastructure.repositories.library_browser import LibraryBrowserRepository
 from romcloud.services.cache import CacheService
+from romcloud.core.models.download import DownloadOrigin
 
 
 class LibraryManagerService:
@@ -25,6 +26,7 @@ class LibraryManagerService:
         cache: CacheService,
         policy_loader: Callable[[], CapabilityPolicy],
         source_reachable: Callable[[], bool],
+        downloads=None,  # noqa: ANN001
     ) -> None:
         self._browser_repo = browser_repo
         self._game_repo = game_repo
@@ -32,6 +34,7 @@ class LibraryManagerService:
         self._cache = cache
         self._policy_loader = policy_loader
         self._source_reachable = source_reachable
+        self._downloads = downloads
 
     def status(self) -> dict[str, object]:
         policy = self._policy_loader()
@@ -95,13 +98,10 @@ class LibraryManagerService:
                     "state": state,
                     "cache_status": entry.status.value if entry else None,
                     "pinned": bool(entry and entry.is_pinned),
-                    "has_local_copy": bool(
-                        entry
-                        and (
-                            entry.size_bytes > 0
-                            or memberships.get(row.game_id)
-                        )
-                    ),
+                    # A membership snapshot is ownership metadata, not proof
+                    # of playable bytes. Only the canonical validity check may
+                    # advertise a local copy to the browser.
+                    "has_local_copy": valid,
                     "offline_ready": valid,
                 }
             )
@@ -123,9 +123,13 @@ class LibraryManagerService:
             self._policy_loader().require(Capability.GAME_DOWNLOAD, "Downloading a game")
             if not self._source_reachable():
                 raise RuntimeError("The ROM source is unavailable; downloads cannot start.")
-            for game_id in ids:
-                self._cache.cache_game(game_id)
-            completed = list(ids)
+            if self._downloads is None:
+                for game_id in ids:
+                    self._cache.cache_game(game_id)
+                completed = list(ids)
+            else:
+                result = self._downloads.enqueue(ids, origin=DownloadOrigin.MANUAL)
+                return {"action": action, "queued": result["items"], "count": result["count"]}
         elif action == "pin":
             for game_id in ids:
                 self._cache.pin(game_id)
@@ -153,6 +157,31 @@ class LibraryManagerService:
         if not self._source_reachable():
             raise RuntimeError("The ROM source is unavailable; pinned downloads cannot start.")
         return self._cache.download_pinned(**callbacks)  # type: ignore[arg-type]
+
+    def enqueue_pinned(self) -> dict[str, object]:
+        self._policy_loader().require(Capability.GAME_DOWNLOAD, "Download Pinned")
+        if not self._source_reachable():
+            raise RuntimeError("The ROM source is unavailable; pinned downloads cannot start.")
+        plan = self._cache.preflight_pinned()
+        if not plan.allowed:
+            raise ValueError(" ".join(plan.reasons))
+        if not plan.game_ids:
+            return {"items": [], "created": 0, "count": 0, "batch_id": None}
+        if self._downloads is None:
+            raise RuntimeError("Download Manager is unavailable.")
+        import uuid
+
+        batch_id = uuid.uuid4().hex
+        result = self._downloads.enqueue(
+            plan.game_ids, origin=DownloadOrigin.PINNED, batch_id=batch_id
+        )
+        return {**result, "batch_id": batch_id}
+
+    @property
+    def downloads(self):  # noqa: ANN201
+        if self._downloads is None:
+            raise RuntimeError("Download Manager is unavailable.")
+        return self._downloads
 
 
 def _optional_text(value: object) -> str | None:

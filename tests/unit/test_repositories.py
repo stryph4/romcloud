@@ -52,7 +52,7 @@ class TestDatabase:
         with db.connect() as conn:
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(games)")}
             assert "is_eligible" in columns
-            assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 3
+            assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 4
             assert conn.execute(
                 "SELECT is_eligible FROM games WHERE id = 'legacy'"
             ).fetchone()[0] == 1
