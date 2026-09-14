@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from romcloud.core.capabilities import CapabilityPolicy, OperatingMode
+from romcloud.core.capabilities import Capability, CapabilityPolicy, OperatingMode
 from romcloud.core.models.cache import CachePolicy
 from romcloud.core.models.download import DownloadOrigin
 from romcloud.core.models.game import Game, GameAsset
@@ -22,15 +22,18 @@ from romcloud.web.server import ManagerHTTPServer
 
 
 def _manager(
-    db, game_repo, cache_repo, cache_service, mode=OperatingMode.CACHE, downloads=None
+    db, game_repo, cache_repo, cache_service, mode=OperatingMode.CACHE, downloads=None,
+    *, source_reachable=True, blocked_capabilities=frozenset()
 ):
     return LibraryManagerService(
         LibraryBrowserRepository(db),
         game_repo,
         cache_repo,
         cache_service,
-        policy_loader=lambda: CapabilityPolicy("smart_cache", mode),
-        source_reachable=lambda: True,
+        policy_loader=lambda: CapabilityPolicy(
+            "smart_cache", mode, blocked_capabilities=blocked_capabilities
+        ),
+        source_reachable=lambda: source_reachable,
         downloads=downloads,
     )
 
@@ -421,6 +424,54 @@ def test_authenticated_download_api_exposes_queue_and_controls(
         server.server_close()
         thread.join(timeout=2)
     assert downloads.started == 1 and downloads.stopped == 1
+
+
+@pytest.mark.parametrize(
+    ("mode", "reachable", "blocked", "message"),
+    [
+        (OperatingMode.OFFLINE, True, frozenset(), "Offline"),
+        (
+            OperatingMode.CACHE, True, frozenset({Capability.GAME_DOWNLOAD}),
+            "configured storage provider",
+        ),
+        (OperatingMode.CACHE, False, frozenset(), "ROM source is unavailable"),
+    ],
+)
+def test_direct_download_enqueue_enforces_policy_before_durable_queue_creation(
+    db, game_repo, cache_repo, cache_service, tmp_path,
+    mode, reachable, blocked, message,
+):
+    game = _game(game_repo, tmp_path / "source", "nes", "Rejected")
+    downloads = _RecordingDownloads()
+    manager = _manager(
+        db, game_repo, cache_repo, cache_service, mode, downloads,
+        source_reachable=reachable, blocked_capabilities=blocked,
+    )
+    server = ManagerHTTPServer(("127.0.0.1", 0), manager, "secret")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{server.server_address[1]}/api/downloads/enqueue",
+        data=json.dumps({"game_ids": [game.id]}).encode(),
+        headers={
+            "Authorization": "Bearer secret",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with pytest.raises(urllib.error.HTTPError) as rejected:
+            urllib.request.urlopen(request, timeout=2)
+        assert rejected.value.code == 400
+        assert message in rejected.value.read().decode()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert downloads.enqueues == []
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM download_items").fetchone()[0] == 0
 
 
 def test_all_download_routes_return_503_when_manager_is_unavailable(

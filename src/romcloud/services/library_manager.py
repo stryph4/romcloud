@@ -120,9 +120,7 @@ class LibraryManagerService:
         if not ids or len(ids) > 500:
             raise ValueError("Select between 1 and 500 games.")
         if action in {"cache", "download_selected"}:
-            self._policy_loader().require(Capability.GAME_DOWNLOAD, "Downloading a game")
-            if not self._source_reachable():
-                raise RuntimeError("The ROM source is unavailable; downloads cannot start.")
+            self._require_download_available("Downloading a game")
             if self._downloads is None:
                 if action == "download_selected":
                     raise RuntimeError("Download Manager is unavailable.")
@@ -151,6 +149,26 @@ class LibraryManagerService:
         else:
             raise ValueError(f"Unsupported action: {action}")
         return {"action": action, "completed": completed, "count": len(completed)}
+
+    def enqueue_downloads(
+        self,
+        game_ids: Iterable[str],
+        *,
+        origin: DownloadOrigin = DownloadOrigin.MANUAL,
+    ) -> dict[str, object]:
+        """Queue user-requested downloads behind the shared policy boundary."""
+        ids = tuple(dict.fromkeys(str(value) for value in game_ids if value))
+        if not ids or len(ids) > 500:
+            raise ValueError("Select between 1 and 500 games.")
+        self._require_download_available("Downloading a game")
+        if self._downloads is None:
+            raise RuntimeError("Download Manager is unavailable.")
+        return self._downloads.enqueue(ids, origin=origin)
+
+    def _require_download_available(self, operation: str) -> None:
+        self._policy_loader().require(Capability.GAME_DOWNLOAD, operation)
+        if not self._source_reachable():
+            raise RuntimeError("The ROM source is unavailable; downloads cannot start.")
 
     def pinned_preflight(self) -> dict[str, object]:
         self._policy_loader().require(Capability.GAME_DOWNLOAD, "Download Pinned preflight")

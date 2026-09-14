@@ -104,6 +104,23 @@ def test_download_repository_dedupes_active_and_recovers_only_inflight(db, game_
     assert repo.get(two.id).state is DownloadState.INTERRUPTED
 
 
+def test_terminal_download_history_is_pruned_to_configured_bound(db, game_repo, tmp_path):
+    game = _game(game_repo, tmp_path / "source")
+    repo = DownloadRepository(db)
+    for _index in range(205):
+        item, created = repo.enqueue(
+            game_id=game.id, game_title=game.title, system=game.system,
+            origin=DownloadOrigin.MANUAL,
+        )
+        assert created
+        assert repo.transition(
+            item.id, from_states=[DownloadState.QUEUED], to_state=DownloadState.COMPLETE
+        )
+
+    assert repo.prune_terminal(keep=200) == 5
+    assert len(repo.list_all()) == 200
+
+
 def test_enqueue_persists_intent_without_claiming_cache_ownership(
     db, game_repo, cache_dir, tmp_path
 ):
@@ -198,6 +215,32 @@ def test_reservations_count_future_growth_and_reject_concurrent_overcommit(
             requested_growth=31, game_id=None, owner_kind="cli", owner_instance_id="two"
         )
     lease.release()
+
+
+def test_live_reservation_owner_lock_prevents_stale_reclamation(
+    db, cache_repo, cache_dir, data_dir
+):
+    coordinator = CacheStorageCoordinator(
+        db=db, cache_repo=cache_repo, cache_root=cache_dir,
+        lock_root=data_dir / "locks", max_size_bytes=100, min_free_bytes=0,
+    )
+    first = coordinator.admit(
+        requested_growth=30, game_id=None, owner_kind="cli", owner_instance_id="first"
+    )
+    second = coordinator.admit(
+        requested_growth=20, game_id=None, owner_kind="cli", owner_instance_id="second"
+    )
+    try:
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT id,reserved_bytes FROM cache_reservations ORDER BY reserved_bytes"
+            ).fetchall()
+        assert [(row["id"], row["reserved_bytes"]) for row in rows] == [
+            (second.id, 20), (first.id, 30),
+        ]
+    finally:
+        second.release()
+        first.release()
 
 
 def _coordinated_cache(db, cache_repo, game_repo, cache_dir, data_dir, source_root, capacity):
@@ -347,6 +390,59 @@ def test_stale_reservation_reclaim_keeps_promoted_recovery_bytes_counted(
         ).fetchone()[0] == 0
 
 
+def test_directory_replacement_final_and_backup_are_both_accounted(
+    db, cache_repo, cache_dir, data_dir
+):
+    staging = StagingRepository(db)
+    staging.replace_plan(
+        relative_path="ps3/Game.ps3", system="ps3", asset_kind="directory",
+        source_provider="local", source_root="/source", expected_size=5,
+        source_manifest_sha256="manifest", files=[{
+            "member_relative_path": "USRDIR/EBOOT.BIN", "expected_size": 5,
+            "source_object_id": None, "source_revision": None,
+            "source_checksum": None, "source_modified_epoch": None,
+        }],
+    )
+    final = cache_dir / "ps3" / "Game.ps3"
+    backup = final.with_name(final.name + ".romcloud-replaced")
+    (final / "USRDIR").mkdir(parents=True)
+    (final / "USRDIR" / "EBOOT.BIN").write_bytes(b"N" * 5)
+    (backup / "USRDIR").mkdir(parents=True)
+    (backup / "USRDIR" / "EBOOT.BIN").write_bytes(b"O" * 7)
+    coordinator = CacheStorageCoordinator(
+        db=db, cache_repo=cache_repo, cache_root=cache_dir,
+        lock_root=data_dir / "locks", max_size_bytes=100, min_free_bytes=0,
+    )
+
+    assert coordinator.snapshot()["staging_bytes"] == 12
+
+
+def test_admission_accounting_does_not_scan_unrelated_cache_trees(
+    db, cache_repo, cache_dir, data_dir, monkeypatch
+):
+    partial = cache_dir / ".partial" / "ps2" / "Game.iso.part"
+    partial.parent.mkdir(parents=True)
+    partial.write_bytes(b"P")
+    unrelated = cache_dir / "ps3" / "Huge.ps3"
+    unrelated.mkdir(parents=True)
+    (unrelated / "orphan.romcloud-replaced").write_bytes(b"not recovery state")
+    coordinator = CacheStorageCoordinator(
+        db=db, cache_repo=cache_repo, cache_root=cache_dir,
+        lock_root=data_dir / "locks", max_size_bytes=100, min_free_bytes=0,
+    )
+    scanned: list[Path] = []
+    original_rglob = Path.rglob
+
+    def track_rglob(path, pattern):
+        scanned.append(path)
+        return original_rglob(path, pattern)
+
+    monkeypatch.setattr(Path, "rglob", track_rglob)
+
+    assert coordinator.snapshot()["staging_bytes"] == 1
+    assert scanned == [cache_dir / ".partial"]
+
+
 def test_descriptor_transfer_uses_the_exact_snapshot_paired_with_its_locks(
     db, cache_repo, game_repo, cache_dir, data_dir, tmp_path, monkeypatch
 ):
@@ -406,6 +502,38 @@ def test_descriptor_transfer_uses_the_exact_snapshot_paired_with_its_locks(
     }
 
 
+def test_shared_m3u_dependency_locks_collide_by_resolved_physical_path(
+    db, cache_repo, game_repo, cache_dir, data_dir, tmp_path
+):
+    source_root = tmp_path / "source"
+    system = source_root / "psx"
+    system.mkdir(parents=True)
+    (system / "Shared.chd").write_bytes(b"shared")
+    games = []
+    for name in ("Collection A", "Collection B"):
+        playlist = system / f"{name}.m3u"
+        playlist.write_text("Shared.chd\n", encoding="utf-8")
+        game = Game.create(
+            "psx", name, "local", str(source_root),
+            [GameAsset(playlist.name, f"psx/{playlist.name}", playlist.stat().st_size, True)],
+        )
+        game_repo.save(game)
+        games.append(game)
+    cache, _transfer, _staging, _coordinator = _coordinated_cache(
+        db, cache_repo, game_repo, cache_dir, data_dir, source_root, 1024
+    )
+
+    first = cache.try_asset_locks(games[0].id)
+    assert first is not None
+    try:
+        assert cache.try_asset_locks(games[1].id) is None
+    finally:
+        first.release()
+    second = cache.try_asset_locks(games[1].id)
+    assert second is not None
+    second.release()
+
+
 class _RecordingFile(AbstractContextManager):
     def __init__(self, path: str, seeks: list[int]) -> None:
         self._file = Path(path).open("rb")
@@ -454,6 +582,10 @@ def test_exact_checkpoint_resume_and_changed_source_restart(db, game_repo, cache
     row = staging.get_file("ps2/Game.iso", "")
     assert row is not None and row.checkpoint_bytes == part.stat().st_size
     assert row.checkpoint_sha256 == hashlib.sha256(part.read_bytes()).hexdigest()
+    # Bytes written after the last durable checkpoint are never trusted. The
+    # retry truncates this tail before verifying and appending at the checkpoint.
+    with part.open("ab") as handle:
+        handle.write(b"uncommitted tail")
 
     final = Path(service.transfer(game))
     assert 1024 * 1024 in provider.seeks

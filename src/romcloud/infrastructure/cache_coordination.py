@@ -212,51 +212,48 @@ class CacheStorageCoordinator:
         # .partial while their manifest still awaits the final DB transaction.
         # Count those paths conservatively so stale-reservation reclamation
         # cannot make their physical quota ownership disappear.
+        recovery_assets = self._recovery_assets()
         return (
             staged
-            + self._unfinalized_promotion_bytes()
-            + self._replacement_backup_bytes()
+            + self._unfinalized_promotion_bytes(recovery_assets)
+            + self._replacement_backup_bytes(recovery_assets)
         )
 
-    def _replacement_backup_bytes(self) -> int:
-        """Count crash remnants from atomic directory replacement."""
-        total = 0
-        partial_root = self.cache_root / ".partial"
-        for path in self.cache_root.rglob("*.romcloud-replaced"):
-            try:
-                path.relative_to(partial_root)
-            except ValueError:
-                pass
-            else:
-                continue
-            if path.is_file() and not path.is_symlink():
-                total += path.stat().st_size
-            elif path.is_dir() and not path.is_symlink():
-                total += sum(
-                    item.stat().st_size
-                    for item in path.rglob("*")
-                    if item.is_file() and not item.is_symlink()
-                )
-        return total
-
-    def _unfinalized_promotion_bytes(self) -> int:
+    def _recovery_assets(self) -> tuple[tuple[str, str], ...]:
         with self.db.connect() as conn:
             rows = conn.execute(
                 "SELECT relative_path, system FROM cache_staging_assets"
             ).fetchall()
+        return tuple((str(row["system"]), str(row["relative_path"])) for row in rows)
+
+    def _replacement_backup_bytes(
+        self, recovery_assets: tuple[tuple[str, str], ...]
+    ) -> int:
+        """Count exact crash backups named by durable recovery manifests.
+
+        Every atomic replacement retains its staging manifest until the final
+        cache transaction commits, so legitimate backups are discoverable
+        without recursively walking unrelated cached directory packages.
+        """
         total = 0
-        for row in rows:
-            path = resolve_cache_path(
-                self.cache_root, row["system"], row["relative_path"]
+        for system, relative_path in recovery_assets:
+            final = resolve_cache_path(
+                self.cache_root, system, relative_path
             )
-            if path.is_file() and not path.is_symlink():
-                total += path.stat().st_size
-            elif path.is_dir() and not path.is_symlink():
-                total += sum(
-                    item.stat().st_size
-                    for item in path.rglob("*")
-                    if item.is_file() and not item.is_symlink()
-                )
+            total += _physical_size(
+                final.with_name(final.name + ".romcloud-replaced")
+            )
+        return total
+
+    def _unfinalized_promotion_bytes(
+        self, recovery_assets: tuple[tuple[str, str], ...]
+    ) -> int:
+        total = 0
+        for system, relative_path in recovery_assets:
+            path = resolve_cache_path(
+                self.cache_root, system, relative_path
+            )
+            total += _physical_size(path)
         return total
 
     def snapshot(self) -> dict[str, int]:
@@ -363,6 +360,18 @@ class CacheStorageCoordinator:
                     [(item,) for item in reclaimed],
                 )
         return len(reclaimed)
+
+
+def _physical_size(path: Path) -> int:
+    if path.is_file() and not path.is_symlink():
+        return path.stat().st_size
+    if path.is_dir() and not path.is_symlink():
+        return sum(
+            item.stat().st_size
+            for item in path.rglob("*")
+            if item.is_file() and not item.is_symlink()
+        )
+    return 0
 
 
 def _utc_now() -> str:

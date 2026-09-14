@@ -292,14 +292,16 @@ class ManagerRequestHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/download-pinned":
                 self._json(HTTPStatus.ACCEPTED, self.server.manager.enqueue_pinned())
             elif parsed.path == "/api/downloads/enqueue":
-                downloads = self._require_download_manager()
+                self._require_download_manager()
                 body = self._body()
                 from romcloud.core.models.download import DownloadOrigin
 
                 origin = DownloadOrigin(str(body.get("origin", "manual")))
                 self._json(
                     HTTPStatus.ACCEPTED,
-                    downloads.enqueue(body.get("game_ids", []), origin=origin),
+                    self.server.manager.enqueue_downloads(
+                        body.get("game_ids", []), origin=origin
+                    ),
                 )
             elif parsed.path == "/api/downloads/cancel-all":
                 downloads = self._require_download_manager()

@@ -98,6 +98,13 @@ def test_downloads_view_renders_durable_states_controls_and_controller_zones() -
     assert 'id="cancel-all-dialog"' in html and 'id="cancel-all-confirm"' in html
     assert '$("cancel-all-dialog").showModal()' in app
     assert 'button.dataset.controllerZone = "downloads"' in app
+    assert 'if (state.view === "downloads")' in app
+    assert 'showLibrary();' in app
+    assert 'window.romcloudGamepad.focusZone("global")' in app
+    assert app.index('if (state.view === "downloads")') < app.index("if (state.selected.size)")
+    assert 'url.searchParams.set("view", view)' in app
+    assert 'url.searchParams.delete("view")' in app
+    assert 'history.replaceState(null, "", url)' in app
     for endpoint in (
         "/api/downloads", "/api/downloads/cancel-all",
         "/api/downloads/retry-all-failed", "/api/downloads/cleanup",

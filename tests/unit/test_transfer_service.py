@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -386,6 +387,105 @@ class TestTransferService:
 
         assert (cache_dir / ".partial" / "ps2" / "Test Game.iso").is_file()
         assert not final.exists()
+
+    def test_directory_recovery_promotes_staging_when_old_final_was_parked(
+        self, dir_game, cache_dir, db
+    ):
+        game, source_root = dir_game
+        staging_repo = StagingRepository(db)
+        service = TransferService(
+            LocalFilesystemProvider(), str(cache_dir), staging_repository=staging_repo
+        )
+        final = Path(service.transfer(game))
+        backup = final.with_name(final.name + ".romcloud-replaced")
+        staged = cache_dir / ".partial" / "ps3" / "GAME"
+
+        # Crash window A: the old final was parked, but the completed staging
+        # directory had not yet been installed in the final namespace.
+        final.replace(backup)
+        shutil.copytree(source_root / "ps3" / "GAME", staged)
+
+        recovered = Path(service.transfer(game))
+
+        assert recovered == final and recovered.is_dir()
+        assert not staged.exists() and not backup.exists()
+        assert (recovered / "PS3_GAME" / "USRDIR" / "EBOOT.BIN").read_bytes() == b"eboot" * 50
+
+    def test_directory_recovery_cleans_backup_after_successful_promotion(
+        self, dir_game, cache_dir, db
+    ):
+        game, _ = dir_game
+        staging_repo = StagingRepository(db)
+        service = TransferService(
+            LocalFilesystemProvider(), str(cache_dir), staging_repository=staging_repo
+        )
+        final = Path(service.transfer(game))
+        backup = final.with_name(final.name + ".romcloud-replaced")
+
+        # Crash window B: new final and durable recovery manifest exist, but
+        # the obsolete replacement backup has not been removed yet.
+        shutil.copytree(final, backup)
+        before = final.stat().st_mtime_ns
+
+        assert Path(service.transfer(game)) == final
+        assert final.stat().st_mtime_ns == before
+        assert not backup.exists()
+
+    def test_directory_second_rename_failure_restores_old_final_and_retries(
+        self, dir_game, cache_dir, db, monkeypatch
+    ):
+        game, _ = dir_game
+        staging_repo = StagingRepository(db)
+        service = TransferService(
+            LocalFilesystemProvider(), str(cache_dir), staging_repository=staging_repo
+        )
+        final = cache_dir / "ps3" / "GAME"
+        staged = cache_dir / ".partial" / "ps3" / "GAME"
+        backup = final.with_name(final.name + ".romcloud-replaced")
+        final.mkdir(parents=True)
+        (final / "old.txt").write_bytes(b"old final")
+        import romcloud.services.transfer as transfer_module
+
+        original_replace = transfer_module.os.replace
+
+        def fail_staged_install(source, destination):
+            if Path(source) == staged and Path(destination) == final:
+                raise OSError("simulated directory install failure")
+            return original_replace(source, destination)
+
+        monkeypatch.setattr(transfer_module.os, "replace", fail_staged_install)
+        with pytest.raises(OSError, match="directory install failure"):
+            service.transfer(game)
+
+        assert (final / "old.txt").read_bytes() == b"old final"
+        assert staged.is_dir()
+        assert staging_repo.get_asset("ps3/GAME") is not None
+        assert not backup.exists()
+
+        monkeypatch.setattr(transfer_module.os, "replace", original_replace)
+        assert Path(service.transfer(game)) == final
+        assert not (final / "old.txt").exists()
+        assert not staged.exists() and not backup.exists()
+
+    def test_directory_recovery_rejects_old_final_when_source_changed(
+        self, dir_game, cache_dir, db
+    ):
+        game, source_root = dir_game
+        staging_repo = StagingRepository(db)
+        service = TransferService(
+            LocalFilesystemProvider(), str(cache_dir), staging_repository=staging_repo
+        )
+        final = Path(service.transfer(game))
+        backup = final.with_name(final.name + ".romcloud-replaced")
+        shutil.copytree(final, backup)
+        source_member = source_root / "ps3" / "GAME" / "PS3_GAME" / "USRDIR" / "EBOOT.BIN"
+        replacement = b"N" * source_member.stat().st_size
+        source_member.write_bytes(replacement)
+
+        recovered = Path(service.transfer(game))
+
+        assert (recovered / "PS3_GAME" / "USRDIR" / "EBOOT.BIN").read_bytes() == replacement
+        assert not backup.exists()
 
     def test_subsequent_transfer_reuses_safe_staging_path_and_completes(
         self, simple_game, cache_dir

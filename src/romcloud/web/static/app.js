@@ -1,5 +1,5 @@
 const $ = (id) => document.getElementById(id);
-const state = {token: "", localSession: false, controllerFirst: false, system: "", scope: "full", page: 1, pages: 0, selected: new Set(), status: null, loadSequence: 0};
+const state = {token: "", localSession: false, controllerFirst: false, view: "library", system: "", scope: "full", page: 1, pages: 0, selected: new Set(), status: null, loadSequence: 0};
 let contentUpdateScheduled = false;
 let oskSession = null;
 let diagnosticsBrowser = null;
@@ -168,9 +168,14 @@ function ensureDiagnosticsBrowser() {
 }
 
 function setViewNav(view) {
+  state.view = view;
   $("nav-library").classList.toggle("active", view === "library");
   $("nav-downloads").classList.toggle("active", view === "downloads");
   $("nav-diagnostics").classList.toggle("active", view === "diagnostics");
+  const url = new URL(location.href);
+  if (view === "library") url.searchParams.delete("view");
+  else url.searchParams.set("view", view);
+  history.replaceState(null, "", url);
 }
 
 async function openDiagnostics() {
@@ -446,7 +451,17 @@ window.addEventListener("romcloud:page-jump", (event) => {
 
 window.addEventListener("romcloud:controller-back", (event) => {
   if (diagnosticsBrowser && diagnosticsBrowser.active) {
-    event.preventDefault(); diagnosticsBrowser.back(); return;
+    event.preventDefault(); diagnosticsBrowser.back();
+    if (!diagnosticsBrowser.active) {
+      setViewNav("library");
+      if (window.romcloudGamepad) window.romcloudGamepad.focusZone("global");
+    }
+    return;
+  }
+  if (state.view === "downloads") {
+    event.preventDefault(); showLibrary();
+    if (window.romcloudGamepad) window.romcloudGamepad.focusZone("global");
+    return;
   }
   if (state.selected.size) {
     state.selected.clear(); updateBulk(); loadGames(); event.preventDefault(); return;

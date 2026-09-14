@@ -389,7 +389,8 @@ class CacheService:
                 self._transfer.estimate_size(resolved_game)
                 - sum(actual_before.values()),
             )
-        staged_before = self._transfer.staging_size(resolved_game)
+        staging_size = getattr(self._transfer, "staging_size", None)
+        staged_before = staging_size(resolved_game) if callable(staging_size) else 0
         needed = max(0, needed - staged_before)
         reservation = None
         if self._storage is not None:
@@ -896,10 +897,19 @@ class CacheService:
     ) -> dict[str, int]:
         """Return valid existing bytes that can be adopted by this snapshot."""
         sizes: dict[str, int] = {}
+        has_recovery_manifest = getattr(
+            self._transfer, "has_recovery_manifest", None
+        )
+        validated_promoted_size = getattr(
+            self._transfer, "validated_promoted_size", None
+        )
         for asset in game.assets:
-            if self._transfer.has_recovery_manifest(asset.relative_path):
-                recovered = self._transfer.validated_promoted_size(
-                    game.system, asset.relative_path
+            if callable(has_recovery_manifest) and has_recovery_manifest(
+                asset.relative_path
+            ):
+                recovered = (
+                    validated_promoted_size(game.system, asset.relative_path)
+                    if callable(validated_promoted_size) else None
                 )
                 if recovered is not None:
                     sizes[asset.relative_path] = recovered
