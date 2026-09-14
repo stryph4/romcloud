@@ -57,7 +57,7 @@
           <label><span>Sort</span><select id="sort" data-controller-zone="controls" data-controller-row="0" data-controller-col="2"><option value="title">Title A–Z</option><option value="title_desc">Title Z–A</option><option value="newest">Recently added</option><option value="recent">Recently played</option><option value="size">Largest local size</option></select></label>
         </div>
 
-        <div id="bulk" class="bulk hidden"><b id="selected-count">0 selected</b><button data-action="pin" data-controller-zone="bulk" data-controller-row="0" data-controller-col="0">Pin Selected</button><button data-action="unpin" data-controller-zone="bulk" data-controller-row="0" data-controller-col="1">Unpin</button><button data-action="remove" class="danger-text" data-controller-zone="bulk" data-controller-row="0" data-controller-col="2">Remove Local Copy</button><button id="clear-selection" data-controller-zone="bulk" data-controller-row="0" data-controller-col="3">Clear</button></div>
+        <div id="bulk" class="bulk hidden"><b id="selected-count">0 selected</b><button id="download-selected" data-action="download_selected" class="primary" data-controller-zone="bulk" data-controller-row="0" data-controller-col="0">Download Selected</button><button data-action="pin" data-controller-zone="bulk" data-controller-row="0" data-controller-col="1">Pin Selected</button><button data-action="unpin" data-controller-zone="bulk" data-controller-row="0" data-controller-col="2">Unpin</button><button data-action="remove" class="danger-text" data-controller-zone="bulk" data-controller-row="0" data-controller-col="3">Remove Local Copy</button><button id="clear-selection" data-controller-zone="bulk" data-controller-row="0" data-controller-col="4">Clear</button></div>
         <div id="notice" class="notice hidden"></div>
         <div id="controller-help" class="controller-help hidden"><b>Controller</b><span>Move</span> D-pad / Left Stick <span>Confirm</span> A <span>Back</span> B <span>Page jump</span> LB / RB <span>Menu</span> Start</div>
 
@@ -131,6 +131,13 @@
   </dialog>
 
   <button id="job" class="job hidden" type="button"><div><b id="job-title">Active download</b><span id="job-detail"></span></div><progress id="job-progress"></progress></button>
+  <dialog id="cancel-all-dialog">
+    <div class="dialog-card">
+      <div class="dialog-head"><div><p class="eyebrow">Download queue</p><h2>Cancel all downloads?</h2></div></div>
+      <p>Queued and active downloads will stop. Retained partial data remains available for resume or explicit discard.</p>
+      <div class="dialog-actions"><button id="cancel-all-back" data-controller-zone="dialog" data-controller-row="0" data-controller-col="0">Keep Downloads</button><button id="cancel-all-confirm" class="danger-text" data-controller-zone="dialog" data-controller-row="0" data-controller-col="1">Cancel All</button></div>
+    </div>
+  </dialog>
   <dialog id="devices-dialog">
     <div class="dialog-card">
       <div class="dialog-head"><h2>Trusted Remote Devices</h2><button id="close-devices" class="icon-button" data-controller-zone="dialog" data-controller-row="0" data-controller-col="0">Close</button></div>

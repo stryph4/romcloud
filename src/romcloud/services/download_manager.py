@@ -128,7 +128,13 @@ class DownloadManagerService:
                 }
             )
             payload.update(stats)
-            if item.state is not DownloadState.COMPLETE:
+            if item.state in {DownloadState.RUNNING, DownloadState.VERIFYING}:
+                payload["bytes_present"] = max(
+                    item.bytes_present, stats["retained_bytes"]
+                )
+            elif item.state is not DownloadState.COMPLETE:
+                # After restart/pause/failure, only durable final membership
+                # and staging checkpoints are truthful retained progress.
                 payload["bytes_present"] = stats["retained_bytes"]
             remaining = max(0, item.bytes_total - int(payload["bytes_present"]))
             payload["eta_seconds"] = remaining / speed if speed > 0 else None
@@ -347,13 +353,29 @@ class DownloadManagerService:
                     error_message="The catalog game no longer exists.",
                 )
                 continue
-            lease = self._cache.try_asset_locks(item.game_id)
+            try:
+                lease = self._cache.try_asset_locks(item.game_id)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Could not resolve/lock download closure: %s", item.id)
+                self._repo.transition(
+                    item.id, from_states=[DownloadState.QUEUED],
+                    to_state=DownloadState.FAILED,
+                    error_code=type(exc).__name__, error_message=str(exc),
+                )
+                continue
             if lease is None:
                 self._wake.wait(0.5)
                 self._wake.clear()
                 continue
             token = TransferCancellationToken()
-            retained = self._cache.retained_staging_size(item.game_id)
+            resolved_snapshot = getattr(lease, "resolved_game", None)
+            retained = (
+                self._cache.retained_staging_size(
+                    item.game_id, resolved_game=resolved_snapshot
+                )
+                if resolved_snapshot is not None
+                else self._cache.retained_staging_size(item.game_id)
+            )
             initial = DownloadState.VERIFYING if retained else DownloadState.RUNNING
             if not self._repo.transition(
                 item.id, from_states=[DownloadState.QUEUED], to_state=initial,

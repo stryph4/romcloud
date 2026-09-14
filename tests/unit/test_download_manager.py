@@ -122,6 +122,52 @@ def test_enqueue_persists_intent_without_claiming_cache_ownership(
         assert conn.execute("SELECT COUNT(*) FROM cache_members").fetchone()[0] == 0
 
 
+def test_status_combines_valid_final_members_with_staging_checkpoints(
+    db, game_repo, cache_repo, cache_dir, tmp_path
+):
+    source_root = tmp_path / "source"
+    (source_root / "psx").mkdir(parents=True)
+    assets = [
+        GameAsset("Shared.chd", "psx/Shared.chd", 10, False),
+        GameAsset("Game.m3u", "psx/Game.m3u", 20, True),
+    ]
+    game = Game.create("psx", "Game", "local", str(source_root), assets)
+    game_repo.save(game)
+    cache_repo.save(CacheEntry.create(game.id, str(cache_dir / "psx" / "Game.m3u")))
+    cache_repo.replace_membership(
+        game.id, assets, {"psx/Shared.chd": 10, "psx/Game.m3u": 0}
+    )
+    staging = StagingRepository(db)
+    staging.replace_plan(
+        relative_path="psx/Game.m3u", system="psx", asset_kind="file",
+        source_provider="local", source_root=str(source_root), expected_size=20,
+        source_manifest_sha256="manifest", files=[{
+            "member_relative_path": "", "expected_size": 20,
+            "source_object_id": None, "source_revision": None,
+            "source_checksum": None, "source_modified_epoch": None,
+        }],
+    )
+    staging.checkpoint("psx/Game.m3u", "", 4, "digest", state="partial")
+    repo = DownloadRepository(db)
+    item, _ = repo.enqueue(
+        game_id=game.id, game_title=game.title, system=game.system,
+        origin=DownloadOrigin.MANUAL,
+    )
+    repo.update_progress(item.id, 4, 30)
+    assert repo.transition(
+        item.id, from_states=[DownloadState.QUEUED], to_state=DownloadState.FAILED
+    )
+    manager = DownloadManagerService(
+        repository=repo, staging_repository=staging, game_repo=game_repo,
+        cache=_WorkerCache(), cache_root=str(cache_dir),
+    )
+
+    payload = manager.status()["failed"][0]
+
+    assert payload["bytes_present"] == 14
+    assert payload["has_partial"] is True
+
+
 def test_asset_locks_collide_by_physical_path_without_global_serialization(tmp_path):
     manager = AssetLockManager(tmp_path / "locks")
     first = manager.acquire([tmp_path / "cache" / "psx" / "Shared.chd"], blocking=False)
@@ -256,6 +302,110 @@ def test_invalid_partial_and_promotion_never_open_capacity_hole(
         assert conn.execute("SELECT COUNT(*) FROM cache_staging_assets").fetchone()[0] == 0
 
 
+def test_stale_reservation_reclaim_keeps_promoted_recovery_bytes_counted(
+    db, cache_repo, cache_dir, data_dir
+):
+    relative = "ps2/Promoted.iso"
+    final = cache_dir / "ps2" / "Promoted.iso"
+    final.parent.mkdir(parents=True)
+    final.write_bytes(b"P" * 70)
+    staging = StagingRepository(db)
+    staging.replace_plan(
+        relative_path=relative, system="ps2", asset_kind="file",
+        source_provider="local", source_root="/source", expected_size=70,
+        source_manifest_sha256="manifest", files=[{
+            "member_relative_path": "", "expected_size": 70,
+            "source_object_id": None, "source_revision": None,
+            "source_checksum": None, "source_modified_epoch": None,
+        }],
+    )
+    staging.complete(relative, "", 70, hashlib.sha256(final.read_bytes()).hexdigest())
+    now = datetime.now(timezone.utc).isoformat()
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO cache_reservations "
+            "(id,owner_kind,owner_instance_id,reserved_bytes,created_at,updated_at) "
+            "VALUES ('dead','cli','gone',70,?,?)",
+            (now, now),
+        )
+    coordinator = CacheStorageCoordinator(
+        db=db, cache_repo=cache_repo, cache_root=cache_dir,
+        lock_root=data_dir / "locks", max_size_bytes=70, min_free_bytes=0,
+    )
+
+    lease = coordinator.admit(
+        requested_growth=0, game_id=None, owner_kind="cli", owner_instance_id="live"
+    )
+    snapshot = coordinator.snapshot()
+    lease.release()
+
+    assert snapshot["staging_bytes"] == 70
+    assert snapshot["reserved_growth"] == 0
+    with db.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM cache_reservations WHERE id='dead'"
+        ).fetchone()[0] == 0
+
+
+def test_descriptor_transfer_uses_the_exact_snapshot_paired_with_its_locks(
+    db, cache_repo, game_repo, cache_dir, data_dir, tmp_path, monkeypatch
+):
+    source_root = tmp_path / "source"
+    system = source_root / "psx"
+    system.mkdir(parents=True)
+    playlist = system / "Collection.m3u"
+    playlist.write_text("Disc A.chd\n", encoding="utf-8")
+    (system / "Disc A.chd").write_bytes(b"A" * 9)
+    (system / "Disc B.chd").write_bytes(b"B" * 9)
+    game = Game.create(
+        "psx", "Collection", "local", str(source_root),
+        [GameAsset("Collection.m3u", "psx/Collection.m3u", playlist.stat().st_size, True)],
+    )
+    game_repo.save(game)
+    cache, transfer, _staging, coordinator = _coordinated_cache(
+        db, cache_repo, game_repo, cache_dir, data_dir, source_root, 1024
+    )
+    held: set[Path] = set()
+    transferred: list[tuple[str, ...]] = []
+    original_acquire = coordinator.assets.acquire
+    original_transfer = transfer.transfer
+
+    def acquire_then_mutate(paths, *, blocking):
+        locked = {Path(path) for path in paths}
+        held.clear()
+        held.update(locked)
+        playlist.write_text("Disc B.chd\n", encoding="utf-8")
+        underlying = original_acquire(paths, blocking=blocking)
+
+        class TrackingLease:
+            def release(self):
+                held.clear()
+                underlying.release()
+
+        return TrackingLease()
+
+    def record_transfer(resolved, *args, **kwargs):
+        transferred.append(tuple(asset.relative_path for asset in resolved.assets))
+        destinations = {
+            cache_dir.joinpath(*Path(asset.relative_path).parts)
+            for asset in resolved.assets
+        }
+        assert destinations <= held
+        return original_transfer(resolved, *args, **kwargs)
+
+    monkeypatch.setattr(coordinator.assets, "acquire", acquire_then_mutate)
+    monkeypatch.setattr(transfer, "transfer", record_transfer)
+
+    cache.cache_game(game.id)
+
+    assert transferred == [("psx/Collection.m3u", "psx/Disc B.chd")]
+    assert (cache_dir / "psx" / "Disc B.chd").read_bytes() == b"B" * 9
+    assert not (cache_dir / "psx" / "Disc A.chd").exists()
+    assert {member.relative_path for member in cache_repo.list_members(game.id)} == {
+        "psx/Collection.m3u", "psx/Disc B.chd",
+    }
+
+
 class _RecordingFile(AbstractContextManager):
     def __init__(self, path: str, seeks: list[int]) -> None:
         self._file = Path(path).open("rb")
@@ -359,6 +509,34 @@ def test_serial_worker_fifo_and_restart_state_preservation(db, game_repo, cache_
     manager.shutdown()
     assert cache.completed == [first.id, second.id]
     assert [item.state for item in repo.list()] == [DownloadState.COMPLETE, DownloadState.COMPLETE]
+
+
+def test_closure_resolution_failure_fails_item_without_killing_worker(
+    db, game_repo, cache_dir, tmp_path
+):
+    first = _game(game_repo, tmp_path / "source", "A.iso")
+    second = _game(game_repo, tmp_path / "source", "B.iso")
+
+    class LockFailCache(_WorkerCache):
+        def try_asset_locks(self, game_id):
+            if game_id == first.id:
+                raise OSError("descriptor changed repeatedly")
+            return super().try_asset_locks(game_id)
+
+    repo = DownloadRepository(db)
+    cache = LockFailCache()
+    manager = DownloadManagerService(
+        repository=repo, staging_repository=StagingRepository(db),
+        game_repo=game_repo, cache=cache, cache_root=str(cache_dir),
+    )
+    first_id = manager.enqueue([first.id])["items"][0]["id"]
+    second_id = manager.enqueue([second.id])["items"][0]["id"]
+    manager.start()
+    _wait_state(repo, first_id, DownloadState.FAILED)
+    _wait_state(repo, second_id, DownloadState.COMPLETE)
+    manager.shutdown()
+
+    assert cache.completed == [second.id]
 
 
 class _ControlledCache(_WorkerCache):

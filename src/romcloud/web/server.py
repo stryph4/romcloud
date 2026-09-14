@@ -40,6 +40,10 @@ _CONTROLLER_EVENT_MAX_BYTES = 4096
 _CONTROLLER_BATCH_MAX = 64
 
 
+class DownloadManagerUnavailable(RuntimeError):
+    """The resident download service is not configured in this process."""
+
+
 class ControllerDiagnosticLog:
     """Bounded JSON-lines diagnostics for the loopback Open Here session."""
 
@@ -215,6 +219,8 @@ class ManagerRequestHandler(BaseHTTPRequestHandler):
                 self._static(parsed.path[1:])
             else:
                 self.send_error(HTTPStatus.NOT_FOUND)
+        except DownloadManagerUnavailable as exc:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
         except (ValueError, ROMCloudError, RuntimeError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except Exception:  # noqa: BLE001
@@ -326,6 +332,8 @@ class ManagerRequestHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, {"id": item_id, "action": control})
             else:
                 self.send_error(HTTPStatus.NOT_FOUND)
+        except DownloadManagerUnavailable as exc:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
         except (ValueError, ROMCloudError, RuntimeError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except Exception:  # noqa: BLE001
@@ -334,7 +342,7 @@ class ManagerRequestHandler(BaseHTTPRequestHandler):
 
     def _require_download_manager(self):  # noqa: ANN201
         if self.server.downloads is None:
-            raise RuntimeError("Download Manager is unavailable.")
+            raise DownloadManagerUnavailable("Download Manager is unavailable.")
         return self.server.downloads
 
     def _authenticated(self) -> bool:

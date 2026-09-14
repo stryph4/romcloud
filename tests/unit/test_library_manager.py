@@ -264,10 +264,16 @@ def test_row_download_and_pinned_batch_enqueue_asynchronously(
     assert result["count"] == 1
     assert downloads.enqueues[0] == ([first.id], DownloadOrigin.MANUAL, None)
 
+    selected = manager.action("download_selected", [first.id, second.id])
+    assert selected["count"] == 2
+    assert downloads.enqueues[1] == (
+        [first.id, second.id], DownloadOrigin.SELECTED, None
+    )
+
     cache_service.pin(first.id)
     cache_service.pin(second.id)
     pinned = manager.enqueue_pinned()
-    ids, origin, batch_id = downloads.enqueues[1]
+    ids, origin, batch_id = downloads.enqueues[2]
     assert set(ids) == {first.id, second.id}
     assert origin is DownloadOrigin.PINNED
     assert batch_id and pinned["batch_id"] == batch_id
@@ -386,7 +392,12 @@ def test_authenticated_download_api_exposes_queue_and_controls(
 
     try:
         with pytest.raises(urllib.error.HTTPError) as denied:
-            urllib.request.urlopen(f"{base}/api/downloads", timeout=2)
+            urllib.request.urlopen(
+                urllib.request.Request(
+                    f"{base}/api/downloads", headers={"Host": "batocera.local"}
+                ),
+                timeout=2,
+            )
         assert denied.value.code == 401
         with urllib.request.urlopen(request("/api/downloads"), timeout=2) as response:
             assert json.load(response)["items"] == []
@@ -410,6 +421,46 @@ def test_authenticated_download_api_exposes_queue_and_controls(
         server.server_close()
         thread.join(timeout=2)
     assert downloads.started == 1 and downloads.stopped == 1
+
+
+def test_all_download_routes_return_503_when_manager_is_unavailable(
+    db, game_repo, cache_repo, cache_service
+):
+    server = ManagerHTTPServer(
+        ("127.0.0.1", 0),
+        _manager(db, game_repo, cache_repo, cache_service),
+        "secret",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    routes = [
+        ("GET", "/api/downloads"),
+        ("POST", "/api/downloads/enqueue"),
+        ("POST", "/api/downloads/cancel-all"),
+        ("POST", "/api/downloads/retry-all-failed"),
+        ("POST", "/api/downloads/cleanup"),
+        ("POST", "/api/downloads/item-1/pause"),
+    ]
+    try:
+        for method, path in routes:
+            request = urllib.request.Request(
+                f"{base}{path}",
+                data=b"{}" if method == "POST" else None,
+                headers={
+                    "Authorization": "Bearer secret",
+                    "Content-Type": "application/json",
+                },
+                method=method,
+            )
+            with pytest.raises(urllib.error.HTTPError) as unavailable:
+                urllib.request.urlopen(request, timeout=2)
+            assert unavailable.value.code == 503, path
+            assert "Download Manager is unavailable" in unavailable.value.read().decode()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def test_local_diagnostics_api_is_paginated_filterable_and_structured(

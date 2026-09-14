@@ -212,7 +212,32 @@ class CacheStorageCoordinator:
         # .partial while their manifest still awaits the final DB transaction.
         # Count those paths conservatively so stale-reservation reclamation
         # cannot make their physical quota ownership disappear.
-        return staged + self._unfinalized_promotion_bytes()
+        return (
+            staged
+            + self._unfinalized_promotion_bytes()
+            + self._replacement_backup_bytes()
+        )
+
+    def _replacement_backup_bytes(self) -> int:
+        """Count crash remnants from atomic directory replacement."""
+        total = 0
+        partial_root = self.cache_root / ".partial"
+        for path in self.cache_root.rglob("*.romcloud-replaced"):
+            try:
+                path.relative_to(partial_root)
+            except ValueError:
+                pass
+            else:
+                continue
+            if path.is_file() and not path.is_symlink():
+                total += path.stat().st_size
+            elif path.is_dir() and not path.is_symlink():
+                total += sum(
+                    item.stat().st_size
+                    for item in path.rglob("*")
+                    if item.is_file() and not item.is_symlink()
+                )
+        return total
 
     def _unfinalized_promotion_bytes(self) -> int:
         with self.db.connect() as conn:

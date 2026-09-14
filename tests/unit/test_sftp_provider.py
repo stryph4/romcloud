@@ -33,6 +33,7 @@ from romcloud.infrastructure.providers.sftp import (
     fingerprint_of,
     probe_host_key,
 )
+from romcloud.infrastructure.repositories.download import StagingRepository
 from romcloud.services.transfer import TransferService
 
 # A client that disconnects right after a rejected auth/host-key handshake
@@ -63,14 +64,31 @@ class _StubServer(paramiko.ServerInterface):
 
 
 class _StubHandle(paramiko.SFTPHandle):
+    def __init__(self, flags, operations, handle_id):
+        super().__init__(flags)
+        self._operations = operations
+        self._handle_id = handle_id
+
     def stat(self):
         return paramiko.SFTPAttributes.from_stat(os.fstat(self.readfile.fileno()))
+
+    def read(self, offset, length):
+        self._operations.append(("read", self._handle_id, offset, length))
+        return super().read(offset, length)
+
+    def write(self, offset, data):
+        self._operations.append(("write", self._handle_id, offset, len(data)))
+        return super().write(offset, data)
 
 
 class _StubSFTPServer(paramiko.SFTPServerInterface):
     """No virtual chroot: the client always sends full real paths (matching
     how :class:`SFTPProvider` itself works), so canonicalization is a no-op
     and only separator style needs reconciling with the host OS."""
+
+    def __init__(self, server, recorder):
+        super().__init__(server)
+        self._recorder = recorder
 
     def canonicalize(self, path):
         return path
@@ -105,6 +123,9 @@ class _StubSFTPServer(paramiko.SFTPServerInterface):
 
     def open(self, path, flags, attr):
         real = self._real(path)
+        handle_id = self._recorder["next_handle"]
+        self._recorder["next_handle"] += 1
+        self._recorder["events"].append(("open", handle_id, path, flags))
         try:
             mode = getattr(attr, "st_mode", None) or 0o666
             fd = os.open(real, flags, mode)
@@ -116,13 +137,14 @@ class _StubSFTPServer(paramiko.SFTPServerInterface):
             fstr = "a+b" if flags & os.O_APPEND else "r+b"
         else:
             fstr = "rb"
-        handle = _StubHandle(flags)
+        handle = _StubHandle(flags, self._recorder["events"], handle_id)
         f = os.fdopen(fd, fstr)
         handle.readfile = f
         handle.writefile = f
         return handle
 
     def remove(self, path):
+        self._recorder["events"].append(("remove", path))
         try:
             os.remove(self._real(path))
         except OSError as exc:
@@ -130,11 +152,16 @@ class _StubSFTPServer(paramiko.SFTPServerInterface):
         return paramiko.SFTP_OK
 
     def mkdir(self, path, attr):
+        self._recorder["events"].append(("mkdir", path))
         try:
             os.mkdir(self._real(path))
         except OSError as exc:
             return paramiko.SFTPServer.convert_errno(exc.errno)
         return paramiko.SFTP_OK
+
+    def rename(self, oldpath, newpath):
+        self._recorder["events"].append(("rename", oldpath, newpath))
+        return paramiko.SFTP_OP_UNSUPPORTED
 
 
 class _SftpTestServer:
@@ -147,6 +174,7 @@ class _SftpTestServer:
         self._sock.listen(5)
         self.port = self._sock.getsockname()[1]
         self._root = str(root)
+        self._recorder = {"events": [], "next_handle": 0}
         self._stop = False
         self._thread = threading.Thread(target=self._serve_forever, daemon=True)
         self._thread.start()
@@ -168,7 +196,9 @@ class _SftpTestServer:
         transport = paramiko.Transport(client_sock)
         transport.add_server_key(self.host_key)
 
-        transport.set_subsystem_handler("sftp", paramiko.SFTPServer, _StubSFTPServer)
+        transport.set_subsystem_handler(
+            "sftp", paramiko.SFTPServer, _StubSFTPServer, self._recorder
+        )
         server = _StubServer()
         try:
             transport.start_server(server=server)
@@ -185,6 +215,13 @@ class _SftpTestServer:
             self._sock.close()
         except OSError:
             pass
+
+    @property
+    def operations(self):
+        return self._recorder["events"]
+
+    def clear_operations(self) -> None:
+        self._recorder["events"].clear()
 
 
 @pytest.fixture
@@ -394,6 +431,109 @@ class TestReadOperations:
         provider = _provider(server)
         with provider.open_binary((root / "stream.bin").as_posix()) as fh:
             assert fh.read() == b"stream-me"
+
+    def test_transfer_service_resumes_verified_offset_with_zero_remote_writes(
+        self, sftp_server, tmp_path, db, monkeypatch
+    ):
+        server, root = sftp_server
+        source_root = root / "roms"
+        source = source_root / "ps2" / "Resume.iso"
+        source.parent.mkdir(parents=True)
+        payload = b"A" * (3 * 1024 * 1024)
+        source.write_bytes(payload)
+        game = Game.create(
+            "ps2", "Resume", "sftp", source_root.as_posix(),
+            [GameAsset("Resume.iso", "ps2/Resume.iso", len(payload), True)],
+        )
+        provider = _provider(server)
+        closed_sessions: list[bool] = []
+        original_connect = provider._connect
+
+        def tracked_connect():
+            client, sftp = original_connect()
+            original_close = client.close
+
+            def tracked_close():
+                closed_sessions.append(True)
+                original_close()
+
+            monkeypatch.setattr(client, "close", tracked_close)
+            return client, sftp
+
+        monkeypatch.setattr(provider, "_connect", tracked_connect)
+        staging = StagingRepository(db)
+        service = TransferService(
+            provider, str(tmp_path / "cache"), staging_repository=staging
+        )
+        all_events = []
+
+        cancellation = TransferCancellationToken()
+        with pytest.raises(TransferCancelledError):
+            service.transfer(
+                game,
+                lambda done, _total: cancellation.cancel()
+                if done >= 1024 * 1024 else None,
+                cancellation,
+            )
+        part = tmp_path / "cache" / ".partial" / "ps2" / "Resume.iso.part"
+        checkpoint = part.stat().st_size
+        record = staging.get_file("ps2/Resume.iso", "")
+        assert checkpoint == 1024 * 1024
+        assert record is not None and record.checkpoint_bytes == checkpoint
+        assert provider._transfer_session_state.get() is None
+        all_events.extend(server.operations)
+
+        server.clear_operations()
+        final = Path(service.transfer(game))
+        resume_events = list(server.operations)
+        all_events.extend(resume_events)
+        first_read_offset: dict[int, int] = {}
+        for event in resume_events:
+            if event[0] == "read":
+                first_read_offset.setdefault(event[1], event[2])
+        # One handle verifies from byte zero; the subsequent transfer handle
+        # begins at the exact durable checkpoint.
+        assert 0 in first_read_offset.values()
+        assert checkpoint in first_read_offset.values()
+        assert final.read_bytes() == payload
+
+        # Build another retained prefix, then replace the source with different
+        # same-size bytes. Verification may read the old offset, but the actual
+        # transfer must restart from byte zero rather than append stale data.
+        final.unlink()
+        cancellation = TransferCancellationToken()
+        server.clear_operations()
+        with pytest.raises(TransferCancelledError):
+            service.transfer(
+                game,
+                lambda done, _total: cancellation.cancel()
+                if done >= checkpoint else None,
+                cancellation,
+            )
+        all_events.extend(server.operations)
+        replacement = b"B" * len(payload)
+        source.write_bytes(replacement)
+        server.clear_operations()
+        assert Path(service.transfer(game)).read_bytes() == replacement
+        mismatch_events = list(server.operations)
+        all_events.extend(mismatch_events)
+        mismatch_first_reads: dict[int, int] = {}
+        for event in mismatch_events:
+            if event[0] == "read":
+                mismatch_first_reads.setdefault(event[1], event[2])
+        assert mismatch_first_reads
+        assert set(mismatch_first_reads.values()) == {0}
+
+        write_flags = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+        mutations = [
+            event for event in all_events
+            if event[0] in {"write", "remove", "mkdir", "rename"}
+            or (event[0] == "open" and event[3] & write_flags)
+        ]
+        assert mutations == []
+        assert len(closed_sessions) == 4
+        assert provider._transfer_session_state.get() is None
+        assert part.exists() is False
 
     def test_is_reachable_false_for_missing_path(self, sftp_server):
         server, root = sftp_server

@@ -91,6 +91,12 @@ def test_downloads_view_renders_durable_states_controls_and_controller_zones() -
     assert 'id="nav-downloads"' in html and 'id="downloads-main"' in html
     assert 'id="job"' in html and 'id="partial-usage"' in html
     assert 'data-controller-zone="download-bulk"' in html
+    assert '"download-bulk", "downloads"' in (
+        STATIC / "controller.js"
+    ).read_text(encoding="utf-8")
+    assert 'id="download-selected"' in html and 'data-action="download_selected"' in html
+    assert 'id="cancel-all-dialog"' in html and 'id="cancel-all-confirm"' in html
+    assert '$("cancel-all-dialog").showModal()' in app
     assert 'button.dataset.controllerZone = "downloads"' in app
     for endpoint in (
         "/api/downloads", "/api/downloads/cancel-all",

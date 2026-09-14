@@ -56,6 +56,7 @@ async function connect(token) {
     $("offline-banner").classList.toggle("hidden", !state.status.offline);
     $("tab-full").disabled = !state.status.full_library_available;
     $("download-pinned").disabled = !state.status.can_download;
+    $("download-selected").disabled = !state.status.can_download;
     if (!state.status.full_library_available) { state.scope = "device"; setActiveTab(); }
     if (!state.status.source_reachable && !state.status.offline) showNotice("ROM source unavailable — browsing local content only.", true);
     if (!window.isSecureContext) showNotice("Controller input requires HTTPS when this manager is opened from another device. Restart without --http.", true);
@@ -272,6 +273,8 @@ async function loadDownloads() {
     contentUpdated();
   } catch (error) {
     $("downloads-list").replaceChildren(el("div", "empty error", error.message));
+    $("job").classList.add("hidden");
+    contentUpdated();
   }
 }
 
@@ -280,7 +283,7 @@ async function runAction(action, ids, button = null) {
   showNotice(`${title(action)} in progress…`);
   try {
     await api("/api/actions", {method: "POST", body: JSON.stringify({action, game_ids: ids})});
-    ids.forEach((id) => state.selected.delete(id)); updateBulk(); showNotice(action === "cache" ? `Queued ${ids.length} download${ids.length === 1 ? "" : "s"}.` : `${title(action)} completed for ${ids.length} game${ids.length === 1 ? "" : "s"}.`); await loadSystems(); await loadGames(); await loadDownloads();
+    ids.forEach((id) => state.selected.delete(id)); updateBulk(); showNotice(["cache", "download_selected"].includes(action) ? `Queued ${ids.length} download${ids.length === 1 ? "" : "s"}.` : `${title(action)} completed for ${ids.length} game${ids.length === 1 ? "" : "s"}.`); await loadSystems(); await loadGames(); await loadDownloads();
   } catch (error) { showNotice(error.message, true); }
   finally { if (button) button.disabled = false; }
 }
@@ -413,7 +416,18 @@ $("clear-selection").addEventListener("click", () => { state.selected.clear(); u
 $("bulk").querySelectorAll("[data-action]").forEach((button) => button.addEventListener("click", () => runAction(button.dataset.action, [...state.selected], button)));
 $("download-pinned").addEventListener("click", showPreflight); $("start-download").addEventListener("click", startDownload);
 $("job").addEventListener("click", openDownloads);
-$("downloads-cancel-all").addEventListener("click", async () => { await api("/api/downloads/cancel-all", {method: "POST", body: "{}"}); await loadDownloads(); });
+$("downloads-cancel-all").addEventListener("click", () => { $("cancel-all-dialog").showModal(); contentUpdated(); });
+$("cancel-all-back").addEventListener("click", () => $("cancel-all-dialog").close("cancel"));
+$("cancel-all-confirm").addEventListener("click", async () => {
+  $("cancel-all-confirm").disabled = true;
+  try {
+    const result = await api("/api/downloads/cancel-all", {method: "POST", body: "{}"});
+    $("cancel-all-dialog").close("confirmed");
+    showDownloadsNotice(`Cancelled ${result.cancelled} download${result.cancelled === 1 ? "" : "s"}.`);
+    await loadDownloads();
+  } catch (error) { showDownloadsNotice(error.message, true); }
+  finally { $("cancel-all-confirm").disabled = false; }
+});
 $("downloads-retry-all").addEventListener("click", async () => { await api("/api/downloads/retry-all-failed", {method: "POST", body: "{}"}); await loadDownloads(); });
 $("downloads-cleanup").addEventListener("click", async () => { const result = await api("/api/downloads/cleanup", {method: "POST", body: "{}"}); showDownloadsNotice(`Cleaned ${result.cleaned} stale download${result.cleaned === 1 ? "" : "s"}.`); await loadDownloads(); });
 

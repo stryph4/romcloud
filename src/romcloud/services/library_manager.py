@@ -119,16 +119,22 @@ class LibraryManagerService:
         ids = tuple(dict.fromkeys(str(value) for value in game_ids if value))
         if not ids or len(ids) > 500:
             raise ValueError("Select between 1 and 500 games.")
-        if action == "cache":
+        if action in {"cache", "download_selected"}:
             self._policy_loader().require(Capability.GAME_DOWNLOAD, "Downloading a game")
             if not self._source_reachable():
                 raise RuntimeError("The ROM source is unavailable; downloads cannot start.")
             if self._downloads is None:
+                if action == "download_selected":
+                    raise RuntimeError("Download Manager is unavailable.")
                 for game_id in ids:
                     self._cache.cache_game(game_id)
                 completed = list(ids)
             else:
-                result = self._downloads.enqueue(ids, origin=DownloadOrigin.MANUAL)
+                origin = (
+                    DownloadOrigin.SELECTED
+                    if action == "download_selected" else DownloadOrigin.MANUAL
+                )
+                result = self._downloads.enqueue(ids, origin=origin)
                 return {"action": action, "queued": result["items"], "count": result["count"]}
         elif action == "pin":
             for game_id in ids:

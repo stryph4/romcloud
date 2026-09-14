@@ -516,7 +516,7 @@ class StagingRepository:
                     COALESCE(SUM(CASE WHEN file.state='complete' OR file.checkpoint_bytes>0 THEN 1 ELSE 0 END),0) AS retained_files,
                     COALESCE(SUM(CASE WHEN file.state IN ('partial','transferring') THEN 1 ELSE 0 END),0) AS interrupted_files,
                     COALESCE(SUM(CASE WHEN file.state!='complete' THEN 1 ELSE 0 END),0) AS remaining_files,
-                    COALESCE(SUM(file.checkpoint_bytes),0) AS retained_bytes
+                    COALESCE(SUM(file.checkpoint_bytes),0) AS staged_bytes
                 FROM cache_staging_files AS file
                 JOIN cache_members AS member
                   ON member.relative_path=file.asset_relative_path
@@ -524,7 +524,24 @@ class StagingRepository:
                 """,
                 (game_id,),
             ).fetchone()
-        return {key: int(row[key]) for key in (
+            retained = conn.execute(
+                """
+                SELECT COALESCE(SUM(
+                    CASE WHEN EXISTS (
+                        SELECT 1 FROM cache_staging_files AS staged
+                        WHERE staged.asset_relative_path=member.relative_path
+                    ) THEN (
+                        SELECT COALESCE(SUM(staged.checkpoint_bytes),0)
+                        FROM cache_staging_files AS staged
+                        WHERE staged.asset_relative_path=member.relative_path
+                    ) ELSE member.size_bytes END
+                ),0)
+                FROM cache_members AS member WHERE member.game_id=?
+                """,
+                (game_id,),
+            ).fetchone()[0]
+        result = {key: int(row[key]) for key in (
             "total_files", "retained_files", "interrupted_files", "remaining_files",
-            "retained_bytes",
         )}
+        result["retained_bytes"] = int(retained)
+        return result

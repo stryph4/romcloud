@@ -88,6 +88,23 @@ class PinnedDownloadPreflight:
         }
 
 
+@dataclass
+class ResolvedAssetLockLease:
+    """Asset locks paired with the immutable closure they protect."""
+
+    lease: FileLockLease
+    resolved_game: Game
+
+    def release(self) -> None:
+        self.lease.release()
+
+    def __enter__(self) -> "ResolvedAssetLockLease":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.release()
+
+
 class CacheService:
     """Manages the local ROM cache."""
 
@@ -295,7 +312,7 @@ class CacheService:
         owner_kind: str = "cli",
         owner_instance_id: Optional[str] = None,
         download_item_id: Optional[str] = None,
-        _asset_lock: Optional[FileLockLease] = None,
+        _asset_lock: Optional[FileLockLease | ResolvedAssetLockLease] = None,
     ) -> str:
         """Ensure *game_id* is cached and return its launch path.
 
@@ -326,23 +343,26 @@ class CacheService:
         if game is None:
             raise GameNotFoundError(f"Game not found in catalog: {game_id}")
 
-        primary = game.primary_asset
+        existing = self._cache_repo.get(game_id)
+        resolved_game = (
+            _asset_lock.resolved_game
+            if isinstance(_asset_lock, ResolvedAssetLockLease)
+            else self._resolved_game(game, existing)
+        )
+        primary = resolved_game.primary_asset
         if primary is None:
             raise CacheError(f"Game {game_id!r} has no cacheable assets")
-
-        existing = self._cache_repo.get(game_id)
-        resolved_game = self._resolved_game(game, existing)
 
         # Physical destination ownership is process-wide and keyed by the
         # resolved asset closure, so shared playlist dependencies collide.
         if self._storage is not None and _asset_lock is None:
-            paths = [
-                resolve_cache_path(self._cache_root, resolved_game.system, asset.relative_path)
-                for asset in resolved_game.assets
-            ]
-            with self._storage.assets.acquire(paths, blocking=True) as lease:
+            lease = self._lock_resolved_closure(game, existing, blocking=True)
+            assert lease is not None
+            with lease:
                 # Re-check after waiting: a background owner may have completed
                 # the exact same physical transfer while this process waited.
+                # The resolved snapshot travels with the lease, so descriptor
+                # changes cannot introduce an unlocked transfer destination.
                 return self.cache_game(
                     game_id,
                     on_progress,
@@ -524,21 +544,67 @@ class CacheService:
             for asset in resolved.assets
         ]
 
-    def try_asset_locks(self, game_id: str) -> Optional[FileLockLease]:
+    def try_asset_locks(self, game_id: str) -> Optional[ResolvedAssetLockLease]:
+        game = self._game_repo.get(game_id)
+        if game is None:
+            raise GameNotFoundError(f"Game not found in catalog: {game_id}")
         if self._storage is None:
-            return FileLockLease([])
-        try:
-            return self._storage.assets.acquire(
-                self.resolved_asset_paths(game_id), blocking=False
+            return ResolvedAssetLockLease(
+                FileLockLease([]),
+                self._resolved_game(game, self._cache_repo.get(game_id)),
             )
-        except LockUnavailable:
-            return None
+        return self._lock_resolved_closure(
+            game, self._cache_repo.get(game_id), blocking=False
+        )
 
-    def retained_staging_size(self, game_id: str) -> int:
+    def _lock_resolved_closure(
+        self,
+        game: Game,
+        entry: Optional[CacheEntry],
+        *,
+        blocking: bool,
+    ) -> Optional[ResolvedAssetLockLease]:
+        """Resolve, lock, and confirm one exact destination closure."""
+        assert self._storage is not None
+        for _attempt in range(4):
+            resolved = self._resolved_game(game, entry)
+            paths = tuple(
+                resolve_cache_path(
+                    self._cache_root, resolved.system, asset.relative_path
+                )
+                for asset in resolved.assets
+            )
+            try:
+                lease = self._storage.assets.acquire(paths, blocking=blocking)
+            except LockUnavailable:
+                return None
+            try:
+                confirmed = self._resolved_game(game, entry)
+                confirmed_paths = tuple(
+                    resolve_cache_path(
+                        self._cache_root, confirmed.system, asset.relative_path
+                    )
+                    for asset in confirmed.assets
+                )
+                if set(confirmed_paths) == set(paths):
+                    return ResolvedAssetLockLease(lease, confirmed)
+            except Exception:
+                lease.release()
+                raise
+            lease.release()
+        raise CacheError(
+            f"Dependency closure changed repeatedly while locking {game.id!r}; retry."
+        )
+
+    def retained_staging_size(
+        self, game_id: str, *, resolved_game: Optional[Game] = None
+    ) -> int:
         game = self._game_repo.get(game_id)
         if game is None:
             return 0
-        resolved = self._resolved_game(game, self._cache_repo.get(game_id))
+        resolved = resolved_game or self._resolved_game(
+            game, self._cache_repo.get(game_id)
+        )
         return self._transfer.staging_size(resolved)
 
     def total_staging_size(self) -> int:

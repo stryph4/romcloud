@@ -175,7 +175,12 @@ class TransferService:
                         # changed.
                         self._staging_repo.delete_asset(asset.relative_path)
                 plans.append(plan)
-                self._persist_plan(game, plan)
+                # Existing recovery state must be reconciled before it can be
+                # used to adopt a promoted final path. A healthy committed
+                # final asset with no prior recovery state is checked first
+                # and must not gain a staging manifest merely by inspection.
+                if previous_manifest is not None:
+                    self._persist_plan(game, plan)
                 if game.total_size_bytes is None:
                     grand_total += plan.total_size_bytes
                 final = self._final_path(game.system, asset.relative_path)
@@ -192,6 +197,9 @@ class TransferService:
                         on_progress(cumulative_done, grand_total or cumulative_done)
                     _check_cancelled(cancellation)
                     continue
+
+                if previous_manifest is None:
+                    self._persist_plan(game, plan)
 
                 # Preserve the original filename verbatim, and mirror its
                 # relative location under the system — never flatten to a
@@ -953,12 +961,16 @@ class TransferService:
             if staged.exists():
                 _protect_staging_removal(staged, on_staging_delta)
                 final.parent.mkdir(parents=True, exist_ok=True)
-                if final.exists():
-                    if final.is_dir():
-                        shutil.rmtree(final)
-                    else:
-                        final.unlink()
-                shutil.move(str(staged), str(final))
+                self._atomic_promote(staged, final)
+            else:
+                # A power loss after a directory promotion but before cleanup
+                # can leave the old final at the deterministic backup path.
+                # The current final was hash-validated above; cleanup is now
+                # safe and keeps quota accounting from retaining stale bytes.
+                backup = _replacement_backup(final)
+                if final.exists() and (backup.exists() or backup.is_symlink()):
+                    _remove_path(backup)
+                    _fsync_directory(final.parent)
             # else: asset was already complete at `final` — nothing to promote.
 
             if asset.is_primary or final_primary is None:
@@ -966,6 +978,48 @@ class TransferService:
 
         assert final_primary is not None  # game.assets is non-empty (checked above)
         return final_primary
+
+    @staticmethod
+    def _atomic_promote(staged: Path, final: Path) -> None:
+        """Atomically rename staged bytes into the final cache namespace.
+
+        Files can be replaced by one ``os.replace``. POSIX cannot replace a
+        non-empty directory directly, so directory repair first atomically
+        parks the old final at a deterministic, quota-accounted backup path.
+        A failed second rename restores the old final; a process crash leaves
+        enough local evidence for the next run to finish idempotently.
+        """
+        if staged.is_symlink() or final.is_symlink():
+            raise TransferError("Refusing to promote a symlink cache asset")
+        backup = _replacement_backup(final)
+        if backup.is_symlink():
+            raise TransferError(f"Refusing replacement symlink: {backup}")
+
+        if staged.is_dir() and final.exists():
+            if backup.exists():
+                # A valid final alongside a backup means an earlier rename
+                # completed and only cleanup was interrupted.
+                _remove_path(backup)
+                _fsync_directory(final.parent)
+            os.replace(final, backup)
+            _fsync_directory(final.parent)
+            try:
+                os.replace(staged, final)
+                _fsync_directory(final.parent)
+            except Exception:
+                if not final.exists() and backup.exists():
+                    os.replace(backup, final)
+                    _fsync_directory(final.parent)
+                raise
+            _remove_path(backup)
+            _fsync_directory(final.parent)
+            return
+
+        os.replace(staged, final)
+        _fsync_directory(final.parent)
+        if backup.exists():
+            _remove_path(backup)
+            _fsync_directory(final.parent)
 
 
 def _existing_size(path: Path) -> Optional[int]:
@@ -976,6 +1030,19 @@ def _existing_size(path: Path) -> Optional[int]:
     if path.is_dir():
         return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
     return None
+
+
+def _replacement_backup(final: Path) -> Path:
+    return final.with_name(final.name + ".romcloud-replaced")
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_symlink():
+        raise TransferError(f"Refusing to remove symlink cache path: {path}")
+    if path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists():
+        path.unlink()
 
 
 def _check_cancelled(cancellation: Optional[TransferCancellationToken]) -> None:
