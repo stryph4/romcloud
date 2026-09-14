@@ -83,6 +83,32 @@ def test_game_and_diagnostics_are_consumers_of_the_shared_browser_navigator() ->
     assert "RepeatButton" in controller
 
 
+def test_downloads_view_renders_durable_states_controls_and_controller_zones() -> None:
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    app = (STATIC / "app.js").read_text(encoding="utf-8")
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+
+    assert 'id="nav-downloads"' in html and 'id="downloads-main"' in html
+    assert 'id="job"' in html and 'id="partial-usage"' in html
+    assert 'data-controller-zone="download-bulk"' in html
+    assert 'button.dataset.controllerZone = "downloads"' in app
+    for endpoint in (
+        "/api/downloads", "/api/downloads/cancel-all",
+        "/api/downloads/retry-all-failed", "/api/downloads/cleanup",
+    ):
+        assert endpoint in app
+    for state in (
+        "running", "verifying", "queued", "paused", "interrupted",
+        "failed", "cancelled", "complete",
+    ):
+        assert state in app
+    for control in ("pause", "resume", "cancel", "retry", "discard", "remove"):
+        assert f'item, "{control}"' in app
+    assert "retained_files" in app and "remaining_files" in app
+    assert "staging_bytes" in app and "active_reserved_growth" in app
+    assert ".downloads-list" in css and ".download-item" in css
+
+
 def test_remote_navigation_and_diagnostics_reuse_single_manager_view() -> None:
     html = (STATIC / "index.html").read_text(encoding="utf-8")
     app = (STATIC / "app.js").read_text(encoding="utf-8")

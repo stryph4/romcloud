@@ -35,6 +35,16 @@ class StagingFileRecord:
     content_sha256: Optional[str]
 
 
+@dataclass(frozen=True)
+class StagingAssetRecord:
+    relative_path: str
+    system: str
+    asset_kind: str
+    expected_size: Optional[int]
+    source_manifest_sha256: Optional[str]
+    updated_at: datetime
+
+
 class DownloadRepository:
     TERMINAL_STATES = ("complete", "cancelled", "failed")
 
@@ -117,6 +127,13 @@ class DownloadRepository:
                 ORDER BY queue_seq
                 """,
                 (terminal_limit,),
+            ).fetchall()
+        return [self._row(row) for row in rows]
+
+    def list_all(self) -> list[DownloadItem]:
+        with self._db.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM download_items ORDER BY queue_seq"
             ).fetchall()
         return [self._row(row) for row in rows]
 
@@ -385,6 +402,69 @@ class StagingRepository:
             content_sha256=row["content_sha256"],
         )
 
+    def get_asset(self, relative_path: str) -> Optional[StagingAssetRecord]:
+        with self._db.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM cache_staging_assets WHERE relative_path=?",
+                (relative_path,),
+            ).fetchone()
+        if row is None:
+            return None
+        return StagingAssetRecord(
+            relative_path=row["relative_path"],
+            system=row["system"],
+            asset_kind=row["asset_kind"],
+            expected_size=row["expected_size"],
+            source_manifest_sha256=row["source_manifest_sha256"],
+            updated_at=_parse(row["updated_at"]) or _now(),
+        )
+
+    def list_files(self, relative_path: str) -> list[StagingFileRecord]:
+        with self._db.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM cache_staging_files WHERE asset_relative_path=? "
+                "ORDER BY member_relative_path",
+                (relative_path,),
+            ).fetchall()
+        return [
+            StagingFileRecord(
+                asset_relative_path=row["asset_relative_path"],
+                member_relative_path=row["member_relative_path"],
+                expected_size=row["expected_size"],
+                source_object_id=row["source_object_id"],
+                source_revision=row["source_revision"],
+                source_checksum=row["source_checksum"],
+                source_modified_epoch=row["source_modified_epoch"],
+                state=row["state"], checkpoint_bytes=row["checkpoint_bytes"],
+                checkpoint_sha256=row["checkpoint_sha256"],
+                content_sha256=row["content_sha256"],
+            )
+            for row in rows
+        ]
+
+    def list_assets(self) -> list[StagingAssetRecord]:
+        with self._db.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM cache_staging_assets ORDER BY relative_path"
+            ).fetchall()
+        return [
+            StagingAssetRecord(
+                relative_path=row["relative_path"], system=row["system"],
+                asset_kind=row["asset_kind"], expected_size=row["expected_size"],
+                source_manifest_sha256=row["source_manifest_sha256"],
+                updated_at=_parse(row["updated_at"]) or _now(),
+            )
+            for row in rows
+        ]
+
+    def owner_game_ids(self, relative_path: str) -> set[str]:
+        with self._db.connect() as conn:
+            rows = conn.execute(
+                "SELECT game_id FROM cache_members WHERE relative_path=?",
+                (relative_path,),
+            ).fetchall()
+        return {str(row["game_id"]) for row in rows}
+
     def checkpoint(self, asset: str, member: str, size: int, digest: str, *, state: str) -> None:
         with self._db.connect() as conn:
             conn.execute(
@@ -411,6 +491,10 @@ class StagingRepository:
                 """,
                 (size, digest, digest, now, asset, member),
             )
+            conn.execute(
+                "UPDATE cache_staging_assets SET updated_at=? WHERE relative_path=?",
+                (now, asset),
+            )
 
     def delete_asset(self, relative_path: str) -> None:
         with self._db.connect() as conn:
@@ -431,7 +515,8 @@ class StagingRepository:
                     COUNT(*) AS total_files,
                     COALESCE(SUM(CASE WHEN file.state='complete' OR file.checkpoint_bytes>0 THEN 1 ELSE 0 END),0) AS retained_files,
                     COALESCE(SUM(CASE WHEN file.state IN ('partial','transferring') THEN 1 ELSE 0 END),0) AS interrupted_files,
-                    COALESCE(SUM(CASE WHEN file.state!='complete' THEN 1 ELSE 0 END),0) AS remaining_files
+                    COALESCE(SUM(CASE WHEN file.state!='complete' THEN 1 ELSE 0 END),0) AS remaining_files,
+                    COALESCE(SUM(file.checkpoint_bytes),0) AS retained_bytes
                 FROM cache_staging_files AS file
                 JOIN cache_members AS member
                   ON member.relative_path=file.asset_relative_path
@@ -440,5 +525,6 @@ class StagingRepository:
                 (game_id,),
             ).fetchone()
         return {key: int(row[key]) for key in (
-            "total_files", "retained_files", "interrupted_files", "remaining_files"
+            "total_files", "retained_files", "interrupted_files", "remaining_files",
+            "retained_bytes",
         )}

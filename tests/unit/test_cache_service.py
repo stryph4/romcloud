@@ -229,7 +229,7 @@ class TestCacheGameCancellation:
         staging = cache_dir / ".partial" / "ps2" / "Final Fantasy X.iso.part"
         final = cache_dir / "ps2" / "Final Fantasy X.iso"
         assert entry.status is CacheStatus.INCOMPLETE
-        assert entry.is_evictable
+        assert not entry.is_evictable
         assert cache_service.is_cached(game_with_file.id) is False
         assert cache_service.get_launch_path(game_with_file.id) is None
         assert staging.exists()

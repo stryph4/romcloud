@@ -75,6 +75,7 @@ class _AssetPlan:
     is_directory: bool
     directories: tuple[str, ...] = ()
     files: tuple[_PlannedFile, ...] = ()
+    recovery_evidence: bool = False
 
     @property
     def total_size_bytes(self) -> int:
@@ -116,16 +117,20 @@ class TransferService:
         game: Game,
         on_progress: Optional[Callable[[int, int], None]] = None,
         cancellation: Optional[TransferCancellationToken] = None,
+        on_staging_delta: Optional[Callable[[int], None]] = None,
     ) -> str:
         """Transfer one logical game within the provider's bounded session."""
         with self._provider.transfer_session():
-            return self._transfer_in_session(game, on_progress, cancellation)
+            return self._transfer_in_session(
+                game, on_progress, cancellation, on_staging_delta
+            )
 
     def _transfer_in_session(
         self,
         game: Game,
         on_progress: Optional[Callable[[int, int], None]] = None,
         cancellation: Optional[TransferCancellationToken] = None,
+        on_staging_delta: Optional[Callable[[int], None]] = None,
     ) -> str:
         """Transfer all game assets and return the final cache path.
 
@@ -151,12 +156,32 @@ class TransferService:
             for asset in game.assets:
                 _check_cancelled(cancellation)
                 plan = self._plan_asset(game, asset, cancellation)
+                previous_manifest = (
+                    self._staging_repo.get_asset(asset.relative_path)
+                    if self._staging_repo is not None else None
+                )
+                if previous_manifest is not None:
+                    from dataclasses import replace
+
+                    plan = replace(plan, recovery_evidence=True)
+                    if (
+                        previous_manifest.source_manifest_sha256
+                        != self._manifest_sha256(plan)
+                    ):
+                        # Keep physical staging for per-file prefix validation,
+                        # but invalidate stale completion/checkpoint evidence.
+                        # In particular, a same-size final path from an old
+                        # promotion must not be adopted after the source plan
+                        # changed.
+                        self._staging_repo.delete_asset(asset.relative_path)
                 plans.append(plan)
                 self._persist_plan(game, plan)
                 if game.total_size_bytes is None:
                     grand_total += plan.total_size_bytes
                 final = self._final_path(game.system, asset.relative_path)
-                final_size = self._validated_size(final, plan)
+                final_size = self._validated_final_size(
+                    final, plan, game, cancellation
+                )
 
                 if final_size is not None:
                     # Already fully cached (from a previous run, or another
@@ -186,6 +211,7 @@ class TransferService:
                         grand_total,
                         on_progress,
                         cancellation,
+                        on_staging_delta,
                     )
                 else:
                     cumulative_done = self._transfer_file(
@@ -196,13 +222,14 @@ class TransferService:
                         grand_total,
                         on_progress,
                         cancellation,
+                        on_staging_delta,
                     )
 
             _check_cancelled(cancellation)
-            self._validate(game, plans)
+            self._validate(game, plans, cancellation)
             _check_cancelled(cancellation)
 
-            final = self._promote(game)
+            final = self._promote(game, on_staging_delta)
             _check_cancelled(cancellation)
             log.info("Transfer complete for %r → %s", game.title, final)
             return final
@@ -239,6 +266,29 @@ class TransferService:
                 total += _existing_size(staged.with_name(staged.name + ".part")) or 0
         return total
 
+    def staging_asset_size(self, system: str, relative_path: str) -> int:
+        staged = self._staging_path(system, relative_path)
+        total = _existing_size(staged) or 0
+        if not staged.is_dir():
+            total += _existing_size(staged.with_name(staged.name + ".part")) or 0
+        return total
+
+    def total_staging_size(self) -> int:
+        return _existing_size(self._partial_root) or 0
+
+    def discard_staging_asset(self, system: str, relative_path: str) -> None:
+        """Remove one already-locked physical staged asset and its manifest."""
+        staged = self._staging_path(system, relative_path)
+        part = staged.with_name(staged.name + ".part")
+        if staged.is_dir() and not staged.is_symlink():
+            shutil.rmtree(staged)
+        elif staged.is_file() and not staged.is_symlink():
+            staged.unlink()
+        if part.is_file() and not part.is_symlink():
+            part.unlink()
+        if self._staging_repo is not None:
+            self._staging_repo.delete_asset(relative_path)
+
     def estimate_size(self, game: Game) -> int:
         """Return the best available source-size estimate for *game*.
 
@@ -257,6 +307,62 @@ class TransferService:
             self._asset_source_root(game), asset.relative_path
         )
         return self._provider.get_size(source) or 0
+
+    def has_recovery_manifest(self, relative_path: str) -> bool:
+        return bool(
+            self._staging_repo is not None
+            and self._staging_repo.get_asset(relative_path) is not None
+        )
+
+    def validated_promoted_size(
+        self, system: str, relative_path: str
+    ) -> Optional[int]:
+        """Validate an unfinalized promoted asset from durable member hashes."""
+        if self._staging_repo is None:
+            return None
+        asset = self._staging_repo.get_asset(relative_path)
+        if asset is None or asset.system != system:
+            return None
+        final = self._final_path(system, relative_path)
+        records = self._staging_repo.list_files(relative_path)
+        if not records or any(
+            record.state != "complete" or not record.content_sha256
+            for record in records
+        ):
+            return None
+        if asset.asset_kind == "file":
+            record = next(
+                (item for item in records if item.member_relative_path == ""), None
+            )
+            if record is None or not final.is_file() or final.is_symlink():
+                return None
+            size = final.stat().st_size
+            if record.expected_size is not None and size != record.expected_size:
+                return None
+            return size if _hash_prefix(final, size) == record.content_sha256 else None
+        if not final.is_dir() or final.is_symlink():
+            return None
+        for candidate in final.rglob("*"):
+            if candidate.is_symlink() or not (candidate.is_file() or candidate.is_dir()):
+                return None
+        expected = {item.member_relative_path: item for item in records}
+        actual = {
+            path.relative_to(final).as_posix(): path
+            for path in final.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        }
+        if set(actual) != set(expected):
+            return None
+        total = 0
+        for relative, path in actual.items():
+            record = expected[relative]
+            size = path.stat().st_size
+            if record.expected_size is not None and size != record.expected_size:
+                return None
+            if _hash_prefix(path, size) != record.content_sha256:
+                return None
+            total += size
+        return total
 
     def discard_staging(
         self, game: Game, *, preserve_relative_paths: Optional[set[str]] = None
@@ -401,8 +507,10 @@ class TransferService:
         grand_total: int,
         on_progress: Optional[Callable[[int, int], None]],
         cancellation: Optional[TransferCancellationToken],
+        on_staging_delta: Optional[Callable[[int], None]],
     ) -> int:
         if staging.exists() and not staging.is_dir():
+            _protect_staging_removal(staging, on_staging_delta)
             staging.unlink()
         staging.mkdir(parents=True, exist_ok=True)
         expected_dirs = set(plan.directories)
@@ -415,8 +523,10 @@ class TransferService:
             if candidate.is_symlink():
                 candidate.unlink()
             elif candidate.is_file() and relative not in expected_files | expected_parts:
+                _protect_staging_removal(candidate, on_staging_delta)
                 candidate.unlink()
             elif candidate.is_dir() and relative not in expected_dirs:
+                _protect_staging_removal(candidate, on_staging_delta)
                 shutil.rmtree(candidate)
         for relative in plan.directories:
             (staging / Path(*PurePosixPath(relative).parts)).mkdir(
@@ -437,6 +547,7 @@ class TransferService:
                 grand_total,
                 on_progress,
                 cancellation,
+                on_staging_delta,
             )
         return cumulative_done
 
@@ -449,6 +560,7 @@ class TransferService:
         grand_total: int,
         on_progress: Optional[Callable[[int, int], None]],
         cancellation: Optional[TransferCancellationToken],
+        on_staging_delta: Optional[Callable[[int], None]],
     ) -> int:
         source = self._provider.resolve_path(
             self._asset_source_root(game), file.relative_path
@@ -475,6 +587,7 @@ class TransferService:
                 if on_progress:
                     on_progress(base_done + clean_size, grand_total or base_done + clean_size)
                 return base_done + clean_size
+            _protect_staging_removal(destination, on_staging_delta)
             destination.unlink()
 
         checkpoint = 0
@@ -484,6 +597,8 @@ class TransferService:
             if checkpoint > actual or checkpoint < 0 or not record.checkpoint_sha256:
                 checkpoint = 0
             elif actual > checkpoint:
+                if on_staging_delta is not None:
+                    on_staging_delta(-(actual - checkpoint))
                 with part.open("r+b") as handle:
                     handle.truncate(checkpoint)
                     handle.flush()
@@ -495,6 +610,8 @@ class TransferService:
             ):
                 checkpoint = 0
         if checkpoint == 0:
+            if part.is_file():
+                _protect_staging_removal(part, on_staging_delta)
             part.parent.mkdir(parents=True, exist_ok=True)
             with part.open("wb") as handle:
                 handle.flush()
@@ -506,6 +623,7 @@ class TransferService:
             return self._transfer_without_resume(
                 source, file, part, destination, asset_path, member_path,
                 base_done, grand_total, on_progress, cancellation,
+                on_staging_delta,
             )
 
         # Seed the running digest from the exact durable local prefix.  The
@@ -529,6 +647,8 @@ class TransferService:
                         if not chunk:
                             break
                         output.write(chunk)
+                        if on_staging_delta is not None:
+                            on_staging_delta(len(chunk))
                         digest.update(chunk)
                         bytes_done += len(chunk)
                         if bytes_done >= next_checkpoint:
@@ -591,11 +711,19 @@ class TransferService:
         grand_total: int,
         on_progress: Optional[Callable[[int, int], None]],
         cancellation: Optional[TransferCancellationToken],
+        on_staging_delta: Optional[Callable[[int], None]],
     ) -> int:
         """Safe fallback for legacy providers: retain partials, never append."""
-        part.unlink(missing_ok=True)
+        if part.is_file():
+            _protect_staging_removal(part, on_staging_delta)
+            part.unlink()
+        previous_done = 0
 
         def progress(done: int, total: int) -> None:
+            nonlocal previous_done
+            if on_staging_delta is not None and done > previous_done:
+                on_staging_delta(done - previous_done)
+            previous_done = done
             _check_cancelled(cancellation)
             if on_progress:
                 on_progress(base_done + done, grand_total or base_done + total)
@@ -666,23 +794,7 @@ class TransferService:
     def _persist_plan(self, game: Game, plan: _AssetPlan) -> None:
         if self._staging_repo is None:
             return
-        manifest_payload = [
-            {
-                "path": item.package_relative_path,
-                "size": item.size_bytes,
-                "object_id": item.object_id,
-                "revision": item.revision,
-                "checksum": item.checksum,
-            }
-            for item in plan.files
-        ]
-        manifest_payload.extend(
-            {"path": directory, "kind": "directory"}
-            for directory in plan.directories
-        )
-        manifest = hashlib.sha256(
-            json.dumps(manifest_payload, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
+        manifest = self._manifest_sha256(plan)
         self._staging_repo.replace_plan(
             relative_path=plan.asset.relative_path,
             system=game.system,
@@ -704,13 +816,40 @@ class TransferService:
             ],
         )
 
-    def _validate(self, game: Game, plans: list[_AssetPlan]) -> None:
+    @staticmethod
+    def _manifest_sha256(plan: _AssetPlan) -> str:
+        manifest_payload = [
+            {
+                "path": item.package_relative_path,
+                "size": item.size_bytes,
+                "object_id": item.object_id,
+                "revision": item.revision,
+                "checksum": item.checksum,
+            }
+            for item in plan.files
+        ]
+        manifest_payload.extend(
+            {"path": directory, "kind": "directory"}
+            for directory in plan.directories
+        )
+        return hashlib.sha256(
+            json.dumps(manifest_payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    def _validate(
+        self,
+        game: Game,
+        plans: list[_AssetPlan],
+        cancellation: Optional[TransferCancellationToken],
+    ) -> None:
         """Check that every asset ended up complete — either already
         correct at its final path, or freshly staged with the expected size."""
         for plan in plans:
             asset = plan.asset
             final = self._final_path(game.system, asset.relative_path)
-            if self._validated_size(final, plan) is not None:
+            if self._validated_final_size(
+                final, plan, game, cancellation
+            ) is not None:
                 continue  # already promoted from a previous run
 
             staged = self._staging_path(game.system, asset.relative_path)
@@ -755,7 +894,51 @@ class TransferService:
             return None
         return sum(actual_files.values())
 
-    def _promote(self, game: Game) -> str:
+    def _validated_final_size(
+        self,
+        path: Path,
+        plan: _AssetPlan,
+        game: Game,
+        cancellation: Optional[TransferCancellationToken],
+    ) -> Optional[int]:
+        if plan.recovery_evidence:
+            asset = (
+                self._staging_repo.get_asset(plan.asset.relative_path)
+                if self._staging_repo is not None else None
+            )
+            if asset is None:
+                return None
+            size = self.validated_promoted_size(
+                asset.system,
+                plan.asset.relative_path,
+            )
+            if size is None:
+                return None
+            # The durable hashes prove that the promoted bytes are exactly
+            # those completed before the crash. Re-read the current source as
+            # well: path/length/mtime and even an unchanged provider manifest
+            # are not sufficient evidence after a same-size source rewrite.
+            for planned in plan.files:
+                local = (
+                    path
+                    if not plan.is_directory
+                    else path / Path(*PurePosixPath(planned.package_relative_path).parts)
+                )
+                source = self._provider.resolve_path(
+                    self._asset_source_root(game), planned.relative_path
+                )
+                if not self._source_matches(
+                    source, local, local.stat().st_size, cancellation
+                ):
+                    return None
+            return size
+        return self._validated_size(path, plan)
+
+    def _promote(
+        self,
+        game: Game,
+        on_staging_delta: Optional[Callable[[int], None]] = None,
+    ) -> str:
         """Move each freshly-staged asset to its final cache location.
 
         An asset already complete at its final path (skipped during
@@ -768,6 +951,7 @@ class TransferService:
             final = self._final_path(game.system, asset.relative_path)
 
             if staged.exists():
+                _protect_staging_removal(staged, on_staging_delta)
                 final.parent.mkdir(parents=True, exist_ok=True)
                 if final.exists():
                     if final.is_dir():
@@ -800,7 +984,7 @@ def _check_cancelled(cancellation: Optional[TransferCancellationToken]) -> None:
 
 
 _CHUNK = 1024 * 1024
-_CHECKPOINT_INTERVAL = 8 * 1024 * 1024
+_CHECKPOINT_INTERVAL = 512 * 1024 * 1024
 
 
 def _hash_prefix(path: Path, length: int) -> str:
@@ -832,3 +1016,15 @@ def _fsync_directory(path: Path) -> None:
         # Some mounted filesystems do not support directory fsync. File data
         # was still flushed before rename; recovery treats the DB as advisory.
         pass
+
+
+def _protect_staging_removal(
+    path: Path, on_staging_delta: Optional[Callable[[int], None]]
+) -> None:
+    if on_staging_delta is None:
+        return
+    size = _existing_size(path) or 0
+    if size:
+        # Negative means these already-present bytes are about to disappear;
+        # the caller must reserve their replacement before the mutation.
+        on_staging_delta(-size)

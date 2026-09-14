@@ -6,19 +6,21 @@ import hashlib
 import sqlite3
 import time
 from contextlib import AbstractContextManager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from romcloud.core.cancellation import TransferCancellationToken
 from romcloud.core.exceptions import InsufficientSpaceError, TransferCancelledError
+from romcloud.core.models.cache import CacheEntry, CachePolicy
 from romcloud.core.models.download import DownloadOrigin, DownloadState
 from romcloud.core.models.game import Game, GameAsset
 from romcloud.infrastructure.cache_coordination import (
     AssetLockManager,
     CacheStorageCoordinator,
     LockUnavailable,
+    ReservationLease,
 )
 from romcloud.infrastructure.database import Database
 from romcloud.infrastructure.providers.local import LocalFilesystemProvider
@@ -29,6 +31,7 @@ from romcloud.infrastructure.repositories.download import (
 )
 from romcloud.infrastructure.repositories.game import GameRepository
 from romcloud.services.download_manager import DownloadManagerService
+from romcloud.services.cache import CacheService
 from romcloud.services.transfer import TransferService
 
 
@@ -101,6 +104,24 @@ def test_download_repository_dedupes_active_and_recovers_only_inflight(db, game_
     assert repo.get(two.id).state is DownloadState.INTERRUPTED
 
 
+def test_enqueue_persists_intent_without_claiming_cache_ownership(
+    db, game_repo, cache_dir, tmp_path
+):
+    game = _game(game_repo, tmp_path / "source")
+    manager = DownloadManagerService(
+        repository=DownloadRepository(db), staging_repository=StagingRepository(db),
+        game_repo=game_repo, cache=_WorkerCache(), cache_root=str(cache_dir),
+    )
+
+    first = manager.enqueue([game.id])
+    duplicate = manager.enqueue([game.id], origin=DownloadOrigin.PINNED)
+
+    assert first["created"] == 1 and duplicate["created"] == 0
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM cache_entries").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM cache_members").fetchone()[0] == 0
+
+
 def test_asset_locks_collide_by_physical_path_without_global_serialization(tmp_path):
     manager = AssetLockManager(tmp_path / "locks")
     first = manager.acquire([tmp_path / "cache" / "psx" / "Shared.chd"], blocking=False)
@@ -131,6 +152,108 @@ def test_reservations_count_future_growth_and_reject_concurrent_overcommit(
             requested_growth=31, game_id=None, owner_kind="cli", owner_instance_id="two"
         )
     lease.release()
+
+
+def _coordinated_cache(db, cache_repo, game_repo, cache_dir, data_dir, source_root, capacity):
+    staging = StagingRepository(db)
+    transfer = TransferService(
+        LocalFilesystemProvider(), str(cache_dir), source_root=str(source_root),
+        staging_repository=staging,
+    )
+    coordinator = CacheStorageCoordinator(
+        db=db, cache_repo=cache_repo, cache_root=cache_dir,
+        lock_root=data_dir / "locks", max_size_bytes=capacity, min_free_bytes=0,
+    )
+    cache = CacheService(
+        cache_repo, game_repo, transfer, str(cache_dir),
+        CachePolicy(max_size_bytes=capacity, min_free_bytes=0),
+        storage_coordinator=coordinator,
+    )
+    return cache, transfer, staging, coordinator
+
+
+def test_post_admission_exception_releases_row_and_os_lease(
+    db, cache_repo, game_repo, cache_dir, data_dir, tmp_path, monkeypatch
+):
+    source_root = tmp_path / "source"
+    game = _game(game_repo, source_root, size=32)
+    cache, _transfer, _staging, coordinator = _coordinated_cache(
+        db, cache_repo, game_repo, cache_dir, data_dir, source_root, 64
+    )
+    monkeypatch.setattr(
+        cache_repo, "save", lambda _entry: (_ for _ in ()).throw(OSError("db write failed"))
+    )
+
+    with pytest.raises(OSError, match="db write failed"):
+        cache.cache_game(game.id)
+
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM cache_reservations").fetchone()[0] == 0
+    # A second lease proves the first process-level reservation lock was also
+    # closed rather than merely deleting its SQLite row.
+    lease = coordinator.admit(
+        requested_growth=64, game_id=None, owner_kind="cli", owner_instance_id="retry"
+    )
+    lease.release()
+
+
+def test_invalid_partial_and_promotion_never_open_capacity_hole(
+    db, cache_repo, game_repo, cache_dir, data_dir, tmp_path, monkeypatch
+):
+    source_root = tmp_path / "source"
+    game = _game(game_repo, source_root, size=70)
+    cache, _transfer, staging, coordinator = _coordinated_cache(
+        db, cache_repo, game_repo, cache_dir, data_dir, source_root, 70
+    )
+    relative = "ps2/Game.iso"
+    staging.replace_plan(
+        relative_path=relative, system="ps2", asset_kind="file",
+        source_provider="local", source_root=str(source_root), expected_size=70,
+        source_manifest_sha256="stale", files=[{
+            "member_relative_path": "", "expected_size": 70,
+            "source_object_id": None, "source_revision": None,
+            "source_checksum": None, "source_modified_epoch": None,
+        }],
+    )
+    part = cache_dir / ".partial" / "ps2" / "Game.iso.part"
+    part.parent.mkdir(parents=True)
+    part.write_bytes(b"B" * 37)
+    staging.checkpoint(
+        relative, "", 37, hashlib.sha256(part.read_bytes()).hexdigest(), state="partial"
+    )
+
+    protected_windows: list[tuple[int, int, int]] = []
+    original_admit = coordinator.admit
+    original_protect = ReservationLease.protect_removal
+
+    def protected_removal(lease, amount):
+        original_protect(lease, amount)
+        snapshot = coordinator.snapshot()
+        protected_windows.append((
+            snapshot["final_bytes"], snapshot["staging_bytes"],
+            snapshot["reserved_growth"],
+        ))
+        with pytest.raises(InsufficientSpaceError):
+            original_admit(
+                requested_growth=1, game_id=None, owner_kind="cli",
+                owner_instance_id="contender",
+            )
+
+    monkeypatch.setattr(
+        "romcloud.infrastructure.cache_coordination.ReservationLease.protect_removal",
+        protected_removal,
+    )
+    final = Path(cache.cache_game(game.id))
+
+    assert final.read_bytes() == b"A" * 70
+    # One protected transition covers invalid partial truncation and another
+    # covers staging-to-final promotion. Each keeps at least the 70-byte target
+    # continuously owned in final + staging + reservation accounting.
+    assert len(protected_windows) >= 2
+    assert all(sum(window) >= 70 for window in protected_windows)
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM cache_reservations").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM cache_staging_assets").fetchone()[0] == 0
 
 
 class _RecordingFile(AbstractContextManager):
@@ -200,9 +323,6 @@ class _WorkerCache:
     def __init__(self) -> None:
         self.completed: list[str] = []
 
-    def prepare_download_membership(self, _game_id):
-        return None
-
     def try_asset_locks(self, _game_id):
         from romcloud.infrastructure.cache_coordination import FileLockLease
         return FileLockLease([])
@@ -215,7 +335,10 @@ class _WorkerCache:
         self.completed.append(game_id)
         return "/cache/game"
 
-    def discard_staging(self, _game_id):
+    def total_staging_size(self):
+        return 0
+
+    def discard_staging_asset(self, _system, _relative_path):
         return None
 
 
@@ -351,3 +474,178 @@ def test_startup_preserves_queued_and_paused_but_interrupts_inflight(
     assert repo.get(items[1].id).state is DownloadState.PAUSED
     assert repo.get(items[2].id).state is DownloadState.INTERRUPTED
     assert repo.get(items[3].id).state is DownloadState.INTERRUPTED
+
+
+class _GcCache(_WorkerCache):
+    def __init__(self, staging: StagingRepository, *, locked: bool = False) -> None:
+        super().__init__()
+        self._staging = staging
+        self.locked = locked
+        self.discarded: list[str] = []
+
+    def discard_staging_asset(self, _system, relative_path):
+        if self.locked:
+            raise RuntimeError("asset locked")
+        self.discarded.append(relative_path)
+        self._staging.delete_asset(relative_path)
+
+
+def _stage_owned_asset(
+    db, cache_repo, staging: StagingRepository, games: list[Game], relative_path: str
+) -> None:
+    from romcloud.core.models.cache import CacheStatus
+
+    for game in games:
+        entry = CacheEntry.create(game.id, f"/cache/{relative_path}")
+        entry.status = CacheStatus.INCOMPLETE
+        cache_repo.save(entry)
+        cache_repo.replace_membership(
+            game.id,
+            [GameAsset(Path(relative_path).name, relative_path, 5, game is games[0])],
+            {},
+        )
+    staging.replace_plan(
+        relative_path=relative_path, system=games[0].system, asset_kind="file",
+        source_provider="local", source_root="/source", expected_size=5,
+        source_manifest_sha256="manifest", files=[{
+            "member_relative_path": "", "expected_size": 5,
+            "source_object_id": None, "source_revision": None,
+            "source_checksum": None, "source_modified_epoch": None,
+        }],
+    )
+    old = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE cache_staging_assets SET updated_at=? WHERE relative_path=?",
+            (old, relative_path),
+        )
+
+
+def _age_downloads(db, *item_ids: str) -> None:
+    old = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
+    with db.connect() as conn:
+        conn.executemany(
+            "UPDATE download_items SET updated_at=? WHERE id=?",
+            [(old, item_id) for item_id in item_ids],
+        )
+
+
+def test_stale_gc_preserves_asset_for_newer_same_game_intent(
+    db, game_repo, cache_repo, cache_dir, tmp_path
+):
+    game = _game(game_repo, tmp_path / "source")
+    repo = DownloadRepository(db)
+    old, _ = repo.enqueue(
+        game_id=game.id, game_title=game.title, system=game.system,
+        origin=DownloadOrigin.MANUAL,
+    )
+    repo.transition(old.id, from_states=[DownloadState.QUEUED], to_state=DownloadState.CANCELLED)
+    newer, _ = repo.enqueue(
+        game_id=game.id, game_title=game.title, system=game.system,
+        origin=DownloadOrigin.MANUAL,
+    )
+    staging = StagingRepository(db)
+    _stage_owned_asset(db, cache_repo, staging, [game], "ps2/Game.iso")
+    _age_downloads(db, old.id)
+    cache = _GcCache(staging)
+
+    DownloadManagerService(
+        repository=repo, staging_repository=staging, game_repo=game_repo,
+        cache=cache, cache_root=str(cache_dir),
+    )
+
+    assert repo.get(newer.id).state is DownloadState.QUEUED
+    assert cache.discarded == []
+
+
+def test_stale_gc_uses_protected_shared_intent_not_owner_count(
+    db, game_repo, cache_repo, cache_dir, tmp_path
+):
+    first = _game(game_repo, tmp_path / "source", "A.iso")
+    second = _game(game_repo, tmp_path / "source", "B.iso")
+    repo = DownloadRepository(db)
+    stale_ids: list[str] = []
+    for game in (first, second):
+        item, _ = repo.enqueue(
+            game_id=game.id, game_title=game.title, system=game.system,
+            origin=DownloadOrigin.MANUAL,
+        )
+        repo.transition(
+            item.id, from_states=[DownloadState.QUEUED], to_state=DownloadState.CANCELLED
+        )
+        stale_ids.append(item.id)
+    staging = StagingRepository(db)
+    _stage_owned_asset(db, cache_repo, staging, [first, second], "ps2/Shared.chd")
+    _age_downloads(db, *stale_ids)
+    cache = _GcCache(staging)
+
+    DownloadManagerService(
+        repository=repo, staging_repository=staging, game_repo=game_repo,
+        cache=cache, cache_root=str(cache_dir),
+    )
+
+    assert cache.discarded == ["ps2/Shared.chd"]
+
+
+def test_stale_gc_preserves_shared_asset_for_paused_owner_indefinitely(
+    db, game_repo, cache_repo, cache_dir, tmp_path
+):
+    stale_game = _game(game_repo, tmp_path / "source", "A.iso")
+    paused_game = _game(game_repo, tmp_path / "source", "B.iso")
+    repo = DownloadRepository(db)
+    stale, _ = repo.enqueue(
+        game_id=stale_game.id, game_title=stale_game.title, system=stale_game.system,
+        origin=DownloadOrigin.MANUAL,
+    )
+    repo.transition(
+        stale.id, from_states=[DownloadState.QUEUED], to_state=DownloadState.CANCELLED
+    )
+    paused, _ = repo.enqueue(
+        game_id=paused_game.id, game_title=paused_game.title, system=paused_game.system,
+        origin=DownloadOrigin.MANUAL,
+    )
+    repo.transition(
+        paused.id, from_states=[DownloadState.QUEUED], to_state=DownloadState.RUNNING
+    )
+    repo.transition(
+        paused.id, from_states=[DownloadState.RUNNING], to_state=DownloadState.PAUSED
+    )
+    staging = StagingRepository(db)
+    _stage_owned_asset(
+        db, cache_repo, staging, [stale_game, paused_game], "ps2/Shared.chd"
+    )
+    _age_downloads(db, stale.id, paused.id)
+    cache = _GcCache(staging)
+
+    DownloadManagerService(
+        repository=repo, staging_repository=staging, game_repo=game_repo,
+        cache=cache, cache_root=str(cache_dir),
+    )
+
+    assert cache.discarded == []
+
+
+def test_stale_gc_skips_asset_held_by_live_writer_lock(
+    db, game_repo, cache_repo, cache_dir, tmp_path
+):
+    game = _game(game_repo, tmp_path / "source")
+    repo = DownloadRepository(db)
+    item, _ = repo.enqueue(
+        game_id=game.id, game_title=game.title, system=game.system,
+        origin=DownloadOrigin.MANUAL,
+    )
+    repo.transition(
+        item.id, from_states=[DownloadState.QUEUED], to_state=DownloadState.CANCELLED
+    )
+    staging = StagingRepository(db)
+    _stage_owned_asset(db, cache_repo, staging, [game], "ps2/Game.iso")
+    _age_downloads(db, item.id)
+    cache = _GcCache(staging, locked=True)
+
+    manager = DownloadManagerService(
+        repository=repo, staging_repository=staging, game_repo=game_repo,
+        cache=cache, cache_root=str(cache_dir),
+    )
+
+    assert manager.cleanup_stale_partials() == 0
+    assert staging.get_asset("ps2/Game.iso") is not None

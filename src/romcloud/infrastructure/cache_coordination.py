@@ -6,13 +6,13 @@ import fcntl
 import hashlib
 import os
 import shutil
-import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Optional
 
 from romcloud.core.exceptions import InsufficientSpaceError
+from romcloud.core.cache_paths import resolve_cache_path
 from romcloud.infrastructure.database import Database
 from romcloud.infrastructure.repositories.cache import CacheRepository
 
@@ -78,33 +78,68 @@ class AssetLockManager:
 
 
 class ReservationLease:
-    _UPDATE_GRANULARITY = 8 * 1024 * 1024
+    # Persisting every transfer chunk is excessive on Batocera flash media.
+    # Lag is deliberately conservative: the durable row temporarily reserves
+    # more future growth than needed, never less.
+    _UPDATE_GRANULARITY = 256 * 1024 * 1024
 
     def __init__(
         self,
         db: Database,
+        coordinator: "CacheStorageCoordinator",
         reservation_id: str,
         handle: object,
         reserved_bytes: int,
     ) -> None:
         self._db = db
+        self._coordinator = coordinator
         self.id = reservation_id
         self._handle = handle
         self._reserved = reserved_bytes
         self._last_persisted = reserved_bytes
         self._released = False
 
-    def shrink_to(self, reserved_bytes: int) -> None:
-        value = max(0, min(self._reserved, int(reserved_bytes)))
-        self._reserved = value
-        if self._last_persisted - value < self._UPDATE_GRANULARITY and value != 0:
+    @property
+    def reserved_bytes(self) -> int:
+        return self._reserved
+
+    def consume_growth(self, bytes_written: int) -> None:
+        """Convert promised future growth into already-present bytes.
+
+        Call only after the bytes are visible in staging. Until the bounded
+        durable update occurs the row over-reserves, which is safe.
+        """
+        self._reserved = max(0, self._reserved - max(0, int(bytes_written)))
+        if (
+            self._last_persisted - self._reserved < self._UPDATE_GRANULARITY
+            and self._reserved != 0
+        ):
             return
-        with self._db.connect() as conn:
-            conn.execute(
-                "UPDATE cache_reservations SET reserved_bytes=?, updated_at=? WHERE id=?",
-                (value, _utc_now(), self.id),
-            )
-        self._last_persisted = value
+        self._persist_reserved()
+
+    def protect_removal(self, bytes_to_remove: int) -> None:
+        """Reserve replacement growth before staged bytes disappear."""
+        amount = max(0, int(bytes_to_remove))
+        if amount == 0:
+            return
+        self._reserved += amount
+        # An increase must be durable before the corresponding filesystem
+        # removal; otherwise another admission could observe a quota hole.
+        self._persist_reserved()
+
+    def _persist_reserved(self) -> None:
+        with self._coordinator.admission_lock():
+            with self._db.connect() as conn:
+                conn.execute(
+                    "UPDATE cache_reservations SET reserved_bytes=?, updated_at=? WHERE id=?",
+                    (self._reserved, _utc_now(), self.id),
+                )
+        self._last_persisted = self._reserved
+
+    def finalize(self, callback: Callable[[], None]) -> None:
+        """Atomically swap reservation visibility for final DB accounting."""
+        with self._coordinator.admission_lock():
+            callback()
 
     def release(self) -> None:
         if self._released:
@@ -153,7 +188,7 @@ class CacheStorageCoordinator:
         self.min_free_bytes = min_free_bytes
 
     @contextmanager
-    def _admission_lock(self) -> Iterator[None]:
+    def admission_lock(self) -> Iterator[None]:
         path = self.lock_root / "cache-admission.lock"
         with path.open("a+b") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -164,13 +199,48 @@ class CacheStorageCoordinator:
 
     def staging_bytes(self) -> int:
         root = self.cache_root / ".partial"
-        if not root.is_dir():
-            return 0
-        return sum(
-            path.stat().st_size
-            for path in root.rglob("*")
-            if path.is_file() and not path.is_symlink()
+        staged = (
+            sum(
+                path.stat().st_size
+                for path in root.rglob("*")
+                if path.is_file() and not path.is_symlink()
+            )
+            if root.is_dir()
+            else 0
         )
+        # A crash can leave validated staging members already promoted out of
+        # .partial while their manifest still awaits the final DB transaction.
+        # Count those paths conservatively so stale-reservation reclamation
+        # cannot make their physical quota ownership disappear.
+        return staged + self._unfinalized_promotion_bytes()
+
+    def _unfinalized_promotion_bytes(self) -> int:
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                "SELECT relative_path, system FROM cache_staging_assets"
+            ).fetchall()
+        total = 0
+        for row in rows:
+            path = resolve_cache_path(
+                self.cache_root, row["system"], row["relative_path"]
+            )
+            if path.is_file() and not path.is_symlink():
+                total += path.stat().st_size
+            elif path.is_dir() and not path.is_symlink():
+                total += sum(
+                    item.stat().st_size
+                    for item in path.rglob("*")
+                    if item.is_file() and not item.is_symlink()
+                )
+        return total
+
+    def snapshot(self) -> dict[str, int]:
+        return {
+            "final_bytes": self.cache_repo.total_size(),
+            "staging_bytes": self.staging_bytes(),
+            "reserved_growth": self._active_reserved(),
+            "free_bytes": shutil.disk_usage(self.cache_root).free,
+        }
 
     def admit(
         self,
@@ -189,7 +259,7 @@ class CacheStorageCoordinator:
         handle = (reservation_dir / f"{reservation_id}.lock").open("a+b")
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
-            with self._admission_lock():
+            with self.admission_lock():
                 self._reclaim_stale_locked()
                 if not self._fits(requested) and evict is not None:
                     evict(requested)
@@ -222,7 +292,11 @@ class CacheStorageCoordinator:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             handle.close()
             raise
-        return ReservationLease(self.db, reservation_id, handle, requested)
+        return ReservationLease(self.db, self, reservation_id, handle, requested)
+
+    def fits_current(self, requested: int) -> bool:
+        """Evaluate using the caller's already-held admission lock."""
+        return self._fits(max(0, int(requested)))
 
     def _fits(self, requested: int) -> bool:
         final = self.cache_repo.total_size()

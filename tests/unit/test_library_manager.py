@@ -14,13 +14,16 @@ import pytest
 
 from romcloud.core.capabilities import CapabilityPolicy, OperatingMode
 from romcloud.core.models.cache import CachePolicy
+from romcloud.core.models.download import DownloadOrigin
 from romcloud.core.models.game import Game, GameAsset
 from romcloud.infrastructure.repositories.library_browser import LibraryBrowserRepository
 from romcloud.services.library_manager import LibraryManagerService
 from romcloud.web.server import ManagerHTTPServer
 
 
-def _manager(db, game_repo, cache_repo, cache_service, mode=OperatingMode.CACHE):
+def _manager(
+    db, game_repo, cache_repo, cache_service, mode=OperatingMode.CACHE, downloads=None
+):
     return LibraryManagerService(
         LibraryBrowserRepository(db),
         game_repo,
@@ -28,6 +31,7 @@ def _manager(db, game_repo, cache_repo, cache_service, mode=OperatingMode.CACHE)
         cache_service,
         policy_loader=lambda: CapabilityPolicy("smart_cache", mode),
         source_reachable=lambda: True,
+        downloads=downloads,
     )
 
 
@@ -45,6 +49,50 @@ def _game(game_repo, root: Path, system: str, title: str, suffix: str = ".rom") 
     )
     game_repo.save(game)
     return game
+
+
+class _RecordingDownloads:
+    def __init__(self) -> None:
+        self.enqueues = []
+        self.controls = []
+        self.started = 0
+        self.stopped = 0
+
+    def start(self):
+        self.started += 1
+
+    def shutdown(self):
+        self.stopped += 1
+
+    def enqueue(self, game_ids, *, origin, batch_id=None):
+        ids = list(game_ids)
+        self.enqueues.append((ids, origin, batch_id))
+        items = [{"id": f"download-{index}", "game_id": game_id} for index, game_id in enumerate(ids)]
+        return {"items": items, "created": len(items), "count": len(items)}
+
+    def status(self):
+        return {"items": [], "active": None, "retained_partial_bytes": 0}
+
+    def cancel_all(self):
+        self.controls.append(("cancel-all", None))
+        return 2
+
+    def retry_all_failed(self):
+        self.controls.append(("retry-all", None))
+        return 1
+
+    def cleanup_stale_partials(self):
+        self.controls.append(("cleanup", None))
+        return 3
+
+    def pause(self, item_id):
+        self.controls.append(("pause", item_id))
+
+    resume = pause
+    cancel = pause
+    retry = pause
+    discard_partial = pause
+    remove_queued = pause
 
 
 def test_system_first_paging_search_filters_and_bulk_pin(
@@ -197,6 +245,36 @@ def test_already_cached_pinned_game_requires_zero_additional_bytes(
     assert plan.additional_bytes == 0
 
 
+def test_row_download_and_pinned_batch_enqueue_asynchronously(
+    db, cache_repo, game_repo, cache_service, tmp_path, monkeypatch
+):
+    root = tmp_path / "source"
+    first = _game(game_repo, root, "nes", "First")
+    second = _game(game_repo, root, "nes", "Second")
+    downloads = _RecordingDownloads()
+    manager = _manager(
+        db, game_repo, cache_repo, cache_service, downloads=downloads
+    )
+    monkeypatch.setattr(
+        cache_service, "cache_game",
+        lambda _game_id: (_ for _ in ()).throw(AssertionError("synchronous transfer")),
+    )
+
+    result = manager.action("cache", [first.id])
+    assert result["count"] == 1
+    assert downloads.enqueues[0] == ([first.id], DownloadOrigin.MANUAL, None)
+
+    cache_service.pin(first.id)
+    cache_service.pin(second.id)
+    pinned = manager.enqueue_pinned()
+    ids, origin, batch_id = downloads.enqueues[1]
+    assert set(ids) == {first.id, second.id}
+    assert origin is DownloadOrigin.PINNED
+    assert batch_id and pinned["batch_id"] == batch_id
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM cache_reservations").fetchone()[0] == 0
+
+
 def test_large_catalog_page_query_is_bounded_and_fast(db, cache_repo, game_repo, cache_service):
     now = datetime.now(timezone.utc).isoformat()
     count = 28_000
@@ -277,6 +355,61 @@ def test_http_api_requires_token_and_serves_paginated_json(
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_authenticated_download_api_exposes_queue_and_controls(
+    db, game_repo, cache_repo, cache_service, tmp_path
+):
+    game = _game(game_repo, tmp_path / "source", "nes", "Queued")
+    downloads = _RecordingDownloads()
+    server = ManagerHTTPServer(
+        ("127.0.0.1", 0),
+        _manager(
+            db, game_repo, cache_repo, cache_service, downloads=downloads
+        ),
+        "secret",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def request(path, body=None):
+        return urllib.request.Request(
+            f"{base}{path}",
+            data=None if body is None else json.dumps(body).encode(),
+            headers={
+                "Authorization": "Bearer secret",
+                "Content-Type": "application/json",
+            },
+            method="GET" if body is None else "POST",
+        )
+
+    try:
+        with pytest.raises(urllib.error.HTTPError) as denied:
+            urllib.request.urlopen(f"{base}/api/downloads", timeout=2)
+        assert denied.value.code == 401
+        with urllib.request.urlopen(request("/api/downloads"), timeout=2) as response:
+            assert json.load(response)["items"] == []
+        with urllib.request.urlopen(
+            request("/api/downloads/enqueue", {"game_ids": [game.id]}), timeout=2
+        ) as response:
+            assert response.status == 202
+            assert json.load(response)["count"] == 1
+        with urllib.request.urlopen(
+            request("/api/downloads/item-1/pause", {}), timeout=2
+        ) as response:
+            assert json.load(response) == {"id": "item-1", "action": "pause"}
+        with urllib.request.urlopen(
+            request("/api/downloads/cancel-all", {}), timeout=2
+        ) as response:
+            assert json.load(response)["cancelled"] == 2
+        assert downloads.enqueues[0] == ([game.id], DownloadOrigin.MANUAL, None)
+        assert ("pause", "item-1") in downloads.controls
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    assert downloads.started == 1 and downloads.stopped == 1
 
 
 def test_local_diagnostics_api_is_paginated_filterable_and_structured(

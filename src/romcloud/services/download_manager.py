@@ -19,6 +19,7 @@ from romcloud.infrastructure.repositories.download import (
 )
 from romcloud.infrastructure.repositories.game import GameRepository
 from romcloud.services.cache import CacheService
+from romcloud.core.dependency_resolvers import DESCRIPTOR_EXTENSIONS
 
 log = get_logger("download_manager")
 
@@ -59,7 +60,10 @@ class DownloadManagerService:
         # hashing, package scans, or automatic resume occurs here.
         self._repo.recover_interrupted()
         self._repo.prune_terminal(keep=HISTORY_LIMIT)
-        self._last_gc = 0.0
+        self._last_gc = time.monotonic()
+        # Startup cleanup uses only durable local intent/manifest state and OS
+        # locks. It never resolves descriptors or accesses the provider.
+        self.cleanup_stale_partials()
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -93,7 +97,6 @@ class DownloadManagerService:
             game = self._games.get(game_id)
             if game is None or not game.is_eligible:
                 raise ValueError(f"Game not found in eligible catalog: {game_id}")
-            self._cache.prepare_download_membership(game.id)
             item, was_created = self._repo.enqueue(
                 game_id=game.id,
                 game_title=game.title,
@@ -116,16 +119,20 @@ class DownloadManagerService:
             sample = self._speed.get(item.id)
             speed = sample[2] if sample and now - sample[0] < 10 else 0.0
             payload["speed_bytes_per_second"] = speed
-            remaining = max(0, item.bytes_total - item.bytes_present)
-            payload["eta_seconds"] = remaining / speed if speed > 0 else None
-            payload["has_partial"] = item.bytes_present > 0
-            payload.update(
+            stats = (
                 self._staging.stats_for_game(item.game_id)
                 if item.game_id is not None else {
                     "total_files": 0, "retained_files": 0,
                     "interrupted_files": 0, "remaining_files": 0,
+                    "retained_bytes": 0,
                 }
             )
+            payload.update(stats)
+            if item.state is not DownloadState.COMPLETE:
+                payload["bytes_present"] = stats["retained_bytes"]
+            remaining = max(0, item.bytes_total - int(payload["bytes_present"]))
+            payload["eta_seconds"] = remaining / speed if speed > 0 else None
+            payload["has_partial"] = stats["retained_bytes"] > 0
             items.append(payload)
         active = [item for item in items if item["state"] in {"running", "verifying"}]
         grouped = {
@@ -138,7 +145,7 @@ class DownloadManagerService:
             "items": items,
             "active": active[0] if active else None,
             **grouped,
-            "retained_partial_bytes": self._staging.bytes_present(),
+            "retained_partial_bytes": self._cache.total_staging_size(),
             "history_limit": HISTORY_LIMIT,
         }
 
@@ -187,9 +194,33 @@ class DownloadManagerService:
             DownloadState.FAILED, DownloadState.CANCELLED,
         }:
             raise ValueError("Partial data cannot be discarded in this state.")
-        if item.game_id is not None:
-            self._cache.discard_staging(item.game_id)
-        self._repo.update_progress(item.id, 0, item.bytes_total)
+        if item.game_id is None:
+            self._repo.update_progress(item.id, 0, item.bytes_total)
+            return
+        now = datetime.now(timezone.utc)
+        others = [
+            other for other in self._repo.list_all()
+            if other.id != item.id and other.game_id is not None
+            and self._is_protected(other, now)
+        ]
+        if any(other.game_id == item.game_id for other in others):
+            raise ValueError(
+                "Retained data belongs to a newer active/protected download for this game."
+            )
+        protected_games = {str(other.game_id) for other in others}
+        game = self._games.get(item.game_id)
+        direct_paths = {
+            asset.relative_path for asset in (game.assets if game is not None else [])
+        }
+        for asset in self._staging.list_assets():
+            owners = self._staging.owner_game_ids(asset.relative_path)
+            if item.game_id not in owners and asset.relative_path not in direct_paths:
+                continue
+            if (owners - {item.game_id}) & protected_games:
+                continue
+            self._cache.discard_staging_asset(asset.system, asset.relative_path)
+        retained = self._staging.stats_for_game(item.game_id)["retained_bytes"]
+        self._repo.update_progress(item.id, retained, item.bytes_total)
 
     def cancel_all(self) -> int:
         count = self._repo.queued_cancel_all()
@@ -207,25 +238,82 @@ class DownloadManagerService:
         return count
 
     def cleanup_stale_partials(self) -> int:
-        cleaned = 0
         now = datetime.now(timezone.utc)
         retention = {
             DownloadState.INTERRUPTED: INTERRUPTED_RETENTION,
             DownloadState.FAILED: FAILED_RETENTION,
             DownloadState.CANCELLED: CANCELLED_RETENTION,
         }
-        for item in self._repo.list(terminal_limit=10000):
+        items = self._repo.list_all()
+        protected_games: set[str] = set()
+        expired_retention: dict[str, timedelta] = {}
+        protected_paths: set[str] = set()
+        unresolved_descriptor_systems: set[str] = set()
+        for item in items:
+            if item.game_id is None or item.state is DownloadState.COMPLETE:
+                continue
             maximum = retention.get(item.state)
-            if maximum is None or item.game_id is None or now - item.updated_at < maximum:
+            protected = maximum is None or now - item.updated_at < maximum
+            if protected:
+                protected_games.add(item.game_id)
+                game = self._games.get(item.game_id)
+                if game is not None:
+                    protected_paths.update(asset.relative_path for asset in game.assets)
+                    primary = game.primary_asset
+                    if (
+                        item.state is DownloadState.QUEUED
+                        and primary is not None
+                        and Path(primary.filename).suffix.lower() in DESCRIPTOR_EXTENSIONS
+                    ):
+                        # Enqueue persists intent only. Until the worker resolves
+                        # and locks this descriptor closure, conservatively keep
+                        # same-system staging that could be a shared dependency.
+                        unresolved_descriptor_systems.add(game.system)
+                continue
+            current = expired_retention.get(item.game_id, timedelta(0))
+            expired_retention[item.game_id] = max(current, maximum or timedelta(0))
+
+        cleaned = 0
+        for asset in self._staging.list_assets():
+            owners = self._staging.owner_game_ids(asset.relative_path)
+            if (
+                asset.relative_path in protected_paths
+                or owners & protected_games
+                or asset.system in unresolved_descriptor_systems
+            ):
+                continue
+            required_age = max(
+                (expired_retention.get(owner, INTERRUPTED_RETENTION) for owner in owners),
+                default=INTERRUPTED_RETENTION,
+            )
+            if now - asset.updated_at < required_age:
                 continue
             try:
-                self._cache.discard_staging(item.game_id)
+                self._cache.discard_staging_asset(
+                    asset.system, asset.relative_path
+                )
             except RuntimeError:
+                # A live physical writer owns the asset lock.
                 continue
-            self._repo.update_progress(item.id, 0, item.bytes_total)
             cleaned += 1
         self._last_gc = time.monotonic()
         return cleaned
+
+    @staticmethod
+    def _is_protected(item, now: datetime) -> bool:  # noqa: ANN001
+        if item.state in {
+            DownloadState.QUEUED,
+            DownloadState.RUNNING,
+            DownloadState.VERIFYING,
+            DownloadState.PAUSED,
+        }:
+            return True
+        maximum = {
+            DownloadState.INTERRUPTED: INTERRUPTED_RETENTION,
+            DownloadState.FAILED: FAILED_RETENTION,
+            DownloadState.CANCELLED: CANCELLED_RETENTION,
+        }.get(item.state)
+        return maximum is not None and now - item.updated_at < maximum
 
     def _request_active_stop(self, item_id: str, action: str) -> None:
         with self._control_lock:

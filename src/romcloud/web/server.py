@@ -286,33 +286,38 @@ class ManagerRequestHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/download-pinned":
                 self._json(HTTPStatus.ACCEPTED, self.server.manager.enqueue_pinned())
             elif parsed.path == "/api/downloads/enqueue":
+                downloads = self._require_download_manager()
                 body = self._body()
                 from romcloud.core.models.download import DownloadOrigin
 
                 origin = DownloadOrigin(str(body.get("origin", "manual")))
                 self._json(
                     HTTPStatus.ACCEPTED,
-                    self.server.downloads.enqueue(body.get("game_ids", []), origin=origin),
+                    downloads.enqueue(body.get("game_ids", []), origin=origin),
                 )
             elif parsed.path == "/api/downloads/cancel-all":
-                self._json(HTTPStatus.OK, {"cancelled": self.server.downloads.cancel_all()})
+                downloads = self._require_download_manager()
+                self._json(HTTPStatus.OK, {"cancelled": downloads.cancel_all()})
             elif parsed.path == "/api/downloads/retry-all-failed":
-                self._json(HTTPStatus.OK, {"retried": self.server.downloads.retry_all_failed()})
+                downloads = self._require_download_manager()
+                self._json(HTTPStatus.OK, {"retried": downloads.retry_all_failed()})
             elif parsed.path == "/api/downloads/cleanup":
-                self._json(HTTPStatus.OK, {"cleaned": self.server.downloads.cleanup_stale_partials()})
+                downloads = self._require_download_manager()
+                self._json(HTTPStatus.OK, {"cleaned": downloads.cleanup_stale_partials()})
             elif parsed.path.startswith("/api/downloads/"):
+                downloads = self._require_download_manager()
                 parts = parsed.path.strip("/").split("/")
                 if len(parts) != 4:
                     self.send_error(HTTPStatus.NOT_FOUND)
                     return
                 item_id, control = parts[2], parts[3]
                 operations = {
-                    "pause": self.server.downloads.pause,
-                    "resume": self.server.downloads.resume,
-                    "cancel": self.server.downloads.cancel,
-                    "retry": self.server.downloads.retry,
-                    "discard": self.server.downloads.discard_partial,
-                    "remove": self.server.downloads.remove_queued,
+                    "pause": downloads.pause,
+                    "resume": downloads.resume,
+                    "cancel": downloads.cancel,
+                    "retry": downloads.retry,
+                    "discard": downloads.discard_partial,
+                    "remove": downloads.remove_queued,
                 }
                 operation = operations.get(control)
                 if operation is None:
@@ -326,6 +331,11 @@ class ManagerRequestHandler(BaseHTTPRequestHandler):
         except Exception:  # noqa: BLE001
             log.exception("Browser manager POST failed")
             self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Internal server error."})
+
+    def _require_download_manager(self):  # noqa: ANN201
+        if self.server.downloads is None:
+            raise RuntimeError("Download Manager is unavailable.")
+        return self.server.downloads
 
     def _authenticated(self) -> bool:
         return self._trusted_local_request() or self._bearer_authenticated() or self._cookie_session() is not None

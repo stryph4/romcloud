@@ -292,7 +292,7 @@ async function showPreflight() {
   try {
     const plan = await api("/api/download-pinned/preflight", {method: "POST", body: "{}"});
     body.replaceChildren();
-    [["Pinned games needing data", number(plan.games_needing_data)], ["Additional download", formatBytes(plan.additional_bytes)], ["Current physical cache", formatBytes(plan.current_cache_bytes)], ["Cache-size limit", formatBytes(plan.max_cache_bytes)], ["Filesystem free", formatBytes(plan.free_bytes)], ["Minimum free reserve", formatBytes(plan.min_free_bytes)]].forEach(([name, value]) => { const metric = el("div", "metric"); metric.append(el("span", "", name), el("b", "", value)); body.append(metric); });
+    [["Pinned games needing data", number(plan.games_needing_data)], ["Future growth needed", formatBytes(plan.additional_bytes)], ["Current physical cache", formatBytes(plan.current_cache_bytes)], ["Retained staging", formatBytes(plan.staging_bytes)], ["Active reserved growth", formatBytes(plan.active_reserved_growth)], ["Projected accounted storage", formatBytes(plan.resulting_cache_bytes)], ["Cache-size limit", formatBytes(plan.max_cache_bytes)], ["Filesystem free", formatBytes(plan.free_bytes)], ["Minimum free reserve", formatBytes(plan.min_free_bytes)]].forEach(([name, value]) => { const metric = el("div", "metric"); metric.append(el("span", "", name), el("b", "", value)); body.append(metric); });
     $("preflight-error").textContent = plan.reasons.join(" ");
     $("start-download").disabled = !plan.allowed || plan.games_needing_data === 0;
     contentUpdated();

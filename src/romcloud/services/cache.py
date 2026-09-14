@@ -57,6 +57,8 @@ class PinnedDownloadPreflight:
     games_needing_data: int
     additional_bytes: int
     current_cache_bytes: int
+    staging_bytes: int
+    active_reserved_growth: int
     max_cache_bytes: int
     free_bytes: int
     min_free_bytes: int
@@ -70,7 +72,12 @@ class PinnedDownloadPreflight:
             "games_needing_data": self.games_needing_data,
             "additional_bytes": self.additional_bytes,
             "current_cache_bytes": self.current_cache_bytes,
-            "resulting_cache_bytes": self.current_cache_bytes + self.additional_bytes,
+            "staging_bytes": self.staging_bytes,
+            "active_reserved_growth": self.active_reserved_growth,
+            "resulting_cache_bytes": (
+                self.current_cache_bytes + self.staging_bytes
+                + self.active_reserved_growth + self.additional_bytes
+            ),
             "max_cache_bytes": self.max_cache_bytes,
             "free_bytes": self.free_bytes,
             "resulting_free_bytes": self.free_bytes - self.additional_bytes,
@@ -373,67 +380,103 @@ class CacheService:
                 owner_instance_id=owner_instance_id or uuid.uuid4().hex,
                 download_item_id=download_item_id,
                 evict=lambda amount: self.evict(
-                    amount, protected_game_ids={game_id}
+                    amount, protected_game_ids={game_id}, _admission_locked=True
                 ),
             )
         else:
             self._ensure_space(needed, protected_game_id=game_id)
-        if cancellation is not None:
-            cancellation.raise_if_cancelled()
-
-        # cache_path is fully determined by (system, primary asset's relative
-        # path) — see romcloud.core.cache_paths — so it is already correct
-        # even before the transfer completes.
-        cache_path = str(
-            resolve_cache_path(
-                self._cache_root, resolved_game.system, primary.relative_path
-            )
-        )
-
-        # Create or update the entry to TRANSFERRING.
-        if existing is None:
-            entry = CacheEntry.create(game_id=game_id, cache_path=cache_path)
-            self._cache_repo.save(entry)
-        else:
-            self._cache_repo.update_status(game_id, CacheStatus.TRANSFERRING)
-        self._cache_repo.replace_membership(
-            game_id, resolved_game.assets, actual_before
-        )
-
-        try:
-            initial_present = staged_before + sum(actual_before.values())
-
-            def coordinated_progress(done: int, total: int) -> None:
-                if reservation is not None:
-                    reservation.shrink_to(max(0, needed - max(0, done - initial_present)))
-                if on_progress is not None:
-                    on_progress(done, total)
-
-            progress = coordinated_progress if reservation is not None else on_progress
-            if cancellation is None:
-                final_path = self._transfer.transfer(resolved_game, progress)
-            else:
-                final_path = self._transfer.transfer(
-                    resolved_game, progress, cancellation=cancellation
+        # No operation may occur between a successful admission and this
+        # cleanup boundary. Cancellation, DB failures, provider errors, and
+        # promotion failures all release both row and OS ownership lock.
+        if reservation is not None:
+            try:
+                return self._cache_game_after_admission(
+                    game_id=game_id,
+                    primary=primary,
+                    resolved_game=resolved_game,
+                    existing=existing,
+                    actual_before=actual_before,
+                    on_progress=on_progress,
+                    cancellation=cancellation,
+                    download_item_id=download_item_id,
+                    reservation=reservation,
                 )
+            finally:
+                reservation.release()
+        return self._cache_game_after_admission(
+            game_id=game_id,
+            primary=primary,
+            resolved_game=resolved_game,
+            existing=existing,
+            actual_before=actual_before,
+            on_progress=on_progress,
+            cancellation=cancellation,
+            download_item_id=download_item_id,
+            reservation=None,
+        )
+
+    def _cache_game_after_admission(
+        self,
+        *,
+        game_id: str,
+        primary: GameAsset,
+        resolved_game: Game,
+        existing: Optional[CacheEntry],
+        actual_before: dict[str, int],
+        on_progress: Optional[Callable[[int, int], None]],
+        cancellation: Optional[TransferCancellationToken],
+        download_item_id: Optional[str],
+        reservation,
+    ) -> str:  # noqa: ANN001
+        try:
+            if cancellation is not None:
                 cancellation.raise_if_cancelled()
-            # Size recorded against the quota must cover *every* asset of
-            # the logical game (e.g. .cue + all .bin tracks), never just
-            # the primary/launch asset. Entry size remains a logical-game
-            # figure; quota uses distinct persisted membership paths.
+            cache_path = str(
+                resolve_cache_path(
+                    self._cache_root, resolved_game.system, primary.relative_path
+                )
+            )
+            if existing is None:
+                self._cache_repo.save(CacheEntry.create(game_id, cache_path))
+            else:
+                self._cache_repo.update_status(game_id, CacheStatus.TRANSFERRING)
+            self._cache_repo.replace_membership(
+                game_id, resolved_game.assets, actual_before
+            )
+
+            def staging_delta(delta: int) -> None:
+                if reservation is None:
+                    return
+                if delta < 0:
+                    reservation.protect_removal(-delta)
+                elif delta > 0:
+                    reservation.consume_growth(delta)
+
+            if reservation is not None:
+                final_path = self._transfer.transfer(
+                    resolved_game,
+                    on_progress,
+                    cancellation,
+                    on_staging_delta=staging_delta,
+                )
+            else:
+                final_path = (
+                    self._transfer.transfer(resolved_game, on_progress)
+                    if cancellation is None
+                    else self._transfer.transfer(
+                        resolved_game, on_progress, cancellation
+                    )
+                )
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
             actual_sizes = {
                 asset.relative_path: _dir_size(
                     resolve_cache_path(
-                        self._cache_root,
-                        resolved_game.system,
-                        asset.relative_path,
+                        self._cache_root, resolved_game.system, asset.relative_path
                     )
                 )
                 for asset in resolved_game.assets
             }
-            actual_size = sum(actual_sizes.values())
-            if cancellation is not None:
-                cancellation.raise_if_cancelled()
             launch_asset = resolved_game.primary_asset
             launch_path = (
                 resolve_cache_path(
@@ -443,30 +486,32 @@ class CacheService:
             )
             if launch_path is None or not launch_path.exists():
                 raise CacheError(
-                    f"Cache completed but the primary launch asset could not be resolved for {game_id}"
+                    "Cache completed but the primary launch asset could not be "
+                    f"resolved for {game_id}"
                 )
             if cancellation is not None:
                 cancellation.raise_if_cancelled()
-            self._cache_repo.finalize_transfer(
-                game_id=game_id,
-                cache_path=final_path,
-                sizes=actual_sizes,
-                staging_assets=[asset.relative_path for asset in resolved_game.assets],
-                download_item_id=download_item_id,
-            )
-            return str(launch_path)
 
+            def finalize() -> None:
+                self._cache_repo.finalize_transfer(
+                    game_id=game_id,
+                    cache_path=final_path,
+                    sizes=actual_sizes,
+                    staging_assets=[asset.relative_path for asset in resolved_game.assets],
+                    download_item_id=download_item_id,
+                )
+
+            if reservation is not None:
+                reservation.finalize(finalize)
+            else:
+                finalize()
+            return str(launch_path)
         except TransferCancelledError:
-            # Staging remains isolated under .partial for a safe subsequent
-            # retry. It is neither a valid cache hit nor a transfer failure.
             self._cache_repo.update_status(game_id, CacheStatus.INCOMPLETE)
             raise
         except Exception:
             self._cache_repo.update_status(game_id, CacheStatus.FAILED)
             raise
-        finally:
-            if reservation is not None:
-                reservation.release()
 
     def resolved_asset_paths(self, game_id: str) -> list[Path]:
         """Return canonical final physical destinations for worker claiming."""
@@ -496,52 +541,23 @@ class CacheService:
         resolved = self._resolved_game(game, self._cache_repo.get(game_id))
         return self._transfer.staging_size(resolved)
 
-    def prepare_download_membership(self, game_id: str) -> None:
-        """Persist the physical closure before queueing for shared ownership."""
-        game = self._game_repo.get(game_id)
-        if game is None:
-            raise GameNotFoundError(f"Game not found in catalog: {game_id}")
-        existing = self._cache_repo.get(game_id)
-        resolved = self._resolved_game(game, existing)
-        actual = self._existing_member_sizes(existing, resolved)
-        if existing is None:
-            primary = resolved.primary_asset
-            if primary is None:
-                raise CacheError(f"Game {game_id!r} has no cacheable assets")
-            entry = CacheEntry.create(
-                game_id,
-                str(resolve_cache_path(
-                    self._cache_root, resolved.system, primary.relative_path
-                )),
-            )
-            entry.status = CacheStatus.INCOMPLETE
-            self._cache_repo.save(entry)
-        self._cache_repo.replace_membership(game_id, resolved.assets, actual)
+    def total_staging_size(self) -> int:
+        return (
+            self._storage.snapshot()["staging_bytes"]
+            if self._storage is not None
+            else self._transfer.total_staging_size()
+        )
 
-    def discard_staging(self, game_id: str) -> None:
-        """Discard resumable bytes while protecting shared physical assets."""
-        game = self._game_repo.get(game_id)
-        if game is None:
-            return
-        resolved = self._resolved_game(game, self._cache_repo.get(game_id))
-        paths = [
-            resolve_cache_path(self._cache_root, resolved.system, asset.relative_path)
-            for asset in resolved.assets
-        ]
+    def discard_staging_asset(self, system: str, relative_path: str) -> None:
+        """Discard one physical staged asset without resolving a game/source."""
+        final_path = resolve_cache_path(self._cache_root, system, relative_path)
         lease = (
-            self._storage.assets.acquire(paths, blocking=False)
+            self._storage.assets.acquire([final_path], blocking=False)
             if self._storage is not None
             else FileLockLease([])
         )
         with lease:
-            preserve = {
-                asset.relative_path
-                for asset in resolved.assets
-                if self._cache_repo.owner_count(asset.relative_path) > 1
-            }
-            self._transfer.discard_staging(
-                resolved, preserve_relative_paths=preserve
-            )
+            self._transfer.discard_staging_asset(system, relative_path)
 
     def remove(
         self,
@@ -642,7 +658,7 @@ class CacheService:
         """
         entries = self._cache_repo.list_pinned()
         needed_games: list[str] = []
-        missing_paths: dict[str, int] = {}
+        missing_paths: dict[str, tuple[str, int]] = {}
         for entry in entries:
             game = self._game_repo.get(entry.game_id)
             if game is None or not game.is_eligible:
@@ -655,21 +671,35 @@ class CacheService:
                 if asset.relative_path in existing:
                     continue
                 size = self._transfer.estimate_asset_size(resolved, asset)
-                missing_paths[asset.relative_path] = max(
-                    missing_paths.get(asset.relative_path, 0), int(size or 0)
+                prior = missing_paths.get(asset.relative_path)
+                missing_paths[asset.relative_path] = (
+                    resolved.system,
+                    max(prior[1] if prior else 0, int(size or 0)),
                 )
             needed_games.append(entry.game_id)
 
-        additional = sum(missing_paths.values())
-        current = self._cache_repo.total_size()
-        free = _free_bytes(str(self._cache_root)) if free_bytes is None else free_bytes
+        additional = sum(
+            max(0, size - self._transfer.staging_asset_size(system, path))
+            for path, (system, size) in missing_paths.items()
+        )
+        if self._storage is not None:
+            snapshot = self._storage.snapshot()
+            current = snapshot["final_bytes"]
+            staging = snapshot["staging_bytes"]
+            reserved = snapshot["reserved_growth"]
+            free = snapshot["free_bytes"] if free_bytes is None else free_bytes
+        else:
+            current = self._cache_repo.total_size()
+            staging = self._transfer.total_staging_size()
+            reserved = 0
+            free = _free_bytes(str(self._cache_root)) if free_bytes is None else free_bytes
         reasons: list[str] = []
-        if current + additional > self._policy.max_size_bytes:
+        if current + staging + reserved + additional > self._policy.max_size_bytes:
             reasons.append(
                 "Pinned downloads would exceed the configured cache-size limit. "
                 "Remove local copies or unpin games first."
             )
-        if free - additional < self._policy.min_free_bytes:
+        if free - reserved - additional < self._policy.min_free_bytes:
             reasons.append(
                 "Pinned downloads would reduce filesystem free space below the "
                 "configured minimum reserve. Remove local copies or unpin games first."
@@ -679,6 +709,8 @@ class CacheService:
             games_needing_data=len(needed_games),
             additional_bytes=additional,
             current_cache_bytes=current,
+            staging_bytes=staging,
+            active_reserved_growth=reserved,
             max_cache_bytes=self._policy.max_size_bytes,
             free_bytes=free,
             min_free_bytes=self._policy.min_free_bytes,
@@ -721,6 +753,7 @@ class CacheService:
         bytes_needed: int = 0,
         *,
         protected_game_ids: Optional[set[str]] = None,
+        _admission_locked: bool = False,
     ) -> list[str]:
         """Free space by evicting LRU-eligible entries.
 
@@ -739,10 +772,16 @@ class CacheService:
         for candidate in candidates:
             # Disk free space and repository usage are authoritative. Re-read
             # both after every removal rather than estimating reclaimed bytes.
-            total = self._cache_repo.total_size()
-            free = _free_bytes(str(self._cache_root))
-
-            if self._has_space_for(total, free, bytes_needed):
+            enough = (
+                self._storage.fits_current(bytes_needed)
+                if self._storage is not None and _admission_locked
+                else self._has_space_for(
+                    self._cache_repo.total_size(),
+                    _free_bytes(str(self._cache_root)),
+                    bytes_needed,
+                )
+            )
+            if enough:
                 break
 
             if (
@@ -792,6 +831,15 @@ class CacheService:
         """Return valid existing bytes that can be adopted by this snapshot."""
         sizes: dict[str, int] = {}
         for asset in game.assets:
+            if self._transfer.has_recovery_manifest(asset.relative_path):
+                recovered = self._transfer.validated_promoted_size(
+                    game.system, asset.relative_path
+                )
+                if recovered is not None:
+                    sizes[asset.relative_path] = recovered
+                # Durable recovery evidence exists, so a failed hash check
+                # must never fall through to the legacy size-only rule.
+                continue
             direct = resolve_cache_path(
                 self._cache_root, game.system, asset.relative_path
             )
