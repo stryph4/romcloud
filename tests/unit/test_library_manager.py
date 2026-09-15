@@ -88,6 +88,9 @@ class _RecordingDownloads:
         self.controls.append(("cleanup", None))
         return 3
 
+    def apply_operating_mode(self, *, offline):
+        self.controls.append(("operating-mode", offline))
+
     def pause(self, item_id):
         self.controls.append(("pause", item_id))
 
@@ -96,6 +99,39 @@ class _RecordingDownloads:
     retry = pause
     discard_partial = pause
     remove_queued = pause
+
+
+def test_resident_worker_starts_only_after_manager_is_discoverable(monkeypatch):
+    import romcloud.web.server as server_module
+
+    events = []
+
+    class StubServer:
+        def __init__(self, *_args, **kwargs):
+            assert kwargs["start_downloads"] is False
+
+        def start_downloads(self):
+            events.append("downloads")
+
+        def serve_forever(self, **_kwargs):
+            events.append("serve")
+
+        def server_close(self):
+            events.append("close")
+
+        def shutdown(self):
+            return None
+
+    monkeypatch.setattr(server_module, "ManagerHTTPServer", StubServer)
+    server_module.serve_manager(
+        object(),
+        "127.0.0.1",
+        0,
+        "secret",
+        on_ready=lambda: events.append("ready"),
+    )
+
+    assert events == ["ready", "downloads", "serve", "close"]
 
 
 def test_system_first_paging_search_filters_and_bulk_pin(
@@ -417,8 +453,13 @@ def test_authenticated_download_api_exposes_queue_and_controls(
             request("/api/downloads/cancel-all", {}), timeout=2
         ) as response:
             assert json.load(response)["cancelled"] == 2
+        with urllib.request.urlopen(
+            request("/api/downloads/operating-mode", {"offline": True}), timeout=2
+        ) as response:
+            assert json.load(response) == {"offline": True, "quiescent": True}
         assert downloads.enqueues[0] == ([game.id], DownloadOrigin.MANUAL, None)
         assert ("pause", "item-1") in downloads.controls
+        assert ("operating-mode", True) in downloads.controls
     finally:
         server.shutdown()
         server.server_close()

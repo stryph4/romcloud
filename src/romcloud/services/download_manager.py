@@ -7,8 +7,9 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
+from romcloud.core.capabilities import Capability, CapabilityPolicy
 from romcloud.core.cancellation import TransferCancellationToken
 from romcloud.core.exceptions import TransferCancelledError
 from romcloud.core.models.download import DownloadOrigin, DownloadState
@@ -41,17 +42,22 @@ class DownloadManagerService:
         game_repo: GameRepository,
         cache: CacheService,
         cache_root: str,
+        capability_policy_loader: Optional[Callable[[], CapabilityPolicy]] = None,
     ) -> None:
         self._repo = repository
         self._staging = staging_repository
         self._games = game_repo
         self._cache = cache
         self._cache_root = Path(cache_root)
+        self._capability_policy_loader = capability_policy_loader
         self.instance_id = uuid.uuid4().hex
         self._wake = threading.Event()
         self._stopping = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._control_lock = threading.Lock()
+        self._control_changed = threading.Condition(self._control_lock)
+        self._offline_suspended = False
+        self._claiming = False
         self._active_item_id: Optional[str] = None
         self._active_token: Optional[TransferCancellationToken] = None
         self._requested_stop: dict[str, str] = {}
@@ -83,6 +89,23 @@ class DownloadManagerService:
         self._wake.set()
         if self._thread is not None:
             self._thread.join(timeout=max(0.0, timeout))
+
+    def apply_operating_mode(self, *, offline: bool, timeout: float = 30.0) -> None:
+        """Quiesce source work for explicit Offline, or re-enable queued work."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._control_changed:
+            self._offline_suspended = offline
+            if offline and self._active_item_id and self._active_token:
+                self._requested_stop[self._active_item_id] = "paused"
+                self._active_token.cancel()
+            self._wake.set()
+            while offline and (self._claiming or self._active_item_id is not None):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        "Download Manager did not reach a safe Offline boundary."
+                    )
+                self._control_changed.wait(remaining)
 
     def enqueue(
         self,
@@ -353,9 +376,26 @@ class DownloadManagerService:
                     error_message="The catalog game no longer exists.",
                 )
                 continue
+            with self._control_changed:
+                blocked = self._downloads_blocked()
+                if not blocked:
+                    # Dependency closure resolution may touch the ROM source.
+                    # Mark this short claim phase so an Offline transition
+                    # waits for its safe boundary before reporting completion.
+                    self._claiming = True
+            if blocked:
+                self._wake.wait(1.0)
+                self._wake.clear()
+                continue
             try:
                 lease = self._cache.try_asset_locks(item.game_id)
             except Exception as exc:  # noqa: BLE001
+                with self._control_changed:
+                    self._claiming = False
+                    self._control_changed.notify_all()
+                    blocked = self._downloads_blocked()
+                if blocked:
+                    continue
                 log.exception("Could not resolve/lock download closure: %s", item.id)
                 self._repo.transition(
                     item.id, from_states=[DownloadState.QUEUED],
@@ -364,9 +404,15 @@ class DownloadManagerService:
                 )
                 continue
             if lease is None:
+                with self._control_changed:
+                    self._claiming = False
+                    self._control_changed.notify_all()
                 self._wake.wait(0.5)
                 self._wake.clear()
                 continue
+            with self._control_changed:
+                self._claiming = False
+                self._control_changed.notify_all()
             token = TransferCancellationToken()
             resolved_snapshot = getattr(lease, "resolved_game", None)
             retained = (
@@ -377,15 +423,28 @@ class DownloadManagerService:
                 else self._cache.retained_staging_size(item.game_id)
             )
             initial = DownloadState.VERIFYING if retained else DownloadState.RUNNING
-            if not self._repo.transition(
-                item.id, from_states=[DownloadState.QUEUED], to_state=initial,
-                worker_instance_id=self.instance_id,
-            ):
+            with self._control_changed:
+                if self._downloads_blocked():
+                    self._claiming = False
+                    self._control_changed.notify_all()
+                    blocked = True
+                else:
+                    blocked = False
+                    transitioned = self._repo.transition(
+                        item.id, from_states=[DownloadState.QUEUED], to_state=initial,
+                        worker_instance_id=self.instance_id,
+                    )
+                    if transitioned:
+                        self._active_item_id = item.id
+                        self._active_token = token
+                    self._claiming = False
+                    self._control_changed.notify_all()
+            if blocked:
                 lease.release()
                 continue
-            with self._control_lock:
-                self._active_item_id = item.id
-                self._active_token = token
+            if not transitioned:
+                lease.release()
+                continue
             started = time.monotonic()
             previous_time = started
             previous_bytes = retained
@@ -445,9 +504,17 @@ class DownloadManagerService:
                         item.id, from_states=[current.state], to_state=target
                     )
             except Exception as exc:  # noqa: BLE001
-                log.exception("Download failed: %s", item.id)
                 current = self._repo.get(item.id)
-                if current is not None:
+                if current is not None and self._downloads_blocked():
+                    current_progress = self._cache.retained_staging_size(item.game_id)
+                    self._repo.update_progress(
+                        item.id, current_progress, latest_total or current.bytes_total
+                    )
+                    self._repo.transition(
+                        item.id, from_states=[current.state], to_state=DownloadState.PAUSED
+                    )
+                elif current is not None:
+                    log.exception("Download failed: %s", item.id)
                     self._repo.transition(
                         item.id, from_states=[current.state], to_state=DownloadState.FAILED,
                         error_code=type(exc).__name__, error_message=str(exc),
@@ -460,7 +527,21 @@ class DownloadManagerService:
                     )
             finally:
                 lease.release()
-                with self._control_lock:
+                with self._control_changed:
                     self._active_item_id = None
                     self._active_token = None
+                    self._control_changed.notify_all()
                 self._repo.prune_terminal(keep=HISTORY_LIMIT)
+
+    def _downloads_blocked(self) -> bool:
+        if self._offline_suspended:
+            return True
+        if self._capability_policy_loader is None:
+            return False
+        policy = self._capability_policy_loader()
+        if policy.offline:
+            # Explicit mode coordination clears this latch when leaving
+            # Offline, avoiding repeated state-file reads while work is queued.
+            self._offline_suspended = True
+            return True
+        return not policy.allows(Capability.GAME_DOWNLOAD)

@@ -35,6 +35,15 @@ MANIFEST_VERSION = 1
 log = logging.getLogger(__name__)
 
 
+def _coordinate_download_manager_mode(config: AppConfig, mode: OperatingMode) -> None:
+    """Synchronize an explicit persisted mode change with a resident manager."""
+    from romcloud.web.lifecycle import coordinate_download_manager_mode
+
+    coordinate_download_manager_mode(
+        config.data_path, offline=mode is OperatingMode.OFFLINE
+    )
+
+
 class DirectLinkConflictError(RuntimeError):
     """The reserved Connected Mode path is not a verified ROMCloud link."""
 
@@ -749,6 +758,7 @@ def set_operating_mode(
     with _operating_mode_lock(config):
         previous = operating_mode(config)
         if requested is previous:
+            _coordinate_download_manager_mode(config, requested)
             _migrate_legacy_direct_saves(
                 config,
                 progress=progress,
@@ -778,9 +788,14 @@ def set_operating_mode(
         )
         presentation_attempted = False
         state_committed = False
+        manager_coordinated = False
         save_reconcile = None
         transition_stage = "prepare the mode transition"
         try:
+            if requested is OperatingMode.OFFLINE:
+                transition_stage = "quiesce the Download Manager"
+                _coordinate_download_manager_mode(config, requested)
+                manager_coordinated = True
             if requested is OperatingMode.CONNECTED:
                 transition_stage = "connect to the configured ROM source"
                 _prepare_connected_source(config, progress)
@@ -815,6 +830,9 @@ def set_operating_mode(
             # a later manual ROMCloud launch both observe the requested mode.
             write_operating_mode(config, requested)
             state_committed = True
+            transition_stage = "coordinate the Download Manager"
+            _coordinate_download_manager_mode(config, requested)
+            manager_coordinated = True
             transition_stage = "refresh EmulationStation"
             _update_emulationstation(
                 config,
@@ -849,6 +867,11 @@ def set_operating_mode(
             if state_committed:
                 try:
                     write_operating_mode(config, previous)
+                except Exception as rollback_exc:
+                    rollback_errors.append(rollback_exc)
+            if state_committed or manager_coordinated:
+                try:
+                    _coordinate_download_manager_mode(config, previous)
                 except Exception as rollback_exc:
                     rollback_errors.append(rollback_exc)
             if presentation_attempted:

@@ -463,6 +463,32 @@ def test_mode_state_and_refresh_notice_precede_es_restart(
     assert notice < refresh_call < restart_call
 
 
+def test_mode_transition_coordinates_downloads_after_state_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _stub_es
+) -> None:
+    config = _config(tmp_path)
+    _library(config)
+    write_operating_mode(config, OperatingMode.CACHE)
+    coordinated: list[tuple[OperatingMode, OperatingMode]] = []
+
+    def coordinate(_config, mode):  # noqa: ANN001
+        coordinated.append((mode, operating_mode(config)))
+
+    monkeypatch.setattr(
+        "romcloud.integrations.batocera.game_access._coordinate_download_manager_mode",
+        coordinate,
+    )
+
+    set_operating_mode(config, OperatingMode.OFFLINE)
+    set_operating_mode(config, OperatingMode.CACHE)
+
+    assert coordinated == [
+        (OperatingMode.OFFLINE, OperatingMode.CACHE),
+        (OperatingMode.OFFLINE, OperatingMode.OFFLINE),
+        (OperatingMode.CACHE, OperatingMode.CACHE),
+    ]
+
+
 def test_failed_es_refresh_restores_pre_transition_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

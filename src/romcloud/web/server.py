@@ -117,6 +117,7 @@ class ManagerHTTPServer(ThreadingHTTPServer):
         auth_registry: BrowserAuthRegistry | None = None,
         controller_log_path: str | Path | None = None,
         diagnostics_path: str | Path | None = None,
+        start_downloads: bool = True,
     ) -> None:
         self.manager = manager
         self.auth_token = token
@@ -152,12 +153,18 @@ class ManagerHTTPServer(ThreadingHTTPServer):
             self.downloads = manager.downloads if descriptor is not None else None
         except RuntimeError:
             self.downloads = None
-        if self.downloads is not None:
-            self.downloads.start()
+        self._downloads_started = False
         super().__init__(address, ManagerRequestHandler)
+        if start_downloads:
+            self.start_downloads()
+
+    def start_downloads(self) -> None:
+        if self.downloads is not None and not self._downloads_started:
+            self.downloads.start()
+            self._downloads_started = True
 
     def server_close(self) -> None:
-        if self.downloads is not None:
+        if self.downloads is not None and self._downloads_started:
             self.downloads.shutdown()
         if self.diagnostic_store is not None and self._owns_diagnostic_store:
             self.diagnostic_store.close()
@@ -312,6 +319,19 @@ class ManagerRequestHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/downloads/cleanup":
                 downloads = self._require_download_manager()
                 self._json(HTTPStatus.OK, {"cleaned": downloads.cleanup_stale_partials()})
+            elif parsed.path == "/api/downloads/operating-mode":
+                if not self._bearer_authenticated():
+                    self._json(
+                        HTTPStatus.FORBIDDEN,
+                        {"error": "Operating-mode coordination is unavailable."},
+                    )
+                    return
+                downloads = self._require_download_manager()
+                offline = self._body().get("offline")
+                if not isinstance(offline, bool):
+                    raise ValueError("Operating-mode coordination requires an offline boolean.")
+                downloads.apply_operating_mode(offline=offline)
+                self._json(HTTPStatus.OK, {"offline": offline, "quiescent": True})
             elif parsed.path.startswith("/api/downloads/"):
                 downloads = self._require_download_manager()
                 parts = parsed.path.strip("/").split("/")
@@ -538,6 +558,7 @@ def serve_manager(
         auth_registry=registry,
         controller_log_path=controller_log_path,
         diagnostics_path=diagnostics_path,
+        start_downloads=False,
     )
     if tls_cert or tls_key:
         if not tls_cert or not tls_key:
@@ -552,6 +573,14 @@ def serve_manager(
         except Exception:
             server.server_close()
             raise
+    # Runtime state is now discoverable before source work can begin. An
+    # explicit Offline transition can therefore always quiesce this worker or
+    # the worker will observe the already-persisted Offline policy at startup.
+    try:
+        server.start_downloads()
+    except Exception:
+        server.server_close()
+        raise
     previous_term = None
     if threading.current_thread() is threading.main_thread():
         previous_term = signal.getsignal(signal.SIGTERM)

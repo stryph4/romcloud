@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+import threading
 import time
 from contextlib import AbstractContextManager
 from datetime import datetime, timedelta, timezone
@@ -11,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from romcloud.core.capabilities import CapabilityPolicy, OperatingMode
 from romcloud.core.cancellation import TransferCancellationToken
 from romcloud.core.exceptions import InsufficientSpaceError, TransferCancelledError
 from romcloud.core.models.cache import CacheEntry, CachePolicy
@@ -701,6 +703,61 @@ class _ControlledCache(_WorkerCache):
         return "/cache/game"
 
 
+class _CheckpointingCache(_WorkerCache):
+    def __init__(self, staging, cache_dir: Path, held_game_id: str) -> None:
+        super().__init__()
+        self._staging = staging
+        self._cache_dir = cache_dir
+        self._held_game_id = held_game_id
+        self.started: list[str] = []
+
+    def _part(self, game_id: str) -> Path:
+        return self._cache_dir / ".partial" / "ps2" / f"{game_id}.iso.part"
+
+    def retained_staging_size(self, game_id, **_kwargs):
+        part = self._part(game_id)
+        return part.stat().st_size if part.exists() else 0
+
+    def cache_game(self, game_id, on_progress=None, cancellation=None, **_kwargs):
+        self.started.append(game_id)
+        if game_id != self._held_game_id:
+            on_progress(10, 10)
+            self.completed.append(game_id)
+            return "/cache/game"
+        relative_path = f"ps2/{game_id}.iso"
+        part = self._part(game_id)
+        part.parent.mkdir(parents=True, exist_ok=True)
+        part.write_bytes(b"part")
+        self._staging.replace_plan(
+            relative_path=relative_path,
+            system="ps2",
+            asset_kind="file",
+            source_provider="local",
+            source_root="/source",
+            expected_size=10,
+            source_manifest_sha256="manifest",
+            files=[{
+                "member_relative_path": "",
+                "expected_size": 10,
+                "source_object_id": None,
+                "source_revision": None,
+                "source_checksum": None,
+                "source_modified_epoch": None,
+            }],
+        )
+        self._staging.checkpoint(
+            relative_path,
+            "",
+            part.stat().st_size,
+            hashlib.sha256(part.read_bytes()).hexdigest(),
+            state="partial",
+        )
+        on_progress(part.stat().st_size, 10)
+        while True:
+            cancellation.raise_if_cancelled()
+            time.sleep(0.005)
+
+
 def _wait_state(repo: DownloadRepository, item_id: str, state: DownloadState) -> None:
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline:
@@ -709,6 +766,134 @@ def _wait_state(repo: DownloadRepository, item_id: str, state: DownloadState) ->
             return
         time.sleep(0.01)
     raise AssertionError(f"download did not reach {state.value}: {repo.get(item_id)}")
+
+
+def test_offline_policy_keeps_queued_work_durable_until_cache_mode_returns(
+    db, game_repo, cache_dir, tmp_path
+):
+    game = _game(game_repo, tmp_path / "source")
+    repo = DownloadRepository(db)
+    cache = _WorkerCache()
+    current_mode = [OperatingMode.OFFLINE]
+    manager = DownloadManagerService(
+        repository=repo,
+        staging_repository=StagingRepository(db),
+        game_repo=game_repo,
+        cache=cache,
+        cache_root=str(cache_dir),
+        capability_policy_loader=lambda: CapabilityPolicy(
+            "smart_cache", current_mode[0]
+        ),
+    )
+    item_id = manager.enqueue([game.id])["items"][0]["id"]
+    manager.start()
+    time.sleep(0.1)
+
+    assert cache.completed == []
+    assert repo.get(item_id).state is DownloadState.QUEUED
+
+    current_mode[0] = OperatingMode.CACHE
+    manager.apply_operating_mode(offline=False)
+    _wait_state(repo, item_id, DownloadState.COMPLETE)
+    manager.shutdown()
+
+
+def test_explicit_offline_pauses_active_retains_checkpoint_and_blocks_next(
+    db, game_repo, cache_dir, tmp_path
+):
+    first = _game(game_repo, tmp_path / "source", "A.iso")
+    second = _game(game_repo, tmp_path / "source", "B.iso")
+    repo = DownloadRepository(db)
+    staging = StagingRepository(db)
+    cache = _CheckpointingCache(staging, cache_dir, first.id)
+    current_mode = [OperatingMode.CACHE]
+    manager = DownloadManagerService(
+        repository=repo,
+        staging_repository=staging,
+        game_repo=game_repo,
+        cache=cache,
+        cache_root=str(cache_dir),
+        capability_policy_loader=lambda: CapabilityPolicy(
+            "smart_cache", current_mode[0]
+        ),
+    )
+    first_id = manager.enqueue([first.id])["items"][0]["id"]
+    second_id = manager.enqueue([second.id])["items"][0]["id"]
+    manager.start()
+    _wait_state(repo, first_id, DownloadState.RUNNING)
+
+    current_mode[0] = OperatingMode.OFFLINE
+    manager.apply_operating_mode(offline=True)
+
+    assert repo.get(first_id).state is DownloadState.PAUSED
+    assert repo.get(second_id).state is DownloadState.QUEUED
+    assert cache.started == [first.id]
+    part = cache._part(first.id)
+    checkpoint = staging.get_file(f"ps2/{first.id}.iso", "")
+    assert part.read_bytes() == b"part"
+    assert checkpoint is not None and checkpoint.checkpoint_bytes == 4
+    assert len(repo.list_all()) == 2
+    time.sleep(0.1)
+    assert cache.started == [first.id]
+
+    current_mode[0] = OperatingMode.CACHE
+    manager.apply_operating_mode(offline=False)
+    _wait_state(repo, second_id, DownloadState.COMPLETE)
+    assert repo.get(first_id).state is DownloadState.PAUSED
+    assert part.read_bytes() == b"part"
+    manager.shutdown()
+
+
+def test_offline_transition_waits_for_claim_and_prevents_remote_start(
+    db, game_repo, cache_dir, tmp_path
+):
+    game = _game(game_repo, tmp_path / "source")
+    repo = DownloadRepository(db)
+    claim_started = threading.Event()
+    release_claim = threading.Event()
+
+    class ClaimBlockingCache(_WorkerCache):
+        def try_asset_locks(self, game_id):
+            claim_started.set()
+            assert release_claim.wait(2)
+            return super().try_asset_locks(game_id)
+
+    cache = ClaimBlockingCache()
+    current_mode = [OperatingMode.CACHE]
+    manager = DownloadManagerService(
+        repository=repo,
+        staging_repository=StagingRepository(db),
+        game_repo=game_repo,
+        cache=cache,
+        cache_root=str(cache_dir),
+        capability_policy_loader=lambda: CapabilityPolicy(
+            "smart_cache", current_mode[0]
+        ),
+    )
+    item_id = manager.enqueue([game.id])["items"][0]["id"]
+    manager.start()
+    assert claim_started.wait(2)
+    current_mode[0] = OperatingMode.OFFLINE
+    errors = []
+
+    def apply_offline():
+        try:
+            manager.apply_operating_mode(offline=True)
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    transition = threading.Thread(target=apply_offline)
+    transition.start()
+    time.sleep(0.05)
+    assert transition.is_alive()
+    release_claim.set()
+    transition.join(timeout=2)
+
+    assert not transition.is_alive()
+    assert errors == []
+    assert cache.completed == []
+    assert repo.get(item_id).state is DownloadState.QUEUED
+    manager.shutdown()
 
 
 def test_pause_resume_cancel_and_cancelled_resume(db, game_repo, cache_dir, tmp_path):

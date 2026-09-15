@@ -392,7 +392,7 @@ class Container:
                 transfer_service=self.transfer,
                 cache_root=self._config.cache.path,
                 policy=policy,
-                capability_policy=self._policy(),
+                capability_policy_loader=self._policy,
                 storage_coordinator=self.storage_coordinator,
             )
         return self._cache
@@ -568,6 +568,7 @@ class Container:
                 game_repo=self.game_repo,
                 cache=self.cache,
                 cache_root=self._config.cache.path,
+                capability_policy_loader=self._policy,
             )
         return self._download_manager
 

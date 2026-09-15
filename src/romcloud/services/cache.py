@@ -116,6 +116,7 @@ class CacheService:
         cache_root: str,
         policy: CachePolicy,
         capability_policy: Optional[CapabilityPolicy] = None,
+        capability_policy_loader: Optional[Callable[[], CapabilityPolicy]] = None,
         dependency_resolver: Optional[DependencyResolverRegistry] = None,
         storage_coordinator: Optional[CacheStorageCoordinator] = None,
     ) -> None:
@@ -125,6 +126,9 @@ class CacheService:
         self._cache_root = Path(cache_root)
         self._policy = policy
         self._capabilities = capability_policy or CapabilityPolicy("smart_cache")
+        self._capability_policy_loader = (
+            capability_policy_loader or (lambda: self._capabilities)
+        )
         self._dependencies = dependency_resolver
         self._storage = storage_coordinator
         if self._dependencies is None and hasattr(transfer_service, "provider"):
@@ -337,7 +341,9 @@ class CacheService:
             assert launch_path is not None  # guaranteed by is_cached
             return launch_path
 
-        self._capabilities.require(Capability.GAME_DOWNLOAD, "Downloading a game")
+        self._capability_policy_loader().require(
+            Capability.GAME_DOWNLOAD, "Downloading a game"
+        )
 
         game = self._game_repo.get(game_id)
         if game is None:

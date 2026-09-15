@@ -481,6 +481,7 @@ def _manager_request(
     method: str = "GET",
     body: dict[str, object] | None = None,
     opener=urllib.request.urlopen,
+    timeout: float = 2.0,
 ) -> dict[str, object]:
     state = read_manager_state(data_path)
     token = str(state.get("token", ""))
@@ -498,11 +499,38 @@ def _manager_request(
         method=method,
     )
     context = ssl._create_unverified_context() if local_url.startswith("https://") else None
-    with opener(request, timeout=2, context=context) as response:
+    with opener(request, timeout=timeout, context=context) as response:
         result = json.load(response)
     if not isinstance(result, dict):
         raise RuntimeError("Library Manager returned an invalid response.")
     return result
+
+
+def coordinate_download_manager_mode(
+    data_path: str | Path,
+    *,
+    offline: bool,
+    opener=urllib.request.urlopen,
+) -> bool:
+    """Notify a live resident manager and wait for Offline quiescence."""
+    if not manager_status(data_path).get("running"):
+        return False
+    try:
+        _manager_request(
+            data_path,
+            "/api/downloads/operating-mode",
+            method="POST",
+            body={"offline": offline},
+            opener=opener,
+            timeout=35.0 if offline else 2.0,
+        )
+    except OSError:
+        # A manager that exited between status and request has no remaining
+        # source I/O to quiesce. A still-live owner must acknowledge Offline.
+        if not manager_status(data_path).get("running"):
+            return False
+        raise
+    return True
 
 
 def issue_pairing_code(
