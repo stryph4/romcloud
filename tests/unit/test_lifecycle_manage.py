@@ -517,6 +517,8 @@ def test_cli_repair_uses_persisted_channel(tmp_path: Path, monkeypatch: pytest.M
             previous=None,
             new=new,
             reconcile_log="warning: Google Drive configuration could not be retrieved.",
+            warnings=("Google Drive configuration could not be retrieved.",),
+            es_restart_required=True,
         ),
     )
 
@@ -524,8 +526,10 @@ def test_cli_repair_uses_persisted_channel(tmp_path: Path, monkeypatch: pytest.M
 
     assert result.exit_code == 0, result.output
     assert captured == ["develop"]
+    assert "Repair completed with warnings" in result.output
     assert "from develop" in result.output
     assert "Google Drive configuration could not be retrieved" in result.output
+    assert "Restart EmulationStation" in result.output
 
 
 def test_cli_repeated_purge_is_safe_after_config_is_gone(

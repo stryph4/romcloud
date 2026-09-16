@@ -512,6 +512,36 @@ class TestCheckForUpdate:
 
 
 class TestPerformUpdateSuccess:
+    def test_repair_propagates_partial_reconciliation_warnings_and_state(self, tmp_path):
+        home = tmp_path / "romcloud"
+        archive = _make_archive_bytes(sha=_SHA, version="2.0.0")
+        opener = _make_opener(_full_payloads(archive_bytes=archive))
+        calls: list[list[str]] = []
+
+        def runner(argv, **kwargs):
+            calls.append(argv)
+            result = _fake_runner_success(argv, **kwargs)
+            if "_reconcile-install" in argv:
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout="repair-state: es_restart_required=true\n",
+                    stderr="warning: Ports gamelist remains unchanged\n",
+                )
+            return result
+
+        result = upd.perform_repair(
+            home,
+            home / "venv" / "bin" / "python",
+            opener=opener,
+            runner=runner,
+        )
+
+        reconcile = next(call for call in calls if "_reconcile-install" in call)
+        assert "--repair" in reconcile
+        assert result.warnings == ("Ports gamelist remains unchanged",)
+        assert result.es_restart_required is True
+
     def test_full_successful_update(self, tmp_path):
         home = tmp_path / "romcloud"
         venv_python = home / "venv" / "bin" / "python"
@@ -916,6 +946,25 @@ class TestPerformUpdateReconcileFailureRollsBack:
 
         assert venv_python.read_text() == "real-existing-python"
 
+    def test_repair_failure_restores_previous_usable_runtime(self, tmp_path):
+        home = tmp_path / "romcloud"
+        venv_python = home / "venv" / "bin" / "python"
+        venv_python.parent.mkdir(parents=True)
+        venv_python.write_text("real-existing-python")
+        opener = _make_opener(
+            _full_payloads(archive_bytes=_make_archive_bytes(sha=_SHA))
+        )
+
+        with pytest.raises(UpdateInstallError):
+            upd.perform_repair(
+                home,
+                venv_python,
+                opener=opener,
+                runner=self._failing_reconcile_runner,
+            )
+
+        assert venv_python.read_text() == "real-existing-python"
+
     def test_version_json_untouched(self, tmp_path):
         home = tmp_path / "romcloud"
         venv_python = home / "venv" / "bin" / "python"
@@ -970,7 +1019,10 @@ class TestPerformUpdateReconcileFailureRollsBack:
 
 
 class TestConfigDataCacheUntouched:
-    def test_sibling_directories_untouched_by_successful_update(self, tmp_path):
+    @pytest.mark.parametrize("repair", [False, True])
+    def test_sibling_directories_untouched_by_successful_update_or_repair(
+        self, tmp_path, repair
+    ):
         home = tmp_path / "romcloud"
         config_dir = home / "config"
         data_dir = home / "data"
@@ -995,7 +1047,13 @@ class TestConfigDataCacheUntouched:
         archive = _make_archive_bytes(sha=_SHA)
         opener = _make_opener(_full_payloads(archive_bytes=archive))
 
-        upd.perform_update(home, home / "venv" / "bin" / "python", opener=opener, runner=_fake_runner_success)
+        operation = upd.perform_repair if repair else upd.perform_update
+        operation(
+            home,
+            home / "venv" / "bin" / "python",
+            opener=opener,
+            runner=_fake_runner_success,
+        )
 
         assert (config_dir / "romcloud.toml").read_text() == "sentinel-config"
         assert (config_dir / "credentials.toml").read_text() == "sentinel-creds"

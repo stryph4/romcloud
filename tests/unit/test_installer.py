@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from romcloud.infrastructure.config import AppConfig, CacheConfig, SourceConfig, write_config
 from romcloud.lifecycle import install as inst
 
 
@@ -94,6 +95,96 @@ class TestDetectSystemPython:
 
 
 class TestInstallPortsUi:
+    def test_copy_failure_preserves_previous_installed_payload(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        project_root = tmp_path / "project"
+        _make_ports_gfx_source(project_root, marker="new")
+        ports_gfx_dir = tmp_path / "ports-gfx"
+        target = ports_gfx_dir / "ports_gfx"
+        target.mkdir(parents=True)
+        (target / "client.py").write_text("# working-old\n")
+        monkeypatch.setattr(inst, "_system_python_has_pygame", lambda _python: True)
+
+        def fail_copy(*_args, **_kwargs):
+            raise OSError("simulated copy failure")
+
+        monkeypatch.setattr(inst.shutil, "copytree", fail_copy)
+        result = inst.install_ports_ui(
+            project_root=project_root,
+            ports_gfx_dir=ports_gfx_dir,
+            bin_dir=tmp_path / "bin",
+            romcloud_bin=tmp_path / "bin" / "romcloud",
+            ports_dir=tmp_path / "ports",
+            system_python="/usr/bin/python3",
+        )
+
+        assert result.installed is False
+        assert "simulated copy failure" in (result.error or "")
+        assert (target / "client.py").read_text() == "# working-old\n"
+
+    def test_swap_failure_restores_previous_installed_payload(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        project_root = tmp_path / "project"
+        _make_ports_gfx_source(project_root, marker="new")
+        ports_gfx_dir = tmp_path / "ports-gfx"
+        target = ports_gfx_dir / "ports_gfx"
+        target.mkdir(parents=True)
+        (target / "client.py").write_text("# working-old\n")
+        monkeypatch.setattr(inst, "_system_python_has_pygame", lambda _python: True)
+        real_rename = Path.rename
+
+        def fail_staged_swap(path: Path, destination: Path):
+            if path.name.startswith(".ports_gfx.staged-"):
+                raise OSError("simulated swap failure")
+            return real_rename(path, destination)
+
+        monkeypatch.setattr(Path, "rename", fail_staged_swap)
+        result = inst.install_ports_ui(
+            project_root=project_root,
+            ports_gfx_dir=ports_gfx_dir,
+            bin_dir=tmp_path / "bin",
+            romcloud_bin=tmp_path / "bin" / "romcloud",
+            ports_dir=tmp_path / "ports",
+            system_python="/usr/bin/python3",
+        )
+
+        assert result.installed is False
+        assert "simulated swap failure" in (result.error or "")
+        assert (target / "client.py").read_text() == "# working-old\n"
+
+    def test_wrapper_failure_after_swap_restores_previous_payload(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        project_root = tmp_path / "project"
+        _make_ports_gfx_source(project_root, marker="new")
+        ports_gfx_dir = tmp_path / "ports-gfx"
+        target = ports_gfx_dir / "ports_gfx"
+        target.mkdir(parents=True)
+        (target / "client.py").write_text("# working-old\n")
+        monkeypatch.setattr(inst, "_system_python_has_pygame", lambda _python: True)
+        monkeypatch.setattr(
+            inst,
+            "_write_executable",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                OSError("simulated wrapper failure")
+            ),
+        )
+
+        result = inst.install_ports_ui(
+            project_root=project_root,
+            ports_gfx_dir=ports_gfx_dir,
+            bin_dir=tmp_path / "bin",
+            romcloud_bin=tmp_path / "bin" / "romcloud",
+            ports_dir=tmp_path / "ports",
+            system_python="/usr/bin/python3",
+        )
+
+        assert result.installed is False
+        assert "simulated wrapper failure" in (result.error or "")
+        assert (target / "client.py").read_text() == "# working-old\n"
+
     def test_installed_when_pygame_available(self, tmp_path: Path) -> None:
         project_root = tmp_path / "project"
         _make_ports_gfx_source(project_root)
@@ -267,7 +358,7 @@ class TestReconcileMountService:
         service_path = tmp_path / "services" / "romcloud_mount"
         monkeypatch.setattr(mount_service, "SERVICE_SCRIPT_PATH", service_path)
 
-        assert inst.reconcile_mount_service(tmp_path / "bin") is True
+        assert inst.reconcile_mount_service(tmp_path / "bin") is False
         assert service_path.is_file()
         assert "mount boot-start" in service_path.read_text(encoding="utf-8")
 
@@ -281,7 +372,7 @@ class TestReconcileMountService:
 
         result = inst.reconcile_mount_service(tmp_path / "bin")
 
-        assert result is True
+        assert result is False
         content = service_path.read_text()
         assert "stale script content" not in content
         assert str(tmp_path / "bin" / "romcloud") in content
@@ -383,6 +474,27 @@ class TestReconcileEsOverride:
 
 
 class TestReconcilePortsGamelist:
+    def test_malformed_shared_gamelist_is_reported_and_preserved(
+        self, tmp_path: Path
+    ) -> None:
+        ports_gfx_target = tmp_path / "ports-gfx" / "ports_gfx"
+        ports_gfx_target.mkdir(parents=True)
+        ports_dir = tmp_path / "ports"
+        ports_dir.mkdir()
+        gamelist = ports_dir / "gamelist.xml"
+        original = b"<gameList><game><path>./Other.sh</path><!-- third party"
+        gamelist.write_bytes(original)
+        entry = ports_dir / "ROMCloud.sh"
+        entry.write_text("#!/bin/bash\n")
+        ports_ui = inst.PortsUiResult(
+            installed=True,
+            ports_gfx_dir=ports_gfx_target,
+            port_entry_path=entry,
+        )
+
+        assert inst.reconcile_ports_gamelist(ports_ui, ports_dir) is False
+        assert gamelist.read_bytes() == original
+
     def test_not_applicable_when_no_port_entry_installed(self, tmp_path: Path) -> None:
         ports_ui = inst.PortsUiResult(installed=False, skip_reason="no_pygame")
 
@@ -450,6 +562,308 @@ class TestReconcilePortsGamelist:
 
 
 class TestReconcileInstall:
+    def test_optional_failures_are_collected_as_truthful_warnings(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        home = tmp_path / "romcloud"
+        project = tmp_path / "project"
+        project.mkdir()
+        monkeypatch.setattr(
+            inst,
+            "install_ports_ui",
+            lambda **_kwargs: inst.PortsUiResult(
+                installed=False, error="payload copy failed"
+            ),
+        )
+        monkeypatch.setattr(inst, "reconcile_mount_service", lambda _bin: False)
+        from romcloud.integrations.batocera import mount_service
+
+        service_path = home / "service" / mount_service.SERVICE_NAME
+        service_path.parent.mkdir(parents=True)
+        service_path.write_text("installed but disabled")
+        monkeypatch.setattr(mount_service, "SERVICE_SCRIPT_PATH", service_path)
+        monkeypatch.setattr(mount_service, "is_service_enabled", lambda **_kwargs: False)
+        monkeypatch.setattr(
+            inst, "_reconcile_es_override_with_change", lambda _path: (False, False)
+        )
+        monkeypatch.setattr(inst, "reconcile_ports_gamelist", lambda *_args: False)
+        monkeypatch.setattr(inst, "reconcile_auto_savesync_hook", lambda _bin: False)
+
+        report = inst.reconcile_install(
+            romcloud_home=home, project_root=project, repair=True
+        )
+
+        assert report.mount_service is True
+        assert report.mount_service_enabled is False
+        assert report.es_override is False
+        assert report.ports_gamelist is False
+        assert report.autosync_hook is False
+        assert report.warnings == (
+            "Graphical Ports UI reconciliation failed: payload copy failed",
+            "Batocera startup service was written but is not enabled; enable it manually.",
+            "EmulationStation integration could not be reconciled.",
+            "The shared Ports gamelist could not be safely reconciled; its original content was preserved.",
+            "Auto SaveSync lifecycle hook could not be reconciled.",
+        )
+
+    def test_repair_reconcile_fixes_bua_switch_overlay_and_direct_restores_it(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        import sys
+        from dataclasses import replace
+        from types import SimpleNamespace
+        from xml.etree import ElementTree as ET
+
+        if "fcntl" not in sys.modules:
+            monkeypatch.setitem(
+                sys.modules,
+                "fcntl",
+                SimpleNamespace(
+                    LOCK_EX=1,
+                    LOCK_NB=2,
+                    LOCK_UN=8,
+                    flock=lambda *_args: None,
+                ),
+            )
+        from romcloud.bootstrap.container import Container
+        from romcloud.core.models.game import Game, GameAsset
+        from romcloud.infrastructure.config import DIRECT_NAS_MODE
+        from romcloud.infrastructure.database import Database
+        from romcloud.infrastructure.library_view import write_operating_mode
+        from romcloud.infrastructure.repositories.game import GameRepository
+        from romcloud.core.capabilities import OperatingMode
+        from romcloud.integrations.batocera import es_config, game_access
+        from romcloud.integrations.batocera.system_registry import (
+            load_effective_system_registry,
+        )
+
+        home = tmp_path / "romcloud"
+        project = tmp_path / "project"
+        project.mkdir()
+        data = home / "data"
+        source = tmp_path / "source"
+        local = tmp_path / "roms"
+        source.mkdir()
+        local.mkdir()
+        config = AppConfig(
+            source=SourceConfig(provider="local", rom_root=str(source)),
+            cache=CacheConfig(path=str(home / "cache")),
+            local_roms_path=str(local),
+            data_path=str(data),
+        )
+        config_path = home / "config" / "romcloud.toml"
+        write_config(config, str(config_path))
+
+        db = Database(str(data / "catalog.db"))
+        db.initialize()
+        GameRepository(db).save(
+            Game.create(
+                system="switch",
+                title="Switch Game",
+                source_provider="local",
+                source_root=str(source),
+                assets=[
+                    GameAsset(
+                        filename="Switch Game.xci",
+                        relative_path="switch/Switch Game.xci",
+                        is_primary=True,
+                    )
+                ],
+            )
+        )
+
+        user = tmp_path / "es-user"
+        share = tmp_path / "es-share"
+        user.mkdir()
+        share.mkdir()
+        stock = share / "es_systems.cfg"
+        stock.write_text(
+            "<systemList><system><name>switch</name><extension>.xci</extension>"
+            "<command>emulatorlauncher -system %SYSTEM% -rom %ROM%</command>"
+            "</system></systemList>",
+            encoding="utf-8",
+        )
+        native_command = (
+            "python /userdata/system/switch/configgen/switchlauncher.py "
+            "%CONTROLLERSCONFIG% -system %SYSTEM% -rom %ROM%"
+        )
+        bua = user / "es_systems_switch.cfg"
+        bua.write_text(
+            "<systemList><system><name>switch</name>"
+            "<path>/userdata/roms/switch-custom</path>"
+            "<extension>.xci .nsp .bua</extension>"
+            f"<command>{native_command}</command>"
+            "<theme>bua-switch</theme></system></systemList>",
+            encoding="utf-8",
+        )
+        override = user / "es_systems_romcloud.cfg"
+        wrapper = home / "bin" / "romcloud-run"
+        monkeypatch.setattr(es_config, "STOCK_ES_SYSTEMS_PATH", stock)
+        monkeypatch.setattr(es_config, "ROMCLOUD_OVERRIDE_PATH", override)
+        monkeypatch.setattr(es_config, "WRAPPER_SCRIPT_PATH", wrapper)
+
+        def registry(container):
+            return load_effective_system_registry(
+                cache_path=Path(container.config.data_path) / "registry.json",
+                user_config_dir=user,
+                system_config_dir=share,
+                legacy_config_dir=tmp_path / "missing-legacy",
+            )
+
+        monkeypatch.setattr(Container, "system_registry", property(registry))
+        monkeypatch.setattr(game_access, "reconcile_game_access", lambda *_a, **_kw: None)
+        self._isolate_optional_integrations(monkeypatch)
+
+        first = inst.reconcile_install(
+            romcloud_home=home, project_root=project, repair=True
+        )
+        patched_once = bua.read_bytes()
+        second = inst.reconcile_install(
+            romcloud_home=home, project_root=project, repair=True
+        )
+
+        patched = ET.fromstring(bua.read_text(encoding="utf-8"))
+        extensions = (patched.findtext("system/extension") or "").split()
+        command = patched.findtext("system/command") or ""
+        assert ".romcloud" in extensions
+        assert command == f"{wrapper} {native_command}"
+        assert "emulatorlauncher" not in command
+        assert patched.findtext("system/path") == "/userdata/roms/switch-custom"
+        assert patched.findtext("system/theme") == "bua-switch"
+        assert bua.read_bytes() == patched_once
+        assert first.es_restart_required is True
+        assert second.es_restart_required is False
+
+        direct_config = replace(config, game_access_mode=DIRECT_NAS_MODE)
+        write_config(direct_config, str(config_path))
+        write_operating_mode(direct_config, OperatingMode.CONNECTED)
+        direct = inst.reconcile_install(
+            romcloud_home=home, project_root=project, repair=True
+        )
+        restored = ET.fromstring(bua.read_text(encoding="utf-8"))
+        assert restored.findtext("system/command") == native_command
+        assert ".romcloud" not in (restored.findtext("system/extension") or "").split()
+        assert restored.findtext("system/path") == "/userdata/roms/switch-custom"
+        assert restored.findtext("system/theme") == "bua-switch"
+        assert override.exists() is False
+        assert direct.es_restart_required is True
+
+    @staticmethod
+    def _configured_home(tmp_path: Path, *, create_catalog: bool) -> tuple[Path, Path]:
+        home = tmp_path / "romcloud"
+        data = home / "data"
+        config = AppConfig(
+            source=SourceConfig(provider="local", rom_root=str(tmp_path / "source")),
+            cache=CacheConfig(path=str(home / "cache")),
+            local_roms_path=str(tmp_path / "roms"),
+            data_path=str(data),
+        )
+        write_config(config, str(home / "config" / "romcloud.toml"))
+        if create_catalog:
+            from romcloud.infrastructure.database import Database
+
+            Database(str(data / "catalog.db")).initialize()
+        project = tmp_path / "project"
+        project.mkdir()
+        return home, project
+
+    @staticmethod
+    def _isolate_optional_integrations(monkeypatch) -> None:
+        monkeypatch.setattr(inst, "detect_system_python", lambda _explicit=None: None)
+        monkeypatch.setattr(inst, "reconcile_mount_service", lambda _bin: True)
+        monkeypatch.setattr(inst, "reconcile_ports_gamelist", lambda *_args: None)
+        monkeypatch.setattr(inst, "reconcile_auto_savesync_hook", lambda _bin: True)
+
+    def test_repair_missing_catalog_preserves_existing_proxy(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        home, project = self._configured_home(tmp_path, create_catalog=False)
+        proxy = tmp_path / "roms" / "switch" / "Existing.romcloud"
+        proxy.parent.mkdir(parents=True)
+        original = (
+            '{"romcloud_version":"1","game_id":"existing-game",'
+            '"title":"Existing","system":"switch","assets":[]}\n'
+        )
+        proxy.write_text(original)
+        self._isolate_optional_integrations(monkeypatch)
+        monkeypatch.setattr(
+            inst,
+            "_reconcile_es_override_with_change",
+            lambda _path: pytest.fail("missing catalog must skip ES reconciliation"),
+        )
+
+        report = inst.reconcile_install(
+            romcloud_home=home, project_root=project, repair=True
+        )
+
+        assert proxy.read_text() == original
+        assert report.catalog_available is False
+        assert report.game_access is None
+        assert any("Catalog state is unavailable" in item for item in report.warnings)
+
+    def test_repair_missing_catalog_preserves_existing_direct_link(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        home, project = self._configured_home(tmp_path, create_catalog=False)
+        source_system = tmp_path / "source" / "switch"
+        source_system.mkdir(parents=True)
+        link = tmp_path / "roms" / "switch" / "ROMCloud"
+        link.parent.mkdir(parents=True)
+        real_symlink = True
+        try:
+            link.symlink_to(source_system, target_is_directory=True)
+        except OSError:
+            # Native Windows CI commonly lacks symlink privilege. The guard is
+            # path-agnostic, so retain a sentinel at the exact owned path there.
+            real_symlink = False
+            link.write_text("direct-link sentinel")
+        manifest = home / "data" / "direct-links.json"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text(
+            '{"version":1,"links":[{"path":"'
+            + str(link).replace("\\", "\\\\")
+            + '","target":"'
+            + str(source_system).replace("\\", "\\\\")
+            + '"}]}\n'
+        )
+        self._isolate_optional_integrations(monkeypatch)
+        monkeypatch.setattr(
+            inst,
+            "_reconcile_es_override_with_change",
+            lambda _path: pytest.fail("missing catalog must skip ES reconciliation"),
+        )
+
+        report = inst.reconcile_install(
+            romcloud_home=home, project_root=project, repair=True
+        )
+
+        if real_symlink:
+            assert link.is_symlink()
+            assert link.resolve() == source_system.resolve()
+        else:
+            assert link.read_text() == "direct-link sentinel"
+        assert report.catalog_available is False
+
+    def test_repair_existing_empty_catalog_is_not_treated_as_missing(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        home, project = self._configured_home(tmp_path, create_catalog=True)
+        self._isolate_optional_integrations(monkeypatch)
+        calls: list[Path] = []
+        monkeypatch.setattr(
+            inst,
+            "_reconcile_es_override_with_change",
+            lambda path: calls.append(path) or (None, False),
+        )
+
+        report = inst.reconcile_install(
+            romcloud_home=home, project_root=project, repair=True
+        )
+
+        assert report.catalog_available is True
+        assert calls == [home / "config" / "romcloud.toml"]
+        assert not any("Catalog state is unavailable" in item for item in report.warnings)
+
     def test_reconciles_auto_savesync_hook(self, tmp_path: Path, monkeypatch) -> None:
         from romcloud.integrations.batocera import auto_savesync
 

@@ -28,6 +28,12 @@ from romcloud.lifecycle import install as installer
     default="",
     help="Explicit system Python override for the graphical Ports UI; empty means auto-detect.",
 )
+@click.option(
+    "--repair",
+    is_flag=True,
+    hidden=True,
+    help="Apply repair-only preservation guards.",
+)
 @click.pass_context
 def reconcile_install_cmd(
     ctx: click.Context,
@@ -35,6 +41,7 @@ def reconcile_install_cmd(
     project_root: Path,
     ports_dir: Path,
     system_python: str,
+    repair: bool,
 ) -> None:
     """Internal: reconcile ROMCloud's installed runtime artifacts."""
     try:
@@ -43,6 +50,7 @@ def reconcile_install_cmd(
             project_root=project_root,
             ports_dir=ports_dir,
             system_python=system_python or None,
+            repair=repair,
         )
     except Exception as exc:  # noqa: BLE001 — must surface as a clear install/update failure
         click.echo(f"ERROR: failed to write ROMCloud runtime artifacts: {exc}", err=True)
@@ -73,16 +81,18 @@ def reconcile_install_cmd(
         elif ports.port_entry_skip_reason == "ports_dir_missing":
             click.echo(f"  Note: {ports_dir} not found — skipped Batocera Port entry.")
     elif ports.error is not None:
-        click.echo(f"  Note: graphical Ports UI reconciliation failed: {ports.error}")
+        click.echo(f"  Graphical Ports UI reconciliation failed: {ports.error}")
     else:
         click.echo(
             "  Skipping graphical Ports UI: no system Python with pygame found (CLI/TUI unaffected)."
         )
 
-    if report.mount_service is True:
+    if report.mount_service is True and report.mount_service_enabled is True:
         click.echo("  Reconciled Batocera mount service script.")
+    elif report.mount_service is True:
+        click.echo("  Wrote Batocera mount service script; enablement failed.")
     elif report.mount_service is False:
-        click.echo("  Note: failed to reconcile Batocera mount service script.")
+        click.echo("  Failed to reconcile Batocera mount service script.")
 
     if report.es_override is True:
         click.echo("  Reconciled EmulationStation override.")
@@ -101,3 +111,8 @@ def reconcile_install_cmd(
 
     if report.proxies_restored:
         click.echo(f"  Restored generated proxies: {report.proxies_restored}")
+
+    if report.es_restart_required:
+        click.echo("repair-state: es_restart_required=true")
+    for warning in report.warnings:
+        click.echo(f"warning: {warning}", err=True)

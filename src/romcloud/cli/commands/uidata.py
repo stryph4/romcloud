@@ -868,6 +868,58 @@ def uidata_update_install(ctx: click.Context) -> None:
     _run_action(ctx, build)
 
 
+@uidata_group.command("repair-install")
+@click.pass_context
+def uidata_repair_install(ctx: click.Context) -> None:
+    """Reinstall and reconcile ROMCloud while preserving user data."""
+
+    def build() -> dict:
+        from romcloud.core.capabilities import Capability
+        from romcloud.lifecycle.update import perform_repair
+
+        _require_capability_if_configured(ctx, Capability.UPDATE_NETWORK, "ROMCloud repair")
+        channel = _configured_update_channel(ctx)
+        progress = _progress_sink({"progress": True})
+        home = Path(sys.prefix).parent
+        try:
+            result = perform_repair(
+                home,
+                Path(sys.executable),
+                channel=channel,
+                progress=progress,
+            )
+        except Exception as exc:
+            emit_progress(
+                progress,
+                "repair",
+                "completed",
+                "error",
+                "ROMCloud repair failed",
+                detail=str(exc),
+            )
+            raise
+        for warning in result.warnings:
+            emit_progress(
+                progress,
+                "repair",
+                "warning",
+                "warning",
+                "Repair completed with an item that needs attention",
+                detail=warning,
+            )
+        return {
+            "version": result.new.version,
+            "commit": result.new.commit_short,
+            "channel": result.new.channel,
+            "result": "partial" if result.warnings else "success",
+            "restart_required": True,
+            "es_restart_required": result.es_restart_required,
+            "warnings": list(result.warnings),
+        }
+
+    _run_action(ctx, build)
+
+
 @uidata_group.command("healthcheck")
 @click.pass_context
 def uidata_healthcheck(ctx: click.Context) -> None:

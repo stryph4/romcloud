@@ -66,6 +66,11 @@ def _service_is_enabled(config_path: Path) -> bool:
     return SERVICE_NAME in configured.replace(",", " ").split()
 
 
+def is_service_enabled(*, config_path: Path | None = None) -> bool:
+    """Return whether Batocera persisted ROMCloud's service enablement."""
+    return _service_is_enabled(config_path or SYSTEM_CONFIG_PATH)
+
+
 def generate_service_script(romcloud_bin: str) -> str:
     """Return the content of the `romcloud_mount` custom-service script.
 

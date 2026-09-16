@@ -1374,6 +1374,33 @@ class TestUpdateRelaunchRequest:
         assert render_completed_update_relaunch(operation, coordinator, splash) is False
         assert frames == [("splash", "Update complete", "Restarting ROMCloud…", 1.0)]
 
+    def test_partial_repair_relaunch_splash_surfaces_warning_state(self):
+        coordinator = GuiRelaunchCoordinator("/opt/romcloud/bin/romcloud")
+        operation = self._operation(
+            OperationState.SUCCEEDED,
+            [
+                OperationLine(
+                    "stdout",
+                    '{"ok":true,"result":"partial","es_restart_required":true,'
+                    '"warnings":["Restart ES"]}',
+                )
+            ],
+        )
+        operation.title = "Repair Installation"
+        frames: list[object] = []
+
+        assert render_completed_update_relaunch(
+            operation, coordinator, _RecordingSplash(frames)
+        ) is True
+        assert frames == [
+            (
+                "splash",
+                "Repair complete",
+                "Restart EmulationStation to apply the repair; restarting ROMCloud…",
+                1.0,
+            )
+        ]
+
     def test_failure_never_renders_successful_restart_splash(self):
         coordinator = GuiRelaunchCoordinator("/opt/romcloud/bin/romcloud")
         operation = self._operation(
@@ -1395,7 +1422,7 @@ class TestUpdateRelaunchRequest:
         from ports_gfx.app import _OPERATIONS
 
         armed = {action for action, spec in _OPERATIONS.items() if spec.arms_gui_relaunch}
-        assert armed == {"update-install"}
+        assert armed == {"update-install", "repair-install"}
 
     def test_only_mode_operations_own_normal_terminal_exit(self):
         from ports_gfx.app import _OPERATIONS
@@ -1548,6 +1575,21 @@ class TestOperationSummaryMessage:
         message, kind = operation_summary_message(operation)
         assert message == "Refresh Catalog: succeeded"
         assert kind == "success"
+
+    def test_partial_repair_reports_warning(self):
+        operation = self._operation(state=OperationState.SUCCEEDED)
+        operation.title = "Repair Installation"
+        operation.runner.lines = [
+            OperationLine(
+                "stdout",
+                '{"ok":true,"result":"partial","warnings":["Restart ES"]}',
+            )
+        ]
+
+        message, kind = operation_summary_message(operation)
+
+        assert message == "Repair Installation: completed with warnings"
+        assert kind == "warning"
 
     def test_failed_operation_reports_error_with_detail(self):
         operation = self._operation(state=OperationState.FAILED, error="exited with code 1")

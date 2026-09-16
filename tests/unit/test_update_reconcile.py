@@ -363,7 +363,7 @@ class TestReconciliationDuringUpdate:
         data_before = (home / "data" / "catalog.db").read_bytes()
         opener = _make_opener(_full_payloads())
 
-        upd.perform_update(
+        upd.perform_repair(
             home, home / "venv" / "bin" / "python",
             opener=opener, runner=_make_runner(),
             ports_dir=tmp_path / "ports", system_python=None,

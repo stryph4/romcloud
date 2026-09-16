@@ -74,10 +74,12 @@ class RemovedGamelistEntry:
 
 def _parse_root(existing_xml: Optional[str]) -> ET.Element:
     if existing_xml:
-        try:
-            return ET.fromstring(existing_xml)
-        except ET.ParseError:
-            pass
+        # A shared Ports gamelist can contain entries owned by Batocera, the
+        # user, and other installers.  Invalid XML is therefore not equivalent
+        # to a missing file: rebuilding from an empty root would silently erase
+        # content we do not own.  Let the parse error reach the I/O/reconcile
+        # boundary so it can preserve the original file and report a warning.
+        return ET.fromstring(existing_xml)
     return ET.Element("gameList")
 
 

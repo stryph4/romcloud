@@ -61,12 +61,20 @@ def repair_cmd(ctx: click.Context, system_python: str | None) -> None:
         )
     except Exception as exc:  # noqa: BLE001
         raise click.ClickException(str(exc)) from exc
-    click.echo(
-        f"Repaired ROMCloud {result.new.version} ({result.new.commit_short}) "
-        f"from {result.new.channel}."
-    )
+    if result.warnings:
+        click.echo(
+            f"Repair completed with warnings for ROMCloud {result.new.version} "
+            f"({result.new.commit_short}) from {result.new.channel}."
+        )
+    else:
+        click.echo(
+            f"Repaired ROMCloud {result.new.version} ({result.new.commit_short}) "
+            f"from {result.new.channel}."
+        )
     if result.reconcile_log:
         click.echo(result.reconcile_log)
+    if result.es_restart_required:
+        click.echo("Restart EmulationStation to apply the repaired integration.")
 
 
 @click.command("uninstall")

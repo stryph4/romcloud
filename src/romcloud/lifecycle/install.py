@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional
@@ -231,9 +232,31 @@ def install_ports_ui(
 
         target = ports_gfx_dir / "ports_gfx"
         ports_gfx_dir.mkdir(parents=True, exist_ok=True)
-        if target.exists():
-            shutil.rmtree(target)
-        shutil.copytree(source, target)
+        token = uuid.uuid4().hex
+        staged = ports_gfx_dir / f".ports_gfx.staged-{token}"
+        previous = ports_gfx_dir / f".ports_gfx.previous-{token}"
+        swapped = False
+        try:
+            shutil.copytree(source, staged)
+            # Validate the minimum runnable payload before moving the working
+            # copy aside. Both renames stay on one filesystem on Batocera.
+            for required in ("__init__.py", "app.py", "client.py"):
+                if not (staged / required).is_file():
+                    raise RuntimeError(
+                        f"staged graphical Ports UI is missing {required}"
+                    )
+            if target.exists():
+                target.rename(previous)
+            try:
+                staged.rename(target)
+                swapped = True
+            except BaseException:
+                if previous.exists() and not target.exists():
+                    previous.rename(target)
+                raise
+        finally:
+            if staged.exists():
+                shutil.rmtree(staged, ignore_errors=True)
 
         display_log = romcloud_bin.parent.parent / "logs" / "gui-display.log"
         wrapper_content = (
@@ -270,7 +293,7 @@ def install_ports_ui(
         else:
             port_entry_skip_reason = "ports_dir_missing"
 
-        return PortsUiResult(
+        result = PortsUiResult(
             installed=True,
             system_python=resolved_python,
             ports_gfx_dir=target,
@@ -279,7 +302,19 @@ def install_ports_ui(
             port_entry_path=port_entry_path,
             port_entry_skip_reason=port_entry_skip_reason,
         )
+        if previous.exists():
+            shutil.rmtree(previous, ignore_errors=True)
+        return result
     except Exception as exc:  # noqa: BLE001 — graphical UI must never break backend install/update
+        # Wrapper or Port-entry failure after the payload swap must restore
+        # the prior working GUI, not strand the installation on a partial UI.
+        try:
+            if "swapped" in locals() and swapped and previous.exists():
+                if target.exists():
+                    shutil.rmtree(target)
+                previous.rename(target)
+        except Exception:
+            log.error("Failed to roll back graphical Ports UI payload", exc_info=True)
         log.warning("Failed to install/refresh graphical Ports UI", exc_info=True)
         return PortsUiResult(installed=False, error=str(exc))
 
@@ -287,13 +322,14 @@ def install_ports_ui(
 # ── previously-enabled Batocera integrations (best-effort, only if applicable) ──
 
 
-def reconcile_mount_service(bin_dir: Path) -> bool:
+def _reconcile_mount_service_status(bin_dir: Path) -> tuple[bool, bool]:
     """Install or refresh ROMCloud's owned Batocera boot service.
 
     It also owns the reliable Auto SaveSync resident-loop handoff and is
     therefore applicable even when no CIFS mount is configured.
 
-    Returns ``True`` on success or ``False`` on a best-effort failure.
+    Returns separate ``(installed, enabled)`` outcomes so a successfully
+    written but disabled service is never reported as fully reconciled.
     """
     from romcloud.integrations.batocera import mount_service
 
@@ -306,24 +342,31 @@ def reconcile_mount_service(bin_dir: Path) -> bool:
                 bin_dir.parent
             ),
         )
-        return True
+        return True, mount_service.is_service_enabled()
     except Exception:  # noqa: BLE001 — optional integration, never fatal
         log.warning("Failed to reconcile Batocera mount service script", exc_info=True)
-        return False
+        return False, False
 
 
-def reconcile_es_override(config_path: Path) -> Optional[bool]:
+def reconcile_mount_service(bin_dir: Path) -> bool:
+    """Compatibility status: true only when the script is installed and enabled."""
+    installed, enabled = _reconcile_mount_service_status(bin_dir)
+    return installed and enabled
+
+
+def _reconcile_es_override_with_change(
+    config_path: Path,
+) -> tuple[Optional[bool], bool]:
     """Restore or refresh ROMCloud's EmulationStation override from the catalog.
 
-    Returns ``None`` if not applicable (no usable configuration/catalog), ``True``
-    if it was refreshed successfully, or ``False`` if refreshing it failed
-    (best-effort; never raises).
+    Returns the existing tri-state reconciliation status plus whether the
+    effective on-disk ES integration changed and therefore needs a restart.
     """
     from romcloud.integrations.batocera import es_config
 
     override_path = es_config.ROMCLOUD_OVERRIDE_PATH
     if not config_path.exists():
-        return None
+        return None, False
     try:
         from romcloud.bootstrap.container import Container
         from romcloud.core.capabilities import OperatingMode
@@ -332,12 +375,18 @@ def reconcile_es_override(config_path: Path) -> Optional[bool]:
 
         config = load_config(str(config_path))
         if operating_mode(config) is OperatingMode.CONNECTED:
-            es_config.remove(override_path=override_path)
-            return True
+            return True, es_config.remove(override_path=override_path)
         container = Container(config)
         managed = container.game_repo.list_systems()
         if not managed and not override_path.exists():
-            return None
+            return None, False
+        before = es_config.status(
+            managed,
+            stock_path=es_config.STOCK_ES_SYSTEMS_PATH,
+            override_path=override_path,
+            wrapper_path=es_config.WRAPPER_SCRIPT_PATH,
+            system_registry=container.system_registry,
+        )
         es_config.refresh(
             managed,
             stock_path=es_config.STOCK_ES_SYSTEMS_PATH,
@@ -345,10 +394,16 @@ def reconcile_es_override(config_path: Path) -> Optional[bool]:
             wrapper_path=es_config.WRAPPER_SCRIPT_PATH,
             system_registry=container.system_registry,
         )
-        return True
+        return True, not before.up_to_date
     except Exception:  # noqa: BLE001 — optional integration, never fatal
         log.warning("Failed to reconcile EmulationStation override", exc_info=True)
-        return False
+        return False, False
+
+
+def reconcile_es_override(config_path: Path) -> Optional[bool]:
+    """Compatibility wrapper returning the existing tri-state status."""
+    status, _changed = _reconcile_es_override_with_change(config_path)
+    return status
 
 
 def reconcile_ports_gamelist(ports_ui: PortsUiResult, ports_dir: Path) -> Optional[bool]:
@@ -370,18 +425,20 @@ def reconcile_ports_gamelist(ports_ui: PortsUiResult, ports_dir: Path) -> Option
     from romcloud.integrations.batocera import ports_gamelist_config
 
     source_icon = ports_ui.ports_gfx_dir / "assets" / "icon.png"
+    icon_ok = True
     if source_icon.exists():
         try:
             ports_gamelist_config.sync_icon(source_icon=source_icon, ports_dir=ports_dir)
         except Exception:  # noqa: BLE001 — best-effort; the gamelist entry itself still gets written below
             log.warning("Failed to sync ROMCloud Ports icon artwork", exc_info=True)
+            icon_ok = False
 
     try:
         ports_gamelist_config.reconcile(
             image=ports_gamelist_config.ROMCLOUD_IMAGE_RELATIVE_PATH,
             gamelist_path=ports_dir / "gamelist.xml",
         )
-        return True
+        return icon_ok
     except Exception:  # noqa: BLE001 — optional integration, never fatal
         log.warning("Failed to reconcile Ports gamelist entry", exc_info=True)
         return False
@@ -412,6 +469,11 @@ class ReconcileReport:
     ports_gamelist: Optional[bool]
     autosync_hook: bool
     proxies_restored: int = 0
+    mount_service_enabled: Optional[bool] = None
+    game_access: Optional[bool] = None
+    catalog_available: Optional[bool] = None
+    es_restart_required: bool = False
+    warnings: tuple[str, ...] = ()
 
 
 def reconcile_install(
@@ -421,6 +483,7 @@ def reconcile_install(
     ports_dir: Optional[Path] = None,
     system_python: Optional[str] = None,
     environment: Optional[Mapping[str, str]] = None,
+    repair: bool = False,
 ) -> ReconcileReport:
     """Reconcile every ROMCloud-managed runtime artifact under
     *romcloud_home* against *project_root* (the current source tree — the
@@ -440,12 +503,14 @@ def reconcile_install(
     config_path = romcloud_home / "config" / "romcloud.toml"
     resolved_ports_dir = Path(ports_dir) if ports_dir else DEFAULT_PORTS_DIR
 
+    warnings: list[str] = []
     try:
         from romcloud.lifecycle.runtime_layout import reconcile_legacy_runtime_layout
 
         reconcile_legacy_runtime_layout(config_path)
     except Exception:  # noqa: BLE001 - optional conservative migration
         log.warning("Failed to reconcile legacy runtime paths", exc_info=True)
+        warnings.append("Legacy runtime paths could not be reconciled.")
 
     core = write_core_wrappers(bin_dir, venv_python)
     google_oauth = reconcile_google_oauth_metadata(
@@ -454,6 +519,10 @@ def reconcile_install(
         environment=environment,
     )
 
+    existing_ports_payload_usable = all(
+        (ports_gfx_dir / "ports_gfx" / name).is_file()
+        for name in ("__init__.py", "app.py", "client.py")
+    )
     ports_ui = install_ports_ui(
         project_root=project_root,
         ports_gfx_dir=ports_gfx_dir,
@@ -463,17 +532,48 @@ def reconcile_install(
         system_python=system_python,
     )
 
-    mount_service_status = reconcile_mount_service(bin_dir)
-    es_override_status = reconcile_es_override(config_path)
-    ports_gamelist_status = reconcile_ports_gamelist(ports_ui, resolved_ports_dir)
-    autosync_hook_status = reconcile_auto_savesync_hook(bin_dir)
-    proxies_restored = 0
+    mount_service_reconciled = reconcile_mount_service(bin_dir)
+    if mount_service_reconciled:
+        mount_service_status, mount_service_enabled = True, True
+    else:
+        from romcloud.integrations.batocera import mount_service
+
+        mount_service_status = mount_service.SERVICE_SCRIPT_PATH.is_file()
+        mount_service_enabled = (
+            mount_service.is_service_enabled() if mount_service_status else False
+        )
+
+    configured = None
+    catalog_available: Optional[bool] = None
     if config_path.exists():
         try:
             from romcloud.infrastructure.config import load_config
-            from romcloud.integrations.batocera.game_access import reconcile_game_access
 
             configured = load_config(str(config_path))
+            catalog_available = (Path(configured.data_path) / "catalog.db").is_file()
+        except Exception:
+            configured = None
+
+    catalog_blocks_repair = repair and configured is not None and not catalog_available
+    es_restart_required = False
+    if catalog_blocks_repair:
+        es_override_status = None
+        warnings.append(
+            "Catalog state is unavailable; preserved existing EmulationStation, "
+            "proxy, and Direct-link presentation without reconciliation."
+        )
+    else:
+        es_override_status, es_restart_required = _reconcile_es_override_with_change(
+            config_path
+        )
+    ports_gamelist_status = reconcile_ports_gamelist(ports_ui, resolved_ports_dir)
+    autosync_hook_status = reconcile_auto_savesync_hook(bin_dir)
+    proxies_restored = 0
+    game_access_status: Optional[bool] = None
+    if configured is not None and not catalog_blocks_repair:
+        try:
+            from romcloud.integrations.batocera.game_access import reconcile_game_access
+
             if configured.source.enabled:
                 before = len(list(Path(configured.local_roms_path).glob("*/*.romcloud")))
                 # The named ES override was already reconciled above; this pass
@@ -482,16 +582,58 @@ def reconcile_install(
                 reconcile_game_access(configured, refresh_es=False)
                 after = len(list(Path(configured.local_roms_path).glob("*/*.romcloud")))
                 proxies_restored = max(0, after - before)
+                game_access_status = True
         except Exception:  # noqa: BLE001 — optional recovery, never breaks runtime repair
             log.warning("Failed to restore missing ROMCloud proxy files", exc_info=True)
+            game_access_status = False
+
+    ports_error = getattr(ports_ui, "error", None)
+    ports_skip_reason = getattr(ports_ui, "skip_reason", None)
+    ports_installed = bool(getattr(ports_ui, "installed", False))
+    if ports_error:
+        warnings.append(f"Graphical Ports UI reconciliation failed: {ports_error}")
+    elif ports_skip_reason == "no_source_payload":
+        warnings.append("Graphical Ports UI source payload is unavailable.")
+    elif repair and not ports_installed and not existing_ports_payload_usable:
+        warnings.append(
+            "Graphical Ports UI remains unavailable because a compatible system "
+            "Python with pygame was not found."
+        )
+    if mount_service_status is False:
+        warnings.append("Batocera startup service script could not be reconciled.")
+    elif mount_service_enabled is False:
+        warnings.append(
+            "Batocera startup service was written but is not enabled; enable it manually."
+        )
+    if es_override_status is False:
+        warnings.append("EmulationStation integration could not be reconciled.")
+    if ports_gamelist_status is False:
+        warnings.append(
+            "The shared Ports gamelist could not be safely reconciled; "
+            "its original content was preserved."
+        )
+    if not autosync_hook_status:
+        warnings.append("Auto SaveSync lifecycle hook could not be reconciled.")
+    if game_access_status is False:
+        warnings.append("Game-access proxies or Direct links could not be reconciled.")
+    if es_restart_required:
+        warnings.append(
+            "EmulationStation configuration changed; restart EmulationStation "
+            "to apply the repair."
+        )
 
     return ReconcileReport(
         core=core,
         google_oauth=google_oauth,
         ports_ui=ports_ui,
         mount_service=mount_service_status,
+        mount_service_enabled=mount_service_enabled,
         es_override=es_override_status,
         ports_gamelist=ports_gamelist_status,
         autosync_hook=autosync_hook_status,
         proxies_restored=proxies_restored,
+        game_access=game_access_status,
+        catalog_available=catalog_available,
+        es_restart_required=es_restart_required,
+        warnings=tuple(warnings),
     )

@@ -82,11 +82,9 @@ def reconcile(
     """
     existing_xml: Optional[str] = None
     if gamelist_path.exists():
-        try:
-            existing_xml = gamelist_path.read_text(encoding="utf-8")
-        except OSError as exc:
-            log.warning("Failed to read %s: %s", gamelist_path, exc)
-            existing_xml = None
+        # An unreadable existing shared file must never be treated as absent;
+        # doing so would replace third-party entries with a new empty document.
+        existing_xml = gamelist_path.read_text(encoding="utf-8")
 
     result = upsert_romcloud_entry(existing_xml, image=image, rom_path=rom_path, name=name)
 

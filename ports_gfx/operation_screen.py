@@ -40,8 +40,8 @@ class OperationSpec:
     args: tuple[str, ...]
     # Explicit ownership flag for the terminal GUI-relaunch handoff (see
     # ``ports_gfx.relaunch.GuiRelaunchCoordinator``): True only for the
-    # self-update action. A completed mode transition, catalog refresh,
-    # mount/reconnect, or any other operation must never arm a replacement
+    # runtime-replacing update/repair actions. A completed mode transition,
+    # catalog refresh, mount/reconnect, or any other operation must never arm a replacement
     # GUI launch — this is a data field, not a display-title string
     # comparison, so it can't drift if titles are ever renamed or reused.
     arms_gui_relaunch: bool = False

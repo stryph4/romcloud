@@ -179,6 +179,11 @@ MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
         ),
         MenuItem("Check for Updates", "update-check"),
         MenuItem("Update ROMCloud", "update-install"),
+        MenuItem(
+            "Repair Installation",
+            "repair-install",
+            "Reinstall and restore ROMCloud runtime files without deleting user data.",
+        ),
         MenuItem("Health Check", "healthcheck"),
         MenuItem("Setup Controller Mapping", CONTROLLER_TEST_ACTION),
         MenuItem("Local Browser Runtime", "browser-runtime-status"),
@@ -373,6 +378,11 @@ _OPERATIONS: dict[str, OperationSpec] = {
     ),
     "update-install": OperationSpec(
         title="Update ROMCloud", args=("uidata", "update-install"), arms_gui_relaunch=True
+    ),
+    "repair-install": OperationSpec(
+        title="Repair Installation",
+        args=("uidata", "repair-install"),
+        arms_gui_relaunch=True,
     ),
     "browser-runtime-status": OperationSpec(
         title="Local Browser Runtime", args=("uidata", "browser-runtime-status")
@@ -585,6 +595,11 @@ def operation_summary_message(operation: OperationScreenState) -> tuple[str, str
     Pure function — no pygame — so it is fully unit-tested.
     """
     if operation.succeeded:
+        if hasattr(operation.runner, "lines"):
+            result = operation_result(operation.runner)
+            warnings = result.data.get("warnings", []) if result.ok else []
+            if warnings:
+                return f"{operation.title}: completed with warnings", "warning"
         return f"{operation.title}: succeeded", "success"
     detail = operation.runner.error
     if hasattr(operation.runner, "lines"):
@@ -634,7 +649,7 @@ def request_relaunch_for_completed_update(
     operation: OperationScreenState,
     relaunch: GuiRelaunchCoordinator,
 ) -> bool:
-    """Enter the terminal relaunch state for one confirmed update success."""
+    """Enter terminal relaunch after a confirmed update or repair success."""
     if not operation.arms_gui_relaunch or not operation.is_finished:
         return False
     if not operation.succeeded:
@@ -653,10 +668,21 @@ def render_completed_update_relaunch(
     relaunch: GuiRelaunchCoordinator,
     splash: SplashRenderer,
 ) -> bool:
-    """Confirm update success and paint the terminal frame before shutdown."""
+    """Confirm runtime replacement and paint its terminal frame before shutdown."""
     if not request_relaunch_for_completed_update(operation, relaunch):
         return False
-    splash.render("Update complete", "Restarting ROMCloud…", 1.0)
+    title = (
+        "Repair complete"
+        if operation.title == "Repair Installation"
+        else "Update complete"
+    )
+    result = operation_result(operation.runner)
+    detail = "Restarting ROMCloud…"
+    if result.ok and result.data.get("es_restart_required"):
+        detail = "Restart EmulationStation to apply the repair; restarting ROMCloud…"
+    elif result.ok and result.data.get("warnings"):
+        detail = "Repair completed with warnings; restarting ROMCloud…"
+    splash.render(title, detail, 1.0)
     return True
 
 
