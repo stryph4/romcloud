@@ -377,12 +377,16 @@ _OPERATIONS: dict[str, OperationSpec] = {
         max_runtime=35.0,
     ),
     "update-install": OperationSpec(
-        title="Update ROMCloud", args=("uidata", "update-install"), arms_gui_relaunch=True
+        title="Update ROMCloud",
+        args=("uidata", "update-install"),
+        arms_gui_relaunch=True,
+        relaunch_operation="update",
     ),
     "repair-install": OperationSpec(
         title="Repair Installation",
         args=("uidata", "repair-install"),
         arms_gui_relaunch=True,
+        relaunch_operation="repair",
     ),
     "browser-runtime-status": OperationSpec(
         title="Local Browser Runtime", args=("uidata", "browser-runtime-status")
@@ -565,6 +569,7 @@ def start_operation(action: str, romcloud_bin: str, *, popen=None) -> OperationS
         title=spec.title,
         runner=runner,
         arms_gui_relaunch=spec.arms_gui_relaunch,
+        relaunch_operation=spec.relaunch_operation,
         exits_after_mode_change=spec.exits_after_mode_change,
     )
 
@@ -656,11 +661,42 @@ def request_relaunch_for_completed_update(
         relaunch.mark_update_failed()
         return False
     result = operation_result(operation.runner)
+    if repair_relaunch_needs_acknowledgment(operation):
+        return False
     # The final successful JSON is written only after perform_update has
     # returned, so the updater's install/reconciliation/post-update work is
     # committed before this process is allowed to enter its terminal state.
     progress_complete = result.ok
     return relaunch.mark_update_succeeded(progress_complete=progress_complete)
+
+
+def repair_relaunch_needs_acknowledgment(
+    operation: OperationScreenState,
+) -> bool:
+    """Return whether warning details must remain visible before relaunch."""
+    if (
+        operation.relaunch_operation != "repair"
+        or not operation.arms_gui_relaunch
+        or not operation.is_finished
+        or not operation.succeeded
+        or operation.relaunch_acknowledged
+    ):
+        return False
+    result = operation_result(operation.runner)
+    return bool(result.ok and result.data.get("warnings"))
+
+
+def acknowledge_completed_relaunch(
+    operation: OperationScreenState,
+    action: Action,
+) -> bool:
+    """Acknowledge a partial Repair before its terminal GUI handoff."""
+    if action not in (Action.BACK, Action.CONFIRM, Action.MENU):
+        return False
+    if not repair_relaunch_needs_acknowledgment(operation):
+        return False
+    operation.relaunch_acknowledged = True
+    return True
 
 
 def render_completed_update_relaunch(
@@ -671,17 +707,19 @@ def render_completed_update_relaunch(
     """Confirm runtime replacement and paint its terminal frame before shutdown."""
     if not request_relaunch_for_completed_update(operation, relaunch):
         return False
-    title = (
-        "Repair complete"
-        if operation.title == "Repair Installation"
-        else "Update complete"
-    )
     result = operation_result(operation.runner)
+    operation_name = (
+        "Repair" if operation.relaunch_operation == "repair" else "Update"
+    )
+    title = f"{operation_name} complete"
+    if result.ok and result.data.get("warnings"):
+        title = f"{operation_name} completed with warnings"
     detail = "Restarting ROMCloud…"
     if result.ok and result.data.get("es_restart_required"):
-        detail = "Restart EmulationStation to apply the repair; restarting ROMCloud…"
-    elif result.ok and result.data.get("warnings"):
-        detail = "Repair completed with warnings; restarting ROMCloud…"
+        detail = (
+            f"Restart EmulationStation to apply the {operation_name.casefold()}; "
+            "restarting ROMCloud…"
+        )
     splash.render(title, detail, 1.0)
     return True
 
@@ -1423,7 +1461,10 @@ def _run(  # noqa: ANN001
                             catalog_progress.scroll(-1, 6)
                         elif ievent.action == Action.DOWN:
                             catalog_progress.scroll(1, 6)
-                    if running and not relaunch.terminal:
+                    acknowledged_relaunch = acknowledge_completed_relaunch(
+                        operation_screen, ievent.action
+                    )
+                    if running and not relaunch.terminal and not acknowledged_relaunch:
                         current_screen = handle_operation_event(ievent, operation_screen)
                     if current_screen == "menu" and not relaunch.terminal:
                         if operation_screen.title == "Check for Updates":
@@ -2257,9 +2298,17 @@ def _render_operation(  # noqa: ANN001
     )
 
     detail_hint = "   Left/Right technical details"
-    hint_text = (
-        _OPERATION_HINT_FINISHED if operation.is_finished else _OPERATION_HINT_RUNNING
-    ) + detail_hint
+    if repair_relaunch_needs_acknowledgment(operation):
+        hint_text = (
+            "A/Enter/Esc/Tap acknowledge and restart ROMCloud   Up/Down scroll"
+        )
+    else:
+        hint_text = (
+            _OPERATION_HINT_FINISHED
+            if operation.is_finished
+            else _OPERATION_HINT_RUNNING
+        )
+    hint_text += detail_hint
     hint = fonts["hint"].render(hint_text, True, _HINT_COLOR)
     screen.blit(hint, (layout.hint_rect.x, layout.hint_rect.y))
 

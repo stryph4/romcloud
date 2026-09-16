@@ -23,3 +23,4 @@ def test_repair_uses_long_running_operation_and_gui_relaunch() -> None:
     spec = _OPERATIONS["repair-install"]
     assert spec.args == ("uidata", "repair-install")
     assert spec.arms_gui_relaunch is True
+    assert spec.relaunch_operation == "repair"

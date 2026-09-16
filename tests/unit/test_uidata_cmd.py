@@ -817,6 +817,38 @@ class TestUpdateBridge:
         assert payload["warnings"] == ["Ports gamelist remains unchanged."]
         assert payload["es_restart_required"] is True
 
+    def test_repair_es_restart_alone_reports_clean_success(self, tmp_path, monkeypatch):
+        from romcloud.lifecycle import update as update_module
+
+        new = update_module.BuildInfo(
+            version="1.1.0",
+            commit="b" * 40,
+            commit_short="b" * 12,
+            build_date="x",
+            source="test",
+        )
+        monkeypatch.setattr(
+            update_module,
+            "perform_repair",
+            lambda home, python, channel, progress=None: update_module.UpdateResult(
+                previous=None,
+                new=new,
+                warnings=(),
+                es_restart_required=True,
+            ),
+        )
+
+        result = CliRunner().invoke(
+            cli,
+            ["--config", str(tmp_path / "missing.toml"), "uidata", "repair-install"],
+        )
+
+        assert result.exit_code == 0
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        assert payload["result"] == "success"
+        assert payload["warnings"] == []
+        assert payload["es_restart_required"] is True
+
 
 class TestHealthcheck:
     def test_emits_source_reachability(self, tmp_path):

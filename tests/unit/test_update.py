@@ -542,6 +542,190 @@ class TestPerformUpdateSuccess:
         assert result.warnings == ("Ports gamelist remains unchanged",)
         assert result.es_restart_required is True
 
+    @pytest.mark.parametrize("repair", [False, True])
+    def test_es_restart_required_alone_is_clean_success(self, tmp_path, repair):
+        home = tmp_path / "romcloud"
+        archive = _make_archive_bytes(sha=_SHA, version="2.0.0")
+        opener = _make_opener(_full_payloads(archive_bytes=archive))
+
+        def runner(argv, **kwargs):
+            result = _fake_runner_success(argv, **kwargs)
+            if "_reconcile-install" in argv:
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout="repair-state: es_restart_required=true\n",
+                    stderr="",
+                )
+            return result
+
+        operation = upd.perform_repair if repair else upd.perform_update
+        result = operation(
+            home,
+            home / "venv" / "bin" / "python",
+            opener=opener,
+            runner=runner,
+        )
+
+        assert result.es_restart_required is True
+        assert result.warnings == ()
+
+    def test_repair_orchestration_runs_repair_reconciler_for_bua_switch(
+        self, tmp_path, monkeypatch
+    ):
+        import sys
+        from types import SimpleNamespace
+        from xml.etree import ElementTree as ET
+
+        if "fcntl" not in sys.modules:
+            monkeypatch.setitem(
+                sys.modules,
+                "fcntl",
+                SimpleNamespace(
+                    LOCK_EX=1,
+                    LOCK_NB=2,
+                    LOCK_UN=8,
+                    flock=lambda *_args: None,
+                ),
+            )
+
+        from romcloud.bootstrap.container import Container
+        from romcloud.core.models.game import Game, GameAsset
+        from romcloud.infrastructure.config import (
+            AppConfig,
+            CacheConfig,
+            SourceConfig,
+            write_config,
+        )
+        from romcloud.infrastructure.database import Database
+        from romcloud.infrastructure.repositories.game import GameRepository
+        from romcloud.integrations.batocera import es_config, game_access
+        from romcloud.integrations.batocera.system_registry import (
+            load_effective_system_registry,
+        )
+        from romcloud.lifecycle import install as inst
+
+        home = tmp_path / "romcloud"
+        data = home / "data"
+        source = tmp_path / "source"
+        local_roms = tmp_path / "roms"
+        source.mkdir()
+        local_roms.mkdir()
+        config = AppConfig(
+            source=SourceConfig(provider="local", rom_root=str(source)),
+            cache=CacheConfig(path=str(home / "cache")),
+            local_roms_path=str(local_roms),
+            data_path=str(data),
+        )
+        write_config(config, str(home / "config" / "romcloud.toml"))
+        database = Database(str(data / "catalog.db"))
+        database.initialize()
+        GameRepository(database).save(
+            Game.create(
+                system="switch",
+                title="Switch Game",
+                source_provider="local",
+                source_root=str(source),
+                assets=[
+                    GameAsset(
+                        filename="Switch Game.xci",
+                        relative_path="switch/Switch Game.xci",
+                        is_primary=True,
+                    )
+                ],
+            )
+        )
+
+        user_config = tmp_path / "es-user"
+        system_config = tmp_path / "es-share"
+        user_config.mkdir()
+        system_config.mkdir()
+        stock = system_config / "es_systems.cfg"
+        stock.write_text(
+            "<systemList><system><name>switch</name><extension>.xci</extension>"
+            "<command>emulatorlauncher -system %SYSTEM% -rom %ROM%</command>"
+            "</system></systemList>",
+            encoding="utf-8",
+        )
+        native_command = (
+            "python /userdata/system/switch/configgen/switchlauncher.py "
+            "%CONTROLLERSCONFIG% -system %SYSTEM% -rom %ROM%"
+        )
+        bua = user_config / "es_systems_switch.cfg"
+        bua.write_text(
+            "<systemList><system><name>switch</name>"
+            "<path>/userdata/roms/switch-custom</path>"
+            "<extension>.xci .nsp .bua</extension>"
+            f"<command>{native_command}</command>"
+            "<theme>bua-switch</theme></system></systemList>",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(es_config, "STOCK_ES_SYSTEMS_PATH", stock)
+        monkeypatch.setattr(
+            es_config, "ROMCLOUD_OVERRIDE_PATH", user_config / "es_systems_romcloud.cfg"
+        )
+        monkeypatch.setattr(es_config, "WRAPPER_SCRIPT_PATH", home / "bin" / "romcloud-run")
+
+        def registry(container):
+            return load_effective_system_registry(
+                cache_path=Path(container.config.data_path) / "registry.json",
+                user_config_dir=user_config,
+                system_config_dir=system_config,
+                legacy_config_dir=tmp_path / "missing-legacy",
+            )
+
+        monkeypatch.setattr(Container, "system_registry", property(registry))
+        monkeypatch.setattr(game_access, "reconcile_game_access", lambda *_a, **_kw: None)
+        monkeypatch.setattr(inst, "detect_system_python", lambda _explicit=None: None)
+        monkeypatch.setattr(
+            inst, "_reconcile_mount_service_status", lambda _bin: (True, True)
+        )
+        monkeypatch.setattr(inst, "reconcile_ports_gamelist", lambda *_args: None)
+        monkeypatch.setattr(inst, "reconcile_auto_savesync_hook", lambda _bin: True)
+
+        reconcile_calls: list[list[str]] = []
+
+        def runner(argv, **kwargs):
+            result = _fake_runner_success(argv, **kwargs)
+            if "_reconcile-install" not in argv:
+                return result
+            reconcile_calls.append(argv)
+            repair_mode = "--repair" in argv
+            project_root = Path(argv[argv.index("--project-root") + 1])
+            report = inst.reconcile_install(
+                romcloud_home=home,
+                project_root=project_root,
+                ports_dir=tmp_path / "ports",
+                repair=repair_mode,
+            )
+            stdout = (
+                "repair-state: es_restart_required=true\n"
+                if report.es_restart_required
+                else ""
+            )
+            return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+        archive = _make_archive_bytes(sha=_SHA)
+        result = upd.perform_repair(
+            home,
+            home / "venv" / "bin" / "python",
+            opener=_make_opener(_full_payloads(archive_bytes=archive)),
+            runner=runner,
+        )
+
+        assert len(reconcile_calls) == 1
+        assert reconcile_calls[0][-1] == "--repair"
+        patched = ET.fromstring(bua.read_text(encoding="utf-8"))
+        assert ".romcloud" in (patched.findtext("system/extension") or "").split()
+        assert patched.findtext("system/command") == (
+            f"{home / 'bin' / 'romcloud-run'} {native_command}"
+        )
+        assert "emulatorlauncher" not in (patched.findtext("system/command") or "")
+        assert patched.findtext("system/path") == "/userdata/roms/switch-custom"
+        assert patched.findtext("system/theme") == "bua-switch"
+        assert result.es_restart_required is True
+        assert result.warnings == ()
+
     def test_full_successful_update(self, tmp_path):
         home = tmp_path / "romcloud"
         venv_python = home / "venv" / "bin" / "python"
@@ -1061,6 +1245,120 @@ class TestConfigDataCacheUntouched:
         assert (logs_dir / "romcloud.log").read_text() == "sentinel-log"
         assert (cache_root / "ps2" / "Game.iso").read_bytes() == b"sentinel-rom-bytes"
         assert (local_roms / "ps2" / "Game.romcloud").read_text() == "sentinel-proxy"
+
+    def test_repair_preserves_download_queue_history_checkpoint_and_saves(
+        self, tmp_path
+    ):
+        import sqlite3
+
+        from romcloud.infrastructure.database import Database
+
+        home = tmp_path / "romcloud"
+        data_dir = home / "data"
+        database_path = data_dir / "catalog.db"
+        Database(str(database_path)).initialize()
+        with sqlite3.connect(database_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO download_items (
+                    id, batch_id, game_id, game_title, system, origin, state,
+                    queue_seq, bytes_total, bytes_present, created_at, updated_at
+                ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "queued-download",
+                    "batch-1",
+                    "Queued Game",
+                    "ps2",
+                    "manual",
+                    "queued",
+                    1,
+                    4096,
+                    1024,
+                    "2026-01-01T00:00:00+00:00",
+                    "2026-01-01T00:00:00+00:00",
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO download_items (
+                    id, batch_id, game_id, game_title, system, origin, state,
+                    queue_seq, bytes_total, bytes_present, created_at, updated_at,
+                    finished_at
+                ) VALUES (?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "history-download",
+                    "Completed Game",
+                    "psx",
+                    "pinned",
+                    "complete",
+                    2,
+                    2048,
+                    2048,
+                    "2026-01-01T00:00:00+00:00",
+                    "2026-01-01T00:01:00+00:00",
+                    "2026-01-01T00:01:00+00:00",
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO cache_staging_assets (
+                    relative_path, system, asset_kind, source_provider,
+                    source_root, expected_size, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "ps2/Partial.iso",
+                    "ps2",
+                    "file",
+                    "local",
+                    str(tmp_path / "source"),
+                    4096,
+                    "2026-01-01T00:00:00+00:00",
+                    "2026-01-01T00:00:00+00:00",
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO cache_staging_files (
+                    asset_relative_path, member_relative_path, expected_size,
+                    state, checkpoint_bytes, checkpoint_sha256
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                ("ps2/Partial.iso", "", 4096, "partial", 1024, "digest"),
+            )
+
+        cache_partial = tmp_path / "cache" / ".staging" / "ps2" / "Partial.iso.part"
+        cache_partial.parent.mkdir(parents=True)
+        cache_partial.write_bytes(b"retained-partial")
+        save_file = tmp_path / "saves" / "ps2" / "memory-card.srm"
+        save_file.parent.mkdir(parents=True)
+        save_file.write_bytes(b"retained-save")
+        before_database = database_path.read_bytes()
+
+        archive = _make_archive_bytes(sha=_SHA)
+        upd.perform_repair(
+            home,
+            home / "venv" / "bin" / "python",
+            opener=_make_opener(_full_payloads(archive_bytes=archive)),
+            runner=_fake_runner_success,
+        )
+
+        assert database_path.read_bytes() == before_database
+        with sqlite3.connect(database_path) as conn:
+            assert conn.execute(
+                "SELECT id, state FROM download_items ORDER BY queue_seq"
+            ).fetchall() == [
+                ("queued-download", "queued"),
+                ("history-download", "complete"),
+            ]
+            assert conn.execute(
+                "SELECT state, checkpoint_bytes, checkpoint_sha256 "
+                "FROM cache_staging_files"
+            ).fetchone() == ("partial", 1024, "digest")
+        assert cache_partial.read_bytes() == b"retained-partial"
+        assert save_file.read_bytes() == b"retained-save"
 
 
 class TestNoGitAvailable:

@@ -122,6 +122,33 @@ class TestInstallPortsUi:
         assert result.installed is False
         assert "simulated copy failure" in (result.error or "")
         assert (target / "client.py").read_text() == "# working-old\n"
+        assert not list(ports_gfx_dir.glob(".ports_gfx.*-*"))
+
+    def test_staged_validation_failure_preserves_previous_payload(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        project_root = tmp_path / "project"
+        source = _make_ports_gfx_source(project_root, marker="new")
+        (source / "client.py").unlink()
+        ports_gfx_dir = tmp_path / "ports-gfx"
+        target = ports_gfx_dir / "ports_gfx"
+        target.mkdir(parents=True)
+        (target / "client.py").write_text("# working-old\n")
+        monkeypatch.setattr(inst, "_system_python_has_pygame", lambda _python: True)
+
+        result = inst.install_ports_ui(
+            project_root=project_root,
+            ports_gfx_dir=ports_gfx_dir,
+            bin_dir=tmp_path / "bin",
+            romcloud_bin=tmp_path / "bin" / "romcloud",
+            ports_dir=tmp_path / "ports",
+            system_python="/usr/bin/python3",
+        )
+
+        assert result.installed is False
+        assert "missing client.py" in (result.error or "")
+        assert (target / "client.py").read_text() == "# working-old\n"
+        assert not list(ports_gfx_dir.glob(".ports_gfx.*-*"))
 
     def test_swap_failure_restores_previous_installed_payload(
         self, tmp_path: Path, monkeypatch
@@ -153,6 +180,7 @@ class TestInstallPortsUi:
         assert result.installed is False
         assert "simulated swap failure" in (result.error or "")
         assert (target / "client.py").read_text() == "# working-old\n"
+        assert not list(ports_gfx_dir.glob(".ports_gfx.*-*"))
 
     def test_wrapper_failure_after_swap_restores_previous_payload(
         self, tmp_path: Path, monkeypatch
@@ -184,6 +212,41 @@ class TestInstallPortsUi:
         assert result.installed is False
         assert "simulated wrapper failure" in (result.error or "")
         assert (target / "client.py").read_text() == "# working-old\n"
+        assert not list(ports_gfx_dir.glob(".ports_gfx.*-*"))
+
+    def test_port_entry_failure_after_swap_restores_previous_payload(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        project_root = tmp_path / "project"
+        _make_ports_gfx_source(project_root, marker="new")
+        ports_gfx_dir = tmp_path / "ports-gfx"
+        target = ports_gfx_dir / "ports_gfx"
+        target.mkdir(parents=True)
+        (target / "client.py").write_text("# working-old\n")
+        ports_dir = tmp_path / "ports"
+        ports_dir.mkdir()
+        monkeypatch.setattr(inst, "_system_python_has_pygame", lambda _python: True)
+        real_write = inst._write_executable
+
+        def fail_port_entry(path: Path, content: str):
+            if path.name == "ROMCloud.sh":
+                raise OSError("simulated Port entry failure")
+            return real_write(path, content)
+
+        monkeypatch.setattr(inst, "_write_executable", fail_port_entry)
+        result = inst.install_ports_ui(
+            project_root=project_root,
+            ports_gfx_dir=ports_gfx_dir,
+            bin_dir=tmp_path / "bin",
+            romcloud_bin=tmp_path / "bin" / "romcloud",
+            ports_dir=ports_dir,
+            system_python="/usr/bin/python3",
+        )
+
+        assert result.installed is False
+        assert "simulated Port entry failure" in (result.error or "")
+        assert (target / "client.py").read_text() == "# working-old\n"
+        assert not list(ports_gfx_dir.glob(".ports_gfx.*-*"))
 
     def test_installed_when_pygame_available(self, tmp_path: Path) -> None:
         project_root = tmp_path / "project"
@@ -575,7 +638,9 @@ class TestReconcileInstall:
                 installed=False, error="payload copy failed"
             ),
         )
-        monkeypatch.setattr(inst, "reconcile_mount_service", lambda _bin: False)
+        monkeypatch.setattr(
+            inst, "_reconcile_mount_service_status", lambda _bin: (True, False)
+        )
         from romcloud.integrations.batocera import mount_service
 
         service_path = home / "service" / mount_service.SERVICE_NAME
@@ -605,6 +670,35 @@ class TestReconcileInstall:
             "The shared Ports gamelist could not be safely reconciled; its original content was preserved.",
             "Auto SaveSync lifecycle hook could not be reconciled.",
         )
+
+    def test_stale_service_file_cannot_mask_reconciliation_failure(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        home = tmp_path / "romcloud"
+        project = tmp_path / "project"
+        project.mkdir()
+        from romcloud.integrations.batocera import mount_service
+
+        stale_service = tmp_path / "service" / mount_service.SERVICE_NAME
+        stale_service.parent.mkdir()
+        stale_service.write_text("stale service")
+        monkeypatch.setattr(mount_service, "SERVICE_SCRIPT_PATH", stale_service)
+        monkeypatch.setattr(
+            inst, "_reconcile_mount_service_status", lambda _bin: (False, False)
+        )
+        monkeypatch.setattr(inst, "detect_system_python", lambda _explicit=None: None)
+        monkeypatch.setattr(
+            inst, "_reconcile_es_override_with_change", lambda _path: (None, False)
+        )
+        monkeypatch.setattr(inst, "reconcile_ports_gamelist", lambda *_args: None)
+        monkeypatch.setattr(inst, "reconcile_auto_savesync_hook", lambda _bin: True)
+
+        report = inst.reconcile_install(romcloud_home=home, project_root=project)
+
+        assert stale_service.is_file()
+        assert report.mount_service is False
+        assert report.mount_service_enabled is False
+        assert "Batocera startup service script could not be reconciled." in report.warnings
 
     def test_repair_reconcile_fixes_bua_switch_overlay_and_direct_restores_it(
         self, tmp_path: Path, monkeypatch
@@ -733,6 +827,8 @@ class TestReconcileInstall:
         assert bua.read_bytes() == patched_once
         assert first.es_restart_required is True
         assert second.es_restart_required is False
+        assert first.warnings == ()
+        assert second.warnings == ()
 
         direct_config = replace(config, game_access_mode=DIRECT_NAS_MODE)
         write_config(direct_config, str(config_path))
@@ -770,7 +866,14 @@ class TestReconcileInstall:
     @staticmethod
     def _isolate_optional_integrations(monkeypatch) -> None:
         monkeypatch.setattr(inst, "detect_system_python", lambda _explicit=None: None)
-        monkeypatch.setattr(inst, "reconcile_mount_service", lambda _bin: True)
+        monkeypatch.setattr(
+            inst,
+            "install_ports_ui",
+            lambda **_kwargs: inst.PortsUiResult(installed=True),
+        )
+        monkeypatch.setattr(
+            inst, "_reconcile_mount_service_status", lambda _bin: (True, True)
+        )
         monkeypatch.setattr(inst, "reconcile_ports_gamelist", lambda *_args: None)
         monkeypatch.setattr(inst, "reconcile_auto_savesync_hook", lambda _bin: True)
 

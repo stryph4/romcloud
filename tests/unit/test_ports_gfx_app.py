@@ -31,8 +31,10 @@ from ports_gfx.app import (
     menu_categories_for_state,
     root_menu_items_for_state,
     completed_mode_transition_requires_exit,
+    acknowledge_completed_relaunch,
     operation_summary_message,
     request_relaunch_for_completed_update,
+    repair_relaunch_needs_acknowledgment,
     render_completed_mode_transition_exit,
     render_completed_update_relaunch,
     start_operation,
@@ -1301,12 +1303,16 @@ class TestUpdateRelaunchRequest:
         lines: list[OperationLine],
         *,
         finished: bool = True,
+        relaunch_operation: str = "update",
     ):
         from ports_gfx.operation_screen import OperationScreenState
 
         runner = _FakeUpdateRunner(state, lines, finished=finished)
         return OperationScreenState(
-            title="Update ROMCloud", runner=runner, arms_gui_relaunch=True
+            title="Update ROMCloud",
+            runner=runner,
+            arms_gui_relaunch=True,
+            relaunch_operation=relaunch_operation,
         )
 
     def test_successful_final_result_enters_terminal_relaunch_state(self):
@@ -1374,7 +1380,7 @@ class TestUpdateRelaunchRequest:
         assert render_completed_update_relaunch(operation, coordinator, splash) is False
         assert frames == [("splash", "Update complete", "Restarting ROMCloud…", 1.0)]
 
-    def test_partial_repair_relaunch_splash_surfaces_warning_state(self):
+    def test_partial_repair_waits_for_acknowledgment_then_relaunches(self):
         coordinator = GuiRelaunchCoordinator("/opt/romcloud/bin/romcloud")
         operation = self._operation(
             OperationState.SUCCEEDED,
@@ -1385,8 +1391,49 @@ class TestUpdateRelaunchRequest:
                     '"warnings":["Restart ES"]}',
                 )
             ],
+            relaunch_operation="repair",
         )
-        operation.title = "Repair Installation"
+        frames: list[object] = []
+
+        assert repair_relaunch_needs_acknowledgment(operation) is True
+        assert request_relaunch_for_completed_update(operation, coordinator) is False
+        assert coordinator.terminal is False
+        assert acknowledge_completed_relaunch(operation, Action.CONFIRM) is True
+        assert repair_relaunch_needs_acknowledgment(operation) is False
+        assert render_completed_update_relaunch(
+            operation, coordinator, _RecordingSplash(frames)
+        ) is True
+        assert frames == [
+            (
+                "splash",
+                "Repair completed with warnings",
+                "Restart EmulationStation to apply the repair; restarting ROMCloud…",
+                1.0,
+            )
+        ]
+
+    def test_clean_repair_relaunches_immediately(self):
+        coordinator = GuiRelaunchCoordinator("/opt/romcloud/bin/romcloud")
+        operation = self._operation(
+            OperationState.SUCCEEDED,
+            [OperationLine("stdout", '{"ok":true,"warnings":[]}')],
+            relaunch_operation="repair",
+        )
+        frames: list[object] = []
+
+        assert render_completed_update_relaunch(
+            operation, coordinator, _RecordingSplash(frames)
+        ) is True
+        assert frames == [
+            ("splash", "Repair complete", "Restarting ROMCloud…", 1.0)
+        ]
+
+    def test_update_warning_message_never_says_repair(self):
+        coordinator = GuiRelaunchCoordinator("/opt/romcloud/bin/romcloud")
+        operation = self._operation(
+            OperationState.SUCCEEDED,
+            [OperationLine("stdout", '{"ok":true,"warnings":["optional"]}')],
+        )
         frames: list[object] = []
 
         assert render_completed_update_relaunch(
@@ -1395,8 +1442,8 @@ class TestUpdateRelaunchRequest:
         assert frames == [
             (
                 "splash",
-                "Repair complete",
-                "Restart EmulationStation to apply the repair; restarting ROMCloud…",
+                "Update completed with warnings",
+                "Restarting ROMCloud…",
                 1.0,
             )
         ]
@@ -1406,6 +1453,7 @@ class TestUpdateRelaunchRequest:
         operation = self._operation(
             OperationState.FAILED,
             [OperationLine("stdout", '{"ok":false,"error":"install failed"}')],
+            relaunch_operation="repair",
         )
         frames: list[object] = []
 

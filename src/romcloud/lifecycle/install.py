@@ -532,16 +532,12 @@ def reconcile_install(
         system_python=system_python,
     )
 
-    mount_service_reconciled = reconcile_mount_service(bin_dir)
-    if mount_service_reconciled:
-        mount_service_status, mount_service_enabled = True, True
-    else:
-        from romcloud.integrations.batocera import mount_service
-
-        mount_service_status = mount_service.SERVICE_SCRIPT_PATH.is_file()
-        mount_service_enabled = (
-            mount_service.is_service_enabled() if mount_service_status else False
-        )
+    # Use the result of this reconciliation attempt directly.  A stale service
+    # script left by an earlier install must not make a failed refresh look
+    # successful.
+    mount_service_status, mount_service_enabled = _reconcile_mount_service_status(
+        bin_dir
+    )
 
     configured = None
     catalog_available: Optional[bool] = None
@@ -616,12 +612,6 @@ def reconcile_install(
         warnings.append("Auto SaveSync lifecycle hook could not be reconciled.")
     if game_access_status is False:
         warnings.append("Game-access proxies or Direct links could not be reconciled.")
-    if es_restart_required:
-        warnings.append(
-            "EmulationStation configuration changed; restart EmulationStation "
-            "to apply the repair."
-        )
-
     return ReconcileReport(
         core=core,
         google_oauth=google_oauth,
