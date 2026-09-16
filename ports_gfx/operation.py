@@ -96,6 +96,7 @@ class OperationRunner:
         self._timeout_message = timeout_message
         self._clock = clock
         self._started_at: float | None = None
+        self._cancel_requested = False
 
     @property
     def state(self) -> OperationState:
@@ -116,6 +117,10 @@ class OperationRunner:
     @property
     def is_finished(self) -> bool:
         return self._state in (OperationState.SUCCEEDED, OperationState.FAILED)
+
+    @property
+    def cancel_requested(self) -> bool:
+        return self._cancel_requested
 
     def start(self) -> None:
         """Launch the subprocess. Never blocks and never raises — a
@@ -223,6 +228,22 @@ class OperationRunner:
         self._state = OperationState.FAILED
         self._returncode = getattr(self._process, "returncode", None)
         self._error = reason
+
+    def request_cancel(self, *, reason: str = "cancellation requested") -> None:
+        """Ask a cooperative backend to stop at its next safe boundary.
+
+        Unlike :meth:`cancel`, this never follows SIGTERM with SIGKILL. It is
+        used by Troubleshoot so an atomic fix cannot be interrupted halfway.
+        """
+
+        if self._state != OperationState.RUNNING or self._process is None:
+            return
+        self._cancel_requested = True
+        self._error = reason
+        try:
+            self._signal_owned_process(signal.SIGTERM, force=False)
+        except (OSError, ProcessLookupError):
+            pass
 
     def poll(self) -> list[OperationLine]:
         """Call once per frame: drains whatever output has arrived so far

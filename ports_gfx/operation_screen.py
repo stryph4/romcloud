@@ -98,6 +98,29 @@ class OperationScreenState:
         if not self.runner.is_finished:
             self.runner.cancel()
 
+    @property
+    def quick_repair_available(self) -> bool:
+        """Whether a completed Troubleshoot scan advertised eligible fixes."""
+
+        if self.title != "Troubleshoot ROMCloud" or not self.succeeded:
+            return False
+        stdout = [line.text for line in self.runner.lines if line.stream == "stdout"]
+        if not stdout:
+            return False
+        try:
+            payload = json.loads(stdout[-1])
+        except (TypeError, ValueError):
+            return False
+        return bool(isinstance(payload, dict) and payload.get("ok") and payload.get("quick_repair_available"))
+
+
+def troubleshoot_quick_repair_requested(
+    screen: OperationScreenState, action: Action | None
+) -> bool:
+    """Quick Repair is entered only by explicit confirmation after stage one."""
+
+    return screen.quick_repair_available and action == Action.CONFIRM
+
 
 def display_lines(runner: OperationRunner, *, details: bool = True) -> list[str]:
     """Format captured output for display — a stderr line is prefixed so
@@ -203,6 +226,9 @@ def handle_operation_event(ievent: InputEvent, screen: OperationScreenState) -> 
 
     if action == Action.BACK:
         if not screen.runner.is_finished:
+            if screen.title in {"Troubleshoot ROMCloud", "Quick Repair"}:
+                screen.runner.request_cancel()
+                return OPERATION_SCREEN
             screen.runner.cancel()
         return MENU_SCREEN
 

@@ -307,6 +307,31 @@ def load_config(
     return config
 
 
+def load_config_read_only(
+    config_path: Optional[str] = None, *, resolve_paths: bool = False
+) -> AppConfig:
+    """Parse and validate configuration without migrations or other writes.
+
+    Maintenance diagnostics must be able to describe legacy or malformed
+    installations without changing the evidence they are inspecting. Keep
+    this entry point intentionally smaller than :func:`load_config`: it reads
+    one TOML document and runs the existing pure schema parser, but never
+    rewrites storage defaults or credentials.
+    """
+
+    path = Path(config_path) if config_path else default_config_path()
+    if not path.exists():
+        raise ConfigurationNotFoundError(
+            f"No configuration found at {path}. Run `romcloud configure` to set up."
+        )
+    try:
+        with path.open("rb") as fh:
+            data = tomllib.load(fh)
+    except Exception as exc:
+        raise ConfigurationError(f"Failed to parse config {path}: {exc}") from exc
+    return _parse(data, path, resolve_paths=resolve_paths)
+
+
 def migrate_legacy_storage_config(
     path: Path,
     *,

@@ -1,185 +1,129 @@
-"""Unit tests for the SMB mount diagnostic line added to `romcloud healthcheck`.
-
-Only relevant when `[smb]` is configured; must never crash healthcheck even
-if the underlying diagnostics call fails.
-"""
+"""The legacy command is now a renderer over shared pure diagnostics."""
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from click.testing import CliRunner
 
-from romcloud.cli.main import cli
 from romcloud.cli.commands.healthcheck import healthcheck_cmd
+from romcloud.core.models.troubleshoot import TroubleshootFinding, TroubleshootReport
 from romcloud.infrastructure.config import (
     AppConfig,
     CacheConfig,
     RemoteDataConfig,
-    SMBConfig,
+    SFTPConfig,
     SourceConfig,
+    write_config,
 )
-from romcloud.infrastructure.config import write_config
-from romcloud.infrastructure.mount_worker import MountDiagnostics
+from romcloud.core.storage import StorageAccessResult
+from romcloud.troubleshoot import ActivitySnapshot, ActivityState, collect_diagnostics
 
 
-def _build_config(tmp_path, smb=None, remote_data=None):
-    source_root = tmp_path / "roms"
-    source_root.mkdir()
-    data_root = tmp_path / "data"
-    data_root.mkdir()
-    return AppConfig(
-        source=SourceConfig(provider="local", rom_root=str(source_root)),
-        cache=CacheConfig(path=str(tmp_path / "cache")),
-        local_roms_path=str(tmp_path / "local_roms"),
-        data_path=str(data_root),
-        smb=smb,
-        remote_data=remote_data,
+def _inactive() -> ActivitySnapshot:
+    state = ActivityState("inactive")
+    return ActivitySnapshot(state, state, state, state, state, state)
+
+
+def test_healthcheck_renders_shared_findings_and_returns_nonzero(monkeypatch) -> None:
+    report = TroubleshootReport(
+        (TroubleshootFinding("bad", "database", "error", "error", "Catalog is corrupt."),)
+    )
+    monkeypatch.setattr(
+        "romcloud.cli.commands.healthcheck.collect_diagnostics",
+        lambda _path: (report, None),
     )
 
+    result = CliRunner().invoke(
+        healthcheck_cmd, [], obj={"config_path": "/does/not/matter"}
+    )
 
-def _invoke(config):
-    return CliRunner().invoke(healthcheck_cmd, [], obj={"config": config})
-
-
-class TestMountDiagnosticLine:
-    def test_standalone_savesync_skips_rom_source_and_cache_checks(self, tmp_path):
-        local_roms = tmp_path / "local-roms"
-        local_roms.mkdir()
-        data = tmp_path / "data"
-        data.mkdir()
-        remote = tmp_path / "remote"
-        remote.mkdir()
-        config = AppConfig(
-            source=SourceConfig(provider="none", rom_root="", selected_systems=()),
-            cache=CacheConfig(path="unused-cache"),
-            local_roms_path=str(local_roms),
-            data_path=str(data),
-            remote_data=RemoteDataConfig(provider="local", root=str(remote)),
-        )
-
-        result = _invoke(config)
-
-        assert result.exit_code == 0, result.output
-        assert "Game management disabled" in result.output
-        assert "Source reachable" not in result.output
-        assert "Cache path writable" not in result.output
-        assert "ROMCloud data location writable" in result.output
-
-    def test_absent_when_no_smb_configured(self, tmp_path):
-        result = _invoke(_build_config(tmp_path, smb=None))
-        assert "SMB locations mounted" not in result.output
-        assert "Source reachable (Local filesystem)" in result.output
-
-    def test_shown_and_passing_when_mounted(self, tmp_path, monkeypatch):
-        diag = MountDiagnostics(
-            configured=True, mounted=True, worker_pid=None,
-            last_state="success", last_detail="mounted", last_timestamp="x",
-        )
-        monkeypatch.setattr("romcloud.infrastructure.mount_worker.get_diagnostics", lambda *a, **k: diag)
-
-        config = _build_config(tmp_path, smb=SMBConfig(server="nas.local", share="ROMs"))
-        result = _invoke(config)
-
-        assert "Source reachable (SMB)" in result.output
-        assert "SMB locations mounted" in result.output
-        assert "✓  SMB locations mounted" in result.output
-
-    def test_shown_and_failing_with_detail_when_not_mounted(self, tmp_path, monkeypatch):
-        diag = MountDiagnostics(
-            configured=True, mounted=False, worker_pid=None,
-            last_state="failed", last_detail="SMB authentication failed", last_timestamp="x",
-        )
-        monkeypatch.setattr("romcloud.infrastructure.mount_worker.get_diagnostics", lambda *a, **k: diag)
-
-        config = _build_config(tmp_path, smb=SMBConfig(server="nas.local", share="ROMs"))
-        result = _invoke(config)
-
-        assert "Source reachable (SMB)" in result.output
-        assert "✗  SMB locations mounted" in result.output
-        assert "last attempt failed" in result.output
-        assert result.exit_code != 0
-
-    def test_never_crashes_healthcheck_if_diagnostics_raise(self, tmp_path, monkeypatch):
-        def _boom(*a, **k):
-            raise RuntimeError("cannot read /proc/mounts")
-
-        monkeypatch.setattr("romcloud.infrastructure.mount_worker.get_diagnostics", _boom)
-
-        config = _build_config(tmp_path, smb=SMBConfig(server="nas.local", share="ROMs"))
-        result = _invoke(config)
-
-        # A failed check legitimately exits 1 (normal `ctx.exit`, not a crash) —
-        # what must never happen is the RuntimeError itself propagating out.
-        assert not isinstance(result.exception, RuntimeError)
-        assert "Source reachable (SMB)" in result.output
-        assert "SMB locations mounted" in result.output
-        assert "error checking status" in result.output
+    assert result.exit_code == 1
+    assert "Catalog is corrupt" in result.output
 
 
-class TestRemoteDataHealth:
-    def test_local_remote_data_reports_real_writability(self, tmp_path):
-        remote_root = tmp_path / "remote-data"
-        remote_root.mkdir()
-        config = _build_config(
-            tmp_path,
-            remote_data=RemoteDataConfig("local", str(remote_root)),
-        )
+def test_source_disabled_configuration_never_constructs_provider(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    config_path = home / "config" / "romcloud.toml"
+    for path in (home / "data", tmp_path / "roms", tmp_path / "remote", tmp_path / "cache"):
+        path.mkdir(parents=True)
+    config = AppConfig(
+        source=SourceConfig("none", "", ()),
+        cache=CacheConfig(str(tmp_path / "cache"), min_free_gb=0),
+        local_roms_path=str(tmp_path / "roms"),
+        data_path=str(home / "data"),
+        remote_data=RemoteDataConfig("local", str(tmp_path / "remote")),
+    )
+    config_path.parent.mkdir(parents=True)
+    write_config(config, str(config_path))
+    monkeypatch.setattr("romcloud.troubleshoot._inspect_browser", lambda *_: None)
 
-        result = _invoke(config)
+    report, _ = collect_diagnostics(config_path, activity=_inactive())
 
-        assert "✓  ROMCloud data location writable" in result.output
-
-    def test_missing_local_remote_data_root_fails_healthcheck(self, tmp_path):
-        remote_root = tmp_path / "missing-remote-data"
-        config = _build_config(
-            tmp_path,
-            remote_data=RemoteDataConfig("local", str(remote_root)),
-        )
-
-        result = _invoke(config)
-
-        assert "✗  ROMCloud data location writable" in result.output
-        assert result.exit_code != 0
+    finding = next(item for item in report.findings if item.id == "source.connectivity")
+    assert finding.status == "healthy"
+    assert "disabled" in finding.message.lower()
 
 
-class TestStartupMigrationFromHealthcheck:
-    def test_healthcheck_triggers_legacy_credentials_migration_idempotently(self, tmp_path, monkeypatch):
-        home = tmp_path / "romcloud"
-        config_dir = home / "config"
-        source_root = home / "roms"
-        source_root.mkdir(parents=True)
-        data_root = home / "data"
-        data_root.mkdir(parents=True)
-        cache_root = home / "cache"
-        cache_root.mkdir(parents=True)
-        local_roms = home / "local_roms"
-        local_roms.mkdir(parents=True)
+def test_valid_read_only_sftp_is_healthy_and_never_calls_write_probe(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    config_path = home / "config" / "romcloud.toml"
+    for path in (home / "data", tmp_path / "roms", tmp_path / "cache"):
+        path.mkdir(parents=True)
+    sftp = SFTPConfig(
+        host="example.test", username="alice", host_key_fingerprint="SHA256:test"
+    )
+    config = AppConfig(
+        source=SourceConfig("none", "", ()),
+        cache=CacheConfig(str(tmp_path / "cache"), min_free_gb=0),
+        local_roms_path=str(tmp_path / "roms"),
+        data_path=str(home / "data"),
+        remote_data=RemoteDataConfig("sftp", "/romcloud", sftp=sftp),
+    )
+    config_path.parent.mkdir(parents=True)
+    write_config(config, str(config_path))
+    monkeypatch.setattr(
+        "romcloud.infrastructure.providers.sftp.SFTPProvider.validate_access",
+        lambda *_: StorageAccessResult(True, True, False, None, "read-only"),
+    )
+    monkeypatch.setattr(
+        "romcloud.infrastructure.providers.sftp.SFTPProvider._probe_write",
+        lambda *_: (_ for _ in ()).throw(AssertionError("write probe called")),
+    )
+    monkeypatch.setattr("romcloud.troubleshoot._inspect_browser", lambda *_: None)
 
-        config = AppConfig(
-            source=SourceConfig(provider="local", rom_root=str(source_root)),
-            cache=CacheConfig(path=str(cache_root)),
-            local_roms_path=str(local_roms),
-            data_path=str(data_root),
-            smb=SMBConfig(server="nas.local", share="ROMs", username="alice"),
-        )
-        config_dir.mkdir(parents=True)
-        cfg_path = config_dir / "romcloud.toml"
-        write_config(config, str(cfg_path))
+    report, _ = collect_diagnostics(config_path, activity=_inactive())
 
-        legacy = cfg_path.parent / "smb.credentials"
-        legacy.write_text('username=testuser\npassword=testpass\n', encoding="utf-8")
-        legacy.chmod(0o600)
+    finding = next(item for item in report.findings if item.id == "remote_data.connectivity")
+    assert finding.status == "healthy"
+    assert "read-only" in finding.detail.lower()
 
-        diag = MountDiagnostics(
-            configured=True, mounted=True, worker_pid=None,
-            last_state="success", last_detail="ok", last_timestamp="x",
-        )
-        monkeypatch.setattr("romcloud.infrastructure.mount_worker.get_diagnostics", lambda *a, **k: diag)
 
-        runner = CliRunner()
-        result1 = runner.invoke(cli, ["--config", str(cfg_path), "healthcheck"])
-        result2 = runner.invoke(cli, ["--config", str(cfg_path), "healthcheck"])
+def test_provider_exception_becomes_finding(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    config_path = home / "config" / "romcloud.toml"
+    for path in (home / "data", tmp_path / "roms", tmp_path / "cache"):
+        path.mkdir(parents=True)
+    sftp = SFTPConfig(
+        host="example.test", username="alice", host_key_fingerprint="SHA256:test"
+    )
+    config = AppConfig(
+        source=SourceConfig("sftp", "/roms"),
+        sftp=sftp,
+        cache=CacheConfig(str(tmp_path / "cache"), min_free_gb=0),
+        local_roms_path=str(tmp_path / "roms"),
+        data_path=str(home / "data"),
+    )
+    config_path.parent.mkdir(parents=True)
+    write_config(config, str(config_path))
+    monkeypatch.setattr(
+        "romcloud.infrastructure.providers.sftp.SFTPProvider.validate_access",
+        lambda *_: (_ for _ in ()).throw(RuntimeError("authentication rejected")),
+    )
+    monkeypatch.setattr("romcloud.troubleshoot._inspect_browser", lambda *_: None)
 
-        assert result1.exit_code == 0, result1.output
-        assert result2.exit_code == 0, result2.output
-        assert not legacy.exists()
-        assert (cfg_path.parent / "credentials.toml").exists()
+    report, _ = collect_diagnostics(config_path, activity=_inactive())
+
+    finding = next(item for item in report.findings if item.id == "source.connectivity")
+    assert finding.status == "error"
+    assert "authentication rejected" in finding.detail

@@ -41,7 +41,7 @@ def cli(ctx: click.Context, config_path: str | None, debug: bool) -> None:
     # Individual uidata actions load it when required; setup-status must be
     # available to the graphical first-run UI on a completely fresh install.
     if ctx.invoked_subcommand not in (
-        "configure", "update", "repair", "uninstall", "purge", "_reconcile-install", "uidata", "mount", "sftp"
+        "configure", "update", "repair", "uninstall", "purge", "_reconcile-install", "uidata", "mount", "sftp", "healthcheck", "troubleshoot"
     ):
         try:
             config = load_config(config_path)
@@ -58,6 +58,15 @@ def cli(ctx: click.Context, config_path: str | None, debug: bool) -> None:
         except ROMCloudError as exc:
             click.echo(f"error: {exc}", err=True)
             ctx.exit(1)
+    elif ctx.invoked_subcommand in ("healthcheck", "troubleshoot"):
+        # Pure diagnostics must not initialize logs/directories or SQLite
+        # diagnostic storage before the collectors run.
+        configure_logging(
+            level="DEBUG" if debug else "INFO",
+            log_dir=None,
+            console=True,
+            diagnostic_db=None,
+        )
     else:
         # Setup/update commands also belong in the central pipeline even when
         # no valid configuration exists yet.
@@ -76,6 +85,7 @@ from romcloud.cli.commands.configure import configure_cmd
 from romcloud.cli.commands.refresh import refresh_cmd
 from romcloud.cli.commands.status import status_cmd
 from romcloud.cli.commands.healthcheck import healthcheck_cmd
+from romcloud.cli.commands.troubleshoot import troubleshoot_cmd
 from romcloud.cli.commands.launch import launch_cmd
 from romcloud.cli.commands.cache import cache_group
 from romcloud.cli.commands.saves import saves_group
@@ -97,6 +107,7 @@ cli.add_command(configure_cmd, name="configure")
 cli.add_command(refresh_cmd, name="refresh")
 cli.add_command(status_cmd, name="status")
 cli.add_command(healthcheck_cmd, name="healthcheck")
+cli.add_command(troubleshoot_cmd, name="troubleshoot")
 cli.add_command(launch_cmd, name="launch")
 cli.add_command(cache_group, name="cache")
 cli.add_command(saves_group, name="saves")

@@ -101,6 +101,7 @@ from ports_gfx.operation_screen import (
     OperationSpec,
     display_lines,
     handle_operation_event,
+    troubleshoot_quick_repair_requested,
     visible_window,
     wrap_lines,
 )
@@ -184,7 +185,11 @@ MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
             "repair-install",
             "Reinstall and restore ROMCloud runtime files without deleting user data.",
         ),
-        MenuItem("Health Check", "healthcheck"),
+        MenuItem(
+            "Troubleshoot ROMCloud",
+            "troubleshoot",
+            "Run read-only diagnostics, then optionally choose Quick Repair.",
+        ),
         MenuItem("Setup Controller Mapping", CONTROLLER_TEST_ACTION),
         MenuItem("Local Browser Runtime", "browser-runtime-status"),
     )
@@ -387,6 +392,12 @@ _OPERATIONS: dict[str, OperationSpec] = {
         args=("uidata", "repair-install"),
         arms_gui_relaunch=True,
         relaunch_operation="repair",
+    ),
+    "troubleshoot": OperationSpec(
+        title="Troubleshoot ROMCloud", args=("uidata", "troubleshoot")
+    ),
+    "troubleshoot-fix": OperationSpec(
+        title="Quick Repair", args=("uidata", "troubleshoot-fix")
     ),
     "browser-runtime-status": OperationSpec(
         title="Local Browser Runtime", args=("uidata", "browser-runtime-status")
@@ -1464,7 +1475,17 @@ def _run(  # noqa: ANN001
                     acknowledged_relaunch = acknowledge_completed_relaunch(
                         operation_screen, ievent.action
                     )
-                    if running and not relaunch.terminal and not acknowledged_relaunch:
+                    quick_repair_started = False
+                    if troubleshoot_quick_repair_requested(operation_screen, ievent.action):
+                        operation_screen = start_operation("troubleshoot-fix", romcloud_bin)
+                        current_screen = OPERATION_SCREEN
+                        quick_repair_started = True
+                    if (
+                        running
+                        and not relaunch.terminal
+                        and not acknowledged_relaunch
+                        and not quick_repair_started
+                    ):
                         current_screen = handle_operation_event(ievent, operation_screen)
                     if current_screen == "menu" and not relaunch.terminal:
                         if operation_screen.title == "Check for Updates":
@@ -2303,11 +2324,14 @@ def _render_operation(  # noqa: ANN001
             "A/Enter/Esc/Tap acknowledge and restart ROMCloud   Up/Down scroll"
         )
     else:
-        hint_text = (
-            _OPERATION_HINT_FINISHED
-            if operation.is_finished
-            else _OPERATION_HINT_RUNNING
-        )
+        if operation.quick_repair_available:
+            hint_text = "A/Enter Quick Repair   B/Esc return   Up/Down scroll"
+        else:
+            hint_text = (
+                _OPERATION_HINT_FINISHED
+                if operation.is_finished
+                else _OPERATION_HINT_RUNNING
+            )
     hint_text += detail_hint
     hint = fonts["hint"].render(hint_text, True, _HINT_COLOR)
     screen.blit(hint, (layout.hint_rect.x, layout.hint_rect.y))
