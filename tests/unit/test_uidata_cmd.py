@@ -851,18 +851,22 @@ class TestUpdateBridge:
 
 
 class TestHealthcheck:
-    def test_emits_source_reachability(self, tmp_path):
+    def test_emits_shared_source_connectivity_finding(self, tmp_path):
         result = _write_and_invoke(tmp_path, ["healthcheck"])
 
         assert result.exit_code == 0, result.output
         payload = json.loads(result.output.strip())
         assert payload["ok"] is True
-        assert payload["source_type"] == "Local filesystem"
-        assert payload["source_internal_provider"] == "local"
-        assert payload["source_description"] == str(tmp_path / "roms")
-        assert payload["source_reachable"] is True
+        assert payload["operation"] == "troubleshoot"
+        source = next(
+            finding
+            for finding in payload["findings"]
+            if finding["id"] == "source.connectivity"
+        )
+        assert source["status"] == "healthy"
+        assert "readable" in source["message"].lower()
 
-    def test_emits_smb_labels_and_metadata_when_smb_configured(self, tmp_path):
+    def test_smb_healthcheck_uses_shared_structured_diagnostics(self, tmp_path):
         config = _build_config(tmp_path, smb=SMBConfig(server="nas.local", share="ROMs", username="alice"))
         config_dir = tmp_path / "config"
         config_dir.mkdir()
@@ -875,11 +879,9 @@ class TestHealthcheck:
         assert result.exit_code == 0, result.output
         payload = json.loads(result.output.strip())
         assert payload["ok"] is True
-        assert payload["source_type"] == "SMB"
-        assert payload["source_internal_provider"] == "local"
-        assert payload["source_server"] == "nas.local"
-        assert payload["source_share"] == "ROMs"
-        assert payload["source_description"] == "nas.local:ROMs"
+        assert payload["operation"] == "troubleshoot"
+        findings = {finding["id"]: finding for finding in payload["findings"]}
+        assert findings["source.connectivity"]["status"] == "healthy"
 
 
 class TestCacheStatus:

@@ -113,18 +113,20 @@ class TestMenuItems:
 
         actions = [item.action for item in MENU_ITEMS]
         assert actions == [
-            app_module.SETUP_ACTION,
-            "connection-status",
-            "connection-mount",
-            "connection-unmount",
-            "status",
-            "refresh",
-            "healthcheck",
-            "cache-status",
+            "category:Library",
+            "library-connected",
+            app_module.ACTIVE_MODE_ACTION,
+            "library-offline",
+            "category:Storage",
             app_module.SAVESYNC_ACTION,
-            "update-check",
-            CONTROLLER_TEST_ACTION,
+            "category:Maintenance",
             EXIT_ACTION,
+        ]
+        maintenance = [item.action for item in MENU_CATEGORIES["Maintenance"]]
+        assert maintenance[3:6] == [
+            "troubleshoot",
+            "repair-install",
+            app_module.UNINSTALL_ACTION,
         ]
 
     def test_exit_is_the_last_item(self):
@@ -144,11 +146,8 @@ class TestMenuItems:
             for items in direct.values()
             for item in items
         )
-        assert all(
-            not item.action.startswith("library-")
-            for items in direct.values()
-            for item in items
-        )
+        mode_actions = {"library-connected", "library-cache", "library-offline"}
+        assert all(item.action not in mode_actions for items in direct.values() for item in items)
         direct_roots = root_menu_items_for_state(
             {"game_access_mode": "direct_nas", "operating_mode": "connected",
              "offline_mode": False, "capabilities": {}}
@@ -181,8 +180,9 @@ class TestMenuItems:
             "Direct", "Cached Storage", "Offline"
         ]
         assert not offline_roots[1].active and not offline_roots[2].active and offline_roots[3].active
+        mode_actions = {"library-connected", "library-cache", "library-offline"}
         assert all(
-            not item.action.startswith("library-")
+            item.action not in mode_actions
             for item in menu_categories_for_state(offline_state, True)["Library"]
         )
         assert [item.label for item in offline_roots] == [
@@ -762,10 +762,9 @@ class TestHandleMenuEvent:
         assert operation is None
 
     def test_confirm_on_controller_test_item_switches_screen(self):
-        state = self._state()
+        state = self._nav_state()
+        state.open_category("Maintenance", action=CONTROLLER_TEST_ACTION)
         layout = self._layout(state)
-        idx = next(i for i, item in enumerate(state.items) if item.action == CONTROLLER_TEST_ACTION)
-        state.select(idx)
 
         running, screen, message, kind, operation = _handle_menu_event(
             InputEvent(action=Action.CONFIRM), state, layout, "/opt/romcloud/bin/romcloud", True, None, "info",
@@ -908,10 +907,9 @@ class TestHandleMenuEvent:
 
         from ports_gfx import app as app_module
 
-        state = self._state()
+        state = self._nav_state()
+        state.open_category("Library", action="refresh")
         layout = self._layout(state)
-        refresh_index = next(i for i, item in enumerate(state.items) if item.action == "refresh")
-        state.select(refresh_index)
 
         def fake_popen(argv, **kwargs):
             import subprocess
