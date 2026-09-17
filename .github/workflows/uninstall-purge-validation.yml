@@ -1,0 +1,49 @@
+name: Uninstall Purge Validation
+
+on:
+  push:
+    branches:
+      - ci/uninstall-purge-validation-20260917
+
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install
+        run: python -m pip install -U pip && python -m pip install -e '.[dev,smb]'
+      - name: Focused lifecycle validation
+        run: |
+          python -m pytest -q \
+            tests/unit/test_lifecycle_manage.py \
+            tests/unit/test_lifecycle_handoff.py \
+            tests/unit/test_game_access.py \
+            tests/unit/test_library_sync_service.py \
+            tests/unit/test_browser_runtime.py \
+            tests/unit/test_ports_gfx_lifecycle_screen.py \
+            tests/unit/test_ports_gamelist_config.py \
+            tests/unit/test_troubleshoot_activity.py \
+            tests/unit/test_mount_service.py
+      - name: Compile
+        run: python -m compileall src ports_gfx
+      - name: Diff check
+        run: git diff --check
+
+  full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install
+        run: python -m pip install -U pip && python -m pip install -e '.[dev,smb]'
+      - name: Full Python suite
+        run: python -m pytest -q
