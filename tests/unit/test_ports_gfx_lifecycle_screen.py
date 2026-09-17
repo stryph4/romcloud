@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import os
+
+import pytest
+
 from ports_gfx.actions import Action
 from ports_gfx.input_manager import InputEvent
 from ports_gfx.lifecycle_screen import LifecycleScreenState, launch_lifecycle_helper
-import pytest
 
 
 def test_uninstall_and_purge_require_hold_and_back_is_zero_mutation() -> None:
@@ -43,6 +46,21 @@ def test_detached_helper_waits_for_the_gui_pid() -> None:
         "4321",
     ]
     assert kwargs["check"] is False
+
+
+def test_detached_helper_defaults_to_the_current_gui_pid() -> None:
+    calls = []
+
+    class Result:
+        returncode = 0
+
+    launch_lifecycle_helper(
+        "/owned/bin/romcloud",
+        "uninstall",
+        run=lambda argv, **kwargs: calls.append((argv, kwargs)) or Result(),
+    )
+
+    assert calls[0][0][-1] == str(os.getpid())
 
 
 def test_helper_staging_failure_prevents_gui_handoff() -> None:

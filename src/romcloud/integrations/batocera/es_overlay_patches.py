@@ -26,6 +26,20 @@ def patch_state_path(config_dir: Path) -> Path:
     return config_dir / PATCH_STATE_NAME
 
 
+def _state_path_is_contained(config_dir: Path, state_path: Path) -> bool:
+    """Require the state ledger to be the fixed file in the real config dir."""
+    if config_dir.is_symlink() or state_path.is_symlink():
+        return False
+    try:
+        directory = config_dir.resolve(strict=True)
+        return (
+            state_path.name == PATCH_STATE_NAME
+            and state_path.parent.resolve(strict=True) == directory
+        )
+    except (OSError, RuntimeError):
+        return False
+
+
 def read_patch_state(path: Path) -> dict | None:
     if not path.is_file() or path.is_symlink():
         return None
@@ -68,6 +82,8 @@ def project_native_root(path: Path, root: ET.Element, state: dict | None) -> ET.
 def restore_owned_patches(config_dir: Path, *, state_path: Path | None = None) -> bool:
     """Restore tracked fields without overwriting third-party modifications."""
     state_path = state_path or patch_state_path(config_dir)
+    if not _state_path_is_contained(config_dir, state_path):
+        return False
     state = read_patch_state(state_path)
     if state is None:
         return False
@@ -125,6 +141,8 @@ def patch_user_overlays(
 ) -> int:
     """Patch conflicting user overlays and persist field-level restore data."""
     state_path = state_path or patch_state_path(config_dir)
+    if not _state_path_is_contained(config_dir, state_path):
+        return 0
     file_roots: dict[Path, ET.Element] = {}
     files_state: dict[str, dict] = {}
     if not config_dir.is_dir():

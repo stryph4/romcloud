@@ -1601,7 +1601,7 @@ def _run(  # noqa: ANN001
                             lifecycle_screen.operation,
                             gui_pid=os.getpid(),
                         )
-                    except OSError as exc:
+                    except (OSError, RuntimeError) as exc:
                         lifecycle_screen.confirm.reset()
                         lifecycle_screen.view = "choices"
                         message = f"Could not start lifecycle helper: {exc}"

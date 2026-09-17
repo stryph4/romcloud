@@ -353,6 +353,17 @@ class LibrarySyncService:
         games = self._games.list_all()
         owned_by_system: dict[str, set[str]] = {}
         for game in games:
+            system_path = Path(game.system)
+            if (
+                system_path.is_absolute()
+                or game.system in {".", ".."}
+                or len(system_path.parts) != 1
+                or "/" in game.system
+                or "\\" in game.system
+            ):
+                raise LibrarySyncError(
+                    f"Unsafe catalog system in local metadata cleanup: {game.system!r}"
+                )
             try:
                 owned_by_system.setdefault(game.system, set()).add(
                     library_id_for_game(game)
@@ -360,7 +371,22 @@ class LibrarySyncService:
             except LibrarySyncError:
                 continue
         for system, owned_ids in owned_by_system.items():
-            path = self._local_roms_root / system / "gamelist.xml"
+            system_root = self._local_roms_root / system
+            if self._local_roms_root.is_symlink() or system_root.is_symlink():
+                raise LibrarySyncError(
+                    f"Unsafe symlinked local metadata boundary: {system_root}"
+                )
+            try:
+                system_root.resolve(strict=True).relative_to(
+                    self._local_roms_root.resolve(strict=True)
+                )
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError) as exc:
+                raise LibrarySyncError(
+                    f"Unsafe local metadata boundary: {system_root}"
+                ) from exc
+            path = system_root / "gamelist.xml"
             if not path.is_file() or path.is_symlink():
                 continue
             existing = path.read_text(encoding="utf-8")

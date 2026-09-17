@@ -1184,6 +1184,32 @@ def test_remove_local_touches_only_owned_entries_and_never_media_trees(tmp_path:
     assert _canonical(config).is_file()
 
 
+def test_remove_local_metadata_rejects_catalog_system_path_traversal(tmp_path: Path):
+    config = _config(tmp_path)
+    container = Container(config)
+    unsafe = Game.create(
+        "../outside",
+        "Unsafe catalog row",
+        "local",
+        config.source.rom_root,
+        [GameAsset("Game.chd", "../outside/Game.chd", is_primary=True)],
+    )
+    container.game_repo.save(unsafe)
+    outside = tmp_path / "outside" / "gamelist.xml"
+    outside.parent.mkdir()
+    marker = "a" * 64
+    outside.write_text(
+        f"<gameList><game><name>Keep</name><{OWNERSHIP_TAG}>{marker}</{OWNERSHIP_TAG}></game></gameList>",
+        encoding="utf-8",
+    )
+    before = outside.read_bytes()
+
+    with pytest.raises(LibrarySyncError, match="Unsafe catalog system"):
+        container.library_sync.remove_local_metadata()
+
+    assert outside.read_bytes() == before
+
+
 def test_malformed_local_xml_and_unsafe_media_fail_safely(tmp_path: Path):
     config, container, source_xml = _setup(tmp_path)
     _local_root(config).write_text("<broken", encoding="utf-8")

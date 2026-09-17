@@ -387,6 +387,64 @@ def _protected_roots(config: AppConfig) -> tuple[Path, ...]:
     return tuple(dict.fromkeys(canonical))
 
 
+def _presentation_root_blockers(
+    config: AppConfig, *, mount_points: tuple[Path, ...]
+) -> tuple[str, ...]:
+    """Reject presentation cleanup when its traversal boundary is unsafe.
+
+    Proxy discovery recursively walks the local ROM presentation root and
+    Direct/Library cleanup mutates narrowly owned entries beneath it. The
+    configured path therefore needs its own safety proof even though the root
+    itself is deliberately preserved.
+    """
+
+    identity = _path_identity(Path(config.local_roms_path))
+    save_root = Path(config.saves.local_path)
+    comparison_roots: list[tuple[str, Path]] = [
+        ("save root", save_root),
+        ("save recovery root", save_root.with_name(save_root.name + ".previous")),
+        ("Batocera system root", Path("/userdata/system")),
+        ("Batocera save root", Path("/userdata/saves")),
+        ("Batocera save recovery root", Path("/userdata/saves.previous")),
+    ]
+    if config.source.enabled and config.source.provider in {"local", "smb"}:
+        comparison_roots.append(("ROM source root", Path(config.source.rom_root)))
+    if config.remote_data is not None and config.remote_data.provider in {"local", "smb"}:
+        comparison_roots.append(("remote data root", Path(config.remote_data.root)))
+    comparison_roots.extend(
+        ("external private key", path) for path in _external_key_paths(config)
+    )
+
+    blockers: list[str] = []
+    for label, root in comparison_roots:
+        if not root.is_absolute():
+            blockers.append(f"{label} is not absolute: {root}")
+            continue
+        try:
+            resolved = root.resolve(strict=False)
+        except (OSError, RuntimeError):
+            blockers.append(f"cannot canonicalize {label}: {root}")
+            continue
+        if _paths_overlap(identity.resolved, resolved):
+            blockers.append(
+                f"local ROM presentation root overlaps {label}: {identity.path} ({root})"
+            )
+
+    for mount_point in mount_points:
+        try:
+            mounted = mount_point.resolve(strict=False)
+        except (OSError, RuntimeError):
+            mounted = mount_point
+        if mounted != Path("/") and (
+            mounted == identity.resolved or _is_within(mounted, identity.resolved)
+        ):
+            blockers.append(
+                f"local ROM presentation root contains a mount boundary: "
+                f"{identity.path} ({mounted})"
+            )
+    return tuple(blockers)
+
+
 def _mount_points(path: Path = Path("/proc/self/mountinfo")) -> tuple[Path, ...]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -595,6 +653,7 @@ def lifecycle_preflight(
     else:
         protected = _protected_roots(config)
         mount_points = _mount_points()
+        blockers.extend(_presentation_root_blockers(config, mount_points=mount_points))
         from romcloud.web.browser_runtime import runtime_root
 
         home_owned = root_is_owned(romcloud_home, "home", romcloud_home)

@@ -13,6 +13,7 @@ from xml.etree import ElementTree as ET
 import pytest
 
 from romcloud.integrations.batocera import es_config
+from romcloud.integrations.batocera import es_overlay_patches
 from romcloud.integrations.batocera.system_registry import (
     EffectiveSystemRegistry,
     SystemLaunchSpec,
@@ -297,6 +298,22 @@ class TestThirdPartyOverlayPrecedence:
         assert bua.exists()
         assert not override.exists()
         assert not (user / "es_systems_romcloud.patches.json").exists()
+
+    def test_restore_refuses_out_of_boundary_patch_state(self, tmp_path):
+        user, _share, _stock, bua, _override = self._layout(tmp_path)
+        outside = tmp_path / "outside" / es_overlay_patches.PATCH_STATE_NAME
+        outside.parent.mkdir()
+        outside.write_text(
+            '{"version": 1, "files": {}}', encoding="utf-8"
+        )
+        before = outside.read_bytes()
+
+        assert not es_overlay_patches.restore_owned_patches(
+            user, state_path=outside
+        )
+
+        assert outside.read_bytes() == before
+        assert bua.is_file()
 
     def test_refresh_rebases_after_third_party_reinstall(self, tmp_path):
         user, share, stock, bua, override = self._layout(tmp_path)

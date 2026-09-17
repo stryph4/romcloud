@@ -640,6 +640,39 @@ def test_purge_rejects_owned_root_containing_actual_save_root(tmp_path: Path) ->
         )
 
 
+def test_preflight_rejects_local_presentation_inside_actual_save_root(tmp_path: Path) -> None:
+    config, home, _local_roms, _cache = _config(tmp_path)
+    save_root = tmp_path / "actual-saves"
+    local_roms = save_root / "romcloud-presentation"
+    local_roms.mkdir(parents=True)
+    unsafe = replace(
+        config,
+        saves=SavesConfig(local_path=str(save_root)),
+        local_roms_path=str(local_roms),
+    )
+
+    with pytest.raises(RuntimeError, match="presentation root overlaps save root"):
+        manage.lifecycle_preflight(
+            operation="uninstall",
+            config=unsafe,
+            romcloud_home=home,
+            activity=_inactive_activity(),
+        )
+
+
+def test_preflight_rejects_local_presentation_overlapping_source_root(tmp_path: Path) -> None:
+    config, home, _local_roms, _cache = _config(tmp_path)
+    unsafe = replace(config, local_roms_path=config.source.rom_root)
+
+    with pytest.raises(RuntimeError, match="presentation root overlaps ROM source root"):
+        manage.lifecycle_preflight(
+            operation="uninstall",
+            config=unsafe,
+            romcloud_home=home,
+            activity=_inactive_activity(),
+        )
+
+
 def test_preflight_blocks_foreign_mount_at_configured_point(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

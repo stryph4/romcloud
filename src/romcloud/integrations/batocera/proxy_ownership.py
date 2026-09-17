@@ -51,6 +51,8 @@ def remove_owned_proxy_files(
     files are preserved for explicit reconciliation. Invalid JSON, foreign
     payloads, symlinks, and paths outside the local ROM root are never removed.
     """
+    if local_root.is_symlink():
+        return 0
     removed: set[Path] = set()
     pattern = "*.[rR][oO][mM][cC][lL][oO][uU][dD]"
     candidates = list(local_root.rglob(pattern)) if local_root.is_dir() else []
