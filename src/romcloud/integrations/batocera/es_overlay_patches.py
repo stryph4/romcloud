@@ -72,15 +72,26 @@ def restore_owned_patches(config_dir: Path, *, state_path: Path | None = None) -
     if state is None:
         return False
     changed = False
+    reconciled = True
     for filename, file_state in state["files"].items():
-        if not isinstance(filename, str) or not isinstance(file_state, dict):
+        if (
+            not isinstance(filename, str)
+            or Path(filename).name != filename
+            or not filename.startswith("es_systems_")
+            or Path(filename).suffix != ".cfg"
+            or not isinstance(file_state, dict)
+        ):
+            reconciled = False
             continue
         path = config_dir / filename
         if not path.is_file() or path.is_symlink():
+            if path.exists() or path.is_symlink():
+                reconciled = False
             continue
         try:
             root = ET.fromstring(path.read_text(encoding="utf-8"))
         except (OSError, ET.ParseError):
+            reconciled = False
             continue
         file_changed = False
         systems = file_state.get("systems", {})
@@ -100,7 +111,8 @@ def restore_owned_patches(config_dir: Path, *, state_path: Path | None = None) -
                 path, _serialize(root), mode=path.stat().st_mode & 0o777
             )
             changed = True
-    state_path.unlink(missing_ok=True)
+    if reconciled:
+        state_path.unlink(missing_ok=True)
     return changed
 
 

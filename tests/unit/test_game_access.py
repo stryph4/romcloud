@@ -365,8 +365,8 @@ def test_uninstall_unlinks_verified_direct_link_and_preserves_roms(tmp_path: Pat
     monkeypatch.setattr(manage.mount_worker, "stop_worker", lambda home: False)
     monkeypatch.setattr(manage.mount_worker, "configured_mounts", lambda cfg: [])
     monkeypatch.setattr(manage.mount_worker, "cleanup_runtime_state", lambda home: None)
-    monkeypatch.setattr(manage.mount_service, "remove_service", lambda: False)
-    monkeypatch.setattr(manage.es_config, "remove", lambda: False)
+    monkeypatch.setattr(manage.mount_service, "remove_service", lambda *args, **kwargs: False)
+    monkeypatch.setattr(manage.es_config, "remove", lambda *args, **kwargs: False)
     monkeypatch.setattr(manage.ports_gamelist_config, "remove", lambda **kwargs: False)
     autosync_hook = tmp_path / "scripts" / "romcloud-autosync"
     autosync_hook.parent.mkdir(parents=True)
@@ -378,7 +378,49 @@ def test_uninstall_unlinks_verified_direct_link_and_preserves_roms(tmp_path: Pat
     assert report.direct_links_removed == 1
     assert not (local / LINK_NAME).exists()
     assert local_game.exists()
-    assert not autosync_hook.exists()
+    assert autosync_hook.exists()  # foreign fixed-path hook is not owned by filename
+
+
+def test_direct_cleanup_preserves_out_of_root_manifest_entry(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    source, _local = _system(config)
+    outside = tmp_path / "outside" / LINK_NAME
+    outside.parent.mkdir()
+    outside.symlink_to(source, target_is_directory=True)
+    manifest = Path(config.data_path) / "direct-links.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(json.dumps({
+        "version": 1,
+        "links": [{"path": str(outside), "target": str(source)}],
+    }))
+
+    report = remove_direct_links(config)
+
+    assert report.removed == 0 and report.uncertain == 1
+    assert outside.is_symlink()
+    assert manifest.exists()
+
+
+def test_direct_cleanup_preserves_wrong_target_and_malformed_manifest(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    source, local = _system(config)
+    wrong = tmp_path / "wrong-target"
+    wrong.mkdir()
+    link = local / LINK_NAME
+    link.symlink_to(wrong, target_is_directory=True)
+    manifest = Path(config.data_path) / "direct-links.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(json.dumps({
+        "version": 1,
+        "links": [{"path": str(link), "target": str(source)}],
+    }))
+    report = remove_direct_links(config)
+    assert report.uncertain == 1 and link.is_symlink()
+
+    manifest.write_text("{malformed")
+    malformed = remove_direct_links(config)
+    assert malformed.uncertain == 1 and link.is_symlink()
+    assert manifest.read_text() == "{malformed"
 
 
 def test_cache_cli_requires_per_command_override_in_direct_mode(monkeypatch) -> None:
@@ -393,6 +435,6 @@ def test_cache_cli_requires_per_command_override_in_direct_mode(monkeypatch) -> 
     allowed = runner.invoke(cache_group, ["--override", "status"], obj={})
 
     assert blocked.exit_code == 1
-    assert "unavailable in Connected Mode" in blocked.output
+    assert "unavailable in Direct" in blocked.output
     assert allowed.exit_code == 0 and "Cache is empty" in allowed.output
     assert container.config.game_access_mode == DIRECT_NAS_MODE

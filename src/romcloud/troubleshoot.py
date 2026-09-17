@@ -45,6 +45,7 @@ class ActivitySnapshot:
     library_sync: ActivityState = field(default_factory=ActivityState)
     browser_manager: ActivityState = field(default_factory=ActivityState)
     graphical_ui: ActivityState = field(default_factory=ActivityState)
+    mount_worker: ActivityState = field(default_factory=ActivityState)
 
     def blockers(self, *names: str) -> tuple[str, ...]:
         blocked: list[str] = []
@@ -212,12 +213,18 @@ def inspect_activity(config: AppConfig, *, catalog_path: Path) -> ActivitySnapsh
     from romcloud.services.auto_savesync import ActiveSessionStore
     from romcloud.web.lifecycle import manager_state_path, manager_status
 
+    process_argv, process_scan_complete = _process_inventory()
     sessions_root = Path(config.data_path) / "savesync-sessions"
     if sessions_root.exists():
         game_active = ActiveSessionStore(Path(config.data_path)).has_active_session()
         game = ActivityState("active" if game_active else "inactive")
     else:
-        game = ActivityState("unknown", "No lifecycle-session directory exists.")
+        game = _process_activity(
+            process_argv,
+            process_scan_complete,
+            lambda argv: any(Path(value).name == "emulatorlauncher" for value in argv),
+            "No lifecycle-session directory exists and process inspection was incomplete.",
+        )
 
     download = ActivityState("unknown", "Catalog download state is unavailable.")
     if catalog_path.is_file():
@@ -235,17 +242,42 @@ def inspect_activity(config: AppConfig, *, catalog_path: Path) -> ActivitySnapsh
             )
         except sqlite3.Error as exc:
             download = ActivityState("unknown", str(exc))
+    elif process_scan_complete:
+        download = _process_activity(
+            process_argv,
+            True,
+            lambda argv: any(value.casefold() in {"download", "downloads"} for value in argv),
+            "",
+        )
 
     savesync = _inspect_existing_lock(Path(config.data_path) / ".savesync-auto.lock")
+    if savesync.state == "unknown":
+        savesync = _process_activity(
+            process_argv,
+            process_scan_complete,
+            lambda argv: any(value in {"saves", "_autosync"} for value in argv)
+            and "menu-loop" not in argv,
+            savesync.detail,
+        )
     library_lock = _local_library_lock(config)
     library_sync = _inspect_existing_lock(library_lock) if library_lock else ActivityState(
         "unknown", "The Library Sync lock is remote or not configured."
     )
+    if library_sync.state == "unknown":
+        library_sync = _process_activity(
+            process_argv,
+            process_scan_complete,
+            lambda argv: any(value.startswith("library-sync") for value in argv),
+            library_sync.detail,
+        )
 
     manager_marker = manager_state_path(config.data_path)
     if not manager_marker.is_file() or manager_marker.is_symlink():
-        browser = ActivityState(
-            "unknown", "No authoritative browser-manager marker exists."
+        browser = _process_activity(
+            process_argv,
+            process_scan_complete,
+            lambda argv: "manager" in argv,
+            "No authoritative browser-manager marker exists.",
         )
     else:
         try:
@@ -259,14 +291,75 @@ def inspect_activity(config: AppConfig, *, catalog_path: Path) -> ActivitySnapsh
         except Exception as exc:  # noqa: BLE001 - diagnostic isolation
             browser = ActivityState("unknown", str(exc))
 
+    graphical_ui = _process_activity(
+        process_argv,
+        process_scan_complete,
+        lambda argv: Path(argv[0]).name == "romcloud-ports"
+        or any(
+            value == "-m" and index + 1 < len(argv) and argv[index + 1] == "ports_gfx"
+            for index, value in enumerate(argv)
+        ),
+        "Graphical UI process inspection was incomplete.",
+    )
+    mount_worker = _process_activity(
+        process_argv,
+        process_scan_complete,
+        lambda argv: "mount-worker" in argv or "boot-worker" in argv,
+        "Mount worker process inspection was incomplete.",
+    )
+
     return ActivitySnapshot(
         game=game,
         download=download,
         savesync=savesync,
         library_sync=library_sync,
         browser_manager=browser,
-        graphical_ui=ActivityState("unknown", "No authoritative GUI ownership marker exists."),
+        graphical_ui=graphical_ui,
+        mount_worker=mount_worker,
     )
+
+
+def _process_inventory(proc_root: Path = Path("/proc")) -> tuple[tuple[tuple[str, ...], ...], bool]:
+    """Read a bounded live argv inventory without signalling any process."""
+    if not proc_root.is_dir():
+        return (), False
+    result: list[tuple[str, ...]] = []
+    complete = True
+    try:
+        entries = tuple(proc_root.iterdir())
+    except OSError:
+        return (), False
+    for entry in entries:
+        if not entry.name.isdigit() or entry.name == str(os.getpid()):
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except (OSError, PermissionError):
+            complete = False
+            continue
+        argv = tuple(
+            value.decode("utf-8", errors="replace")
+            for value in raw.split(b"\0")
+            if value
+        )
+        if argv:
+            result.append(argv)
+    return tuple(result), complete
+
+
+def _process_activity(
+    inventory: tuple[tuple[str, ...], ...],
+    complete: bool,
+    matches: Callable[[tuple[str, ...]], bool],
+    unknown_detail: str,
+) -> ActivityState:
+    if any(matches(argv) for argv in inventory):
+        return ActivityState("active", "A matching live process was found.")
+    if complete:
+        return ActivityState("inactive", "No matching live process was found.")
+    return ActivityState("unknown", unknown_detail)
 
 
 def _inspect_existing_lock(path: Path) -> ActivityState:

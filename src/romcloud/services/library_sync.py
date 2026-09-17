@@ -348,9 +348,18 @@ class LibrarySyncService:
         return report
 
     def remove_local_metadata(self) -> int:
-        """Remove only entries carrying ROMCloud's ownership marker."""
+        """Remove entries whose marker is derivable from the trusted catalog."""
         removed = 0
-        for system in self._games.list_systems():
+        games = self._games.list_all()
+        owned_by_system: dict[str, set[str]] = {}
+        for game in games:
+            try:
+                owned_by_system.setdefault(game.system, set()).add(
+                    library_id_for_game(game)
+                )
+            except LibrarySyncError:
+                continue
+        for system, owned_ids in owned_by_system.items():
             path = self._local_roms_root / system / "gamelist.xml"
             if not path.is_file() or path.is_symlink():
                 continue
@@ -361,7 +370,7 @@ class LibrarySyncService:
                 continue
             system_removed = 0
             for element in list(root.findall("game")):
-                if (element.findtext(OWNERSHIP_TAG) or "").strip():
+                if (element.findtext(OWNERSHIP_TAG) or "").strip() in owned_ids:
                     root.remove(element)
                     removed += 1
                     system_removed += 1
@@ -371,6 +380,81 @@ class LibrarySyncService:
                 if result != existing:
                     atomic_write_text(path, result)
         return removed
+
+    def remove_owned_local_media(self) -> tuple[int, tuple[str, ...]]:
+        """Remove only content-addressed local media proven by canonical state."""
+        canonical = self._local_root / CANONICAL_FILENAME
+        if not canonical.is_file() or canonical.is_symlink():
+            return 0, ("Local Library Sync canonical state is unavailable; preserved media.",)
+        try:
+            dataset = _read_dataset(canonical)
+        except LibrarySyncError as exc:
+            return 0, (f"Local Library Sync canonical state is untrusted; preserved media: {exc}",)
+
+        expected: dict[Path, tuple[str, int]] = {}
+        for record in dataset.get("records", {}).values():
+            if not isinstance(record, dict):
+                continue
+            system = record.get("system")
+            media = record.get("media")
+            if not isinstance(system, str) or not system or not isinstance(media, dict):
+                continue
+            for descriptor in media.values():
+                if not isinstance(descriptor, dict):
+                    continue
+                digest = descriptor.get("sha256")
+                size = descriptor.get("size")
+                suffix = descriptor.get("suffix", "")
+                if (
+                    not _valid_sha256(digest)
+                    or not isinstance(size, int)
+                    or size < 0
+                    or not isinstance(suffix, str)
+                    or suffix not in ("", Path("x" + suffix).suffix)
+                    or "/" in suffix
+                    or "\\" in suffix
+                ):
+                    continue
+                path = (
+                    self._local_roms_root
+                    / system
+                    / LOCAL_MEDIA_DIR
+                    / str(digest)[:2]
+                    / f"{digest}{suffix}"
+                )
+                expected[path] = (str(digest), size)
+
+        removed = 0
+        warnings: list[str] = []
+        touched_roots: set[Path] = set()
+        for path, (digest, size) in expected.items():
+            if not path.exists():
+                continue
+            touched_roots.add(path.parent.parent)
+            if path.is_symlink() or not path.is_file():
+                warnings.append(f"Preserved unsafe Library Sync media path: {path}")
+                continue
+            try:
+                actual_digest, actual_size = _hash_file(path)
+            except OSError as exc:
+                warnings.append(f"Preserved unreadable Library Sync media: {path}: {exc}")
+                continue
+            if (actual_digest, actual_size) != (digest, size):
+                warnings.append(f"Preserved unverified Library Sync media: {path}")
+                continue
+            path.unlink()
+            removed += 1
+
+        for root in touched_roots:
+            try:
+                for child in root.iterdir():
+                    if child.is_dir() and not child.is_symlink():
+                        child.rmdir()
+                root.rmdir()
+            except OSError:
+                # Foreign/unverified siblings intentionally keep the directory.
+                pass
+        return removed, tuple(warnings)
 
     def _require_available(self) -> None:
         self._capabilities.require(Capability.LIBRARY_SYNC, "Library Sync")

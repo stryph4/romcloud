@@ -236,11 +236,48 @@ def install_service(
     return service_path
 
 
-def remove_service(*, service_path: Path = SERVICE_SCRIPT_PATH) -> bool:
+def service_is_owned(service_path: Path, romcloud_bin: str | Path) -> bool:
+    """Return whether *service_path* is the exact generated ROMCloud script."""
+    if service_path.is_symlink() or not service_path.is_file():
+        return False
+    try:
+        return service_path.read_text(encoding="utf-8") == generate_service_script(
+            str(romcloud_bin)
+        )
+    except (OSError, UnicodeError):
+        return False
+
+
+def remove_service(
+    romcloud_bin: str | Path | None = None,
+    *,
+    service_path: Path = SERVICE_SCRIPT_PATH,
+) -> bool:
     """Disable (best-effort) and delete the service script.
 
     Never touches any other file under /userdata/system/services/.
     """
+    if romcloud_bin is None and service_path.is_file() and not service_path.is_symlink():
+        try:
+            for line in service_path.read_text(encoding="utf-8").splitlines():
+                prefix = 'export ROMCLOUD_BIN="'
+                if line.startswith(prefix) and line.endswith('"'):
+                    romcloud_bin = line[len(prefix) : -1]
+                    break
+        except (OSError, UnicodeError):
+            pass
+    owned = bool(romcloud_bin is not None and service_is_owned(service_path, romcloud_bin))
+    legacy_owned = bool(
+        romcloud_bin is not None
+        and service_is_owned(LEGACY_SERVICE_PATH, romcloud_bin)
+    )
+    if (service_path.exists() or service_path.is_symlink()) and not owned:
+        log.warning("Preserved foreign or unverifiable service script: %s", service_path)
+    if (LEGACY_SERVICE_PATH.exists() or LEGACY_SERVICE_PATH.is_symlink()) and not legacy_owned:
+        log.warning("Preserved foreign or unverifiable legacy service script: %s", LEGACY_SERVICE_PATH)
+    if not owned and not legacy_owned:
+        return False
+
     try:
         subprocess.run(
             ["batocera-services", "disable", SERVICE_NAME],
@@ -255,7 +292,7 @@ def remove_service(*, service_path: Path = SERVICE_SCRIPT_PATH) -> bool:
         log.warning("Timed out disabling Batocera service %s", SERVICE_NAME)
 
     removed = False
-    if service_path.exists():
+    if owned:
         try:
             service_path.unlink()
             log.info("Removed service script: %s", service_path)
@@ -264,19 +301,13 @@ def remove_service(*, service_path: Path = SERVICE_SCRIPT_PATH) -> bool:
             log.warning("Failed to remove service script: %s", service_path)
 
     # Also remove legacy path if it's the ROMCloud-owned script.
-    if LEGACY_SERVICE_PATH.exists():
+    if legacy_owned:
         try:
-            content = LEGACY_SERVICE_PATH.read_text(encoding="utf-8")
+            LEGACY_SERVICE_PATH.unlink()
+            log.info("Removed legacy service script: %s", LEGACY_SERVICE_PATH)
+            removed = True
         except Exception:
-            content = ""
-
-        if "ROMCloud SMB source mount" in content or "romcloud mount boot-start" in content:
-            try:
-                LEGACY_SERVICE_PATH.unlink()
-                log.info("Removed legacy service script: %s", LEGACY_SERVICE_PATH)
-                removed = True
-            except Exception:
-                log.warning("Failed to remove legacy service script: %s", LEGACY_SERVICE_PATH)
+            log.warning("Failed to remove legacy service script: %s", LEGACY_SERVICE_PATH)
 
     return removed
 

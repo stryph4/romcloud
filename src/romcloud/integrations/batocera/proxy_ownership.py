@@ -46,11 +46,10 @@ def remove_owned_proxy_files(
 ) -> int:
     """Remove only identity-matching ROMCloud proxies beneath *local_root*.
 
-    Manifest paths are checked first, then the local ROM tree is scanned for
-    signed orphan/duplicate proxies.  The latter matters when a legacy proxy
-    file survived after its ownership row was lost or moved.  Invalid JSON,
-    foreign payloads, symlinks, and paths outside the local ROM root are never
-    removed.
+    Only catalog-manifest paths are ownership authority. A payload that merely
+    looks like ROMCloud output is not sufficient proof: valid-shaped orphan
+    files are preserved for explicit reconciliation. Invalid JSON, foreign
+    payloads, symlinks, and paths outside the local ROM root are never removed.
     """
     removed: set[Path] = set()
     pattern = "*.[rR][oO][mM][cC][lL][oO][uU][dD]"
@@ -85,19 +84,5 @@ def remove_owned_proxy_files(
         ):
             candidate.unlink(missing_ok=True)
             removed.add(candidate)
-
-    for path in candidates:
-        if path_key(path) in inspected:
-            continue
-        payload = proxy_payload(path)
-        if payload is not None and verified_payloads is not None:
-            verified_payloads[path] = payload
-        if (
-            payload is not None
-            and selected(payload["game_id"])
-            and is_within(path, local_root)
-        ):
-            path.unlink(missing_ok=True)
-            removed.add(path)
 
     return len(removed)

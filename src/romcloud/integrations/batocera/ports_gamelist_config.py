@@ -19,8 +19,10 @@ how EmulationStation reliably resolves Ports artwork on real hardware.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from xml.etree import ElementTree as ET
 
 from romcloud.infrastructure.logging import get_logger
 from romcloud.integrations.batocera.ports_gamelist import (
@@ -103,15 +105,111 @@ def reconcile(
     return True
 
 
+@dataclass(frozen=True)
+class PortsOwnership:
+    launcher_owned: bool = False
+    icon_owned: bool = False
+    entry_owned: bool = False
+    warnings: tuple[str, ...] = ()
+
+
+def inspect_ownership(
+    *,
+    ports_dir: Path,
+    expected_wrapper: Path,
+    expected_icon: Path | None = None,
+    gamelist_path: Optional[Path] = None,
+) -> PortsOwnership:
+    """Prove ownership without trusting the reserved filenames alone."""
+    warnings: list[str] = []
+    launcher = ports_dir / "ROMCloud.sh"
+    launcher_owned = False
+    if launcher.exists() or launcher.is_symlink():
+        try:
+            content = launcher.read_text(encoding="utf-8")
+            expected_exec = f'exec "{expected_wrapper}" "$@"'
+            expected_log = str(expected_wrapper.parent.parent / "logs" / "gui-display.log")
+            launcher_owned = (
+                launcher.is_file()
+                and not launcher.is_symlink()
+                and content.startswith("#!/bin/bash\n")
+                and content.rstrip().endswith(expected_exec)
+                and content.count('event="port_entry_start"') == 1
+                and f'ROMCLOUD_DISPLAY_LOG="{expected_log}"' in content
+            )
+        except (OSError, UnicodeError):
+            launcher_owned = False
+        if not launcher_owned:
+            warnings.append(f"Preserved foreign or unreadable Ports launcher: {launcher}")
+
+    icon = ports_dir / "images" / ROMCLOUD_IMAGE_FILENAME
+    icon_owned = False
+    if icon.exists() or icon.is_symlink():
+        try:
+            icon_owned = bool(
+                expected_icon is not None
+                and expected_icon.is_file()
+                and not icon.is_symlink()
+                and icon.is_file()
+                and icon.read_bytes() == expected_icon.read_bytes()
+            )
+        except OSError:
+            icon_owned = False
+        if not icon_owned:
+            warnings.append(f"Preserved foreign or unverifiable Ports icon: {icon}")
+
+    entry_owned = False
+    path = gamelist_path or ports_dir / "gamelist.xml"
+    if path.exists() or path.is_symlink():
+        if path.is_symlink() or not path.is_file():
+            warnings.append(f"Preserved unsafe shared Ports gamelist: {path}")
+        else:
+            try:
+                root = ET.fromstring(path.read_text(encoding="utf-8"))
+            except (OSError, ET.ParseError, UnicodeError):
+                warnings.append(f"Preserved malformed or unreadable shared Ports gamelist: {path}")
+            else:
+                matches = []
+                for element in root.findall("game"):
+                    if (element.findtext("path") or "").strip() == ROMCLOUD_ROM_PATH:
+                        matches.append(element)
+                if len(matches) == 1:
+                    element = matches[0]
+                    fields = [(child.tag, (child.text or "").strip()) for child in element]
+                    entry_owned = sorted(fields) == sorted(
+                        [
+                            ("path", ROMCLOUD_ROM_PATH),
+                            ("name", ROMCLOUD_GAME_NAME),
+                            ("image", ROMCLOUD_IMAGE_RELATIVE_PATH),
+                        ]
+                    )
+                if matches and not entry_owned:
+                    warnings.append(f"Preserved unverified ROMCloud Ports gamelist entry: {path}")
+    return PortsOwnership(launcher_owned, icon_owned, entry_owned, tuple(warnings))
+
+
 def remove(
     *,
     ports_dir: Path,
     gamelist_path: Optional[Path] = None,
+    expected_wrapper: Path | None = None,
+    expected_icon: Path | None = None,
 ) -> bool:
-    """Remove ROMCloud's exact Ports artifacts without touching shared data."""
+    """Remove only positively verified ROMCloud Ports artifacts."""
+    if expected_wrapper is None:
+        log.warning("Ports cleanup skipped: no expected ROMCloud wrapper was supplied")
+        return False
+    ownership = inspect_ownership(
+        ports_dir=ports_dir,
+        expected_wrapper=expected_wrapper,
+        expected_icon=expected_icon,
+        gamelist_path=gamelist_path,
+    )
+    for warning in ownership.warnings:
+        log.warning("%s", warning)
     changed = False
     path = gamelist_path or ports_dir / "gamelist.xml"
-    if path.exists():
+    if ownership.launcher_owned and ownership.entry_owned:
         try:
             existing_xml = path.read_text(encoding="utf-8")
             result = remove_romcloud_entry(existing_xml)
@@ -123,11 +221,12 @@ def remove(
         except OSError as exc:
             log.warning("Failed to remove ROMCloud entry from %s: %s", path, exc)
 
-    for owned_path in (
-        ports_dir / "ROMCloud.sh",
-        ports_dir / "images" / ROMCLOUD_IMAGE_FILENAME,
-    ):
-        if owned_path.exists():
-            owned_path.unlink()
-            changed = True
+    launcher = ports_dir / "ROMCloud.sh"
+    if ownership.launcher_owned:
+        launcher.unlink()
+        changed = True
+    icon = ports_dir / "images" / ROMCLOUD_IMAGE_FILENAME
+    if ownership.icon_owned:
+        icon.unlink()
+        changed = True
     return changed
