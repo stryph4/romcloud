@@ -61,6 +61,8 @@ def main(argv: list[str] | None = None) -> int:
     if len(args) != 6:
         return 2
     operation, raw_config, raw_pid, raw_stage, raw_ready, raw_result = args
+    if operation not in {"uninstall", "purge"}:
+        return 2
     stage = Path(raw_stage)
     ready = Path(raw_ready)
     result = Path(raw_result)
