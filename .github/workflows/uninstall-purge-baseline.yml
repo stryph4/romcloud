@@ -1,0 +1,46 @@
+name: Uninstall Purge Baseline Classification
+
+on:
+  push:
+    branches:
+      - ci/uninstall-purge-baseline-20260917
+
+jobs:
+  classify:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: first-wip
+            ref: cad2fc9a7a15f482a2bf1547d18969e115c043f0
+          - label: develop-base
+            ref: 47b80cc11a88a7adcc5ef4b94a97fb1c5c86d194
+    name: Baseline ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install
+        run: python -m pip install -U pip && python -m pip install -e '.[dev,smb]'
+      - name: Re-run feature-suite failures
+        run: |
+          python -m pytest -q \
+            tests/integration/test_setup_flow.py::test_setup_lifecycle_persists_config_state_and_reconcile_calls \
+            tests/integration/test_startup_library_manager.py::test_boot_worker_launches_browser_with_real_startup_service \
+            tests/unit/test_healthcheck.py::test_read_only_checks_cover_integrations_and_source \
+            tests/unit/test_healthcheck.py::test_read_only_checks_use_injected_runtime \
+            tests/unit/test_mount_service.py::test_install_service_embeds_absolute_binary_and_mount_command \
+            tests/unit/test_mount_startup_handoff.py::test_service_start_uses_boot_start_handoff \
+            tests/unit/test_mount_startup_handoff.py::test_direct_service_start_returns_quickly_when_network_is_down \
+            tests/unit/test_mount_startup_handoff.py::test_manager_boot_start_failure_still_returns_success_without_mount_regression \
+            tests/unit/test_ports_gfx_app.py::test_build_app_returns_ready_runtime \
+            tests/unit/test_ports_gfx_app.py::test_main_menu_contains_required_sections_and_version \
+            tests/unit/test_ports_gfx_app.py::test_library_manager_menu_requires_cached_mode_and_can_open \
+            tests/unit/test_ports_gfx_app.py::test_library_sync_button_disabled_without_remote_data \
+            tests/unit/test_ports_gfx_app.py::test_input_menu_has_controller_test_entry
