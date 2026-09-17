@@ -234,7 +234,9 @@ def remove_direct_links(config: AppConfig) -> DirectLinkReport:
                 and relative.name == LINK_NAME
                 and len(target_relative.parts) == 1
                 and relative.parent.name == target_relative.name
-                and path.parent.resolve(strict=True).is_dir()
+                and path.parent.is_dir()
+                and not path.parent.is_symlink()
+                and path.parent.resolve(strict=True).parent == local_root.resolve(strict=True)
                 and target_path.resolve(strict=True).is_dir()
             )
         except (OSError, ValueError):

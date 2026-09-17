@@ -3,6 +3,7 @@ from __future__ import annotations
 from ports_gfx.actions import Action
 from ports_gfx.input_manager import InputEvent
 from ports_gfx.lifecycle_screen import LifecycleScreenState, launch_lifecycle_helper
+import pytest
 
 
 def test_uninstall_and_purge_require_hold_and_back_is_zero_mutation() -> None:
@@ -24,18 +25,34 @@ def test_uninstall_and_purge_require_hold_and_back_is_zero_mutation() -> None:
 def test_detached_helper_waits_for_the_gui_pid() -> None:
     calls = []
 
-    def popen(argv, **kwargs):
-        calls.append((argv, kwargs))
-        return object()
+    class Result:
+        returncode = 0
 
-    launch_lifecycle_helper("/owned/bin/romcloud", "uninstall", gui_pid=4321, popen=popen)
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return Result()
+
+    launch_lifecycle_helper("/owned/bin/romcloud", "uninstall", gui_pid=4321, run=run)
 
     argv, kwargs = calls[0]
     assert argv == [
         "/owned/bin/romcloud",
         "uninstall",
         "--yes",
-        "--wait-for-pid",
+        "--stage-for-pid",
         "4321",
     ]
-    assert kwargs["start_new_session"] is True
+    assert kwargs["check"] is False
+
+
+def test_helper_staging_failure_prevents_gui_handoff() -> None:
+    class Result:
+        returncode = 1
+
+    with pytest.raises(RuntimeError, match="nothing was removed"):
+        launch_lifecycle_helper(
+            "/owned/bin/romcloud",
+            "purge",
+            gui_pid=4321,
+            run=lambda *args, **kwargs: Result(),
+        )

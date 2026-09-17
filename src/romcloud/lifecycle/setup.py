@@ -822,6 +822,25 @@ def apply_setup(
     config = _build_config(
         config_path, request, existing, selected_systems=selected_systems
     )
+    from romcloud.infrastructure.ownership import root_is_owned
+
+    setup_home = config_path.parent.parent
+    home_was_owned = root_is_owned(setup_home, "home", setup_home)
+
+    def claimable_root(path: Path, kind: str) -> bool:
+        if root_is_owned(setup_home, kind, path):
+            return True
+        if path == setup_home / kind and home_was_owned:
+            return True
+        if path.is_symlink():
+            return False
+        try:
+            return not path.exists() or (path.is_dir() and not any(path.iterdir()))
+        except OSError:
+            return False
+
+    data_claimable = claimable_root(Path(config.data_path), "data")
+    cache_claimable = claimable_root(Path(config.cache.path), "cache")
     _guard_pending_legacy_save_provider_change(existing, config)
     mounted_during_setup: list[str] = []
     save_sync_report = None
@@ -1107,6 +1126,17 @@ def apply_setup(
         )
         raise RuntimeError(f"{step}: {safe_error}") from exc
 
+    # Configuration is not deletion authority.  Only a fully successful setup
+    # may bind its persistent roots into the install-owned ledger.
+    from romcloud.infrastructure.ownership import record_owned_roots
+
+    if home_was_owned:
+        owned_roots = {"home": setup_home}
+        if data_claimable:
+            owned_roots["data"] = Path(config.data_path)
+        if cache_claimable:
+            owned_roots["cache"] = Path(config.cache.path)
+        record_owned_roots(setup_home, owned_roots)
     state_path.unlink(missing_ok=True)
     log.info(
         "Setup outcome: complete — save_sync_initialized=%s unresolved_conflict_count=%d",

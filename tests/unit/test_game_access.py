@@ -423,10 +423,32 @@ def test_direct_cleanup_preserves_wrong_target_and_malformed_manifest(tmp_path: 
     assert manifest.read_text() == "{malformed"
 
 
+def test_direct_cleanup_preserves_link_beneath_symlinked_system_parent(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    source, local = _system(config)
+    local.rmdir()
+    outside = tmp_path / "outside-system"
+    outside.mkdir()
+    local.symlink_to(outside, target_is_directory=True)
+    link = local / LINK_NAME
+    link.symlink_to(source, target_is_directory=True)
+    manifest = Path(config.data_path) / "direct-links.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        json.dumps({"version": 1, "links": [{"path": str(link), "target": str(source)}]})
+    )
+
+    report = remove_direct_links(config)
+
+    assert report.removed == 0 and report.uncertain == 1
+    assert link.is_symlink()
+    assert manifest.exists()
+
+
 def test_cache_cli_requires_per_command_override_in_direct_mode(monkeypatch) -> None:
     container = SimpleNamespace(
         config=SimpleNamespace(game_access_mode=DIRECT_NAS_MODE),
-        cache_repo=SimpleNamespace(list_complete=lambda: []),
+        cache_repo=SimpleNamespace(list_all=lambda: []),
     )
     monkeypatch.setattr(cache_module, "get_container", lambda ctx: container)
     runner = CliRunner()

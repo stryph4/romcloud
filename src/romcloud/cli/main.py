@@ -58,9 +58,9 @@ def cli(ctx: click.Context, config_path: str | None, debug: bool) -> None:
         except ROMCloudError as exc:
             click.echo(f"error: {exc}", err=True)
             ctx.exit(1)
-    elif ctx.invoked_subcommand in ("healthcheck", "troubleshoot"):
-        # Pure diagnostics must not initialize logs/directories or SQLite
-        # diagnostic storage before the collectors run.
+    elif ctx.invoked_subcommand in ("healthcheck", "troubleshoot", "uninstall", "purge"):
+        # Diagnostics and destructive lifecycle commands must not initialize
+        # logs/directories or SQLite before their read-only safety preflight.
         configure_logging(
             level="DEBUG" if debug else "INFO",
             log_dir=None,

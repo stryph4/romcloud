@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import subprocess
 from dataclasses import dataclass, field
 from typing import Callable
@@ -84,16 +83,19 @@ def launch_lifecycle_helper(
     operation: str,
     *,
     gui_pid: int | None = None,
-    popen: Callable[..., object] = subprocess.Popen,
+    run: Callable[..., object] = subprocess.run,
 ) -> object:
-    """Start the independent CLI handoff; it cannot mutate until this GUI exits."""
+    """Stage the independent worker before allowing this GUI to exit."""
     if operation not in {"uninstall", "purge"}:
         raise ValueError(f"Unsupported lifecycle operation: {operation}")
     pid = os.getpid() if gui_pid is None else gui_pid
-    return popen(
-        [romcloud_bin, operation, "--yes", "--wait-for-pid", str(pid)],
+    result = run(
+        [romcloud_bin, operation, "--yes", "--stage-for-pid", str(pid)],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        start_new_session=os.name == "posix",
+        check=False,
     )
+    if getattr(result, "returncode", 1) != 0:
+        raise RuntimeError("Could not stage the ROMCloud lifecycle helper; nothing was removed")
+    return result

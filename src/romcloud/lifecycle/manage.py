@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -20,6 +21,7 @@ from romcloud.infrastructure.credentials import (
     cifs_credentials_path,
     remote_data_cifs_credentials_path,
 )
+from romcloud.infrastructure.ownership import root_is_owned
 from romcloud.core.progress import ProgressSink, emit_progress
 from romcloud.integrations.batocera import (
     auto_savesync,
@@ -61,6 +63,9 @@ class PathIdentity:
     device: int | None = None
     inode: int | None = None
     mode: int | None = None
+    ownership_kind: str = ""
+    owned: bool = False
+    ownership_detail: str = ""
 
 
 @dataclass(frozen=True)
@@ -273,6 +278,29 @@ def repair(
 _LEGACY_CREDENTIALS_FILENAME = "smb.credentials"
 
 
+def _is_ephemeral_cifs_credential(path: Path) -> bool:
+    if not re.fullmatch(r"\.romcloud-cifs-(?:source|remote-data)-[A-Za-z0-9_]{6,}", path.name):
+        return False
+    try:
+        info = path.lstat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_nlink != 1
+            or info.st_uid != os.geteuid()
+            or info.st_size > 16 * 1024
+        ):
+            return False
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return False
+    keys = [line.partition("=")[0] for line in lines if "=" in line]
+    return len(keys) == len(lines) and set(keys) in (
+        {"username", "password"},
+        {"username", "password", "domain"},
+    ) and len(keys) == len(set(keys))
+
+
 def _remove_credential_files(config: AppConfig) -> None:
     """Remove every ROMCloud-owned local credential copy during Purge.
 
@@ -290,7 +318,7 @@ def _remove_credential_files(config: AppConfig) -> None:
     remote_data_cifs_credentials_path(credentials_path).unlink(missing_ok=True)
     (credentials_path.parent / "setup-state.json").unlink(missing_ok=True)
     for stale in credentials_path.parent.glob(".romcloud-cifs-*"):
-        if stale.is_file() and not stale.is_symlink():
+        if _is_ephemeral_cifs_credential(stale):
             stale.unlink(missing_ok=True)
 
 
@@ -380,6 +408,9 @@ def _validate_owned_tree(
     *,
     protected: tuple[Path, ...],
     mount_points: tuple[Path, ...] | None = None,
+    ownership_kind: str = "",
+    owned: bool = False,
+    ownership_detail: str = "",
 ) -> PathIdentity:
     identity = _path_identity(path)
     if any(_paths_overlap(identity.resolved, item) for item in protected):
@@ -397,29 +428,91 @@ def _validate_owned_tree(
             raise RuntimeError(
                 f"Refusing lifecycle target containing a mount boundary: {path} ({mounted})"
             )
-    return identity
+    return replace(
+        identity,
+        ownership_kind=ownership_kind,
+        owned=owned,
+        ownership_detail=ownership_detail,
+    )
 
 
 def _assert_path_identity(expected: PathIdentity) -> None:
     current = _path_identity(expected.path)
-    if current != expected:
+    if (
+        current.path,
+        current.resolved,
+        current.exists,
+        current.device,
+        current.inode,
+        current.mode,
+    ) != (
+        expected.path,
+        expected.resolved,
+        expected.exists,
+        expected.device,
+        expected.inode,
+        expected.mode,
+    ):
         raise RuntimeError(f"Lifecycle target identity changed after preflight: {expected.path}")
 
 
-def _activity_blockers(snapshot: ActivitySnapshot) -> tuple[str, ...]:
+def _verified_mount_worker_pid(romcloud_home: Path) -> int | None:
+    """Read the worker identity without stale-lock cleanup or other mutation."""
+
+    path = mount_worker.lock_path(romcloud_home)
+    try:
+        pid = int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    return pid if mount_worker._pid_alive(pid) and mount_worker._worker_cmdline_matches(  # noqa: SLF001
+        pid, proc_root=Path("/proc")
+    ) else None
+
+
+def _menu_loop_identity(data_root: Path) -> tuple[str, int | None]:
+    path = auto_savesync.menu_loop_pid_path(data_root)
+    if not path.exists():
+        return "inactive", None
+    try:
+        pid = int(path.read_text(encoding="ascii").strip())
+    except (OSError, ValueError):
+        return "unknown", None
+    if not auto_savesync._pid_alive(pid):  # noqa: SLF001
+        return "inactive", None
+    if auto_savesync._menu_loop_cmdline_matches(pid, proc_root=Path("/proc")):  # noqa: SLF001
+        return "active", pid
+    return "unknown", pid
+
+
+def _activity_blockers(
+    snapshot: ActivitySnapshot, *, romcloud_home: Path, data_root: Path
+) -> tuple[str, ...]:
     blocked: list[str] = []
-    for name in (
-        "game",
-        "download",
-        "savesync",
-        "library_sync",
-        "browser_manager",
-        "graphical_ui",
-        "mount_worker",
-    ):
+    for name in ("game", "download", "savesync", "library_sync", "graphical_ui"):
         state = getattr(snapshot, name)
         if state.state != "inactive":
             blocked.append(f"{name}:{state.state} ({state.detail or 'no detail'})")
+
+    manager = snapshot.browser_manager
+    manager_owned = (
+        manager.state == "active" and manager.detail == "Owned manager endpoint is reachable."
+    )
+    if manager.state == "unknown" or (manager.state == "active" and not manager_owned):
+        blocked.append(
+            f"browser_manager:{manager.state} ({manager.detail or 'unverified process ownership'})"
+        )
+
+    worker = snapshot.mount_worker
+    if worker.state == "unknown" or (
+        worker.state == "active" and _verified_mount_worker_pid(romcloud_home) is None
+    ):
+        blocked.append(
+            f"mount_worker:{worker.state} ({worker.detail or 'unverified process ownership'})"
+        )
+
+    menu_state, menu_pid = _menu_loop_identity(data_root)
+    if menu_state == "unknown":
+        blocked.append(f"menu_loop:unknown (unverified PID {menu_pid or 'marker'})")
     return tuple(blocked)
 
 
@@ -454,6 +547,21 @@ def _mount_preflight(config: AppConfig) -> tuple[tuple[MountIdentity, ...], tupl
     return tuple(identities), tuple(blockers)
 
 
+def _root_ownership(
+    *, romcloud_home: Path, path: Path, kind: str, home_owned: bool
+) -> tuple[bool, str]:
+    if kind == "runtime":
+        owned = home_owned and path.parent == romcloud_home and path.name in {
+            "bin",
+            "venv",
+            "ports-gfx",
+            "runtime",
+        }
+        return owned, "inherited from the path-bound ROMCloud home ledger" if owned else "home ownership is unproven"
+    owned = root_is_owned(romcloud_home, kind, path)
+    return owned, "exact path-bound ownership ledger match" if owned else f"no exact {kind} ownership ledger entry"
+
+
 def lifecycle_preflight(
     *,
     operation: str,
@@ -468,7 +576,13 @@ def lifecycle_preflight(
     snapshot = activity or inspect_activity(
         config, catalog_path=Path(config.data_path) / "catalog.db"
     )
-    blockers = list(_activity_blockers(snapshot))
+    blockers = list(
+        _activity_blockers(
+            snapshot,
+            romcloud_home=romcloud_home,
+            data_root=Path(config.data_path),
+        )
+    )
     warnings: list[str] = []
     findings: list[str] = []
     mounts: tuple[MountIdentity, ...] = ()
@@ -481,23 +595,48 @@ def lifecycle_preflight(
     else:
         protected = _protected_roots(config)
         mount_points = _mount_points()
-        if operation == "purge":
-            candidate_roots = [
-                romcloud_home,
-                Path(config.data_path),
-                Path(config.cache.path),
-                *(romcloud_home / name for name in ("bin", "venv", "ports-gfx", "runtime")),
-            ]
-        else:
-            candidate_roots = [
-                romcloud_home / name for name in ("bin", "venv", "ports-gfx", "runtime")
-            ]
-        for candidate in candidate_roots:
+        from romcloud.web.browser_runtime import runtime_root
+
+        home_owned = root_is_owned(romcloud_home, "home", romcloud_home)
+        candidate_roots: list[tuple[Path, str]] = [
+            (romcloud_home, "home"),
+            (Path(config.data_path), "data"),
+            *(([(Path(config.cache.path), "cache")]) if operation == "purge" else []),
+            *((romcloud_home / name, "runtime") for name in ("bin", "venv", "ports-gfx", "runtime")),
+            (runtime_root(config.data_path), "browser"),
+        ]
+        for candidate, kind in candidate_roots:
+            owned, ownership_detail = _root_ownership(
+                romcloud_home=romcloud_home,
+                path=candidate,
+                kind=kind,
+                home_owned=home_owned,
+            )
+            if kind == "browser":
+                from romcloud.web.browser_runtime import managed_runtime_is_owned
+
+                owned = managed_runtime_is_owned(config.data_path)
+                ownership_detail = (
+                    "exact managed-browser root marker"
+                    if owned
+                    else "managed-browser root marker is absent or invalid"
+                )
             identities.append(
                 _validate_owned_tree(
-                    candidate, protected=protected, mount_points=mount_points
+                    candidate,
+                    protected=protected,
+                    mount_points=mount_points,
+                    ownership_kind=kind,
+                    owned=owned,
+                    ownership_detail=ownership_detail,
                 )
             )
+            if owned:
+                findings.append(f"{kind}:{candidate}:owned")
+            elif candidate.exists() or candidate.is_symlink():
+                warnings.append(
+                    f"Preserved unverified {kind} root {candidate}: {ownership_detail}."
+                )
 
         # Nested data/cache roots are normalized by deleting the deepest roots
         # first, but they must never contain one another or contain the home.
@@ -573,6 +712,17 @@ def _record_stage(
     return result
 
 
+def _remove_verified_optional(
+    action: Callable[[], object],
+    still_owned: Callable[[], bool],
+    label: str,
+) -> object:
+    result = action()
+    if still_owned():
+        raise RuntimeError(f"Owned {label} remains after cleanup")
+    return result
+
+
 def _runtime_identity(preflight: LifecyclePreflight, path: Path) -> PathIdentity:
     for identity in preflight.owned_roots:
         if identity.path == path:
@@ -580,17 +730,65 @@ def _runtime_identity(preflight: LifecyclePreflight, path: Path) -> PathIdentity
     raise RuntimeError(f"No preflight identity exists for {path}")
 
 
+def _record_recursive_root(
+    stages: list[LifecycleStageResult],
+    warnings: list[str],
+    *,
+    name: str,
+    path: Path,
+    romcloud_home: Path,
+    preflight: LifecyclePreflight,
+) -> None:
+    identity = _runtime_identity(preflight, path)
+    if not identity.exists:
+        stages.append(LifecycleStageResult(name, "already_absent"))
+        return
+    if not identity.owned:
+        detail = f"Preserved {path}: {identity.ownership_detail}"
+        stages.append(LifecycleStageResult(name, "uncertain", detail))
+        warnings.append(detail)
+        return
+    _record_stage(
+        stages,
+        name,
+        lambda: _remove_owned_tree(
+            path,
+            romcloud_home=romcloud_home,
+            protected=preflight.protected_roots,
+            expected=identity,
+        ),
+    )
+
+
 def _remove_owned_tree(
     path: Path,
     *,
+    romcloud_home: Path,
     protected: tuple[Path, ...],
     expected: PathIdentity,
 ) -> bool:
+    if not expected.owned:
+        raise RuntimeError(f"Recursive deletion lacks positive ownership proof: {path}")
     _assert_path_identity(expected)
     if not expected.exists:
         return False
+    home_owned = root_is_owned(romcloud_home, "home", romcloud_home)
+    still_owned, detail = _root_ownership(
+        romcloud_home=romcloud_home,
+        path=path,
+        kind=expected.ownership_kind,
+        home_owned=home_owned,
+    )
+    if not still_owned:
+        raise RuntimeError(f"Ownership changed before recursive deletion of {path}: {detail}")
     # Re-run the complete safety proof immediately before recursive deletion.
-    _validate_owned_tree(path, protected=protected)
+    _validate_owned_tree(
+        path,
+        protected=protected,
+        ownership_kind=expected.ownership_kind,
+        owned=True,
+        ownership_detail=detail,
+    )
     shutil.rmtree(path)
     if path.exists() or path.is_symlink():
         raise RuntimeError(f"Required lifecycle target remains after deletion: {path}")
@@ -626,6 +824,16 @@ def uninstall(
         else Path("/userdata/system/romcloud")
     )
     romcloud_bin = ownership_home / "bin" / "romcloud"
+    home_identity = (
+        _runtime_identity(selected_preflight, romcloud_home)
+        if selected_preflight.config_trusted
+        else replace(
+            _path_identity(romcloud_home),
+            ownership_kind="home",
+            owned=False,
+            ownership_detail="configuration is untrusted",
+        )
+    )
     if (mount_service.SERVICE_SCRIPT_PATH.exists() or mount_service.SERVICE_SCRIPT_PATH.is_symlink()) and not mount_service.service_is_owned(
         mount_service.SERVICE_SCRIPT_PATH, romcloud_bin
     ):
@@ -683,13 +891,25 @@ def uninstall(
         _record_stage(
             stages,
             "startup-service",
-            lambda: mount_service.remove_service(romcloud_bin),
+            lambda: _remove_verified_optional(
+                lambda: mount_service.remove_service(romcloud_bin),
+                lambda: mount_service.service_is_owned(
+                    mount_service.SERVICE_SCRIPT_PATH, romcloud_bin
+                ),
+                "startup service",
+            ),
             required=False,
         )
         _record_stage(
             stages,
             "auto-savesync-hook",
-            lambda: auto_savesync.remove_hook(romcloud_bin),
+            lambda: _remove_verified_optional(
+                lambda: auto_savesync.remove_hook(romcloud_bin),
+                lambda: auto_savesync.hook_is_owned(
+                    romcloud_bin, hook_path=auto_savesync.HOOK_PATH
+                ),
+                "Auto SaveSync hook",
+            ),
             required=False,
         )
         _record_stage(
@@ -738,39 +958,81 @@ def uninstall(
                 )
             else:
                 stages.append(LifecycleStageResult("proxies", "uncertain", "Catalog ownership evidence unavailable"))
-            _record_stage(
-                stages,
-                "mount-runtime-state",
-                lambda: mount_worker.cleanup_runtime_state(romcloud_home) or True,
+            if home_identity.owned:
+                _record_stage(
+                    stages,
+                    "mount-runtime-state",
+                    lambda: mount_worker.cleanup_runtime_state(romcloud_home) or True,
+                )
+            else:
+                stages.append(
+                    LifecycleStageResult(
+                        "mount-runtime-state",
+                        "uncertain",
+                        "Preserved because ROMCloud home ownership is unproven.",
+                    )
+                )
+
+            from romcloud.web.browser_runtime import (
+                managed_runtime_is_owned,
+                remove_managed_runtime,
+                runtime_root,
             )
+
+            browser_root = runtime_root(config.data_path)
+            browser_identity = _runtime_identity(selected_preflight, browser_root)
+            if not browser_identity.exists:
+                stages.append(LifecycleStageResult("managed-browser", "already_absent"))
+            elif not browser_identity.owned:
+                detail = f"Preserved unverified managed-browser runtime: {browser_root}"
+                stages.append(LifecycleStageResult("managed-browser", "uncertain", detail))
+                warnings.append(detail)
+            else:
+                _assert_path_identity(browser_identity)
+                if not managed_runtime_is_owned(config.data_path):
+                    raise RuntimeError(
+                        f"Managed-browser ownership changed before deletion: {browser_root}"
+                    )
+                _record_stage(
+                    stages,
+                    "managed-browser",
+                    lambda: remove_managed_runtime(config.data_path),
+                )
 
             for name in ("bin", "venv", "ports-gfx", "runtime"):
                 path = romcloud_home / name
-                identity = _runtime_identity(selected_preflight, path)
-                _record_stage(
+                _record_recursive_root(
                     stages,
-                    f"runtime-{name}",
-                    lambda path=path, identity=identity: _remove_owned_tree(
-                        path,
-                        protected=selected_preflight.protected_roots,
-                        expected=identity,
-                    ),
+                    warnings,
+                    name=f"runtime-{name}",
+                    path=path,
+                    romcloud_home=romcloud_home,
+                    preflight=selected_preflight,
                 )
             version = romcloud_home / "version.json"
-            if version.is_file() and not version.is_symlink():
+            if home_identity.owned and version.is_file() and not version.is_symlink():
                 version.unlink()
                 stages.append(LifecycleStageResult("build-metadata", "removed"))
+            elif version.exists() or version.is_symlink():
+                detail = f"Preserved unverified build metadata: {version}"
+                warnings.append(detail)
+                stages.append(LifecycleStageResult("build-metadata", "uncertain", detail))
             else:
                 stages.append(LifecycleStageResult("build-metadata", "already_absent"))
             run_dir = romcloud_home / "run"
-            try:
-                run_dir.rmdir()
-                stages.append(LifecycleStageResult("transient-runtime", "removed"))
-            except FileNotFoundError:
-                stages.append(LifecycleStageResult("transient-runtime", "already_absent"))
-            except OSError as exc:
-                warnings.append(f"Preserved non-empty transient runtime directory: {run_dir}: {exc}")
-                stages.append(LifecycleStageResult("transient-runtime", "warning", str(exc)))
+            if not home_identity.owned and run_dir.exists():
+                detail = f"Preserved unverified transient runtime directory: {run_dir}"
+                warnings.append(detail)
+                stages.append(LifecycleStageResult("transient-runtime", "uncertain", detail))
+            else:
+                try:
+                    run_dir.rmdir()
+                    stages.append(LifecycleStageResult("transient-runtime", "removed"))
+                except FileNotFoundError:
+                    stages.append(LifecycleStageResult("transient-runtime", "already_absent"))
+                except OSError as exc:
+                    warnings.append(f"Preserved non-empty transient runtime directory: {run_dir}: {exc}")
+                    stages.append(LifecycleStageResult("transient-runtime", "warning", str(exc)))
     except Exception as exc:
         report = LifecycleReport(
             proxies_removed,
@@ -837,25 +1099,32 @@ def purge(
                 )
             )
 
-        _record_stage(stages, "credentials-auth", lambda: _remove_credential_files(config) or True)
+        home_identity = _runtime_identity(selected_preflight, romcloud_home)
+        credentials_parent = config.credentials_path.parent.resolve(strict=False)
+        expected_config_dir = (romcloud_home / "config").resolve(strict=False)
+        if home_identity.owned and credentials_parent == expected_config_dir:
+            _record_stage(stages, "credentials-auth", lambda: _remove_credential_files(config) or True)
+        else:
+            detail = f"Preserved credentials at unverified location: {config.credentials_path}"
+            stages.append(LifecycleStageResult("credentials-auth", "uncertain", detail))
+            warnings.append(detail)
 
-        identity_by_path = {item.path: item for item in selected_preflight.owned_roots}
-        external_roots = {Path(config.cache.path), Path(config.data_path)}
-        for root in sorted(external_roots, key=lambda value: len(value.parts), reverse=True):
-            if _is_within(root, romcloud_home):
-                continue
-            identity = identity_by_path[root]
-            _record_stage(
+        persistent_roots = {Path(config.cache.path), Path(config.data_path)}
+        for root in sorted(persistent_roots, key=lambda value: len(value.parts), reverse=True):
+            _record_recursive_root(
                 stages,
-                f"persistent-{root.name}",
-                lambda root=root, identity=identity: _remove_owned_tree(
-                    root,
-                    protected=selected_preflight.protected_roots,
-                    expected=identity,
-                ),
+                warnings,
+                name=f"persistent-{root.name}",
+                path=root,
+                romcloud_home=romcloud_home,
+                preflight=selected_preflight,
             )
 
-        if config.logging.path and not _is_within(Path(config.logging.path), romcloud_home):
+        if (
+            home_identity.owned
+            and config.logging.path
+            and _is_within(Path(config.logging.path), romcloud_home)
+        ):
             log_dir = Path(config.logging.path)
             removed_log = False
             for name in (
@@ -875,15 +1144,37 @@ def purge(
                     removed_log = True
             stages.append(LifecycleStageResult("logs", "removed" if removed_log else "already_absent"))
 
-        home_identity = identity_by_path[romcloud_home]
-        _record_stage(
-            stages,
-            "romcloud-home",
-            lambda: _remove_owned_tree(
+        # Configuration is removed narrowly.  The home itself is never
+        # recursively deleted here: unknown siblings must survive even when
+        # the ROMCloud home ledger is valid.
+        if home_identity.owned:
+            for path in (
+                romcloud_home / "config" / "romcloud.toml",
+                romcloud_home / "config" / "owned-roots.json",
+            ):
+                if path.is_file() and not path.is_symlink():
+                    path.unlink()
+        if home_identity.owned:
+            for directory in (
+                romcloud_home / "config",
+                romcloud_home / "logs",
+                romcloud_home / "run",
                 romcloud_home,
-                protected=selected_preflight.protected_roots,
-                expected=home_identity,
-            ),
+            ):
+                try:
+                    directory.rmdir()
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    warnings.append(f"Preserved non-empty lifecycle directory {directory}: {exc}")
+        stages.append(
+            LifecycleStageResult(
+                "romcloud-home",
+                "removed" if not romcloud_home.exists() else "uncertain",
+                "Unknown or unverifiable children were preserved."
+                if romcloud_home.exists()
+                else "",
+            )
         )
     except Exception as exc:
         failed = LifecycleReport(

@@ -292,13 +292,15 @@ def remove_service(
         log.warning("Timed out disabling Batocera service %s", SERVICE_NAME)
 
     removed = False
+    removal_errors: list[str] = []
     if owned:
         try:
             service_path.unlink()
             log.info("Removed service script: %s", service_path)
             removed = True
-        except Exception:
+        except Exception as exc:
             log.warning("Failed to remove service script: %s", service_path)
+            removal_errors.append(f"{service_path}: {exc}")
 
     # Also remove legacy path if it's the ROMCloud-owned script.
     if legacy_owned:
@@ -306,8 +308,12 @@ def remove_service(
             LEGACY_SERVICE_PATH.unlink()
             log.info("Removed legacy service script: %s", LEGACY_SERVICE_PATH)
             removed = True
-        except Exception:
+        except Exception as exc:
             log.warning("Failed to remove legacy service script: %s", LEGACY_SERVICE_PATH)
+            removal_errors.append(f"{LEGACY_SERVICE_PATH}: {exc}")
+
+    if removal_errors:
+        raise RuntimeError("Owned service removal failed: " + "; ".join(removal_errors))
 
     return removed
 

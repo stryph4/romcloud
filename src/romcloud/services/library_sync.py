@@ -383,6 +383,8 @@ class LibrarySyncService:
 
     def remove_owned_local_media(self) -> tuple[int, tuple[str, ...]]:
         """Remove only content-addressed local media proven by canonical state."""
+        if self._local_roms_root.is_symlink():
+            return 0, ("Local ROM root is a symlink; preserved Library Sync media.",)
         canonical = self._local_root / CANONICAL_FILENAME
         if not canonical.is_file() or canonical.is_symlink():
             return 0, ("Local Library Sync canonical state is unavailable; preserved media.",)
@@ -391,16 +393,38 @@ class LibrarySyncService:
         except LibrarySyncError as exc:
             return 0, (f"Local Library Sync canonical state is untrusted; preserved media: {exc}",)
 
-        expected: dict[Path, tuple[str, int]] = {}
+        expected: dict[Path, tuple[str, int, Path]] = {}
+        warnings: list[str] = []
         for record in dataset.get("records", {}).values():
             if not isinstance(record, dict):
+                warnings.append("Preserved media for malformed canonical record.")
                 continue
             system = record.get("system")
             media = record.get("media")
             if not isinstance(system, str) or not system or not isinstance(media, dict):
+                warnings.append("Preserved media for canonical record with invalid system/media.")
+                continue
+            system_path = Path(system)
+            if (
+                system_path.is_absolute()
+                or system in {".", ".."}
+                or len(system_path.parts) != 1
+                or "/" in system
+                or "\\" in system
+            ):
+                warnings.append(f"Preserved media for unsafe canonical system: {system!r}")
+                continue
+            system_root = self._local_roms_root / system
+            if system_root.is_symlink():
+                warnings.append(f"Preserved media beneath symlinked system directory: {system_root}")
+                continue
+            media_root = system_root / LOCAL_MEDIA_DIR
+            if media_root.is_symlink():
+                warnings.append(f"Preserved symlinked Library Sync media root: {media_root}")
                 continue
             for descriptor in media.values():
                 if not isinstance(descriptor, dict):
+                    warnings.append(f"Preserved malformed Library Sync media descriptor for {system}.")
                     continue
                 digest = descriptor.get("sha256")
                 size = descriptor.get("size")
@@ -414,24 +438,37 @@ class LibrarySyncService:
                     or "/" in suffix
                     or "\\" in suffix
                 ):
+                    warnings.append(f"Preserved invalid Library Sync media descriptor for {system}.")
                     continue
                 path = (
-                    self._local_roms_root
-                    / system
-                    / LOCAL_MEDIA_DIR
+                    media_root
                     / str(digest)[:2]
                     / f"{digest}{suffix}"
                 )
-                expected[path] = (str(digest), size)
+                expected[path] = (str(digest), size, media_root)
 
         removed = 0
-        warnings: list[str] = []
         touched_roots: set[Path] = set()
-        for path, (digest, size) in expected.items():
+        for path, (digest, size, media_root) in expected.items():
             if not path.exists():
                 continue
             touched_roots.add(path.parent.parent)
-            if path.is_symlink() or not path.is_file():
+            try:
+                resolved_media = media_root.resolve(strict=True)
+                resolved_path = path.resolve(strict=True)
+                resolved_path.relative_to(resolved_media)
+                safe_parents = (
+                    media_root.parent.is_dir()
+                    and not media_root.parent.is_symlink()
+                    and media_root.is_dir()
+                    and not media_root.is_symlink()
+                    and path.parent.is_dir()
+                    and not path.parent.is_symlink()
+                    and path.parent.parent == media_root
+                )
+            except (OSError, ValueError):
+                safe_parents = False
+            if not safe_parents or path.is_symlink() or not path.is_file():
                 warnings.append(f"Preserved unsafe Library Sync media path: {path}")
                 continue
             try:

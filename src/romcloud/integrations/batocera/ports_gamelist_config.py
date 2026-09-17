@@ -220,6 +220,7 @@ def remove(
                 changed = True
         except OSError as exc:
             log.warning("Failed to remove ROMCloud entry from %s: %s", path, exc)
+            raise RuntimeError(f"Owned Ports gamelist removal failed: {path}: {exc}") from exc
 
     launcher = ports_dir / "ROMCloud.sh"
     if ownership.launcher_owned:

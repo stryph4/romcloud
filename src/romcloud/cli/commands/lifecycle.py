@@ -130,8 +130,14 @@ def repair_cmd(ctx: click.Context, system_python: str | None) -> None:
 @click.command("uninstall")
 @click.option("--yes", is_flag=True, help="Remove without prompting.")
 @click.option("--wait-for-pid", type=int, default=None, hidden=True)
+@click.option("--stage-for-pid", type=int, default=None, hidden=True)
 @click.pass_context
-def uninstall_cmd(ctx: click.Context, yes: bool, wait_for_pid: int | None) -> None:
+def uninstall_cmd(
+    ctx: click.Context,
+    yes: bool,
+    wait_for_pid: int | None,
+    stage_for_pid: int | None,
+) -> None:
     """Remove ROMCloud runtime/integration while preserving recoverable data."""
     click.echo(
         "This removes ROMCloud runtime, launch integration, service, ES overlay, "
@@ -142,6 +148,16 @@ def uninstall_cmd(ctx: click.Context, yes: bool, wait_for_pid: int | None) -> No
         click.echo("Uninstall cancelled.")
         return
     try:
+        if stage_for_pid is not None:
+            from romcloud.lifecycle.handoff import stage_lifecycle_helper
+
+            result = stage_lifecycle_helper(
+                operation="uninstall",
+                config_path=Path(ctx.obj["config_path"]),
+                wait_for_pid=stage_for_pid,
+            )
+            click.echo(f"Staged lifecycle helper ready; result: {result}")
+            return
         _wait_for_handoff(wait_for_pid)
         romcloud_home, config, trusted = _lifecycle_paths(ctx)
         report = manage.uninstall(
@@ -164,8 +180,14 @@ def uninstall_cmd(ctx: click.Context, yes: bool, wait_for_pid: int | None) -> No
 @click.command("purge")
 @click.option("--yes", is_flag=True, help="Purge without prompting.")
 @click.option("--wait-for-pid", type=int, default=None, hidden=True)
+@click.option("--stage-for-pid", type=int, default=None, hidden=True)
 @click.pass_context
-def purge_cmd(ctx: click.Context, yes: bool, wait_for_pid: int | None) -> None:
+def purge_cmd(
+    ctx: click.Context,
+    yes: bool,
+    wait_for_pid: int | None,
+    stage_for_pid: int | None,
+) -> None:
     """Remove ROMCloud and all ROMCloud-owned persistent state."""
     click.echo(
         "This permanently removes ROMCloud runtime, integration, proxies, config, "
@@ -177,6 +199,16 @@ def purge_cmd(ctx: click.Context, yes: bool, wait_for_pid: int | None) -> None:
         click.echo("Purge cancelled.")
         return
     try:
+        if stage_for_pid is not None:
+            from romcloud.lifecycle.handoff import stage_lifecycle_helper
+
+            result = stage_lifecycle_helper(
+                operation="purge",
+                config_path=Path(ctx.obj["config_path"]),
+                wait_for_pid=stage_for_pid,
+            )
+            click.echo(f"Staged lifecycle helper ready; result: {result}")
+            return
         _wait_for_handoff(wait_for_pid)
         romcloud_home, config, trusted = _lifecycle_paths(ctx)
         report = manage.purge(

@@ -513,6 +513,11 @@ def reconcile_install(
         warnings.append("Legacy runtime paths could not be reconciled.")
 
     core = write_core_wrappers(bin_dir, venv_python)
+    # The lifecycle ledger is deletion authority; configuration alone is not.
+    # Record the home only after the required wrappers were written exactly.
+    from romcloud.infrastructure.ownership import record_owned_roots
+
+    record_owned_roots(romcloud_home, {"home": romcloud_home})
     google_oauth = reconcile_google_oauth_metadata(
         romcloud_home=romcloud_home,
         project_root=project_root,

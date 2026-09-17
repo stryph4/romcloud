@@ -30,7 +30,13 @@ from romcloud.integrations.batocera.game_access import (
     reconcile_game_access,
     set_operating_mode,
 )
-from romcloud.services.library_sync import OWNERSHIP_TAG, library_id_for_game
+from romcloud.services.library_sync import (
+    CANONICAL_FILENAME,
+    LOCAL_MEDIA_DIR,
+    OWNERSHIP_TAG,
+    SCHEMA_VERSION,
+    library_id_for_game,
+)
 from romcloud.core.models.librarysync import LibrarySyncReport
 
 
@@ -151,6 +157,71 @@ def _stub_mode_frontend(monkeypatch) -> None:  # noqa: ANN001
         "romcloud.integrations.batocera.game_access._migrate_legacy_direct_saves",
         lambda *_args, **_kwargs: None,
     )
+
+
+@pytest.mark.parametrize("unsafe_system", ["../escape", "/absolute/system"])
+def test_media_purge_rejects_unsafe_canonical_system_paths(
+    tmp_path: Path, unsafe_system: str
+) -> None:
+    config = _config(tmp_path)
+    blob = b"owned-looking"
+    digest = hashlib.sha256(blob).hexdigest()
+    outside = tmp_path / "outside" / LOCAL_MEDIA_DIR / digest[:2] / digest
+    outside.parent.mkdir(parents=True)
+    outside.write_bytes(blob)
+    canonical = Path(config.data_path) / "library" / CANONICAL_FILENAME
+    canonical.parent.mkdir(parents=True)
+    canonical.write_text(
+        json.dumps(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "records": {
+                    "bad": {
+                        "system": unsafe_system,
+                        "media": {"image": {"sha256": digest, "size": len(blob), "suffix": ""}},
+                    }
+                },
+            }
+        )
+    )
+
+    removed, warnings = Container(config).library_sync.remove_owned_local_media()
+
+    assert removed == 0
+    assert outside.read_bytes() == blob
+    assert any("unsafe canonical system" in item for item in warnings)
+
+
+def test_media_purge_rejects_symlinked_system_escape(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    blob = b"owned-looking"
+    digest = hashlib.sha256(blob).hexdigest()
+    outside_system = tmp_path / "outside-system"
+    target = outside_system / LOCAL_MEDIA_DIR / digest[:2] / digest
+    target.parent.mkdir(parents=True)
+    target.write_bytes(blob)
+    (Path(config.local_roms_path) / "evil").symlink_to(outside_system, target_is_directory=True)
+    canonical = Path(config.data_path) / "library" / CANONICAL_FILENAME
+    canonical.parent.mkdir(parents=True)
+    canonical.write_text(
+        json.dumps(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "records": {
+                    "bad": {
+                        "system": "evil",
+                        "media": {"image": {"sha256": digest, "size": len(blob), "suffix": ""}},
+                    }
+                },
+            }
+        )
+    )
+
+    removed, warnings = Container(config).library_sync.remove_owned_local_media()
+
+    assert removed == 0
+    assert target.read_bytes() == blob
+    assert any("symlinked system" in item for item in warnings)
 
 
 def test_opt_in_disabled_does_no_library_work(tmp_path: Path):
