@@ -33,7 +33,7 @@ def _fake_config(
 ):
     home = Path(romcloud_home)
     return SimpleNamespace(
-        source=SimpleNamespace(rom_root=rom_root),
+        source=SimpleNamespace(provider="local", rom_root=rom_root),
         smb=smb,
         credentials_path=home / "config" / "credentials.toml",
         data_path=str(home / "data"),
@@ -519,7 +519,8 @@ class TestInstall:
         monkeypatch.setattr(
             mount_cmd_module.mount_service,
             "install_service",
-            lambda romcloud_bin: captured.setdefault("bin", romcloud_bin) or Path("/svc/romcloud_mount"),
+            lambda romcloud_bin, **_kwargs: captured.setdefault("bin", romcloud_bin)
+            or Path("/svc/romcloud_mount"),
         )
 
         result = _invoke(["install"], _fake_config(smb=_fake_smb(), romcloud_home="/opt/romcloud"))

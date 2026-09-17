@@ -523,7 +523,7 @@ class TestRefresh:
         monkeypatch.setattr(
             es_config,
             "install",
-            lambda systems: type(
+            lambda systems, **_kwargs: type(
                 "Result", (), {"included_systems": [], "missing_systems": []}
             )(),
         )
