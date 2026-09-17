@@ -942,6 +942,8 @@ def _inspect_presentation(ctx: DiagnosticContext, findings: list[TroubleshootFin
 def _inspect_direct_presentation(
     ctx: DiagnosticContext, findings: list[TroubleshootFinding]
 ) -> None:
+    from romcloud.integrations.batocera.proxy_ownership import is_within
+
     manifest = Path(ctx.config.data_path) / "direct-links.json"
     if not manifest.exists():
         findings.append(_finding("presentation.direct_manifest", "presentation", "warning", "Direct-link ownership manifest is missing.", detail=str(manifest)))
@@ -970,12 +972,33 @@ def _inspect_direct_presentation(
             links = payload.get("links", [])
             missing_links: list[dict[str, str]] = []
             conflicts: list[str] = []
+            unauthorized: list[str] = []
+            unavailable: list[str] = []
+            expected = _expected_direct_pairs(ctx)
+            local_root = Path(ctx.config.local_roms_path)
+            source_root = Path(ctx.config.source.rom_root)
             for record in links:
                 path = Path(record["path"])
-                if not path.exists() and not path.is_symlink():
+                target = Path(record["target"])
+                pair = (_path_key(path), _path_key(target))
+                if pair not in expected:
+                    unauthorized.append(str(path))
+                    continue
+                system_dir = path.parent
+                authorized = (
+                    system_dir.is_dir()
+                    and not system_dir.is_symlink()
+                    and target.is_dir()
+                    and not target.is_symlink()
+                    and is_within(path, local_root)
+                    and is_within(target, source_root)
+                )
+                if not path.exists() and not path.is_symlink() and authorized:
                     missing_links.append(
                         {"path": str(path), "target": str(record["target"])}
                     )
+                elif not path.exists() and not path.is_symlink():
+                    unavailable.append(str(path))
                 elif not path.is_symlink():
                     conflicts.append(str(path))
                 else:
@@ -988,8 +1011,101 @@ def _inspect_direct_presentation(
                         conflicts.append(str(path))
             if conflicts:
                 findings.append(_finding("presentation.direct_link_foreign", "presentation", "error", "One or more Direct destinations are foreign or have the wrong target.", detail="; ".join(conflicts[:10])))
+            if unauthorized:
+                findings.append(_finding("presentation.direct_link_unauthorized", "presentation", "warning", "One or more Direct manifest records are stale or outside the currently managed path set.", detail="; ".join(unauthorized[:10])))
+            if unavailable:
+                findings.append(_finding("presentation.direct_link_unavailable", "presentation", "warning", "One or more owned Direct links cannot be restored because their user-owned system directory or source directory is unavailable.", detail="; ".join(unavailable[:10])))
             if missing_links:
                 findings.append(_finding("presentation.direct_link_missing", "presentation", "warning", f"{len(missing_links)} owned Direct link(s) are missing.", detail="; ".join(item["path"] for item in missing_links[:10]), fixability="conditional", blocked_by=ctx.activity.blockers("game"), metadata={"links": missing_links}))
+
+
+def _path_key(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _expected_direct_pairs(ctx: DiagnosticContext) -> set[tuple[str, str]]:
+    local_root = Path(ctx.config.local_roms_path)
+    source_root = Path(ctx.config.source.rom_root)
+    return {
+        (
+            _path_key(local_root / system / "ROMCloud"),
+            _path_key(source_root / system),
+        )
+        for system in ctx.managed_systems
+    }
+
+
+def _cached_member_size(path: Path) -> int:
+    if path.is_file():
+        return path.stat().st_size
+    return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+
+
+def _valid_cached_game_ids_read_only(
+    ctx: DiagnosticContext, conn: sqlite3.Connection
+) -> set[str]:
+    """Mirror CacheService's playable-cache rule without repositories/writes."""
+
+    from romcloud.core.cache_paths import resolve_cache_path
+    from romcloud.core.exceptions import CacheError
+
+    selected = ctx.config.source.selected_systems
+    rows = tuple(
+        conn.execute(
+            "SELECT c.game_id, c.cache_path, g.system "
+            "FROM cache_entries c JOIN games g ON g.id = c.game_id "
+            "WHERE c.status = 'complete' AND c.membership_resolved = 1 "
+            "AND g.is_eligible = 1 ORDER BY c.game_id"
+        )
+    )
+    valid: set[str] = set()
+    cache_root = Path(ctx.config.cache.path)
+    for row in rows:
+        game_id = str(row[0])
+        cache_path = Path(str(row[1]))
+        system = str(row[2])
+        if selected is not None and system not in selected:
+            continue
+        members = tuple(
+            conn.execute(
+                "SELECT relative_path, expected_size, is_primary "
+                "FROM cache_members WHERE game_id = ? "
+                "ORDER BY is_primary DESC, relative_path",
+                (game_id,),
+            )
+        )
+        if not members or not any(bool(member[2]) for member in members):
+            continue
+        playable = True
+        for member in members:
+            relative_path = str(member[0])
+            try:
+                direct = resolve_cache_path(cache_root, system, relative_path)
+            except CacheError:
+                playable = False
+                break
+            member_path = direct
+            if not direct.exists() and cache_path.is_dir():
+                nested = cache_path / Path(relative_path).name
+                if nested.exists():
+                    member_path = nested
+            if not member_path.exists() or member_path.is_symlink():
+                playable = False
+                break
+            expected_size = member[1]
+            if expected_size is not None:
+                try:
+                    actual_size = _cached_member_size(member_path)
+                    expected_size = int(expected_size)
+                except (OSError, TypeError, ValueError):
+                    playable = False
+                    break
+                if actual_size != expected_size:
+                    playable = False
+                    break
+        if playable:
+            valid.add(game_id)
+    return valid
 
 
 def _inspect_proxy_presentation(
@@ -1002,29 +1118,35 @@ def _inspect_proxy_presentation(
     missing: list[tuple[str, str]] = []
     foreign: list[str] = []
     from romcloud.integrations.batocera.proxy_ownership import proxy_payload
-    cache_clause = (
-        "AND EXISTS (SELECT 1 FROM cache_entries c "
-        "WHERE c.game_id = g.id AND c.status = 'complete')"
-        if offline
-        else ""
-    )
     try:
         with _open_sqlite_read_only(catalog) as conn:
-            records = tuple(
+            playable_ids = (
+                _valid_cached_game_ids_read_only(ctx, conn) if offline else None
+            )
+            all_records = tuple(
                 conn.execute(
                     "SELECT p.game_id, p.proxy_path FROM proxy_records p "
                     "JOIN games g ON g.id = p.game_id "
-                    f"WHERE g.is_eligible = 1 {cache_clause} "
+                    "WHERE g.is_eligible = 1 "
                     "ORDER BY p.proxy_path"
                 )
             )
-            unregistered = int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM games g "
-                    "LEFT JOIN proxy_records p ON p.game_id = g.id "
-                    f"WHERE g.is_eligible = 1 AND p.game_id IS NULL {cache_clause}"
-                ).fetchone()[0]
+            records = tuple(
+                record
+                for record in all_records
+                if playable_ids is None or str(record[0]) in playable_ids
             )
+            if playable_ids is None:
+                unregistered = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM games g "
+                        "LEFT JOIN proxy_records p ON p.game_id = g.id "
+                        "WHERE g.is_eligible = 1 AND p.game_id IS NULL"
+                    ).fetchone()[0]
+                )
+            else:
+                registered = {str(record[0]) for record in all_records}
+                unregistered = len(playable_ids - registered)
     except sqlite3.Error as exc:
         findings.append(_finding("presentation.proxies", "presentation", "error", "Proxy ownership records are inaccessible.", detail=str(exc)))
         return
@@ -1369,6 +1491,9 @@ def _restore_diagnosed_proxies(
     changed = False
     local_root = Path(ctx.config.local_roms_path)
     with _open_sqlite_read_only(catalog_path) as conn:
+        playable_ids = (
+            _valid_cached_game_ids_read_only(ctx, conn) if offline else None
+        )
         for game_id in sorted(game_ids):
             row = conn.execute(
                 "SELECT p.proxy_path, g.title, g.system, g.source_provider, "
@@ -1378,14 +1503,8 @@ def _restore_diagnosed_proxies(
             ).fetchone()
             if row is None or not bool(row[5]):
                 continue
-            if offline:
-                cached = conn.execute(
-                    "SELECT 1 FROM cache_entries "
-                    "WHERE game_id = ? AND status = 'complete'",
-                    (game_id,),
-                ).fetchone()
-                if cached is None:
-                    continue
+            if playable_ids is not None and game_id not in playable_ids:
+                continue
             path = Path(str(row[0]))
             if path.exists() or path.is_symlink() or not is_within(path, local_root):
                 continue
@@ -1460,25 +1579,35 @@ def _restore_diagnosed_direct_links(
     }
     local_root = Path(ctx.config.local_roms_path)
     source_root = Path(ctx.config.source.rom_root)
+    expected = {
+        (
+            _path_key(local_root / system / "ROMCloud"),
+            _path_key(source_root / system),
+        )
+        for system in catalog.managed_systems
+    }
     changed = False
     for record in records:
         pair = (str(record.get("path", "")), str(record.get("target", "")))
         if pair not in manifest_records:
             continue
         path, target = map(Path, pair)
+        normalized_pair = (_path_key(path), _path_key(target))
+        system_dir = path.parent
         if (
-            path.exists()
+            normalized_pair not in expected
+            or path.exists()
             or path.is_symlink()
-            or not target.exists()
+            or not system_dir.is_dir()
+            or system_dir.is_symlink()
+            or not target.is_dir()
+            or target.is_symlink()
             or not is_within(path, local_root)
             or not is_within(target, source_root)
         ):
             continue
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.parent.is_symlink():
-            continue
         try:
-            path.symlink_to(target, target_is_directory=target.is_dir())
+            path.symlink_to(target, target_is_directory=True)
         except FileExistsError:
             continue
         changed = True
