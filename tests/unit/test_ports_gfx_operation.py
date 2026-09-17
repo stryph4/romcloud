@@ -228,3 +228,35 @@ class TestCancellationAndDeadlines:
         runner.cancel()
 
         assert calls == [(4242, signal.SIGTERM)]
+
+    @pytest.mark.skipif(os.name != "posix", reason="direct PID signaling is POSIX")
+    def test_cooperative_cancel_signals_only_the_top_level_process(self, monkeypatch):
+        direct_calls = []
+        group_calls = []
+
+        class FakeProcess:
+            pid = 4242
+            stdout = None
+            stderr = None
+            returncode = None
+
+        monkeypatch.setattr(
+            "ports_gfx.operation.os.kill",
+            lambda pid, sig: direct_calls.append((pid, sig)),
+        )
+        monkeypatch.setattr(
+            "ports_gfx.operation.os.killpg",
+            lambda pgid, sig: group_calls.append((pgid, sig)),
+        )
+        runner = OperationRunner(
+            ["romcloud", "uidata", "troubleshoot-fix"],
+            popen=lambda *a, **k: FakeProcess(),
+        )
+        runner.start()
+
+        runner.request_cancel()
+
+        assert direct_calls == [(4242, signal.SIGTERM)]
+        assert group_calls == []
+        assert runner.cancel_requested is True
+        assert runner.state == OperationState.RUNNING

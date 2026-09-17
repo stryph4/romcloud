@@ -104,15 +104,30 @@ class TroubleshootReport:
 
     @property
     def es_restart_required(self) -> bool:
-        return any(item.restart_required.emulationstation for item in self.findings)
+        return self.mode == "quick_repair" and any(
+            item.restart_required.emulationstation
+            and item.fix.succeeded is True
+            and item.fix.changed
+            for item in self.findings
+        )
 
     @property
     def service_restart_required(self) -> bool:
-        return any(item.restart_required.service for item in self.findings)
+        return self.mode == "quick_repair" and any(
+            item.restart_required.service
+            and item.fix.succeeded is True
+            and item.fix.changed
+            for item in self.findings
+        )
 
     @property
     def gui_relaunch_required(self) -> bool:
-        return any(item.restart_required.gui for item in self.findings)
+        return self.mode == "quick_repair" and any(
+            item.restart_required.gui
+            and item.fix.succeeded is True
+            and item.fix.changed
+            for item in self.findings
+        )
 
     def as_dict(self) -> dict[str, Any]:
         return {

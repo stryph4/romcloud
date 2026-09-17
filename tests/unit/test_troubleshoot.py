@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 from click.testing import CliRunner
 
 from romcloud.core.models.troubleshoot import TroubleshootFinding, TroubleshootReport
+from romcloud.core.capabilities import OperatingMode
 from romcloud.infrastructure.config import (
     AppConfig,
     CacheConfig,
@@ -14,6 +16,8 @@ from romcloud.infrastructure.config import (
     load_config_read_only,
     write_config,
 )
+from romcloud.infrastructure.database import Database
+from romcloud.infrastructure.library_view import write_operating_mode
 from romcloud.troubleshoot import (
     ActivitySnapshot,
     ActivityState,
@@ -130,6 +134,8 @@ def test_corrupt_catalog_is_reported_and_preserved(tmp_path: Path, monkeypatch) 
 
 def test_malformed_direct_manifest_is_not_treated_as_missing(tmp_path: Path, monkeypatch) -> None:
     config_path, config = _install(tmp_path)
+    Database(str(Path(config.data_path) / "catalog.db")).initialize()
+    write_operating_mode(config, OperatingMode.CONNECTED)
     manifest = Path(config.data_path) / "direct-links.json"
     manifest.write_text("{broken", encoding="utf-8")
     monkeypatch.setattr("romcloud.troubleshoot._inspect_browser", lambda *_: None)
@@ -148,6 +154,10 @@ def test_quick_repair_rewrites_owned_core_wrappers_then_second_run_is_noop(tmp_p
     (home / "venv" / "bin").mkdir(parents=True)
     python = home / "venv" / "bin" / "python"
     python.write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        "romcloud.troubleshoot.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stderr=""),
+    )
     monkeypatch.setattr("romcloud.troubleshoot._inspect_browser", lambda *_: None)
 
     first = run_quick_repair(config_path, paths=_paths(tmp_path), activity=_inactive())

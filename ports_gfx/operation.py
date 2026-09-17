@@ -241,7 +241,17 @@ class OperationRunner:
         self._cancel_requested = True
         self._error = reason
         try:
-            self._signal_owned_process(signal.SIGTERM, force=False)
+            # Cooperative Troubleshoot cancellation belongs only to the
+            # top-level CLI process.  Do not broadcast to its process group:
+            # a child performing the current atomic fix must be allowed to
+            # finish before the CLI observes its cancellation token.
+            pid = getattr(self._process, "pid", None)
+            if os.name == "posix" and isinstance(pid, int):
+                os.kill(pid, signal.SIGTERM)
+            else:
+                terminate = getattr(self._process, "terminate", None)
+                if terminate is not None:
+                    terminate()
         except (OSError, ProcessLookupError):
             pass
 

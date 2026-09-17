@@ -101,6 +101,7 @@ from ports_gfx.operation_screen import (
     OperationSpec,
     display_lines,
     handle_operation_event,
+    troubleshoot_result_summary,
     troubleshoot_quick_repair_requested,
     visible_window,
     wrap_lines,
@@ -611,6 +612,9 @@ def operation_summary_message(operation: OperationScreenState) -> tuple[str, str
     Pure function — no pygame — so it is fully unit-tested.
     """
     if operation.succeeded:
+        troubleshoot_summary = troubleshoot_result_summary(operation)
+        if troubleshoot_summary[0]:
+            return troubleshoot_summary
         if hasattr(operation.runner, "lines"):
             result = operation_result(operation.runner)
             warnings = result.data.get("warnings", []) if result.ok else []
@@ -2269,7 +2273,15 @@ def _render_operation(  # noqa: ANN001
         _ERROR_COLOR if state == OperationState.FAILED else _FG_COLOR
     )
     state_y = layout.navigation_rect.y
-    state_label = fonts["body"].render(_STATE_LABELS[state], True, state_color)
+    result_summary, result_kind = troubleshoot_result_summary(operation)
+    state_text = result_summary or _STATE_LABELS[state]
+    if result_summary:
+        state_color = {
+            "success": _SUCCESS_COLOR,
+            "warning": _WARNING_COLOR,
+            "error": _ERROR_COLOR,
+        }.get(result_kind, state_color)
+    state_label = fonts["body"].render(state_text, True, state_color)
     screen.blit(state_label, (layout.safe_area.x, state_y))
 
     output_top = state_y + layout.fonts.body + 12

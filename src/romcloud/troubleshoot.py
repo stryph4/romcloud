@@ -7,8 +7,8 @@ import os
 import sqlite3
 import stat
 import subprocess
-import sys
 import signal
+import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -24,7 +24,11 @@ from romcloud.core.models.troubleshoot import (
 )
 from romcloud.core.progress import ProgressSink, emit_progress
 from romcloud.infrastructure.config import AppConfig, load_config_read_only
-from romcloud.infrastructure.library_view import inspect_operating_mode
+from romcloud.infrastructure.library_view import (
+    OperatingModeInspection,
+    inspect_operating_mode,
+)
+from romcloud.integrations.batocera.system_registry import EffectiveSystemRegistry
 
 
 @dataclass(frozen=True)
@@ -62,6 +66,25 @@ class TroubleshootPaths:
     es_override: Path = Path(
         "/userdata/system/configs/emulationstation/es_systems_romcloud.cfg"
     )
+    es_user_config_dir: Path = Path("/userdata/system/configs/emulationstation")
+    es_system_config_dir: Path = Path("/usr/share/emulationstation")
+    es_legacy_config_dir: Path = Path("/etc/emulationstation")
+
+
+@dataclass(frozen=True)
+class CatalogInspection:
+    """Read-only catalog authorization state for catalog-derived repairs."""
+
+    state: str  # missing, unreadable, corrupt, incompatible, integrity_failed, trusted
+    detail: str = ""
+    version: int | None = None
+    tables: frozenset[str] = frozenset()
+    managed_systems: tuple[str, ...] = ()
+    changed_during_check: bool = False
+
+    @property
+    def trusted(self) -> bool:
+        return self.state == "trusted"
 
 
 @dataclass(frozen=True)
@@ -71,8 +94,21 @@ class DiagnosticContext:
     romcloud_home: Path
     paths: TroubleshootPaths
     activity: ActivitySnapshot
-    catalog_available: bool
-    managed_systems: tuple[str, ...] = ()
+    mode: OperatingModeInspection
+    catalog: CatalogInspection
+    system_registry: EffectiveSystemRegistry | None = None
+    system_registry_error: str = ""
+    secrets: tuple[str, ...] = ()
+
+    @property
+    def catalog_available(self) -> bool:
+        """Compatibility spelling; availability now means explicitly trusted."""
+
+        return self.catalog.trusted
+
+    @property
+    def managed_systems(self) -> tuple[str, ...]:
+        return self.catalog.managed_systems
 
 
 class CancellationToken:
@@ -147,11 +183,34 @@ def _file_matches(path: Path, expected: str) -> bool:
     return content == expected
 
 
+def _sanitize_text(value: object, secrets: Iterable[str] = ()) -> str:
+    """Apply structured redaction plus exact replacement of loaded secrets."""
+
+    from romcloud.core.progress import redact_text
+    from romcloud.infrastructure.diagnostics import redact_metadata
+
+    exact = redact_text(str(value), *tuple(secrets))
+    return str(redact_metadata({"detail": exact}).get("detail", ""))
+
+
+def _sanitize_findings(
+    findings: Iterable[TroubleshootFinding], secrets: Iterable[str]
+) -> list[TroubleshootFinding]:
+    return [
+        replace(
+            finding,
+            message=_sanitize_text(finding.message, secrets),
+            detail=_sanitize_text(finding.detail, secrets),
+        )
+        for finding in findings
+    ]
+
+
 def inspect_activity(config: AppConfig, *, catalog_path: Path) -> ActivitySnapshot:
     """Best-effort snapshot which never creates, removes, or locks a path."""
 
     from romcloud.services.auto_savesync import ActiveSessionStore
-    from romcloud.web.lifecycle import manager_status
+    from romcloud.web.lifecycle import manager_state_path, manager_status
 
     sessions_root = Path(config.data_path) / "savesync-sessions"
     if sessions_root.exists():
@@ -164,10 +223,16 @@ def inspect_activity(config: AppConfig, *, catalog_path: Path) -> ActivitySnapsh
     if catalog_path.is_file():
         try:
             with _open_sqlite_read_only(catalog_path) as conn:
-                row = conn.execute(
+                running = int(conn.execute(
                     "SELECT COUNT(*) FROM download_items WHERE state IN ('running','verifying')"
-                ).fetchone()
-            download = ActivityState("active" if int(row[0]) else "inactive")
+                ).fetchone()[0])
+                reservations = int(
+                    conn.execute("SELECT COUNT(*) FROM cache_reservations").fetchone()[0]
+                )
+            download = ActivityState(
+                "active" if running or reservations else "inactive",
+                f"running={running}; reservations={reservations}",
+            )
         except sqlite3.Error as exc:
             download = ActivityState("unknown", str(exc))
 
@@ -177,14 +242,22 @@ def inspect_activity(config: AppConfig, *, catalog_path: Path) -> ActivitySnapsh
         "unknown", "The Library Sync lock is remote or not configured."
     )
 
-    try:
-        manager = manager_status(config.data_path)
+    manager_marker = manager_state_path(config.data_path)
+    if not manager_marker.is_file() or manager_marker.is_symlink():
         browser = ActivityState(
-            "active" if manager.get("running") else "inactive",
-            "Owned manager endpoint is reachable." if manager.get("running") else "",
+            "unknown", "No authoritative browser-manager marker exists."
         )
-    except Exception as exc:  # noqa: BLE001 - diagnostic isolation
-        browser = ActivityState("unknown", str(exc))
+    else:
+        try:
+            manager = manager_status(config.data_path)
+            browser = ActivityState(
+                "active" if manager.get("running") else "inactive",
+                "Owned manager endpoint is reachable."
+                if manager.get("running")
+                else "Owned manager marker is present but not active.",
+            )
+        except Exception as exc:  # noqa: BLE001 - diagnostic isolation
+            browser = ActivityState("unknown", str(exc))
 
     return ActivitySnapshot(
         game=game,
@@ -238,12 +311,95 @@ def _local_library_lock(config: AppConfig) -> Path | None:
 
 
 def _open_sqlite_read_only(path: Path) -> sqlite3.Connection:
-    # immutable=1 prevents SQLite from creating WAL/SHM sidecars. Diagnostics
-    # prefer a conservative snapshot over changing the database directory.
+    # ``immutable=1`` is deliberately not used: it ignores committed rows that
+    # are still resident in an existing WAL.  URI read-only mode plus
+    # ``query_only`` sees the live committed snapshot without authorizing any
+    # database-content mutation. SQLite may consult existing WAL/SHM sidecars.
     uri_path = quote(path.resolve(strict=False).as_posix(), safe="/:")
-    conn = sqlite3.connect(f"file:{uri_path}?mode=ro&immutable=1", uri=True)
+    conn = sqlite3.connect(f"file:{uri_path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only = ON")
     return conn
+
+
+def _inspect_catalog(path: Path) -> CatalogInspection:
+    """Establish whether catalog contents are safe to use as repair authority."""
+
+    from romcloud.infrastructure.database import _CURRENT_SCHEMA_VERSION
+
+    required = frozenset(
+        {
+            "games",
+            "game_assets",
+            "cache_entries",
+            "proxy_records",
+            "download_items",
+            "cache_staging_assets",
+            "cache_reservations",
+        }
+    )
+    if not path.is_file():
+        return CatalogInspection("missing", detail=str(path))
+    try:
+        before = path.stat()
+        with _open_sqlite_read_only(path) as conn:
+            quick = str(conn.execute("PRAGMA quick_check").fetchone()[0])
+            if quick != "ok":
+                return CatalogInspection("integrity_failed", detail=quick)
+            foreign = conn.execute("PRAGMA foreign_key_check").fetchmany(20)
+            if foreign:
+                return CatalogInspection(
+                    "integrity_failed",
+                    detail=f"foreign_key_rows={len(foreign)}",
+                )
+            tables = frozenset(
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            )
+            if "schema_version" not in tables:
+                return CatalogInspection(
+                    "incompatible", detail="schema_version table is missing", tables=tables
+                )
+            row = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
+            version = int(row[0]) if row is not None else None
+            if version != _CURRENT_SCHEMA_VERSION or not required.issubset(tables):
+                return CatalogInspection(
+                    "incompatible",
+                    detail=(
+                        f"found version={version!r}; expected={_CURRENT_SCHEMA_VERSION}; "
+                        f"missing tables={sorted(required - tables)}"
+                    ),
+                    version=version,
+                    tables=tables,
+                )
+            systems = tuple(
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT DISTINCT system FROM games "
+                    "WHERE is_eligible=1 ORDER BY system"
+                )
+            )
+        after = path.stat()
+    except (sqlite3.DatabaseError, OSError, TypeError, ValueError) as exc:
+        detail = str(exc)
+        corrupt = isinstance(exc, sqlite3.DatabaseError) and any(
+            marker in detail.casefold()
+            for marker in ("malformed", "not a database", "file is encrypted")
+        )
+        return CatalogInspection("corrupt" if corrupt else "unreadable", detail=detail)
+    changed = (before.st_size, before.st_mtime_ns) != (
+        after.st_size,
+        after.st_mtime_ns,
+    )
+    return CatalogInspection(
+        "trusted",
+        version=version,
+        tables=tables,
+        managed_systems=systems,
+        changed_during_check=changed,
+    )
 
 
 def collect_diagnostics(
@@ -274,20 +430,38 @@ def collect_diagnostics(
         return TroubleshootReport(tuple(findings)), None
     findings.append(_finding("config.parse", "configuration", "healthy", "ROMCloud configuration parses successfully."))
 
-    _inspect_credentials(config, findings)
+    secrets = _inspect_credentials(config, findings)
     home = config_path.parent.parent
     catalog_path = Path(config.data_path) / "catalog.db"
+    catalog = _inspect_catalog(catalog_path)
+    mode = inspect_operating_mode(config)
     snapshot = activity or inspect_activity(config, catalog_path=catalog_path)
+    registry = None
+    registry_error = ""
+    if catalog.trusted and mode.state == "valid":
+        from romcloud.integrations.batocera.system_registry import (
+            inspect_live_system_registry,
+        )
+
+        try:
+            registry = inspect_live_system_registry(
+                user_config_dir=selected_paths.es_user_config_dir,
+                system_config_dir=selected_paths.es_system_config_dir,
+                legacy_config_dir=selected_paths.es_legacy_config_dir,
+            )
+        except Exception as exc:  # noqa: BLE001 - uncertainty is an ES finding
+            registry_error = _sanitize_text(exc, secrets)
     context = DiagnosticContext(
         config_path=config_path,
         config=config,
         romcloud_home=home,
         paths=selected_paths,
         activity=snapshot,
-        catalog_available=catalog_path.is_file(),
-        managed_systems=(
-            _managed_systems_read_only(catalog_path) if catalog_path.is_file() else ()
-        ),
+        mode=mode,
+        catalog=catalog,
+        system_registry=registry,
+        system_registry_error=registry_error,
+        secrets=secrets,
     )
 
     collectors: tuple[tuple[str, Callable[[DiagnosticContext, list[TroubleshootFinding]], None]], ...] = (
@@ -323,7 +497,8 @@ def collect_diagnostics(
         try:
             collector(context, findings)
         except Exception as exc:  # noqa: BLE001 - isolate every subsystem
-            findings.append(_finding(f"{stage}.inspection", stage, "error", f"{stage.replace('-', ' ').title()} inspection failed.", detail=str(exc)))
+            findings.append(_finding(f"{stage}.inspection", stage, "error", f"{stage.replace('-', ' ').title()} inspection failed.", detail=_sanitize_text(exc, secrets)))
+    findings = _sanitize_findings(findings, secrets)
     for finding in findings:
         emit_progress(
             progress,
@@ -337,7 +512,9 @@ def collect_diagnostics(
     return TroubleshootReport(tuple(findings), cancelled=was_cancelled), context
 
 
-def _inspect_credentials(config: AppConfig, findings: list[TroubleshootFinding]) -> None:
+def _inspect_credentials(
+    config: AppConfig, findings: list[TroubleshootFinding]
+) -> tuple[str, ...]:
     from romcloud.infrastructure.credentials import (
         credential_lock_state,
         load_remote_data_sftp_password,
@@ -357,15 +534,20 @@ def _inspect_credentials(config: AppConfig, findings: list[TroubleshootFinding])
         requirements.append(("remote_data_sftp", "remote-data SFTP", load_remote_data_sftp_password))
     if not requirements:
         findings.append(_finding("credentials.references", "security", "healthy", "No password credential references are required."))
-        return
+        return ()
     missing: list[str] = []
     locked: list[str] = []
+    secrets: list[str] = []
     for section, label, loader in requirements:
         state = credential_lock_state(config.credentials_path, section)
         if state == "locked":
             locked.append(label)
-        elif loader(config.credentials_path) is None:
-            missing.append(label)
+        else:
+            value = loader(config.credentials_path)
+            if value is None:
+                missing.append(label)
+            else:
+                secrets.append(value)
     if missing or locked:
         detail = "; ".join(filter(None, (
             f"missing: {', '.join(missing)}" if missing else "",
@@ -382,6 +564,7 @@ def _inspect_credentials(config: AppConfig, findings: list[TroubleshootFinding])
         else:
             private = os.name == "nt" or not bool(permissions & 0o077)
             findings.append(_finding("credentials.permissions", "security", "healthy" if private else "warning", "Credential-store permissions are restricted." if private else "Credential-store permissions allow group or other access.", detail=f"mode={permissions:o}", fixability="confirmation" if not private else "none"))
+    return tuple(secrets)
 
 
 def _inspect_runtime(ctx: DiagnosticContext, findings: list[TroubleshootFinding]) -> None:
@@ -428,7 +611,7 @@ def _inspect_runtime(ctx: DiagnosticContext, findings: list[TroubleshootFinding]
     )
     for finding_id, path, expected, label in wrappers:
         okay = _file_matches(path, expected)
-        findings.append(_finding(finding_id, "runtime", "healthy" if okay else "warning", f"{label} is current." if okay else f"{label} is missing or stale.", detail=str(path), fixability="automatic", metadata={"path": str(path)}))
+        findings.append(_finding(finding_id, "runtime", "healthy" if okay else "warning", f"{label} is current." if okay else f"{label} is missing or stale.", detail=str(path), fixability="automatic" if python_ok else "confirmation", blocked_by=() if python_ok else ("runtime:broken",), metadata={"path": str(path)}))
 
     for finding_id, name, label in (
         ("runtime.graphical_wrapper", "romcloud-ports", "Graphical Ports wrapper"),
@@ -446,7 +629,7 @@ def _inspect_runtime(ctx: DiagnosticContext, findings: list[TroubleshootFinding]
 
 
 def _inspect_mode(ctx: DiagnosticContext, findings: list[TroubleshootFinding]) -> None:
-    inspected = inspect_operating_mode(ctx.config)
+    inspected = ctx.mode
     if inspected.state == "valid":
         findings.append(_finding("operating_mode.state", "operating-mode", "healthy", f"Operating-mode state is valid ({inspected.mode.value})."))
     else:
@@ -459,31 +642,54 @@ def _inspect_mode(ctx: DiagnosticContext, findings: list[TroubleshootFinding]) -
 
 
 def _inspect_database(ctx: DiagnosticContext, findings: list[TroubleshootFinding]) -> None:
-    from romcloud.infrastructure.database import _CURRENT_SCHEMA_VERSION
-
     path = Path(ctx.config.data_path) / "catalog.db"
-    if not path.is_file():
+    catalog = ctx.catalog
+    if catalog.state == "missing":
         findings.append(_finding("database.catalog", "database", "error", "The expected catalog database is missing.", detail=str(path)))
         findings.append(_finding("database.presentation_gate", "database", "skipped", "Presentation diagnostics were gated because the catalog is missing.", detail="No database was created."))
         return
-    before = path.stat()
-    try:
-        with _open_sqlite_read_only(path) as conn:
-            quick = str(conn.execute("PRAGMA quick_check").fetchone()[0])
-            foreign = conn.execute("PRAGMA foreign_key_check").fetchmany(20)
-            row = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
-            version = int(row[0]) if row is not None else None
-            tables = {str(item[0]) for item in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            required = {"games", "game_assets", "cache_entries", "proxy_records", "download_items", "cache_staging_assets", "cache_reservations"}
-    except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
-        findings.append(_finding("database.catalog", "database", "error", "The catalog database cannot be opened read-only.", detail=str(exc)))
+    if not catalog.trusted:
+        messages = {
+            "unreadable": "The catalog database cannot be opened read-only.",
+            "corrupt": "The catalog database is corrupt.",
+            "incompatible": "The catalog schema is incompatible with this ROMCloud build.",
+            "integrity_failed": "Catalog integrity checks failed.",
+        }
+        findings.append(
+            _finding(
+                "database.catalog",
+                "database",
+                "error",
+                messages.get(catalog.state, "The catalog database is not trusted."),
+                detail=catalog.detail,
+            )
+        )
+        findings.append(
+            _finding(
+                "database.presentation_gate",
+                "database",
+                "skipped",
+                "Catalog-derived diagnostics and repairs were gated.",
+                detail=f"catalog trust state={catalog.state}",
+            )
+        )
+        if catalog.state == "incompatible":
+            findings.append(
+                _finding(
+                    "database.schema",
+                    "database",
+                    "warning",
+                    "Catalog schema migration or a compatible ROMCloud build is required.",
+                    detail=catalog.detail,
+                    fixability="confirmation",
+                    blocked_by=ctx.activity.blockers("download", "browser_manager"),
+                )
+            )
         return
-    after = path.stat()
     findings.append(_finding("database.catalog", "database", "healthy", "The catalog database opens read-only."))
-    findings.append(_finding("database.integrity", "database", "healthy" if quick == "ok" and not foreign else "error", "Catalog integrity checks passed." if quick == "ok" and not foreign else "Catalog integrity checks failed.", detail="" if quick == "ok" and not foreign else f"quick_check={quick}; foreign_key_rows={len(foreign)}"))
-    schema_ok = version == _CURRENT_SCHEMA_VERSION and required.issubset(tables)
-    findings.append(_finding("database.schema", "database", "healthy" if schema_ok else "warning", "Catalog schema is current." if schema_ok else "Catalog schema is missing tables or needs migration.", detail=f"found version={version!r}; expected={_CURRENT_SCHEMA_VERSION}", fixability="confirmation" if version is not None and version < _CURRENT_SCHEMA_VERSION else "none", blocked_by=ctx.activity.blockers("download", "browser_manager")))
-    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+    findings.append(_finding("database.integrity", "database", "healthy", "Catalog integrity checks passed."))
+    findings.append(_finding("database.schema", "database", "healthy", "Catalog schema is current.", detail=f"version={catalog.version}"))
+    if catalog.changed_during_check:
         findings.append(_finding("database.read_only_invariant", "database", "error", "Database metadata changed during diagnostics."))
     _inspect_download_tables(path, findings)
 
@@ -498,14 +704,6 @@ def _inspect_download_tables(path: Path, findings: list[TroubleshootFinding]) ->
         findings.append(_finding("download.state", "download", "error", "Download Manager durable state is inaccessible.", detail=str(exc)))
         return
     findings.append(_finding("download.state", "download", "healthy", "Download Manager durable tables are readable.", detail=f"states={counts}; staging={staging}; reservations={reservations}"))
-
-
-def _managed_systems_read_only(path: Path) -> tuple[str, ...]:
-    try:
-        with _open_sqlite_read_only(path) as conn:
-            return tuple(str(row[0]) for row in conn.execute("SELECT DISTINCT system FROM games WHERE is_eligible=1 ORDER BY system"))
-    except sqlite3.Error:
-        return ()
 
 
 def _inspect_connectivity(ctx: DiagnosticContext, findings: list[TroubleshootFinding]) -> None:
@@ -528,6 +726,17 @@ def _inspect_provider_role(ctx: DiagnosticContext, role: str, provider_id: str, 
 
     finding_id = f"{role}.connectivity"
     try:
+        if provider_id == "google_drive":
+            findings.append(
+                _finding(
+                    finding_id,
+                    "provider",
+                    "healthy",
+                    f"{role.replace('_', ' ').title()} Google Drive support is not active in this beta.",
+                    detail="No local-path or writable capability was assumed.",
+                )
+            )
+            return
         if provider_id == "sftp":
             sftp_cfg = ctx.config.sftp if role == "source" else ctx.config.remote_data.sftp
             if sftp_cfg is None:
@@ -546,13 +755,38 @@ def _inspect_provider_role(ctx: DiagnosticContext, role: str, provider_id: str, 
             if result.readable:
                 findings.append(_finding(finding_id, "provider", "healthy", f"{role.replace('_', ' ').title()} SFTP location is readable.", detail="SFTP is intentionally read-only; no write probe was performed."))
             else:
-                findings.append(_finding(finding_id, "provider", "error", f"{role.replace('_', ' ').title()} SFTP location is unavailable.", detail=result.detail))
+                kind = _provider_failure_kind(result.detail)
+                findings.append(_finding(finding_id, "provider", "error", f"{role.replace('_', ' ').title()} SFTP {kind} failure.", detail=result.detail, metadata={"failure_kind": kind}))
             return
         provider = LocalFilesystemProvider()
         result = provider.validate_access(root)
-        findings.append(_finding(finding_id, "provider", "healthy" if result.readable else "error", f"{role.replace('_', ' ').title()} location is readable." if result.readable else f"{role.replace('_', ' ').title()} location is unavailable.", detail=result.detail or str(root)))
+        unavailable = (
+            f"{role.replace('_', ' ').title()} SMB path is configured but not mounted or readable."
+            if provider_id == "smb"
+            else f"{role.replace('_', ' ').title()} local path is unavailable."
+        )
+        findings.append(_finding(finding_id, "provider", "healthy" if result.readable else "error", f"{role.replace('_', ' ').title()} location is readable." if result.readable else unavailable, detail=result.detail or str(root)))
     except Exception as exc:  # noqa: BLE001 - auth/trust/connectivity become findings
-        findings.append(_finding(finding_id, "provider", "error", f"{role.replace('_', ' ').title()} provider validation failed.", detail=str(exc)))
+        detail = _sanitize_text(exc, ctx.secrets)
+        kind = _provider_failure_kind(detail)
+        findings.append(_finding(finding_id, "provider", "error", f"{role.replace('_', ' ').title()} provider {kind} failure.", detail=detail, metadata={"failure_kind": kind}))
+
+
+def _provider_failure_kind(detail: str) -> str:
+    text = str(detail).casefold()
+    if "host key" in text and any(word in text for word in ("mismatch", "changed", "does not match")):
+        return "host-key-mismatch"
+    if "host key" in text or "fingerprint" in text:
+        return "host-key-unknown"
+    if any(word in text for word in ("authentication", "auth failed", "permission denied (publickey")):
+        return "authentication"
+    if any(word in text for word in ("timed out", "timeout", "unreachable", "refused", "resolve")):
+        return "unreachable"
+    if any(word in text for word in ("does not exist", "not found", "missing root")):
+        return "missing-root"
+    if any(word in text for word in ("permission", "read access denied")):
+        return "read-permission"
+    return "connectivity"
 
 
 def _inspect_mounts(ctx: DiagnosticContext, findings: list[TroubleshootFinding]) -> None:
@@ -562,20 +796,23 @@ def _inspect_mounts(ctx: DiagnosticContext, findings: list[TroubleshootFinding])
     targets = mount_worker.configured_mounts(ctx.config, resolve_paths=False)
     if not targets:
         findings.append(_finding("mount.integration", "mount", "healthy", "No SMB mount integration is required."))
-        return
-    ready = all(mount_worker._configured_mount_is_ready(target) for target in targets)
-    blockers = ctx.activity.blockers("game", "download", "savesync", "library_sync")
-    findings.append(_finding("mount.integration", "mount", "healthy" if ready else "warning", "Configured SMB locations are mounted." if ready else "One or more configured SMB locations are not mounted.", fixability="conditional", blocked_by=blockers))
-    lock = mount_worker.lock_path(ctx.romcloud_home)
-    worker_running = False
-    if lock.is_file() and not lock.is_symlink():
-        try:
-            pid = int(lock.read_text(encoding="ascii").strip())
-            worker_running = mount_worker._pid_alive(pid) and mount_worker._worker_cmdline_matches(pid, proc_root=Path("/proc"))
-        except (OSError, ValueError):
-            worker_running = False
-    worker_needed = not ready and not worker_running
-    findings.append(_finding("mount.worker", "mount", "warning" if worker_needed else "healthy", "The required ROMCloud mount worker is not running." if worker_needed else "Mount worker state is appropriate.", detail=str(lock), fixability="conditional" if worker_needed else "none", blocked_by=blockers))
+    else:
+        ready = all(mount_worker._configured_mount_is_ready(target) for target in targets)
+        blockers = ctx.activity.blockers("game", "download", "savesync", "library_sync")
+        findings.append(_finding("mount.integration", "mount", "healthy" if ready else "warning", "Configured SMB locations are mounted." if ready else "One or more configured SMB locations are not mounted.", fixability="conditional", blocked_by=blockers))
+        lock = mount_worker.lock_path(ctx.romcloud_home)
+        worker_running = False
+        if lock.is_file() and not lock.is_symlink():
+            try:
+                pid = int(lock.read_text(encoding="ascii").strip())
+                worker_running = mount_worker._pid_alive(pid) and mount_worker._worker_cmdline_matches(pid, proc_root=Path("/proc"))
+            except (OSError, ValueError):
+                worker_running = False
+        worker_needed = not ready and not worker_running
+        findings.append(_finding("mount.worker", "mount", "warning" if worker_needed else "healthy", "The required ROMCloud mount worker is not running." if worker_needed else "Mount worker state is appropriate.", detail=str(lock), fixability="conditional" if worker_needed else "none", blocked_by=blockers))
+
+    # The owned boot service also starts the Auto SaveSync resident loop and
+    # Library Manager, so its health is independent of SMB configuration.
     expected = mount_service.generate_service_script(str(ctx.romcloud_home / "bin" / "romcloud"))
     service_current = _file_matches(ctx.paths.mount_service, expected)
     enabled = mount_service.is_service_enabled(config_path=ctx.paths.services_config)
@@ -588,17 +825,18 @@ def _inspect_emulationstation(
     from romcloud.core.capabilities import OperatingMode
     from romcloud.integrations.batocera import es_config
 
-    if not ctx.catalog_available:
+    if not ctx.catalog.trusted:
         findings.append(
             _finding(
                 "es.integration",
                 "emulationstation",
                 "skipped",
-                "EmulationStation reconciliation was gated by the missing catalog.",
+                "EmulationStation reconciliation was gated by an untrusted catalog.",
+                detail=f"catalog trust state={ctx.catalog.state}",
             )
         )
         return
-    mode = inspect_operating_mode(ctx.config)
+    mode = ctx.mode
     if mode.state != "valid":
         findings.append(
             _finding(
@@ -627,14 +865,14 @@ def _inspect_emulationstation(
             )
         )
         return
-    if not ctx.paths.es_stock.is_file():
+    if ctx.system_registry is None:
         findings.append(
             _finding(
                 "es.integration",
                 "emulationstation",
-                "warning",
-                "Batocera's stock EmulationStation registry is unavailable.",
-                detail=str(ctx.paths.es_stock),
+                "skipped",
+                "The effective live EmulationStation registry is not trustworthy.",
+                detail=ctx.system_registry_error,
             )
         )
         return
@@ -643,6 +881,7 @@ def _inspect_emulationstation(
         stock_path=ctx.paths.es_stock,
         override_path=ctx.paths.es_override,
         wrapper_path=ctx.romcloud_home / "bin" / "romcloud-run",
+        system_registry=ctx.system_registry,
     )
     okay = status.wrapper_installed and status.override_exists and status.up_to_date
     findings.append(
@@ -665,6 +904,44 @@ def _inspect_emulationstation(
 
 
 def _inspect_presentation(ctx: DiagnosticContext, findings: list[TroubleshootFinding]) -> None:
+    from romcloud.core.capabilities import OperatingMode
+
+    if ctx.mode.state != "valid" or ctx.mode.mode is None:
+        findings.append(
+            _finding(
+                "presentation.mode_gate",
+                "presentation",
+                "skipped",
+                "Presentation health cannot be evaluated until operating mode is valid.",
+                detail=ctx.mode.detail,
+            )
+        )
+        return
+    if not ctx.catalog.trusted:
+        findings.append(
+            _finding(
+                "presentation.catalog_gate",
+                "presentation",
+                "skipped",
+                "Presentation health cannot authorize repairs from an untrusted catalog.",
+                detail=f"catalog trust state={ctx.catalog.state}",
+            )
+        )
+        return
+
+    if ctx.mode.mode is OperatingMode.CONNECTED:
+        _inspect_direct_presentation(ctx, findings)
+        return
+    _inspect_proxy_presentation(
+        ctx,
+        findings,
+        offline=ctx.mode.mode is OperatingMode.OFFLINE,
+    )
+
+
+def _inspect_direct_presentation(
+    ctx: DiagnosticContext, findings: list[TroubleshootFinding]
+) -> None:
     manifest = Path(ctx.config.data_path) / "direct-links.json"
     if not manifest.exists():
         findings.append(_finding("presentation.direct_manifest", "presentation", "warning", "Direct-link ownership manifest is missing.", detail=str(manifest)))
@@ -674,21 +951,31 @@ def _inspect_presentation(ctx: DiagnosticContext, findings: list[TroubleshootFin
         if content is not None:
             try:
                 payload = json.loads(content)
-                valid = isinstance(payload, dict) and payload.get("version") == 1 and isinstance(payload.get("links"), list)
+                links_value = payload.get("links") if isinstance(payload, dict) else None
+                valid = (
+                    isinstance(payload, dict)
+                    and payload.get("version") == 1
+                    and isinstance(links_value, list)
+                    and all(
+                        isinstance(record, dict)
+                        and isinstance(record.get("path"), str)
+                        and isinstance(record.get("target"), str)
+                        for record in links_value
+                    )
+                )
             except json.JSONDecodeError:
                 pass
         findings.append(_finding("presentation.direct_manifest", "presentation", "healthy" if valid else "error", "Direct-link ownership manifest is valid." if valid else "Direct-link ownership manifest is malformed.", detail=error or str(manifest)))
         if valid:
             links = payload.get("links", [])
-            missing_links: list[str] = []
+            missing_links: list[dict[str, str]] = []
             conflicts: list[str] = []
             for record in links:
-                if not isinstance(record, dict) or not isinstance(record.get("path"), str) or not isinstance(record.get("target"), str):
-                    conflicts.append("invalid manifest record")
-                    continue
                 path = Path(record["path"])
                 if not path.exists() and not path.is_symlink():
-                    missing_links.append(str(path))
+                    missing_links.append(
+                        {"path": str(path), "target": str(record["target"])}
+                    )
                 elif not path.is_symlink():
                     conflicts.append(str(path))
                 else:
@@ -702,17 +989,42 @@ def _inspect_presentation(ctx: DiagnosticContext, findings: list[TroubleshootFin
             if conflicts:
                 findings.append(_finding("presentation.direct_link_foreign", "presentation", "error", "One or more Direct destinations are foreign or have the wrong target.", detail="; ".join(conflicts[:10])))
             if missing_links:
-                findings.append(_finding("presentation.direct_link_missing", "presentation", "warning", f"{len(missing_links)} owned Direct link(s) are missing.", detail="; ".join(missing_links[:10]), fixability="conditional", blocked_by=ctx.activity.blockers("game")))
+                findings.append(_finding("presentation.direct_link_missing", "presentation", "warning", f"{len(missing_links)} owned Direct link(s) are missing.", detail="; ".join(item["path"] for item in missing_links[:10]), fixability="conditional", blocked_by=ctx.activity.blockers("game"), metadata={"links": missing_links}))
 
+
+def _inspect_proxy_presentation(
+    ctx: DiagnosticContext,
+    findings: list[TroubleshootFinding],
+    *,
+    offline: bool,
+) -> None:
     catalog = Path(ctx.config.data_path) / "catalog.db"
-    if not ctx.catalog_available:
-        return
     missing: list[tuple[str, str]] = []
     foreign: list[str] = []
     from romcloud.integrations.batocera.proxy_ownership import proxy_payload
+    cache_clause = (
+        "AND EXISTS (SELECT 1 FROM cache_entries c "
+        "WHERE c.game_id = g.id AND c.status = 'complete')"
+        if offline
+        else ""
+    )
     try:
         with _open_sqlite_read_only(catalog) as conn:
-            records = tuple(conn.execute("SELECT game_id, proxy_path FROM proxy_records ORDER BY proxy_path"))
+            records = tuple(
+                conn.execute(
+                    "SELECT p.game_id, p.proxy_path FROM proxy_records p "
+                    "JOIN games g ON g.id = p.game_id "
+                    f"WHERE g.is_eligible = 1 {cache_clause} "
+                    "ORDER BY p.proxy_path"
+                )
+            )
+            unregistered = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM games g "
+                    "LEFT JOIN proxy_records p ON p.game_id = g.id "
+                    f"WHERE g.is_eligible = 1 AND p.game_id IS NULL {cache_clause}"
+                ).fetchone()[0]
+            )
     except sqlite3.Error as exc:
         findings.append(_finding("presentation.proxies", "presentation", "error", "Proxy ownership records are inaccessible.", detail=str(exc)))
         return
@@ -728,7 +1040,18 @@ def _inspect_presentation(ctx: DiagnosticContext, findings: list[TroubleshootFin
     if missing:
         findings.append(_finding("presentation.proxy_missing", "presentation", "warning", f"{len(missing)} owned proxy file(s) are missing.", detail="; ".join(path for _, path in missing[:10]), fixability="conditional", blocked_by=blockers, metadata={"game_ids": [game_id for game_id, _ in missing]}))
     elif not foreign:
-        findings.append(_finding("presentation.proxies", "presentation", "healthy", "Owned proxy presentation is present."))
+        label = "offline-playable" if offline else "selected"
+        findings.append(_finding("presentation.proxies", "presentation", "healthy", f"Owned proxy presentation is present for {label} games."))
+    if unregistered:
+        findings.append(
+            _finding(
+                "presentation.proxy_unregistered",
+                "presentation",
+                "warning",
+                f"{unregistered} expected game(s) have no validated proxy ownership record.",
+                detail="Quick Repair will not invent ownership destinations.",
+            )
+        )
 
 
 def _inspect_ports(ctx: DiagnosticContext, findings: list[TroubleshootFinding]) -> None:
@@ -738,6 +1061,25 @@ def _inspect_ports(ctx: DiagnosticContext, findings: list[TroubleshootFinding]) 
     ports_dir = Path(ctx.config.local_roms_path) / "ports"
     owned_launcher = ports_dir / "ROMCloud.sh"
     applicable = ports_dir.is_dir() and owned_launcher.is_file()
+    launcher_content, launcher_error = _safe_read(owned_launcher)
+    graphical_wrapper = ctx.romcloud_home / "bin" / "romcloud-ports"
+    launcher_current = bool(
+        launcher_content
+        and 'exec "' in launcher_content
+        and str(graphical_wrapper) in launcher_content
+    )
+    findings.append(
+        _finding(
+            "ports.launcher",
+            "ports",
+            "healthy" if launcher_current else "warning",
+            "The ROMCloud Ports launcher targets the installed graphical wrapper."
+            if launcher_current
+            else "The ROMCloud Ports launcher is missing or stale.",
+            detail=launcher_error or str(owned_launcher),
+            fixability="confirmation",
+        )
+    )
     gamelist = ports_dir / "gamelist.xml"
     existing: str | None = None
     if gamelist.exists():
@@ -783,7 +1125,9 @@ def _inspect_savesync(ctx: DiagnosticContext, findings: list[TroubleshootFinding
 
     path = Path(ctx.config.data_path) / "savesync-state.json"
     if not path.exists():
-        findings.append(_finding("savesync.state", "savesync", "warning", "SaveSync state has not been initialized.", detail=str(path)))
+        findings.append(_finding("savesync.state", "savesync", "healthy", "SaveSync state has not been initialized; no sync history exists yet.", detail=str(path)))
+        if ctx.config.remote_data is not None and ctx.config.remote_data.provider == "sftp":
+            findings.append(_finding("savesync.sftp_policy", "savesync", "healthy", "SaveSync writes are unavailable by policy for read-only SFTP; Library Sync reads remain supported."))
         return
     before = path.stat()
     try:
@@ -846,8 +1190,8 @@ def _inspect_browser(ctx: DiagnosticContext, findings: list[TroubleshootFinding]
     except Exception as exc:  # noqa: BLE001
         findings.append(_finding("browser.manager", "browser", "warning", "Browser manager/runtime status could not be determined.", detail=str(exc)))
         return
-    findings.append(_finding("browser.manager", "browser", "healthy" if manager.get("running") else "warning", "Browser manager is running." if manager.get("running") else "Browser manager is not running.", detail="Manager startup remains an explicit user action.", fixability="none"))
-    findings.append(_finding("browser.runtime", "browser", "healthy" if runtime.get("available") else "warning", "A usable local browser runtime is available." if runtime.get("available") else "No usable local browser runtime was found."))
+    findings.append(_finding("browser.manager", "browser", "healthy", "Browser manager is running." if manager.get("running") else "Browser manager is idle (not required outside an active browser session).", fixability="none"))
+    findings.append(_finding("browser.runtime", "browser", "healthy", "A usable local browser runtime is available." if runtime.get("available") else "No local browser runtime is installed; browser views remain optional."))
 
 
 def run_quick_repair(
@@ -889,6 +1233,12 @@ def run_quick_repair(
             activity=activity,
             cancelled=cancelled,
         )
+        if current.cancelled:
+            was_cancelled = True
+            outcomes[finding.id] = FindingFix(
+                False, None, False, "Cancelled before this fix started."
+            )
+            continue
         current_finding = next(
             (item for item in current.findings if item.id == finding.id), None
         )
@@ -905,8 +1255,9 @@ def run_quick_repair(
         try:
             changed = bool(handlers[finding.id]())
         except Exception as exc:  # noqa: BLE001 - preserve partial results
-            outcomes[finding.id] = FindingFix(True, False, False, str(exc))
-            emit_progress(progress, "troubleshoot", finding.id, "error", "Quick Repair step failed", detail=str(exc))
+            detail = _sanitize_text(exc, context.secrets)
+            outcomes[finding.id] = FindingFix(True, False, False, detail)
+            emit_progress(progress, "troubleshoot", finding.id, "error", "Quick Repair step failed", detail=detail)
         else:
             outcomes[finding.id] = FindingFix(True, True, changed, "")
             emit_progress(progress, "troubleshoot", finding.id, "success", "Quick Repair step completed")
@@ -925,18 +1276,229 @@ def run_quick_repair(
         if outcome is None:
             merged.append(finding)
             continue
+        if not outcome.attempted and outcome.succeeded is None:
+            merged.append(
+                replace(
+                    finding,
+                    status="skipped",
+                    severity="warning",
+                    fix=outcome,
+                )
+            )
+            continue
         if outcome.succeeded and finding.status == "healthy":
             old = initial_by_id.get(finding.id, finding)
-            merged.append(replace(finding, status="fixed", fixability=old.fixability, fix=outcome, restart_required=old.restart_required))
+            merged.append(
+                replace(
+                    finding,
+                    status=(
+                        "fixed"
+                        if outcome.changed or not outcome.attempted
+                        else "healthy"
+                    ),
+                    fixability=old.fixability,
+                    fix=outcome,
+                    restart_required=old.restart_required,
+                )
+            )
         elif outcome.succeeded:
             merged.append(replace(finding, fix=FindingFix(True, False, outcome.changed, "Post-fix diagnostic remains unhealthy.")))
         else:
             merged.append(replace(finding, status="error", severity="error", fix=outcome))
-    for finding_id, outcome in outcomes.items():
-        if finding_id not in {item.id for item in final.findings}:
-            old = initial_by_id[finding_id]
-            merged.append(replace(old, status="fixed" if outcome.succeeded else "error", severity="info" if outcome.succeeded else "error", fix=outcome))
+    final_ids = {item.id for item in final.findings}
+    for finding_id, old in initial_by_id.items():
+        if finding_id not in final_ids:
+            outcome = outcomes.get(finding_id)
+            if outcome is None:
+                merged.append(old)
+                continue
+            if not outcome.attempted and outcome.succeeded is None:
+                merged.append(
+                    replace(old, status="skipped", severity="warning", fix=outcome)
+                )
+            elif outcome.succeeded and not outcome.changed:
+                merged.append(
+                    replace(old, status="healthy", severity="info", fix=outcome)
+                )
+            else:
+                merged.append(replace(old, status="fixed" if outcome.succeeded else "error", severity="info" if outcome.succeeded else "error", fix=outcome))
     return TroubleshootReport(tuple(merged), mode="quick_repair", cancelled=was_cancelled)
+
+
+def _atomic_create_text_no_replace(path: Path, content: str) -> bool:
+    """Atomically materialize one absent owned file without replacing a race."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.parent.is_symlink():
+        return False
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            return False
+        return True
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _restore_diagnosed_proxies(
+    ctx: DiagnosticContext, game_ids: set[str]
+) -> bool:
+    """Restore only missing, registered proxies from a trusted catalog."""
+
+    from romcloud.core.capabilities import OperatingMode
+    from romcloud.integrations.batocera.proxy_ownership import is_within
+
+    catalog_path = Path(ctx.config.data_path) / "catalog.db"
+    catalog = _inspect_catalog(catalog_path)
+    mode = inspect_operating_mode(ctx.config)
+    if not catalog.trusted or mode.state != "valid" or mode.mode not in {
+        OperatingMode.CACHE,
+        OperatingMode.OFFLINE,
+    }:
+        raise RuntimeError(
+            "Proxy repair authority changed after diagnostics; no proxy was written."
+        )
+    offline = mode.mode is OperatingMode.OFFLINE
+    changed = False
+    local_root = Path(ctx.config.local_roms_path)
+    with _open_sqlite_read_only(catalog_path) as conn:
+        for game_id in sorted(game_ids):
+            row = conn.execute(
+                "SELECT p.proxy_path, g.title, g.system, g.source_provider, "
+                "g.source_root, g.is_eligible FROM proxy_records p "
+                "JOIN games g ON g.id = p.game_id WHERE p.game_id = ?",
+                (game_id,),
+            ).fetchone()
+            if row is None or not bool(row[5]):
+                continue
+            if offline:
+                cached = conn.execute(
+                    "SELECT 1 FROM cache_entries "
+                    "WHERE game_id = ? AND status = 'complete'",
+                    (game_id,),
+                ).fetchone()
+                if cached is None:
+                    continue
+            path = Path(str(row[0]))
+            if path.exists() or path.is_symlink() or not is_within(path, local_root):
+                continue
+            assets = [
+                {
+                    "filename": str(asset[0]),
+                    "relative_path": str(asset[1]),
+                    "is_primary": bool(asset[2]),
+                }
+                for asset in conn.execute(
+                    "SELECT filename, relative_path, is_primary FROM game_assets "
+                    "WHERE game_id = ? ORDER BY id",
+                    (game_id,),
+                )
+            ]
+            payload = {
+                "romcloud_version": "1",
+                "game_id": game_id,
+                "title": str(row[1]),
+                "system": str(row[2]),
+                "source_provider": str(row[3]),
+                "source_root": str(row[4]),
+                "assets": assets,
+            }
+            changed = (
+                _atomic_create_text_no_replace(
+                    path, json.dumps(payload, indent=2, ensure_ascii=False)
+                )
+                or changed
+            )
+    return changed
+
+
+def _restore_diagnosed_direct_links(
+    ctx: DiagnosticContext, records: Iterable[Mapping[str, object]]
+) -> bool:
+    """Restore only absent links named by a valid Direct ownership manifest."""
+
+    from romcloud.core.capabilities import OperatingMode
+    from romcloud.integrations.batocera.proxy_ownership import is_within
+
+    catalog = _inspect_catalog(Path(ctx.config.data_path) / "catalog.db")
+    mode = inspect_operating_mode(ctx.config)
+    manifest = Path(ctx.config.data_path) / "direct-links.json"
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return False
+    if (
+        not catalog.trusted
+        or mode.state != "valid"
+        or mode.mode is not OperatingMode.CONNECTED
+        or not isinstance(payload, dict)
+        or payload.get("version") != 1
+        or not isinstance(payload.get("links"), list)
+        or not all(
+            isinstance(item, dict)
+            and isinstance(item.get("path"), str)
+            and isinstance(item.get("target"), str)
+            for item in payload.get("links", [])
+        )
+    ):
+        raise RuntimeError(
+            "Direct-link repair authority changed after diagnostics; no link was written."
+        )
+    manifest_records = {
+        (str(item.get("path")), str(item.get("target")))
+        for item in payload["links"]
+        if isinstance(item, dict)
+        and isinstance(item.get("path"), str)
+        and isinstance(item.get("target"), str)
+    }
+    local_root = Path(ctx.config.local_roms_path)
+    source_root = Path(ctx.config.source.rom_root)
+    changed = False
+    for record in records:
+        pair = (str(record.get("path", "")), str(record.get("target", "")))
+        if pair not in manifest_records:
+            continue
+        path, target = map(Path, pair)
+        if (
+            path.exists()
+            or path.is_symlink()
+            or not target.exists()
+            or not is_within(path, local_root)
+            or not is_within(target, source_root)
+        ):
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.parent.is_symlink():
+            continue
+        try:
+            path.symlink_to(target, target_is_directory=target.is_dir())
+        except FileExistsError:
+            continue
+        changed = True
+    return changed
+
+
+def _files_snapshot(root: Path) -> dict[str, bytes]:
+    if not root.is_dir():
+        return {}
+    result: dict[str, bytes] = {}
+    for path in root.iterdir():
+        if path.is_file() and not path.is_symlink() and (
+            path.name.startswith("es_systems_")
+            or path.name == "romcloud-es-overlay-patches.json"
+        ):
+            try:
+                result[path.name] = path.read_bytes()
+            except OSError:
+                pass
+    return result
 
 
 def _fix_handlers(ctx: DiagnosticContext) -> dict[str, Callable[[], bool]]:
@@ -957,12 +1519,15 @@ def _fix_handlers(ctx: DiagnosticContext) -> dict[str, Callable[[], bool]]:
 
     def service() -> bool:
         before = ctx.paths.mount_service.read_bytes() if ctx.paths.mount_service.is_file() else None
+        config_before = ctx.paths.services_config.read_bytes() if ctx.paths.services_config.is_file() else None
         mount_service.install_service(
             str(home / "bin" / "romcloud"),
             service_path=ctx.paths.mount_service,
             services_config_path=ctx.paths.services_config,
         )
-        return before != ctx.paths.mount_service.read_bytes()
+        after = ctx.paths.mount_service.read_bytes() if ctx.paths.mount_service.is_file() else None
+        config_after = ctx.paths.services_config.read_bytes() if ctx.paths.services_config.is_file() else None
+        return before != after or config_before != config_after
 
     def gamelist() -> bool:
         return ports_gamelist_config.reconcile(gamelist_path=ports_dir / "gamelist.xml")
@@ -974,33 +1539,66 @@ def _fix_handlers(ctx: DiagnosticContext) -> dict[str, Callable[[], bool]]:
         )
 
     def proxies() -> bool:
-        from romcloud.lifecycle.manage import restore_owned_proxies
-
         finding = next(item for item in collect_diagnostics(ctx.config_path, paths=ctx.paths, activity=ctx.activity)[0].findings if item.id == "presentation.proxy_missing")
         game_ids = {str(value) for value in finding.metadata.get("game_ids", [])}
-        return restore_owned_proxies(ctx.config, game_ids=game_ids) > 0
+        return _restore_diagnosed_proxies(ctx, game_ids)
 
     def direct_links() -> bool:
-        from romcloud.integrations.batocera.game_access import reconcile_direct_links
-
-        report = reconcile_direct_links(ctx.config)
-        return bool(report.restored or report.removed)
+        finding = next(item for item in collect_diagnostics(ctx.config_path, paths=ctx.paths, activity=ctx.activity)[0].findings if item.id == "presentation.direct_link_missing")
+        records = finding.metadata.get("links", [])
+        return _restore_diagnosed_direct_links(
+            ctx, records if isinstance(records, list) else []
+        )
 
     def es_refresh() -> bool:
+        from romcloud.core.capabilities import OperatingMode
         from romcloud.integrations.batocera import es_config
+        from romcloud.integrations.batocera.system_registry import (
+            inspect_live_system_registry,
+        )
 
+        catalog = _inspect_catalog(Path(ctx.config.data_path) / "catalog.db")
+        mode = inspect_operating_mode(ctx.config)
+        if (
+            not catalog.trusted
+            or mode.state != "valid"
+            or mode.mode not in {OperatingMode.CACHE, OperatingMode.OFFLINE}
+        ):
+            raise RuntimeError(
+                "ES repair authority changed after diagnostics; no ES file was written."
+            )
+        before = _files_snapshot(ctx.paths.es_user_config_dir)
+        registry = inspect_live_system_registry(
+            user_config_dir=ctx.paths.es_user_config_dir,
+            system_config_dir=ctx.paths.es_system_config_dir,
+            legacy_config_dir=ctx.paths.es_legacy_config_dir,
+        )
         es_config.refresh(
-            ctx.managed_systems,
+            catalog.managed_systems,
             stock_path=ctx.paths.es_stock,
             override_path=ctx.paths.es_override,
             wrapper_path=ctx.romcloud_home / "bin" / "romcloud-run",
+            system_registry=registry,
         )
-        return True
+        return before != _files_snapshot(ctx.paths.es_user_config_dir)
 
     def es_remove() -> bool:
+        from romcloud.core.capabilities import OperatingMode
         from romcloud.integrations.batocera import es_config
 
-        return es_config.remove(override_path=ctx.paths.es_override)
+        catalog = _inspect_catalog(Path(ctx.config.data_path) / "catalog.db")
+        mode = inspect_operating_mode(ctx.config)
+        if (
+            not catalog.trusted
+            or mode.state != "valid"
+            or mode.mode is not OperatingMode.CONNECTED
+        ):
+            raise RuntimeError(
+                "ES repair authority changed after diagnostics; no ES file was written."
+            )
+        before = _files_snapshot(ctx.paths.es_user_config_dir)
+        es_config.remove(override_path=ctx.paths.es_override)
+        return before != _files_snapshot(ctx.paths.es_user_config_dir)
 
     def mount_missing() -> bool:
         from romcloud.services.connections import mount_connections

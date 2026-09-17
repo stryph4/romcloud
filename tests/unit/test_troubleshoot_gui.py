@@ -5,6 +5,7 @@ from ports_gfx.app import MENU_CATEGORIES, _OPERATIONS
 from ports_gfx.operation import OperationLine, OperationState
 from ports_gfx.operation_screen import (
     OperationScreenState,
+    troubleshoot_result_summary,
     troubleshoot_quick_repair_requested,
 )
 
@@ -44,3 +45,36 @@ def test_no_quick_repair_action_when_no_safe_fix_exists() -> None:
 def test_troubleshoot_never_arms_gui_relaunch() -> None:
     assert _OPERATIONS["troubleshoot"].arms_gui_relaunch is False
     assert _OPERATIONS["troubleshoot-fix"].arms_gui_relaunch is False
+
+
+def test_diagnostic_summary_distinguishes_health_errors_from_process_success() -> None:
+    screen = OperationScreenState(
+        title="Troubleshoot ROMCloud",
+        runner=_Runner(
+            '{"ok":true,"summary":{"healthy":4,"fixed":0,"warning":2,'
+            '"error":1,"skipped":0},"findings":['
+            '{"status":"warning","fixability":"automatic","blocked_by":[]},'
+            '{"status":"warning","fixability":"none","blocked_by":[]}]} '
+        ),
+    )
+
+    text, kind = troubleshoot_result_summary(screen)
+
+    assert "3 issue(s) found" in text
+    assert "1 can be repaired automatically" in text
+    assert kind == "error"
+
+
+def test_quick_repair_summary_reports_fixed_and_remaining() -> None:
+    screen = OperationScreenState(
+        title="Quick Repair",
+        runner=_Runner(
+            '{"ok":true,"summary":{"healthy":4,"fixed":2,"warning":1,'
+            '"error":0,"skipped":0}}'
+        ),
+    )
+
+    text, kind = troubleshoot_result_summary(screen)
+
+    assert text == "Quick Repair complete — 2 fixed; 1 issue(s) still need attention"
+    assert kind == "warning"

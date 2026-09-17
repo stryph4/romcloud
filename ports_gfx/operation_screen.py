@@ -113,6 +113,62 @@ class OperationScreenState:
             return False
         return bool(isinstance(payload, dict) and payload.get("ok") and payload.get("quick_repair_available"))
 
+    @property
+    def result_payload(self) -> dict:
+        if not self.succeeded:
+            return {}
+        stdout = [line.text for line in self.runner.lines if line.stream == "stdout"]
+        if not stdout:
+            return {}
+        try:
+            payload = json.loads(stdout[-1])
+        except (TypeError, ValueError):
+            return {}
+        return payload if isinstance(payload, dict) and payload.get("ok") else {}
+
+
+def troubleshoot_result_summary(screen: OperationScreenState) -> tuple[str, str]:
+    """Return a truthful completed-health summary independent of exit status."""
+
+    if screen.title not in {"Troubleshoot ROMCloud", "Quick Repair"}:
+        return "", ""
+    payload = screen.result_payload
+    summary = payload.get("summary")
+    if not isinstance(summary, dict):
+        return "", ""
+    warning = int(summary.get("warning", 0) or 0)
+    error = int(summary.get("error", 0) or 0)
+    skipped = int(summary.get("skipped", 0) or 0)
+    fixed = int(summary.get("fixed", 0) or 0)
+    remaining = warning + error + skipped
+    if screen.title == "Quick Repair":
+        if remaining:
+            return (
+                f"Quick Repair complete — {fixed} fixed; {remaining} issue(s) still need attention",
+                "warning" if not error else "error",
+            )
+        return f"Quick Repair complete — {fixed} fixed", "success"
+    if not remaining:
+        return "Diagnostics complete — No problems found", "success"
+    findings = payload.get("findings", [])
+    fixable = sum(
+        isinstance(item, dict)
+        and item.get("status") in {"warning", "error"}
+        and item.get("fixability") in {"automatic", "conditional"}
+        and not item.get("blocked_by")
+        for item in findings if isinstance(findings, list)
+    )
+    if fixable:
+        return (
+            f"Diagnostics complete — {remaining} issue(s) found; "
+            f"{fixable} can be repaired automatically",
+            "warning" if not error else "error",
+        )
+    return (
+        f"Diagnostics complete — {remaining} issue(s) need attention",
+        "warning" if not error else "error",
+    )
+
 
 def troubleshoot_quick_repair_requested(
     screen: OperationScreenState, action: Action | None
