@@ -700,7 +700,7 @@ class TestReconcileInstall:
         assert report.mount_service_enabled is False
         assert "Batocera startup service script could not be reconciled." in report.warnings
 
-    def test_repair_reconcile_fixes_bua_switch_overlay_and_direct_restores_it(
+    def test_repair_reconcile_restores_bua_switch_fields_and_preserves_unverified_override(
         self, tmp_path: Path, monkeypatch
     ) -> None:
         import sys
@@ -841,7 +841,7 @@ class TestReconcileInstall:
         assert ".romcloud" not in (restored.findtext("system/extension") or "").split()
         assert restored.findtext("system/path") == "/userdata/roms/switch-custom"
         assert restored.findtext("system/theme") == "bua-switch"
-        assert override.exists() is False
+        assert override.is_file()
         assert direct.es_restart_required is True
 
     @staticmethod
