@@ -7,7 +7,35 @@ from pathlib import Path
 
 import pytest
 
-from romcloud.infrastructure.atomic_file import atomic_write_text
+from romcloud.infrastructure.atomic_file import atomic_write_bytes, atomic_write_text
+
+
+class TestAtomicWriteBytes:
+    def test_preserves_exact_bytes_without_platform_newline_translation(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "canonical.json"
+
+        atomic_write_bytes(path, b'{"line":"one"}\n')
+
+        assert path.read_bytes() == b'{"line":"one"}\n'
+
+    def test_replace_failure_preserves_original_and_cleans_temporary(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "canonical.json"
+        path.write_bytes(b"original")
+        monkeypatch.setattr(
+            os,
+            "replace",
+            lambda *_args: (_ for _ in ()).throw(OSError("simulated failure")),
+        )
+
+        with pytest.raises(OSError, match="simulated failure"):
+            atomic_write_bytes(path, b"replacement")
+
+        assert path.read_bytes() == b"original"
+        assert list(tmp_path.iterdir()) == [path]
 
 
 class TestAtomicWriteText:

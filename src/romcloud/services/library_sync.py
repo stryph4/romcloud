@@ -16,7 +16,9 @@ import posixpath
 import shutil
 import unicodedata
 import uuid
+from copy import deepcopy
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Iterable, Optional
@@ -33,7 +35,7 @@ from romcloud.core.models.librarysync import LibraryImportPreview, LibrarySyncRe
 from romcloud.core.models.proxy import ProxyRecord
 from romcloud.core.progress import ProgressSink, emit_progress
 from romcloud.core.storage import StorageProvider
-from romcloud.infrastructure.atomic_file import atomic_write_text
+from romcloud.infrastructure.atomic_file import atomic_write_bytes, atomic_write_text
 from romcloud.infrastructure.repositories.game import GameRepository
 from romcloud.infrastructure.repositories.proxy import ProxyRepository
 
@@ -55,6 +57,24 @@ METADATA_TAGS = frozenset(
 MEDIA_TAGS = frozenset(
     {"image", "thumbnail", "video", "marquee", "fanart", "manual", "boxback", "bezel", "wheel"}
 )
+
+
+@dataclass(frozen=True)
+class _CatalogSnapshot:
+    """One operation's committed catalog truth and reusable indexes."""
+
+    eligible_games: tuple[Game, ...]
+    eligible_by_system: dict[str, tuple[Game, ...]]
+    eligible_by_library_id: dict[str, Game]
+    all_systems: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _CanonicalSerialization:
+    encoded: bytes
+
+
+_CONTENT_NOT_LOADED = object()
 
 
 class _DirectoryFileIndex:
@@ -135,25 +155,47 @@ def _safe_relative(text: str, *, strip_romcloud: bool = False) -> Optional[str]:
     return PurePosixPath(*parts).as_posix()
 
 
-def _read_dataset(path: Path) -> dict:
+def _read_dataset_with_content(path: Path) -> tuple[dict, Optional[bytes]]:
     if not path.exists():
-        return _empty_dataset()
+        return _empty_dataset(), None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        content = path.read_bytes()
+        payload = json.loads(content)
     except (OSError, ValueError) as exc:
         raise LibrarySyncError(f"Cannot read canonical library {path}: {exc}") from exc
     if payload.get("schema_version") != SCHEMA_VERSION or not isinstance(payload.get("records"), dict):
         raise LibrarySyncError(f"Unsupported canonical library format: {path}")
-    return payload
+    return payload, content
 
 
-def _write_dataset(path: Path, dataset: dict) -> bool:
-    content = json.dumps(dataset, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
-    if path.exists() and path.read_text(encoding="utf-8") == content:
+def _read_dataset(path: Path) -> dict:
+    return _read_dataset_with_content(path)[0]
+
+
+def _serialize_dataset(dataset: dict) -> _CanonicalSerialization:
+    text = json.dumps(dataset, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    return _CanonicalSerialization(encoded=text.encode("utf-8"))
+
+
+def _write_dataset(
+    path: Path,
+    serialized: _CanonicalSerialization,
+    *,
+    existing_content: object = _CONTENT_NOT_LOADED,
+) -> bool:
+    if existing_content is _CONTENT_NOT_LOADED:
+        existing_content = path.read_bytes() if path.exists() else None
+    if existing_content == serialized.encoded:
         return False
-    atomic_write_text(path, content)
-    # Treat a failed/read-incomplete destination write as a failed commit.
-    if _read_dataset(path) != dataset:
+    atomic_write_bytes(path, serialized.encoded)
+    # Exact-byte verification is stronger than reparsing and comparing the
+    # object graph: it detects truncation, encoding drift, and any change to
+    # the canonical deterministic representation committed by the writer.
+    try:
+        committed = path.read_bytes()
+    except OSError as exc:
+        raise LibrarySyncError(f"Canonical library verification failed: {path}") from exc
+    if committed != serialized.encoded:
         raise LibrarySyncError(f"Canonical library verification failed: {path}")
     return True
 
@@ -215,20 +257,43 @@ class LibrarySyncService:
                 "remote metadata/media remains available."
             )
 
-    def _read_remote_dataset(self, remote_path: Path) -> dict:
+    def _read_remote_dataset(
+        self, remote_path: Path
+    ) -> tuple[dict, Optional[bytes]]:
         if self._remote_has_filesystem_semantics():
-            return _read_dataset(remote_path)
+            return _read_dataset_with_content(remote_path)
         assert self._provider is not None and self._remote_root is not None
         remote_full_path = posixpath.join(self._remote_root.as_posix(), CANONICAL_FILENAME)
         if self._provider.get_size(remote_full_path) is None:
-            return _empty_dataset()
+            return _empty_dataset(), None
         self._local_root.mkdir(parents=True, exist_ok=True)
         scratch = self._local_root / f".romcloud-remote-dataset-{uuid.uuid4().hex}.json"
         try:
             self._provider.transfer_to(remote_full_path, str(scratch))
-            return _read_dataset(scratch)
+            return _read_dataset(scratch), None
         finally:
             scratch.unlink(missing_ok=True)
+
+    def _catalog_snapshot(self) -> _CatalogSnapshot:
+        """Hydrate and index committed catalog rows exactly once per operation."""
+        all_games = tuple(self._games.list_all(include_ineligible=True))
+        eligible_games = tuple(game for game in all_games if game.is_eligible)
+        grouped: dict[str, list[Game]] = {}
+        by_library_id: dict[str, Game] = {}
+        for game in eligible_games:
+            grouped.setdefault(game.system, []).append(game)
+            by_library_id[library_id_for_game(game)] = game
+        return _CatalogSnapshot(
+            eligible_games=eligible_games,
+            eligible_by_system={
+                system: tuple(games) for system, games in grouped.items()
+            },
+            eligible_by_library_id=by_library_id,
+            all_systems=tuple(sorted({game.system for game in all_games})),
+        )
+
+    def _proxy_snapshot(self) -> dict[str, ProxyRecord]:
+        return {record.game_id: record for record in self._proxies.list_all()}
 
     def _copy_remote_media(
         self, safe_blob: str, destination: Path, digest: str, size: int
@@ -338,9 +403,13 @@ class LibrarySyncService:
             raise LibrarySyncError("Library Sync is disabled; enable it in configuration first.")
         report = LibrarySyncReport(direction="render", reconciliation="local")
         validation = self._read_media_validation()
+        catalog = self._catalog_snapshot()
+        proxies_by_id = self._proxy_snapshot()
         report.rendered = self._render_local(
             _read_dataset(self._local_root / CANONICAL_FILENAME),
             report,
+            catalog=catalog,
+            proxies_by_id=proxies_by_id,
             media_validation=validation,
             materialize_media=False,
         )
@@ -553,13 +622,15 @@ class LibrarySyncService:
         remote_path = self._remote_root / CANONICAL_FILENAME
         local_path = self._local_root / CANONICAL_FILENAME
         lock = _exclusive_lock(self._remote_root / ".library-sync.lock") if write_remote else nullcontext()
+        catalog = self._catalog_snapshot()
+        proxies_by_id = self._proxy_snapshot()
         with lock:
-            remote = self._read_remote_dataset(remote_path)
-            local = _read_dataset(local_path)
+            remote, remote_content = self._read_remote_dataset(remote_path)
+            local, local_content = _read_dataset_with_content(local_path)
 
             # Remote is authoritative for existing non-empty values. Local/source
             # input may only fill gaps; conflicts are retained and surfaced.
-            merged = json.loads(json.dumps(remote))
+            merged = deepcopy(remote)
             self._merge(merged, local, report, "local canonical")
             emit_progress(
                 progress,
@@ -568,9 +639,11 @@ class LibrarySyncService:
                 "running",
                 "Reading source metadata…",
             )
-            imported, origins = self._import_gamelists(report, progress)
+            imported, origins = self._import_gamelists(
+                catalog, proxies_by_id, report, progress
+            )
             self._merge(merged, imported, report, "gamelist import")
-            self._seed_catalog_records(merged, report)
+            self._seed_catalog_records(merged, catalog, report)
             if write_remote:
                 self._materialize_remote_media(
                     merged,
@@ -580,12 +653,20 @@ class LibrarySyncService:
                     verify_existing=full,
                     media_presence=media_presence,
                 )
-                _write_dataset(remote_path, merged)
-        _write_dataset(local_path, merged)
+            serialized = _serialize_dataset(merged)
+            if write_remote:
+                _write_dataset(
+                    remote_path,
+                    serialized,
+                    existing_content=remote_content,
+                )
+        _write_dataset(local_path, serialized, existing_content=local_content)
         report.rendered = self._render_local(
             merged,
             report,
             progress,
+            catalog=catalog,
+            proxies_by_id=proxies_by_id,
             media_validation=media_validation,
             verify_existing=full,
             media_presence=media_presence,
@@ -606,7 +687,7 @@ class LibrarySyncService:
         records = base["records"]
         for library_id, candidate in incoming.get("records", {}).items():
             if library_id not in records:
-                records[library_id] = json.loads(json.dumps(candidate))
+                records[library_id] = deepcopy(candidate)
                 report.metadata_added += 1
                 report.media_added += len(candidate.get("media", {}))
                 continue
@@ -619,7 +700,7 @@ class LibrarySyncService:
                         continue
                     existing = current_section.get(key)
                     if existing in (None, "", {}):
-                        current_section[key] = json.loads(json.dumps(value))
+                        current_section[key] = deepcopy(value)
                         changed = True
                         if section == "media":
                             report.media_added += 1
@@ -655,9 +736,14 @@ class LibrarySyncService:
             if changed:
                 report.metadata_updated += 1
 
-    def _seed_catalog_records(self, dataset: dict, report: LibrarySyncReport) -> None:
+    def _seed_catalog_records(
+        self,
+        dataset: dict,
+        catalog: _CatalogSnapshot,
+        report: LibrarySyncReport,
+    ) -> None:
         records = dataset["records"]
-        for game in self._games.list_all():
+        for game in catalog.eligible_games:
             library_id = library_id_for_game(game)
             record = records.get(library_id)
             if record is None:
@@ -675,25 +761,29 @@ class LibrarySyncService:
                     report.metadata_updated += 1
 
     def _import_gamelists(
-        self, report: LibrarySyncReport, progress: ProgressSink = None
+        self,
+        catalog: _CatalogSnapshot,
+        proxies_by_id: dict[str, ProxyRecord],
+        report: LibrarySyncReport,
+        progress: ProgressSink = None,
     ) -> tuple[dict, dict[tuple[str, str], Path]]:
         dataset = _empty_dataset()
         origins: dict[tuple[str, str], Path] = {}
-        games = self._games.list_all()
-        by_id = {library_id_for_game(game): game for game in games}
         examined = 0
-        for system in sorted({game.system for game in games}):
-            system_games = [game for game in games if game.system == system]
+        for system in sorted(catalog.eligible_by_system):
+            system_games = catalog.eligible_by_system[system]
             source_xml = self._source_root / system / "gamelist.xml"
             if source_xml.is_file() and not source_xml.is_symlink():
                 examined += self._import_one_xml(
-                    source_xml, system, system_games, by_id, dataset, origins,
+                    source_xml, system, system_games,
+                    catalog.eligible_by_library_id, proxies_by_id, dataset, origins,
                     report, source=True, progress=progress, examined=examined,
                 )
             local_xml = self._local_roms_root / system / "gamelist.xml"
             if local_xml.is_file() and not local_xml.is_symlink():
                 examined += self._import_one_xml(
-                    local_xml, system, system_games, by_id, dataset, origins,
+                    local_xml, system, system_games,
+                    catalog.eligible_by_library_id, proxies_by_id, dataset, origins,
                     report, source=False, progress=progress, examined=examined,
                 )
         return dataset, origins
@@ -702,8 +792,9 @@ class LibrarySyncService:
         self,
         path: Path,
         system: str,
-        games: list[Game],
+        games: tuple[Game, ...],
         by_id: dict[str, Game],
+        proxies_by_id: dict[str, ProxyRecord],
         dataset: dict,
         origins: dict[tuple[str, str], Path],
         report: LibrarySyncReport,
@@ -723,7 +814,7 @@ class LibrarySyncService:
         by_source = {_source_relative(game): game for game in games}
         by_proxy: dict[str, Game] = {}
         for game in games:
-            record = self._proxies.get(game.id)
+            record = proxies_by_id.get(game.id)
             if record is not None:
                 try:
                     rel = Path(record.proxy_path).relative_to(self._local_roms_root / system).as_posix()
@@ -1006,6 +1097,8 @@ class LibrarySyncService:
         report: LibrarySyncReport,
         progress: ProgressSink = None,
         *,
+        catalog: _CatalogSnapshot,
+        proxies_by_id: dict[str, ProxyRecord],
         media_validation: Optional[dict[str, dict]] = None,
         materialize_media: bool = True,
         verify_existing: bool = False,
@@ -1015,7 +1108,7 @@ class LibrarySyncService:
         media_presence = media_presence or _DirectoryFileIndex(report)
         rendered = 0
         by_system: dict[str, list[tuple[Game, str, dict]]] = {}
-        for game in self._games.list_all():
+        for game in catalog.eligible_games:
             library_id = library_id_for_game(game)
             record = dataset["records"].get(library_id)
             if record is not None:
@@ -1023,12 +1116,11 @@ class LibrarySyncService:
         # Retained ineligible rows are intentionally absent above, but their
         # previously rendered ROMCloud-owned gamelist entries still need a
         # reconciliation pass so they cannot linger in Library presentation.
-        for system in self._games.list_systems(include_ineligible=True):
+        for system in catalog.all_systems:
             by_system.setdefault(system, [])
         total = sum(len(entries) for entries in by_system.values())
-        # Loaded once for the whole render — resolving each game's local
-        # launch path must never issue its own per-game database query.
-        proxies_by_id = {record.game_id: record for record in self._proxies.list_all()}
+        # The operation-scoped proxy projection supplied above ensures local
+        # launch-path resolution never issues a per-game database query.
         emit_progress(
             progress,
             "library_sync",

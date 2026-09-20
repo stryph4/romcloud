@@ -36,3 +36,23 @@ def atomic_write_text(path: Path, content: str, *, mode: Optional[int] = None) -
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise
+
+
+def atomic_write_bytes(path: Path, content: bytes, *, mode: Optional[int] = None) -> None:
+    """Atomically write exact *content* bytes to *path*.
+
+    Unlike text mode, this preserves canonical line endings on every host.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        if mode is not None:
+            os.chmod(tmp_path, mode)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(content)
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
