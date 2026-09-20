@@ -2,12 +2,138 @@
 
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
 
 import pytest
 
+import romcloud.infrastructure.atomic_file as atomic_file
 from romcloud.infrastructure.atomic_file import atomic_write_bytes, atomic_write_text
+
+
+@pytest.mark.parametrize(
+    ("writer", "content"),
+    (
+        (atomic_write_text, "new text\n"),
+        (atomic_write_bytes, b"new bytes\n"),
+    ),
+)
+def test_atomic_writers_flush_and_fsync_before_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, writer, content
+) -> None:
+    path = tmp_path / "state"
+    events: list[str] = []
+    real_fdopen = atomic_file.os.fdopen
+    real_fsync = atomic_file.os.fsync
+    real_replace = atomic_file.os.replace
+
+    class TrackedHandle:
+        def __init__(self, handle) -> None:
+            self._handle = handle
+
+        def __enter__(self):
+            self._handle.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._handle.__exit__(*args)
+
+        def write(self, value):
+            events.append("write")
+            return self._handle.write(value)
+
+        def flush(self) -> None:
+            events.append("flush")
+            self._handle.flush()
+
+        def fileno(self) -> int:
+            return self._handle.fileno()
+
+    def tracked_fdopen(*args, **kwargs):
+        return TrackedHandle(real_fdopen(*args, **kwargs))
+
+    def tracked_fsync(descriptor: int) -> None:
+        events.append("fsync")
+        real_fsync(descriptor)
+
+    def tracked_replace(source: object, destination: object) -> None:
+        events.append("replace")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(atomic_file.os, "fdopen", tracked_fdopen)
+    monkeypatch.setattr(atomic_file.os, "fsync", tracked_fsync)
+    monkeypatch.setattr(atomic_file.os, "replace", tracked_replace)
+
+    writer(path, content)
+
+    assert events[:4] == ["write", "flush", "fsync", "replace"]
+    if os.name != "nt":
+        assert events == ["write", "flush", "fsync", "replace", "fsync"]
+
+
+@pytest.mark.parametrize(
+    ("writer", "content"),
+    (
+        (atomic_write_text, "replacement"),
+        (atomic_write_bytes, b"replacement"),
+    ),
+)
+def test_atomic_writers_preserve_original_and_clean_temp_after_file_fsync_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, writer, content
+) -> None:
+    path = tmp_path / "state"
+    path.write_bytes(b"original")
+    monkeypatch.setattr(
+        atomic_file.os,
+        "fsync",
+        lambda _descriptor: (_ for _ in ()).throw(
+            OSError("simulated file fsync failure")
+        ),
+    )
+
+    with pytest.raises(OSError, match="simulated file fsync failure"):
+        writer(path, content)
+
+    assert path.read_bytes() == b"original"
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_directory_fsync_ignores_only_unsupported_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    closed: list[int] = []
+    monkeypatch.setattr(atomic_file.os, "name", "posix")
+    monkeypatch.setattr(atomic_file.os, "open", lambda *_args: 42)
+    monkeypatch.setattr(
+        atomic_file.os,
+        "fsync",
+        lambda _descriptor: (_ for _ in ()).throw(OSError(errno.EINVAL, "unsupported")),
+    )
+    monkeypatch.setattr(atomic_file.os, "close", closed.append)
+
+    atomic_file._fsync_directory(tmp_path)
+
+    assert closed == [42]
+
+
+def test_directory_fsync_propagates_other_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    closed: list[int] = []
+    monkeypatch.setattr(atomic_file.os, "name", "posix")
+    monkeypatch.setattr(atomic_file.os, "open", lambda *_args: 42)
+    monkeypatch.setattr(
+        atomic_file.os,
+        "fsync",
+        lambda _descriptor: (_ for _ in ()).throw(OSError(errno.EIO, "I/O failure")),
+    )
+    monkeypatch.setattr(atomic_file.os, "close", closed.append)
+
+    with pytest.raises(OSError, match="I/O failure"):
+        atomic_file._fsync_directory(tmp_path)
+
+    assert closed == [42]
 
 
 class TestAtomicWriteBytes:
