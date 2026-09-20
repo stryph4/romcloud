@@ -135,15 +135,19 @@ class DownloadManagerService:
         return {"items": items, "created": created, "count": len(items)}
 
     def status(self) -> dict[str, object]:
+        download_items = self._repo.list(terminal_limit=HISTORY_LIMIT)
+        stats_by_game = self._staging.stats_for_games(
+            item.game_id for item in download_items if item.game_id is not None
+        )
         items = []
         now = time.monotonic()
-        for item in self._repo.list(terminal_limit=HISTORY_LIMIT):
+        for item in download_items:
             payload = item.as_dict()
             sample = self._speed.get(item.id)
             speed = sample[2] if sample and now - sample[0] < 10 else 0.0
             payload["speed_bytes_per_second"] = speed
             stats = (
-                self._staging.stats_for_game(item.game_id)
+                stats_by_game[item.game_id]
                 if item.game_id is not None else {
                     "total_files": 0, "retained_files": 0,
                     "interrupted_files": 0, "remaining_files": 0,
@@ -451,17 +455,22 @@ class DownloadManagerService:
             persisted_time = started
             persisted_bytes = retained
             latest_total = item.bytes_total
+            verification_pending = initial is DownloadState.VERIFYING
 
             def progress(done: int, total: int) -> None:
-                nonlocal previous_time, previous_bytes, persisted_time, persisted_bytes, latest_total
+                nonlocal previous_time, previous_bytes, persisted_time, persisted_bytes
+                nonlocal latest_total, verification_pending
                 latest_total = total
-                current = self._repo.get(item.id)
-                if current is not None and current.state is DownloadState.VERIFYING:
+                if verification_pending:
+                    # The conditional UPDATE is the source of truth.  If a
+                    # pause/cancel/control path won the race, it changes no
+                    # row; no preliminary SELECT is needed to protect it.
                     self._repo.transition(
                         item.id, from_states=[DownloadState.VERIFYING],
                         to_state=DownloadState.RUNNING,
                         worker_instance_id=self.instance_id,
                     )
+                    verification_pending = False
                 now_mono = time.monotonic()
                 if (
                     now_mono - persisted_time >= 1.0

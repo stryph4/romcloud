@@ -176,15 +176,84 @@ def test_status_combines_valid_final_members_with_staging_checkpoints(
     assert repo.transition(
         item.id, from_states=[DownloadState.QUEUED], to_state=DownloadState.FAILED
     )
+    status_cache = _WorkerCache()
+    status_cache.total_staging_size = lambda: 73
     manager = DownloadManagerService(
         repository=repo, staging_repository=staging, game_repo=game_repo,
-        cache=_WorkerCache(), cache_root=str(cache_dir),
+        cache=status_cache, cache_root=str(cache_dir),
     )
 
-    payload = manager.status()["failed"][0]
+    status = manager.status()
+    payload = status["failed"][0]
 
     assert payload["bytes_present"] == 14
     assert payload["has_partial"] is True
+    # Global staging/recovery accounting remains the cache coordinator's
+    # conservative value; batching per-game SQL must not replace it.
+    assert status["retained_partial_bytes"] == 73
+
+    assert staging.stats_for_games((game.id, game.id, "missing")) == {
+        game.id: {
+            "total_files": 1,
+            "retained_files": 1,
+            "interrupted_files": 1,
+            "remaining_files": 1,
+            "retained_bytes": 14,
+        },
+        "missing": {
+            "total_files": 0,
+            "retained_files": 0,
+            "interrupted_files": 0,
+            "remaining_files": 0,
+            "retained_bytes": 0,
+        },
+    }
+
+
+@pytest.mark.parametrize("count", [0, 1, 10, 200])
+def test_staging_stats_batch_uses_one_connection_for_status_sized_inputs(
+    db, monkeypatch, count
+):
+    staging = StagingRepository(db)
+    original_connect = db.connect
+    connections = 0
+    statements: list[str] = []
+
+    def counted_connect():
+        nonlocal connections
+        connections += 1
+        connection = original_connect()
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(db, "connect", counted_connect)
+    ids = tuple(f"game-{index}" for index in range(count))
+
+    result = staging.stats_for_games(ids)
+
+    assert tuple(result) == ids
+    assert connections == (1 if count else 0)
+    assert sum(statement.lstrip().upper().startswith("WITH ") for statement in statements) == (
+        1 if count else 0
+    )
+
+
+def test_staging_stats_batch_deduplicates_game_ids_before_query(db, monkeypatch):
+    staging = StagingRepository(db)
+    original_connect = db.connect
+    connections = 0
+
+    def counted_connect():
+        nonlocal connections
+        connections += 1
+        return original_connect()
+
+    monkeypatch.setattr(db, "connect", counted_connect)
+
+    result = staging.stats_for_games(["one"] * 200)
+
+    assert list(result) == ["one"]
+    assert connections == 1
 
 
 def test_asset_locks_collide_by_physical_path_without_global_serialization(tmp_path):
@@ -624,6 +693,232 @@ class _WorkerCache:
 
     def discard_staging_asset(self, _system, _relative_path):
         return None
+
+
+def test_status_for_200_rows_uses_one_list_and_one_grouped_stats_connection(
+    db, game_repo, cache_dir, tmp_path, monkeypatch
+):
+    game = _game(game_repo, tmp_path / "source")
+    repo = DownloadRepository(db)
+    for _index in range(200):
+        item, created = repo.enqueue(
+            game_id=game.id,
+            game_title=game.title,
+            system=game.system,
+            origin=DownloadOrigin.MANUAL,
+        )
+        assert created
+        assert repo.transition(
+            item.id,
+            from_states=[DownloadState.QUEUED],
+            to_state=DownloadState.COMPLETE,
+        )
+    manager = DownloadManagerService(
+        repository=repo,
+        staging_repository=StagingRepository(db),
+        game_repo=game_repo,
+        cache=_WorkerCache(),
+        cache_root=str(cache_dir),
+    )
+    original_connect = db.connect
+    connections = 0
+    statements: list[str] = []
+
+    def counted_connect():
+        nonlocal connections
+        connections += 1
+        connection = original_connect()
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(db, "connect", counted_connect)
+
+    status = manager.status()
+
+    assert len(status["items"]) == 200
+    assert status["retained_partial_bytes"] == 0
+    assert connections == 2
+    data_statements = [
+        statement for statement in statements
+        if statement.lstrip().upper().startswith(("SELECT ", "WITH "))
+    ]
+    assert len(data_statements) == 2
+
+
+class _CountingDownloadRepository(DownloadRepository):
+    def __init__(self, database) -> None:
+        super().__init__(database)
+        self.get_calls = 0
+        self.verification_transition_attempts = 0
+        self.verification_transition_successes = 0
+
+    def get(self, item_id):  # noqa: ANN001, ANN201
+        self.get_calls += 1
+        return super().get(item_id)
+
+    def transition(self, item_id, *, from_states, to_state, **kwargs):  # noqa: ANN001, ANN201
+        states = tuple(from_states)
+        verification_transition = (
+            states == (DownloadState.VERIFYING,)
+            and to_state is DownloadState.RUNNING
+        )
+        if verification_transition:
+            self.verification_transition_attempts += 1
+        changed = super().transition(
+            item_id,
+            from_states=states,
+            to_state=to_state,
+            **kwargs,
+        )
+        if verification_transition and changed:
+            self.verification_transition_successes += 1
+        return changed
+
+
+class _BurstProgressCache(_WorkerCache):
+    def __init__(self, *, callbacks: int = 2000, deferred: bool = False) -> None:
+        super().__init__()
+        self.callbacks = callbacks
+        self.partial = 4
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+        if not deferred:
+            self.release.set()
+
+    def retained_staging_size(self, _game_id):
+        return self.partial
+
+    def cache_game(self, game_id, on_progress=None, cancellation=None, **_kwargs):
+        self.entered.set()
+        assert self.release.wait(2)
+        total = self.partial + self.callbacks
+        for index in range(1, self.callbacks + 1):
+            on_progress(self.partial + index, total)
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
+        self.completed.append(game_id)
+        self.finished.set()
+        return "/cache/game"
+
+
+def _db_download_state(db, item_id: str) -> DownloadState:
+    with db.connect() as connection:
+        value = connection.execute(
+            "SELECT state FROM download_items WHERE id=?", (item_id,)
+        ).fetchone()[0]
+    return DownloadState(value)
+
+
+def _wait_db_download_state(db, item_id: str, state: DownloadState) -> None:
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if _db_download_state(db, item_id) is state:
+            return
+        time.sleep(0.01)
+    raise AssertionError(
+        f"download did not reach {state.value}: {_db_download_state(db, item_id).value}"
+    )
+
+
+def test_progress_callbacks_attempt_verification_transition_once_without_reads(
+    db, game_repo, cache_dir, tmp_path
+):
+    game = _game(game_repo, tmp_path / "source")
+    repo = _CountingDownloadRepository(db)
+    cache = _BurstProgressCache(callbacks=5000)
+    manager = DownloadManagerService(
+        repository=repo,
+        staging_repository=StagingRepository(db),
+        game_repo=game_repo,
+        cache=cache,
+        cache_root=str(cache_dir),
+    )
+    item_id = manager.enqueue([game.id])["items"][0]["id"]
+
+    manager.start()
+    assert cache.finished.wait(3)
+    _wait_db_download_state(db, item_id, DownloadState.COMPLETE)
+    manager.shutdown()
+
+    # The single read belongs to final completion; none belong to the 5,000
+    # progress callbacks.
+    assert repo.get_calls == 1
+    assert repo.verification_transition_attempts == 1
+    assert repo.verification_transition_successes == 1
+
+
+@pytest.mark.parametrize(
+    ("control", "expected"),
+    [("pause", DownloadState.PAUSED), ("cancel", DownloadState.CANCELLED)],
+)
+@pytest.mark.parametrize("durable_control_won", [False, True])
+def test_control_before_first_progress_cannot_be_overwritten_by_verification_transition(
+    db, game_repo, cache_dir, tmp_path, control, expected, durable_control_won
+):
+    game = _game(game_repo, tmp_path / "source")
+    repo = _CountingDownloadRepository(db)
+    cache = _BurstProgressCache(callbacks=1, deferred=True)
+    manager = DownloadManagerService(
+        repository=repo,
+        staging_repository=StagingRepository(db),
+        game_repo=game_repo,
+        cache=cache,
+        cache_root=str(cache_dir),
+    )
+    item_id = manager.enqueue([game.id])["items"][0]["id"]
+    manager.start()
+    assert cache.entered.wait(2)
+    _wait_db_download_state(db, item_id, DownloadState.VERIFYING)
+
+    getattr(manager, control)(item_id)
+    if durable_control_won:
+        assert repo.transition(
+            item_id,
+            from_states=[DownloadState.VERIFYING],
+            to_state=expected,
+        )
+    cache.release.set()
+    _wait_db_download_state(db, item_id, expected)
+    manager.shutdown()
+
+    assert repo.verification_transition_attempts == 1
+    assert repo.verification_transition_successes == (0 if durable_control_won else 1)
+
+
+def test_resumed_partial_attempt_transitions_once_and_completes(
+    db, game_repo, cache_dir, tmp_path
+):
+    game = _game(game_repo, tmp_path / "source")
+    repo = _CountingDownloadRepository(db)
+    cache = _BurstProgressCache(callbacks=20)
+    manager = DownloadManagerService(
+        repository=repo,
+        staging_repository=StagingRepository(db),
+        game_repo=game_repo,
+        cache=cache,
+        cache_root=str(cache_dir),
+    )
+    item_id = manager.enqueue([game.id])["items"][0]["id"]
+    assert repo.transition(
+        item_id,
+        from_states=[DownloadState.QUEUED],
+        to_state=DownloadState.RUNNING,
+    )
+    assert repo.transition(
+        item_id,
+        from_states=[DownloadState.RUNNING],
+        to_state=DownloadState.PAUSED,
+    )
+    manager.resume(item_id)
+
+    manager.start()
+    assert cache.finished.wait(3)
+    _wait_db_download_state(db, item_id, DownloadState.COMPLETE)
+    manager.shutdown()
+
+    assert repo.verification_transition_attempts == 1
+    assert repo.verification_transition_successes == 1
 
 
 def test_serial_worker_fifo_and_restart_state_preservation(db, game_repo, cache_dir, tmp_path):

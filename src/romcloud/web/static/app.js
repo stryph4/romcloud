@@ -3,7 +3,8 @@ const state = {token: "", localSession: false, controllerFirst: false, view: "li
 let contentUpdateScheduled = false;
 let oskSession = null;
 let diagnosticsBrowser = null;
-let downloadsTimer = null;
+let downloadsPoller = null;
+let downloadsRenderSignature = "";
 
 function contentUpdated() {
   if (contentUpdateScheduled) return;
@@ -176,6 +177,7 @@ function setViewNav(view) {
   if (view === "library") url.searchParams.delete("view");
   else url.searchParams.set("view", view);
   history.replaceState(null, "", url);
+  if (downloadsPoller) void downloadsPoller.viewChanged();
 }
 
 async function openDiagnostics() {
@@ -202,7 +204,7 @@ async function openDownloads() {
   $("downloads-main").classList.remove("hidden");
   $("app-section-title").textContent = "Downloads";
   setViewNav("downloads");
-  await loadDownloads();
+  await refreshDownloads();
 }
 
 function downloadControl(text, item, action, row, col, danger = false) {
@@ -214,7 +216,7 @@ function downloadControl(text, item, action, row, col, danger = false) {
     button.disabled = true;
     try {
       await api(`/api/downloads/${item.id}/${action}`, {method: "POST", body: "{}"});
-      await loadDownloads();
+      await refreshDownloads();
     } catch (error) { showDownloadsNotice(error.message, true); }
     finally { button.disabled = false; }
   });
@@ -229,6 +231,9 @@ function showDownloadsNotice(message, error = false) {
 async function loadDownloads() {
   try {
     const data = await api("/api/downloads");
+    const signature = JSON.stringify(data);
+    if (signature === downloadsRenderSignature) return data;
+    downloadsRenderSignature = signature;
     $("partial-usage").textContent = `${formatBytes(data.retained_partial_bytes)} retained`;
     const root = $("downloads-list"); root.replaceChildren();
     const groups = [
@@ -276,11 +281,18 @@ async function loadDownloads() {
       else $("job-progress").removeAttribute("value");
     }
     contentUpdated();
+    return data;
   } catch (error) {
+    downloadsRenderSignature = "";
     $("downloads-list").replaceChildren(el("div", "empty error", error.message));
     $("job").classList.add("hidden");
     contentUpdated();
+    return null;
   }
+}
+
+function refreshDownloads() {
+  return downloadsPoller ? downloadsPoller.refreshNow() : loadDownloads();
 }
 
 async function runAction(action, ids, button = null) {
@@ -288,7 +300,7 @@ async function runAction(action, ids, button = null) {
   showNotice(`${title(action)} in progress…`);
   try {
     await api("/api/actions", {method: "POST", body: JSON.stringify({action, game_ids: ids})});
-    ids.forEach((id) => state.selected.delete(id)); updateBulk(); showNotice(["cache", "download_selected"].includes(action) ? `Queued ${ids.length} download${ids.length === 1 ? "" : "s"}.` : `${title(action)} completed for ${ids.length} game${ids.length === 1 ? "" : "s"}.`); await loadSystems(); await loadGames(); await loadDownloads();
+    ids.forEach((id) => state.selected.delete(id)); updateBulk(); showNotice(["cache", "download_selected"].includes(action) ? `Queued ${ids.length} download${ids.length === 1 ? "" : "s"}.` : `${title(action)} completed for ${ids.length} game${ids.length === 1 ? "" : "s"}.`); await loadSystems(); await loadGames(); await refreshDownloads();
   } catch (error) { showNotice(error.message, true); }
   finally { if (button) button.disabled = false; }
 }
@@ -309,7 +321,7 @@ async function showPreflight() {
 
 async function startDownload() {
   $("start-download").disabled = true;
-  try { await api("/api/download-pinned", {method: "POST", body: "{}"}); $("preflight").close(); await loadDownloads(); showNotice("Pinned downloads queued."); }
+  try { await api("/api/download-pinned", {method: "POST", body: "{}"}); $("preflight").close(); await refreshDownloads(); showNotice("Pinned downloads queued."); }
   catch (error) { $("preflight-error").textContent = error.message; $("start-download").disabled = false; }
 }
 
@@ -429,12 +441,16 @@ $("cancel-all-confirm").addEventListener("click", async () => {
     const result = await api("/api/downloads/cancel-all", {method: "POST", body: "{}"});
     $("cancel-all-dialog").close("confirmed");
     showDownloadsNotice(`Cancelled ${result.cancelled} download${result.cancelled === 1 ? "" : "s"}.`);
-    await loadDownloads();
+    await refreshDownloads();
   } catch (error) { showDownloadsNotice(error.message, true); }
   finally { $("cancel-all-confirm").disabled = false; }
 });
-$("downloads-retry-all").addEventListener("click", async () => { await api("/api/downloads/retry-all-failed", {method: "POST", body: "{}"}); await loadDownloads(); });
-$("downloads-cleanup").addEventListener("click", async () => { const result = await api("/api/downloads/cleanup", {method: "POST", body: "{}"}); showDownloadsNotice(`Cleaned ${result.cleaned} stale download${result.cleaned === 1 ? "" : "s"}.`); await loadDownloads(); });
+$("downloads-retry-all").addEventListener("click", async () => { await api("/api/downloads/retry-all-failed", {method: "POST", body: "{}"}); await refreshDownloads(); });
+$("downloads-cleanup").addEventListener("click", async () => { const result = await api("/api/downloads/cleanup", {method: "POST", body: "{}"}); showDownloadsNotice(`Cleaned ${result.cleaned} stale download${result.cleaned === 1 ? "" : "s"}.`); await refreshDownloads(); });
+
+document.addEventListener("visibilitychange", () => {
+  if (downloadsPoller) void downloadsPoller.visibilityChanged();
+});
 
 window.addEventListener("romcloud:page-jump", (event) => {
   if (diagnosticsBrowser && diagnosticsBrowser.active) {
@@ -502,7 +518,11 @@ window.addEventListener("romcloud:controller-status", (event) => {
   $("nav-downloads").addEventListener("click", openDownloads);
   $("nav-diagnostics").addEventListener("click", openDiagnostics);
   await connect(state.token || "");
-  downloadsTimer = setInterval(loadDownloads, 1000);
+  downloadsPoller = new window.ROMCloudDownloadPolling.AdaptiveDownloadPoller({
+    document,
+    load: loadDownloads,
+    isDownloadsView: () => state.view === "downloads",
+  });
   const requestedView = new URLSearchParams(location.search).get("view");
   if (new URLSearchParams(location.search).get("view") === "diagnostics") {
     await openDiagnostics();

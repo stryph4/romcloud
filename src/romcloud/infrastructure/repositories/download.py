@@ -508,40 +508,89 @@ class StagingRepository:
         return int(row[0])
 
     def stats_for_game(self, game_id: str) -> dict[str, int]:
+        return self.stats_for_games((game_id,))[game_id]
+
+    def stats_for_games(
+        self, game_ids: Iterable[str]
+    ) -> dict[str, dict[str, int]]:
+        """Return staging/cache progress for many games using grouped reads.
+
+        Download status displays may contain hundreds of rows (and repeated
+        historical rows for the same game).  Resolve each distinct game once
+        while preserving the exact single-game accounting rule: a cache member
+        with any durable staging manifest is represented by its checkpoints;
+        otherwise its committed cache-member size is retained progress.
+        """
+        unique_ids = tuple(dict.fromkeys(str(game_id) for game_id in game_ids))
+        if not unique_ids:
+            return {}
+
+        results = {game_id: _empty_staging_stats() for game_id in unique_ids}
+        # Stay below SQLite's historical 999-variable limit.  All chunks share
+        # one connection, so very large nonterminal queues still avoid N
+        # connections even when more than one grouped statement is required.
+        batch_size = 400
         with self._db.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT
-                    COUNT(*) AS total_files,
-                    COALESCE(SUM(CASE WHEN file.state='complete' OR file.checkpoint_bytes>0 THEN 1 ELSE 0 END),0) AS retained_files,
-                    COALESCE(SUM(CASE WHEN file.state IN ('partial','transferring') THEN 1 ELSE 0 END),0) AS interrupted_files,
-                    COALESCE(SUM(CASE WHEN file.state!='complete' THEN 1 ELSE 0 END),0) AS remaining_files,
-                    COALESCE(SUM(file.checkpoint_bytes),0) AS staged_bytes
-                FROM cache_staging_files AS file
-                JOIN cache_members AS member
-                  ON member.relative_path=file.asset_relative_path
-                WHERE member.game_id=?
-                """,
-                (game_id,),
-            ).fetchone()
-            retained = conn.execute(
-                """
-                SELECT COALESCE(SUM(
-                    CASE WHEN EXISTS (
-                        SELECT 1 FROM cache_staging_files AS staged
-                        WHERE staged.asset_relative_path=member.relative_path
-                    ) THEN (
-                        SELECT COALESCE(SUM(staged.checkpoint_bytes),0)
-                        FROM cache_staging_files AS staged
-                        WHERE staged.asset_relative_path=member.relative_path
-                    ) ELSE member.size_bytes END
-                ),0)
-                FROM cache_members AS member WHERE member.game_id=?
-                """,
-                (game_id,),
-            ).fetchone()[0]
-        result = {key: int(row[key]) for key in (
-            "total_files", "retained_files", "interrupted_files", "remaining_files",
-        )}
-        result["retained_bytes"] = int(retained)
-        return result
+            for start in range(0, len(unique_ids), batch_size):
+                batch = unique_ids[start:start + batch_size]
+                placeholders = ",".join("?" for _ in batch)
+                rows = conn.execute(
+                    f"""
+                    WITH per_member AS (
+                        SELECT
+                            member.game_id AS game_id,
+                            member.relative_path AS relative_path,
+                            member.size_bytes AS size_bytes,
+                            COUNT(file.asset_relative_path) AS total_files,
+                            COALESCE(SUM(CASE
+                                WHEN file.state='complete' OR file.checkpoint_bytes>0
+                                THEN 1 ELSE 0 END), 0) AS retained_files,
+                            COALESCE(SUM(CASE
+                                WHEN file.state IN ('partial','transferring')
+                                THEN 1 ELSE 0 END), 0) AS interrupted_files,
+                            COALESCE(SUM(CASE
+                                WHEN file.state!='complete' THEN 1 ELSE 0 END), 0)
+                                AS remaining_files,
+                            COALESCE(SUM(file.checkpoint_bytes), 0) AS staged_bytes
+                        FROM cache_members AS member
+                        LEFT JOIN cache_staging_files AS file
+                          ON file.asset_relative_path=member.relative_path
+                        WHERE member.game_id IN ({placeholders})
+                        GROUP BY member.game_id, member.relative_path, member.size_bytes
+                    )
+                    SELECT
+                        game_id,
+                        COALESCE(SUM(total_files), 0) AS total_files,
+                        COALESCE(SUM(retained_files), 0) AS retained_files,
+                        COALESCE(SUM(interrupted_files), 0) AS interrupted_files,
+                        COALESCE(SUM(remaining_files), 0) AS remaining_files,
+                        COALESCE(SUM(CASE
+                            WHEN total_files > 0 THEN staged_bytes ELSE size_bytes END
+                        ), 0) AS retained_bytes
+                    FROM per_member
+                    GROUP BY game_id
+                    """,
+                    batch,
+                ).fetchall()
+                for row in rows:
+                    results[str(row["game_id"])] = {
+                        key: int(row[key])
+                        for key in (
+                            "total_files",
+                            "retained_files",
+                            "interrupted_files",
+                            "remaining_files",
+                            "retained_bytes",
+                        )
+                    }
+        return results
+
+
+def _empty_staging_stats() -> dict[str, int]:
+    return {
+        "total_files": 0,
+        "retained_files": 0,
+        "interrupted_files": 0,
+        "remaining_files": 0,
+        "retained_bytes": 0,
+    }

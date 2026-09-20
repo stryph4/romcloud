@@ -221,7 +221,8 @@ class ManagerRequestHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/" or parsed.path == "/index.html":
                 self._static("index.html")
             elif parsed.path in {
-                "/app.js", "/app.css", "/controller.js", "/spatial_navigation.js", "/diagnostics.js"
+                "/app.js", "/app.css", "/controller.js", "/spatial_navigation.js",
+                "/download_polling.js", "/diagnostics.js"
             }:
                 self._static(parsed.path[1:])
             else:

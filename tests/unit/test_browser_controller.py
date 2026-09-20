@@ -17,11 +17,19 @@ def test_controller_assets_wire_all_required_inputs_and_focus_scopes() -> None:
     spatial = (STATIC / "spatial_navigation.js").read_text(encoding="utf-8")
     app = (STATIC / "app.js").read_text(encoding="utf-8")
     diagnostics = (STATIC / "diagnostics.js").read_text(encoding="utf-8")
+    download_polling = (STATIC / "download_polling.js").read_text(encoding="utf-8")
     css = (STATIC / "app.css").read_text(encoding="utf-8")
     server = (ROOT / "src" / "romcloud" / "web" / "server.py").read_text(encoding="utf-8")
 
-    assert html.index('/controller.js') < html.index('/spatial_navigation.js') < html.index('/app.js')
+    assert (
+        html.index('/controller.js')
+        < html.index('/spatial_navigation.js')
+        < html.index('/download_polling.js')
+        < html.index('/app.js')
+    )
     assert '"/spatial_navigation.js"' in server
+    assert '"/download_polling.js"' in server
+    assert "AdaptiveDownloadPoller" in download_polling
     assert "chooseSpatialTarget" in spatial
     for zone in ("systems", "tabs", "controls", "games", "dialog", "pager"):
         assert zone in javascript or f'data-controller-zone="{zone}"' in html
@@ -119,6 +127,8 @@ def test_downloads_view_renders_durable_states_controls_and_controller_zones() -
         assert f'item, "{control}"' in app
     assert "retained_files" in app and "remaining_files" in app
     assert "staging_bytes" in app and "active_reserved_growth" in app
+    assert "downloadsRenderSignature" in app
+    assert "signature === downloadsRenderSignature" in app
     assert ".downloads-list" in css and ".download-item" in css
 
 
@@ -174,6 +184,64 @@ def test_controller_focus_and_repeat_state_machine_when_node_is_available() -> N
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "controller state tests passed" in result.stdout
+
+
+def test_download_polling_state_machine_when_node_is_available() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node is not installed on this development host")
+    result = subprocess.run(
+        [
+            node,
+            str(ROOT / "tests" / "js" / "download_polling_test.js"),
+            str(STATIC / "download_polling.js"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "download polling tests passed" in result.stdout
+
+
+def test_download_polling_executes_in_chromium_when_available(tmp_path: Path) -> None:
+    candidates = [
+        shutil.which("chromium"),
+        shutil.which("google-chrome"),
+        shutil.which("chrome"),
+        Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+        Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
+    ]
+    browser = next((str(path) for path in candidates if path and Path(path).is_file()), None)
+    if browser is None:
+        pytest.skip("Chromium is not installed on this development host")
+    harness = (ROOT / "tests" / "js" / "download_polling_harness.html").resolve().as_uri()
+    result = subprocess.run(
+        [
+            browser,
+            "--headless=new",
+            "--disable-gpu",
+            "--no-sandbox",
+            f"--user-data-dir={tmp_path / 'download-polling-profile'}",
+            "--virtual-time-budget=1000",
+            "--dump-dom",
+            harness,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    diagnostic = result.stdout + result.stderr
+    if (
+        result.returncode
+        and "crashpad" in diagnostic
+        and "Operation not permitted" in diagnostic
+    ):
+        pytest.skip("Chromium crash reporter is blocked by this test sandbox")
+    assert result.returncode == 0, diagnostic
+    assert 'data-result="passed"' in result.stdout, diagnostic
 
 
 def test_controller_core_executes_in_chromium_when_available(tmp_path: Path) -> None:
