@@ -183,6 +183,16 @@ class StorageProvider(ABC):
         )
 
     @contextmanager
+    def operation_session(self) -> Iterator[None]:
+        """Bound a multi-step provider operation.
+
+        Most providers need no lifecycle. Protocol providers may override
+        this scope to reuse one connection across related provider calls while
+        retaining their narrower catalog and transfer session boundaries.
+        """
+        yield
+
+    @contextmanager
     def catalog_system_scan(self, system: str) -> Iterator[None]:
         """Bound one system's catalog enumeration work.
 

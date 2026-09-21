@@ -9,6 +9,8 @@ or external infrastructure is required.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import socket
 import threading
@@ -24,8 +26,10 @@ from romcloud.core.exceptions import (
     ProviderHostKeyUnknownError,
     ProviderNotReachableError,
     TransferCancelledError,
+    TransferError,
 )
 from romcloud.core.models.game import Game, GameAsset
+from romcloud.core.models.proxy import ProxyRecord
 from romcloud.integrations.batocera.catalog import CatalogService
 from romcloud.integrations.batocera.system_registry import EffectiveSystemRegistry
 from romcloud.infrastructure.providers.sftp import (
@@ -34,6 +38,7 @@ from romcloud.infrastructure.providers.sftp import (
     probe_host_key,
 )
 from romcloud.infrastructure.repositories.download import StagingRepository
+from romcloud.services.library_sync import LibrarySyncService, library_id_for_game
 from romcloud.services.transfer import TransferService
 
 # A client that disconnects right after a rejected auth/host-key handshake
@@ -251,6 +256,26 @@ def _provider(server, *, password=TEST_PASSWORD, fingerprint=_UNSET, probe_writa
     )
 
 
+def _track_connections(provider, monkeypatch) -> dict[str, int]:
+    counts = {"opened": 0, "closed": 0}
+    original_connect = provider._connect
+
+    def tracked_connect():
+        counts["opened"] += 1
+        client, sftp = original_connect()
+        original_close = client.close
+
+        def tracked_close():
+            counts["closed"] += 1
+            original_close()
+
+        monkeypatch.setattr(client, "close", tracked_close)
+        return client, sftp
+
+    monkeypatch.setattr(provider, "_connect", tracked_connect)
+    return counts
+
+
 class TestHostKeyTrust:
     def test_probe_host_key_matches_server_fingerprint(self, sftp_server):
         server, _root = sftp_server
@@ -299,6 +324,60 @@ class TestAuthentication:
         )
         with pytest.raises(ProviderNotReachableError):
             provider.list_systems(str(root))
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            ProviderAuthError("auth failed"),
+            ProviderHostKeyUnknownError(
+                "unknown host key", fingerprint="SHA256:test", key_type="ssh-rsa"
+            ),
+            ProviderHostKeyMismatchError(
+                "host key mismatch", fingerprint="SHA256:test", key_type="ssh-rsa"
+            ),
+        ],
+        ids=["auth", "unknown-host-key", "host-key-mismatch"],
+    )
+    def test_permanent_connection_failures_are_not_retried(
+        self, sftp_server, monkeypatch, error
+    ):
+        server, _root = sftp_server
+        provider = _provider(server)
+        attempts = 0
+
+        def fail_once():
+            nonlocal attempts
+            attempts += 1
+            raise error
+
+        monkeypatch.setattr(provider, "_connect_once", fail_once)
+
+        with pytest.raises(type(error)):
+            provider._connect()
+
+        assert attempts == 1
+
+    def test_transient_initial_connection_failure_has_one_bounded_retry(
+        self, sftp_server, monkeypatch
+    ):
+        server, _root = sftp_server
+        provider = _provider(server)
+        attempts = 0
+
+        def fail():
+            nonlocal attempts
+            attempts += 1
+            raise ProviderNotReachableError("offline")
+
+        monkeypatch.setattr(provider, "_connect_once", fail)
+        monkeypatch.setattr(
+            "romcloud.infrastructure.providers.sftp.time.sleep", lambda _delay: None
+        )
+
+        with pytest.raises(ProviderNotReachableError):
+            provider._connect()
+
+        assert attempts == 2
 
 
 class TestReadOperations:
@@ -431,6 +510,197 @@ class TestReadOperations:
         provider = _provider(server)
         with provider.open_binary((root / "stream.bin").as_posix()) as fh:
             assert fh.read() == b"stream-me"
+
+    def test_operation_scope_nests_catalog_and_transfer_scopes(
+        self, sftp_server, monkeypatch
+    ):
+        server, root = sftp_server
+        (root / "nes").mkdir()
+        rom = root / "nes" / "Mario.nes"
+        rom.write_bytes(b"rom")
+        provider = _provider(server)
+        connections = _track_connections(provider, monkeypatch)
+
+        with provider.operation_session():
+            with provider.operation_session():
+                assert provider.list_systems(root.as_posix()) == ["nes"]
+                with provider.catalog_system_scan("nes"):
+                    assert provider.get_size(rom.as_posix()) == 3
+                with provider.transfer_session():
+                    assert provider.read_text(rom.as_posix()) == "rom"
+                assert connections == {"opened": 1, "closed": 0}
+
+        assert connections == {"opened": 1, "closed": 1}
+        assert provider._operation_session_state.get() is None
+        assert provider._catalog_scan_state.get() is None
+        assert provider._transfer_session_state.get() is None
+
+    def test_operation_scope_closes_after_nested_transfer_error(
+        self, sftp_server, monkeypatch
+    ):
+        server, root = sftp_server
+        (root / "file.bin").write_bytes(b"data")
+        provider = _provider(server)
+        connections = _track_connections(provider, monkeypatch)
+
+        with pytest.raises(TransferError, match="transfer failed"):
+            with provider.operation_session():
+                with provider.transfer_session():
+                    assert provider.get_size((root / "file.bin").as_posix()) == 4
+                    raise TransferError("transfer failed")
+
+        assert connections == {"opened": 1, "closed": 1}
+        assert provider._operation_session_state.get() is None
+        assert provider._transfer_session_state.get() is None
+
+    def test_operation_scope_closes_after_provider_error(
+        self, sftp_server, monkeypatch
+    ):
+        server, root = sftp_server
+        (root / "file.bin").write_bytes(b"data")
+        provider = _provider(server)
+        connections = _track_connections(provider, monkeypatch)
+
+        with pytest.raises(ProviderNotReachableError, match="connection lost"):
+            with provider.operation_session():
+                assert provider.get_size((root / "file.bin").as_posix()) == 4
+                raise ProviderNotReachableError("connection lost")
+
+        assert connections == {"opened": 1, "closed": 1}
+        assert provider._operation_session_state.get() is None
+
+    def test_library_pull_reuses_one_read_only_session_for_dataset_and_media(
+        self,
+        sftp_server,
+        tmp_path,
+        game_repo,
+        proxy_repo,
+        monkeypatch,
+    ):
+        server, root = sftp_server
+        remote_library = root / "library"
+        remote_library.mkdir()
+        local_roms = tmp_path / "local-roms"
+        local_system = local_roms / "ps2"
+        local_system.mkdir(parents=True)
+        data_root = tmp_path / "data-root"
+        data_root.mkdir()
+        source_root = tmp_path / "source"
+        source_root.mkdir()
+
+        game = Game.create(
+            "ps2",
+            "Game",
+            "sftp",
+            (root / "roms").as_posix(),
+            [GameAsset("Game.iso", "ps2/Game.iso", 4, True)],
+        )
+        game_repo.save(game)
+        proxy = local_system / "Game.romcloud"
+        proxy.write_text("{}", encoding="utf-8")
+        proxy_repo.save(ProxyRecord.create(game.id, str(proxy)))
+        library_id = library_id_for_game(game)
+
+        media_payloads = {
+            "image": (b"image-bytes", ".png"),
+            "video": (b"video-bytes", ".mp4"),
+        }
+        media = {}
+        for tag, (payload, suffix) in media_payloads.items():
+            digest = hashlib.sha256(payload).hexdigest()
+            blob = f"media/sha256/{digest[:2]}/{digest}{suffix}"
+            remote_blob = remote_library / Path(blob)
+            remote_blob.parent.mkdir(parents=True, exist_ok=True)
+            remote_blob.write_bytes(payload)
+            media[tag] = {
+                "sha256": digest,
+                "size": len(payload),
+                "suffix": suffix,
+                "blob": blob,
+            }
+        expected_manual = b"expected-manual-bytes"
+        manual_digest = hashlib.sha256(expected_manual).hexdigest()
+        manual_blob = f"media/sha256/{manual_digest[:2]}/{manual_digest}.pdf"
+        corrupt_manual = remote_library / Path(manual_blob)
+        corrupt_manual.parent.mkdir(parents=True, exist_ok=True)
+        corrupt_manual.write_bytes(b"corrupt-manual-bytes")
+        media["manual"] = {
+            "sha256": manual_digest,
+            "size": len(expected_manual),
+            "suffix": ".pdf",
+            "blob": manual_blob,
+        }
+        (remote_library / "library.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "records": {
+                        library_id: {
+                            "system": "ps2",
+                            "source_path": "Game.iso",
+                            "metadata": {"name": "Game"},
+                            "media": media,
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        provider = _provider(server)
+        connections = _track_connections(provider, monkeypatch)
+        service = LibrarySyncService(
+            enabled=True,
+            provider=provider,
+            connectivity_root=root.as_posix(),
+            source_root=str(source_root),
+            local_roms_root=str(local_roms),
+            data_root=str(data_root),
+            remote_root=remote_library.as_posix(),
+            game_access_mode="smart_cache",
+            game_repo=game_repo,
+            proxy_repo=proxy_repo,
+        )
+
+        report = service.pull()
+
+        assert len(report.failures) == 1
+        assert "manual" in report.failures[0]
+        assert "Media verification failed" in report.failures[0]
+        assert report.media_transferred == 2
+        assert connections == {"opened": 1, "closed": 1}
+        for tag, (payload, suffix) in media_payloads.items():
+            descriptor = media[tag]
+            rendered = (
+                local_system
+                / ".romcloud-media"
+                / descriptor["sha256"][:2]
+                / f"{descriptor['sha256']}{suffix}"
+            )
+            assert rendered.read_bytes() == payload
+            assert (
+                hashlib.sha256(rendered.read_bytes()).hexdigest()
+                == descriptor["sha256"]
+            )
+        corrupt_destination = (
+            local_system
+            / ".romcloud-media"
+            / manual_digest[:2]
+            / f"{manual_digest}.pdf"
+        )
+        assert not corrupt_destination.exists()
+        assert not list(corrupt_destination.parent.glob("*.partial"))
+        write_flags = (
+            os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+        )
+        mutations = [
+            event
+            for event in server.operations
+            if event[0] in {"write", "remove", "mkdir", "rename"}
+            or (event[0] == "open" and event[3] & write_flags)
+        ]
+        assert mutations == []
+        assert provider._operation_session_state.get() is None
 
     def test_transfer_service_resumes_verified_offset_with_zero_remote_writes(
         self, sftp_server, tmp_path, db, monkeypatch
@@ -591,6 +861,39 @@ class TestCatalogScanPerformance:
         assert metrics.directory_listings == 1
         assert metrics.entries_examined == 1
         assert metrics.stat_calls == 0
+
+    def test_refresh_reuses_one_connection_and_isolates_system_scan_caches(
+        self, sftp_server, game_repo, proxy_repo, local_roms_dir, monkeypatch
+    ):
+        server, root = sftp_server
+        for system, filename in (("nes", "Mario.nes"), ("snes", "Zelda.sfc")):
+            directory = root / system
+            directory.mkdir()
+            (directory / filename).write_bytes(system.encode("ascii"))
+        provider = _provider(server)
+        connections = _track_connections(provider, monkeypatch)
+        service = CatalogService(
+            provider=provider,
+            game_repo=game_repo,
+            proxy_repo=proxy_repo,
+            local_roms_root=str(local_roms_dir),
+            source_root=root.as_posix(),
+            system_registry=EffectiveSystemRegistry.from_extensions(
+                {"nes": {".nes"}, "snes": {".sfc"}}
+            ),
+        )
+
+        result = service.refresh()
+
+        assert result.errors == []
+        assert result.added == 2
+        assert connections == {"opened": 1, "closed": 1}
+        assert set(provider.catalog_scan_metrics) == {"nes", "snes"}
+        assert provider.catalog_scan_metrics["nes"].directory_listings == 1
+        assert provider.catalog_scan_metrics["snes"].directory_listings == 1
+        assert provider.catalog_scan_metrics["nes"].entries_examined == 1
+        assert provider.catalog_scan_metrics["snes"].entries_examined == 1
+        assert provider._operation_session_state.get() is None
 
     def test_single_file_system_uses_one_listing_and_no_metadata_calls(
         self, sftp_server, game_repo, proxy_repo, local_roms_dir

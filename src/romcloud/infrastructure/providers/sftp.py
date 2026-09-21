@@ -7,10 +7,10 @@ operations are gated elsewhere by provider/capability policy.
 
 No local mount/filesystem is involved (unlike SMB, which is a real CIFS
 kernel mount read through :class:`~romcloud.infrastructure.providers.local.LocalFilesystemProvider`).
-Ordinary operations open a short-lived, bounded SSH/SFTP session. Catalog
-refresh reuses one session only for the duration of each system scan and
-then closes it; no persistent background connection or reconnect daemon is
-maintained.
+Ordinary operations open a short-lived, bounded SSH/SFTP session. Explicit
+operation scopes reuse one session across their related calls, while catalog
+and transfer scopes continue to provide narrower reuse when invoked alone.
+No persistent background connection or reconnect daemon is maintained.
 
 Host-key verification is always enforced. A caller must supply the
 fingerprint trusted for this target (obtained once via
@@ -119,6 +119,14 @@ class _SFTPCatalogScanState:
         )
 
 
+@dataclass
+class _SFTPOperationSessionState:
+    """Lazily-owned connection for one bounded high-level operation."""
+
+    client: Optional[paramiko.SSHClient] = None
+    sftp: Optional[paramiko.SFTPClient] = None
+
+
 def fingerprint_of(key: paramiko.PKey) -> str:
     """OpenSSH-style ``SHA256:...`` fingerprint of *key*."""
     digest = hashlib.sha256(key.asbytes()).digest()
@@ -215,6 +223,9 @@ class SFTPProvider(StorageProvider):
         _ = probe_writable
         self._connect_timeout = connect_timeout
         self._operation_timeout = operation_timeout
+        self._operation_session_state: contextvars.ContextVar[
+            Optional[_SFTPOperationSessionState]
+        ] = contextvars.ContextVar("romcloud_sftp_operation_session", default=None)
         self._catalog_scan_state: contextvars.ContextVar[
             Optional[_SFTPCatalogScanState]
         ] = contextvars.ContextVar("romcloud_sftp_catalog_scan", default=None)
@@ -249,7 +260,13 @@ class SFTPProvider(StorageProvider):
             yield
             return
 
-        client, sftp = self._connect()
+        operation_state = self._operation_session_state.get()
+        if operation_state is None:
+            client, sftp = self._connect()
+            owns_connection = True
+        else:
+            client, sftp = self._operation_connection(operation_state)
+            owns_connection = False
         state = _SFTPCatalogScanState(
             system=system,
             client=client,
@@ -261,7 +278,8 @@ class SFTPProvider(StorageProvider):
             yield
         finally:
             self._catalog_scan_state.reset(token)
-            state.client.close()
+            if owns_connection:
+                state.client.close()
             metrics = state.finish()
             self._catalog_scan_metrics[system] = metrics
             log.info(
@@ -337,6 +355,28 @@ class SFTPProvider(StorageProvider):
             time.sleep(_CONNECT_RETRY_DELAY)
             return self._connect_once()
 
+    def _operation_connection(
+        self, state: _SFTPOperationSessionState
+    ) -> tuple[paramiko.SSHClient, paramiko.SFTPClient]:
+        if state.client is None or state.sftp is None:
+            state.client, state.sftp = self._connect()
+        return state.client, state.sftp
+
+    @contextlib.contextmanager
+    def operation_session(self) -> Iterator[None]:
+        """Reuse one lazily-opened connection for a high-level operation."""
+        if self._operation_session_state.get() is not None:
+            yield
+            return
+        state = _SFTPOperationSessionState()
+        token = self._operation_session_state.set(state)
+        try:
+            yield
+        finally:
+            self._operation_session_state.reset(token)
+            if state.client is not None:
+                state.client.close()
+
     class _Session:
         """Context manager guaranteeing the transport is always closed."""
 
@@ -359,6 +399,10 @@ class SFTPProvider(StorageProvider):
         transfer_state = self._transfer_session_state.get()
         if transfer_state is not None:
             return SFTPProvider._BorrowedSession(transfer_state[1])
+        operation_state = self._operation_session_state.get()
+        if operation_state is not None:
+            _client, sftp = self._operation_connection(operation_state)
+            return SFTPProvider._BorrowedSession(sftp)
         return SFTPProvider._Session(self)
 
     class _BorrowedSession:
@@ -379,13 +423,20 @@ class SFTPProvider(StorageProvider):
         if self._transfer_session_state.get() is not None:
             yield
             return
-        client, sftp = self._connect()
+        operation_state = self._operation_session_state.get()
+        if operation_state is None:
+            client, sftp = self._connect()
+            owns_connection = True
+        else:
+            client, sftp = self._operation_connection(operation_state)
+            owns_connection = False
         token = self._transfer_session_state.set((client, sftp))
         try:
             yield
         finally:
             self._transfer_session_state.reset(token)
-            client.close()
+            if owns_connection:
+                client.close()
 
     @staticmethod
     def _cache_key(path: str) -> str:

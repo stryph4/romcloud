@@ -609,6 +609,27 @@ class LibrarySyncService:
         progress: ProgressSink = None,
         full: bool = False,
     ) -> LibrarySyncReport:
+        session = (
+            self._provider.operation_session()
+            if self._provider is not None
+            else nullcontext()
+        )
+        with session:
+            return self._run_in_operation(
+                direction,
+                write_remote=write_remote,
+                progress=progress,
+                full=full,
+            )
+
+    def _run_in_operation(
+        self,
+        direction: str,
+        *,
+        write_remote: bool,
+        progress: ProgressSink = None,
+        full: bool = False,
+    ) -> LibrarySyncReport:
         self._require_available()
         if write_remote:
             self._require_durable_remote("Library Sync publish")

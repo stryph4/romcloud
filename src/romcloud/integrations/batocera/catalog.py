@@ -150,6 +150,11 @@ class CatalogService:
     # ── public API ────────────────────────────────────────────────────────────
 
     def refresh(self, progress: ProgressSink = None) -> CatalogRefreshResult:
+        """Run one catalog refresh in a bounded provider operation scope."""
+        with self._provider.operation_session():
+            return self._refresh(progress)
+
+    def _refresh(self, progress: ProgressSink = None) -> CatalogRefreshResult:
         """Scan the remote ROM root; create proxy files for new games.
 
         Already-tracked games are skipped (not duplicated). An existing game
