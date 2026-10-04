@@ -56,7 +56,7 @@ assert.ok(diagnosticBody.events.some((event) =>
 ));
 assert.ok(diagnosticBody.events.some((event) => event.event === "gamepad-snapshot"));
 assert.ok(diagnosticBody.events.some((event) =>
-  event.event === "gamepad-snapshot" && event.detail.mapping_supported === false
+  event.event === "gamepad-snapshot" && event.detail.mapping_supported === true
 ));
 assert.ok(diagnosticBody.events.some((event) => event.event === "gamepad-input-change"));
 assert.ok(diagnosticBody.events.some((event) => event.event === "focus-change"));
