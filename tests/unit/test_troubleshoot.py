@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -154,6 +155,7 @@ def test_quick_repair_rewrites_owned_core_wrappers_then_second_run_is_noop(tmp_p
     (home / "venv" / "bin").mkdir(parents=True)
     python = home / "venv" / "bin" / "python"
     python.write_text("", encoding="utf-8")
+    python.chmod(python.stat().st_mode | stat.S_IEXEC)
     monkeypatch.setattr(
         "romcloud.troubleshoot.subprocess.run",
         lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stderr=""),
@@ -186,7 +188,7 @@ def test_healthcheck_and_troubleshoot_share_collectors_and_do_not_migrate(tmp_pa
         cli, ["--config", str(config_path), "troubleshoot", "--json-output"]
     )
 
-    assert "Catalog" in health.output
+    assert "catalog database is missing" in health.output
     assert json.loads(troubleshoot.output)["operation"] == "troubleshoot"
     assert legacy.exists()
     assert not (config_path.parent / "credentials.toml").exists()

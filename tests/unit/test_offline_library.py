@@ -11,7 +11,7 @@ from click.testing import CliRunner
 from romcloud.bootstrap.container import Container
 from romcloud.cli.main import cli
 from romcloud.core.capabilities import OperatingMode
-from romcloud.core.exceptions import ModeTransitionError
+from romcloud.core.exceptions import ConfigurationError, ModeTransitionError
 from romcloud.core.models.cache import CacheEntry, CacheStatus
 from romcloud.core.models.game import Game, GameAsset
 from romcloud.core.models.proxy import ProxyRecord
@@ -309,7 +309,10 @@ def test_connected_transition_rejects_source_overlapping_local_roms(tmp_path: Pa
         source=SourceConfig("local", config.local_roms_path),
     )
 
-    with pytest.raises(ModeTransitionError, match="remains in Cache Mode"):
+    with pytest.raises(
+        ConfigurationError,
+        match="source to be separate from Batocera's local ROM directory",
+    ):
         set_operating_mode(overlapping, OperatingMode.CONNECTED)
 
     assert operating_mode(overlapping) is OperatingMode.CACHE

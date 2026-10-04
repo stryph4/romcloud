@@ -120,6 +120,7 @@ class TestScanTree:
         selected = (
             "dolphin-emu/GC/MemoryCardA.USA.raw",
             "dolphin-emu/GC/USA/Card A/01-GAME-progress.gci",
+            "dolphin-emu/StateSaves/RMCE01.s01",
             "dolphin-emu/Wii/title/00010004/524d4345/data/banner.bin",
             "dolphin-emu/Wii/title/00010004/524d4345/data/rksys.dat",
         )
@@ -128,7 +129,6 @@ class TestScanTree:
             "dolphin-emu/Cache/Shaders/cache.bin",
             "dolphin-emu/Logs/dolphin.log",
             "dolphin-emu/ScreenShots/RMCE01.png",
-            "dolphin-emu/StateSaves/RMCE01.s01",
             "dolphin-emu/Load/Textures/RMCE01/texture.png",
             "dolphin-emu/GameSettings/RMCE01.ini",
             "dolphin-emu/GC/USA/IPL.bin",

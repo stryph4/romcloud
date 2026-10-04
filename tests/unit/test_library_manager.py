@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
 import threading
 import time
@@ -11,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+
+from tests.browser_test_support import usable_chromium
 
 from romcloud.core.capabilities import Capability, CapabilityPolicy, OperatingMode
 from romcloud.core.models.cache import CachePolicy
@@ -657,16 +658,7 @@ def test_local_diagnostics_reuses_active_store_without_reinitializing(
 def test_real_browser_loads_authenticated_manager_app(
     db, game_repo, cache_repo, cache_service, tmp_path
 ):
-    candidates = [
-        shutil.which("chromium"),
-        shutil.which("google-chrome"),
-        shutil.which("chrome"),
-        Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
-        Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
-    ]
-    browser = next((str(path) for path in candidates if path and Path(path).is_file()), None)
-    if browser is None:
-        pytest.skip("Chromium is not installed on this development host")
+    browser = usable_chromium()
     _game(game_repo, tmp_path / "source", "nes", "Rendered Browser Game")
     server = ManagerHTTPServer(
         ("127.0.0.1", 0),

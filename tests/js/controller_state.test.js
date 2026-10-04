@@ -52,11 +52,11 @@ assert.strictEqual(diagnosticRequests.length, 1);
 const diagnosticBody = JSON.parse(diagnosticRequests[0].options.body);
 assert.ok(diagnosticBody.events.some((event) => event.event === "controller-initialized"));
 assert.ok(diagnosticBody.events.some((event) =>
-  event.event === "controller-boundary" && event.detail.state === "nonstandard-gamepad-exposed"
+  event.event === "controller-boundary" && event.detail.state === "compatible-nonstandard-gamepad-exposed"
 ));
 assert.ok(diagnosticBody.events.some((event) => event.event === "gamepad-snapshot"));
 assert.ok(diagnosticBody.events.some((event) =>
-  event.event === "gamepad-snapshot" && event.detail.mapping_supported === false
+  event.event === "gamepad-snapshot" && event.detail.mapping_supported === true
 ));
 assert.ok(diagnosticBody.events.some((event) => event.event === "gamepad-input-change"));
 assert.ok(diagnosticBody.events.some((event) => event.event === "focus-change"));
@@ -78,6 +78,7 @@ assert.deepStrictEqual(model.current, {zone: "systems", row: 0, col: 0});
 assert.deepStrictEqual(model.moveVertical(1), {zone: "systems", row: 1, col: 0});
 assert.deepStrictEqual(model.moveHorizontal(1), {zone: "primary", row: 0, col: 0});
 model.set({zone: "systems", row: 1, col: 0});
+assert.deepStrictEqual(model.moveVertical(1), {zone: "systems", row: 2, col: 0});
 assert.deepStrictEqual(model.moveVertical(1), {zone: "primary", row: 0, col: 0});
 assert.deepStrictEqual(model.moveVertical(1), {zone: "tabs", row: 0, col: 0});
 assert.deepStrictEqual(model.moveHorizontal(1), {zone: "tabs", row: 0, col: 1});

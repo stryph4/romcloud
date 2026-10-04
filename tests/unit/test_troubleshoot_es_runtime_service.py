@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 from xml.etree import ElementTree as ET
@@ -88,6 +89,7 @@ def test_verified_runtime_allows_owned_wrapper_repair(tmp_path: Path, monkeypatc
     python = config_path.parent.parent / "venv" / "bin" / "python"
     python.parent.mkdir(parents=True)
     python.write_bytes(b"runtime")
+    python.chmod(python.stat().st_mode | stat.S_IEXEC)
     monkeypatch.setattr(
         "romcloud.troubleshoot.subprocess.run",
         lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stderr=""),

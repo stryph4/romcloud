@@ -404,12 +404,14 @@ def _local_library_lock(config: AppConfig) -> Path | None:
 
 
 def _open_sqlite_read_only(path: Path) -> sqlite3.Connection:
-    # ``immutable=1`` is deliberately not used: it ignores committed rows that
-    # are still resident in an existing WAL.  URI read-only mode plus
-    # ``query_only`` sees the live committed snapshot without authorizing any
-    # database-content mutation. SQLite may consult existing WAL/SHM sidecars.
+    # Immutable mode prevents SQLite from creating a new empty WAL sidecar for
+    # a WAL-mode database that currently has no WAL. When a WAL already exists
+    # we must use ordinary read-only mode so committed rows resident there are
+    # included in the diagnostic snapshot.
     uri_path = quote(path.resolve(strict=False).as_posix(), safe="/:")
-    conn = sqlite3.connect(f"file:{uri_path}?mode=ro", uri=True)
+    wal_path = path.with_name(f"{path.name}-wal")
+    query = "mode=ro" if wal_path.exists() else "mode=ro&immutable=1"
+    conn = sqlite3.connect(f"file:{uri_path}?{query}", uri=True)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only = ON")
     return conn
