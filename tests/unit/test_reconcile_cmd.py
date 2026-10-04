@@ -78,6 +78,8 @@ class TestReconcileInstallCmd:
         project_root = tmp_path / "project"
         (project_root / "ports_gfx").mkdir(parents=True)
         (project_root / "ports_gfx" / "__init__.py").write_text("")
+        (project_root / "ports_gfx" / "app.py").write_text("")
+        (project_root / "ports_gfx" / "client.py").write_text("")
         fake_python = _write_fake_system_python(tmp_path / "fake-python-pygame", has_pygame=True)
         ports_dir = tmp_path / "ports"
         ports_dir.mkdir()

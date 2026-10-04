@@ -58,9 +58,17 @@ def cli(ctx: click.Context, config_path: str | None, debug: bool) -> None:
         except ROMCloudError as exc:
             click.echo(f"error: {exc}", err=True)
             ctx.exit(1)
-    elif ctx.invoked_subcommand in ("healthcheck", "troubleshoot", "uninstall", "purge"):
+    elif ctx.invoked_subcommand in (
+        "healthcheck",
+        "troubleshoot",
+        "uninstall",
+        "purge",
+        "mount",
+    ):
         # Diagnostics and destructive lifecycle commands must not initialize
         # logs/directories or SQLite before their read-only safety preflight.
+        # Mount lifecycle commands likewise defer configuration and logging
+        # until the nested command can select its safe path-resolution mode.
         configure_logging(
             level="DEBUG" if debug else "INFO",
             log_dir=None,

@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.browser_test_support import usable_chromium
+
 
 ROOT = Path(__file__).parents[2]
 STATIC = ROOT / "src" / "romcloud" / "web" / "static"
@@ -206,16 +208,7 @@ def test_download_polling_state_machine_when_node_is_available() -> None:
 
 
 def test_download_polling_executes_in_chromium_when_available(tmp_path: Path) -> None:
-    candidates = [
-        shutil.which("chromium"),
-        shutil.which("google-chrome"),
-        shutil.which("chrome"),
-        Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
-        Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
-    ]
-    browser = next((str(path) for path in candidates if path and Path(path).is_file()), None)
-    if browser is None:
-        pytest.skip("Chromium is not installed on this development host")
+    browser = usable_chromium()
     harness = (ROOT / "tests" / "js" / "download_polling_harness.html").resolve().as_uri()
     result = subprocess.run(
         [
@@ -245,16 +238,7 @@ def test_download_polling_executes_in_chromium_when_available(tmp_path: Path) ->
 
 
 def test_controller_core_executes_in_chromium_when_available(tmp_path: Path) -> None:
-    candidates = [
-        shutil.which("chromium"),
-        shutil.which("google-chrome"),
-        shutil.which("chrome"),
-        Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
-        Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
-    ]
-    browser = next((str(path) for path in candidates if path and Path(path).is_file()), None)
-    if browser is None:
-        pytest.skip("Chromium is not installed on this development host")
+    browser = usable_chromium()
     harness = (ROOT / "tests" / "js" / "controller_harness.html").resolve().as_uri()
     result = subprocess.run(
         [
@@ -283,16 +267,7 @@ def test_controller_core_executes_in_chromium_when_available(tmp_path: Path) -> 
 
 
 def test_gamepad_navigation_executes_in_chromium_when_available(tmp_path: Path) -> None:
-    candidates = [
-        shutil.which("chromium"),
-        shutil.which("google-chrome"),
-        shutil.which("chrome"),
-        Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
-        Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
-    ]
-    browser = next((str(path) for path in candidates if path and Path(path).is_file()), None)
-    if browser is None:
-        pytest.skip("Chromium is not installed on this development host")
+    browser = usable_chromium()
     harness = (ROOT / "tests" / "js" / "controller_browser_harness.html").resolve().as_uri()
     result = subprocess.run(
         [
@@ -321,14 +296,7 @@ def test_gamepad_navigation_executes_in_chromium_when_available(tmp_path: Path) 
 
 
 def test_diagnostics_navigation_executes_in_chromium_when_available(tmp_path: Path) -> None:
-    candidates = [
-        shutil.which("chromium"), shutil.which("google-chrome"), shutil.which("chrome"),
-        Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
-        Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
-    ]
-    browser = next((str(path) for path in candidates if path and Path(path).is_file()), None)
-    if browser is None:
-        pytest.skip("Chromium is not installed on this development host")
+    browser = usable_chromium()
     harness = (ROOT / "tests" / "js" / "diagnostics_browser_harness.html").resolve().as_uri()
     result = subprocess.run(
         [

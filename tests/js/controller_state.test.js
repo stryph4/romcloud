@@ -52,7 +52,7 @@ assert.strictEqual(diagnosticRequests.length, 1);
 const diagnosticBody = JSON.parse(diagnosticRequests[0].options.body);
 assert.ok(diagnosticBody.events.some((event) => event.event === "controller-initialized"));
 assert.ok(diagnosticBody.events.some((event) =>
-  event.event === "controller-boundary" && event.detail.state === "nonstandard-gamepad-exposed"
+  event.event === "controller-boundary" && event.detail.state === "compatible-nonstandard-gamepad-exposed"
 ));
 assert.ok(diagnosticBody.events.some((event) => event.event === "gamepad-snapshot"));
 assert.ok(diagnosticBody.events.some((event) =>

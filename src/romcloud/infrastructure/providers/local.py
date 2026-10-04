@@ -128,6 +128,13 @@ class LocalFilesystemProvider(StorageProvider):
         ):
             raise ProviderError(f"Unsafe relative source directory: {system!r}")
         system_path = root.joinpath(*relative.parts)
+        cursor = root
+        for part in relative.parts:
+            cursor /= part
+            if cursor.is_symlink():
+                raise ProviderError(
+                    f"Source directory contains a symlink: {system!r}"
+                )
         try:
             system_path.resolve().relative_to(root)
         except (OSError, ValueError) as exc:
