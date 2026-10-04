@@ -78,6 +78,7 @@ assert.deepStrictEqual(model.current, {zone: "systems", row: 0, col: 0});
 assert.deepStrictEqual(model.moveVertical(1), {zone: "systems", row: 1, col: 0});
 assert.deepStrictEqual(model.moveHorizontal(1), {zone: "primary", row: 0, col: 0});
 model.set({zone: "systems", row: 1, col: 0});
+assert.deepStrictEqual(model.moveVertical(1), {zone: "systems", row: 2, col: 0});
 assert.deepStrictEqual(model.moveVertical(1), {zone: "primary", row: 0, col: 0});
 assert.deepStrictEqual(model.moveVertical(1), {zone: "tabs", row: 0, col: 0});
 assert.deepStrictEqual(model.moveHorizontal(1), {zone: "tabs", row: 0, col: 1});
