@@ -1529,7 +1529,7 @@ class TestApply:
         unmounted = []
         monkeypatch.setattr(
             "romcloud.infrastructure.mount.unmount_cifs_source",
-            lambda path: unmounted.append(path) or True,
+            lambda path, **kwargs: unmounted.append(path) or True,
         )
         payload = _payload(
             remote_data_type="smb",
@@ -1585,7 +1585,7 @@ class TestApply:
             lambda **kwargs: SimpleNamespace(already_mounted=False),
         )
 
-        def cleanup(path):
+        def cleanup(path, **kwargs):
             if path == "/userdata/romcloud/remote":
                 raise RuntimeError("target busy")
             return True

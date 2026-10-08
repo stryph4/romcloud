@@ -28,7 +28,12 @@ from romcloud.services.smb_discovery import (
     SMBErrorKind,
     SMBServerTarget,
     ShareInfo,
+    ShareValidationResult,
     SystemDetectionResult,
+)
+from romcloud.services.directory_browser import (
+    join_remote_directory,
+    normalize_remote_directory,
 )
 from romcloud.ui.prompts import prompt_password
 
@@ -71,6 +76,7 @@ class SMBSetupResult:
     share: str
     username: str
     password: str = field(repr=False)
+    remote_path: str
     detected_systems: tuple[str, ...]
 
 
@@ -171,12 +177,28 @@ def run_smb_setup_wizard(
 
         click.echo("\u2713 Read access verified")
 
+        remote_path = ""
+        selected_validation = validation
+        if detect_systems:
+            selection = _select_rom_directory(
+                discovery,
+                target,
+                credentials,
+                share,
+                validation,
+                password=password,
+            )
+            if selection is None:
+                return None
+            remote_path, selected_validation = selection
+
         detection = (
-            discovery.detect_systems(validation)
+            discovery.detect_systems(selected_validation)
             if detect_systems
             else SystemDetectionResult(detected_systems=(), unrecognized_entries=())
         )
-        click.echo(f"\nConnected to //{server}/{share}")
+        suffix = f"/{remote_path}" if remote_path else ""
+        click.echo(f"\nConnected to //{server}/{share}{suffix}")
         if detect_systems:
             click.echo("\nDetected systems:\n")
             for system in detection.detected_systems:
@@ -190,6 +212,7 @@ def run_smb_setup_wizard(
                 share=share,
                 username=username,
                 password=password,
+                remote_path=remote_path,
                 detected_systems=detection.detected_systems,
             )
 
@@ -208,3 +231,58 @@ def _numbered_select(choices: list[str]) -> str:
         default=1,
     )
     return choices[choice - 1]
+
+
+def _select_rom_directory(
+    discovery: SMBDiscoveryService,
+    target: SMBServerTarget,
+    credentials: SMBCredentials,
+    share: str,
+    root_validation: ShareValidationResult,
+    *,
+    password: str,
+) -> Optional[tuple[str, ShareValidationResult]]:
+    """Choose and validate the share-relative directory containing systems."""
+    entries = root_validation.entries
+    directory_names = [entry.name for entry in entries if entry.is_directory]
+    if not entries:
+        # Older transports and test doubles provide names without file-type
+        # metadata. Treat them as browseable candidates for compatibility.
+        directory_names = list(root_validation.top_level_entries)
+
+    use_root = "Use share root"
+    manual = "Enter path manually"
+    while True:
+        click.echo("\nChoose the folder containing your Batocera system folders:")
+        try:
+            selection = _numbered_select(directory_names + [use_root, manual])
+        except (click.Abort, KeyboardInterrupt):
+            return None
+
+        if selection == use_root:
+            return "", root_validation
+        if selection == manual:
+            entered = click.prompt("Share-relative folder")
+            try:
+                remote_path = normalize_remote_directory(entered)
+            except ValueError as exc:
+                click.echo(f"Invalid folder: {exc}")
+                continue
+            if not remote_path:
+                return "", root_validation
+        else:
+            try:
+                remote_path = join_remote_directory("", selection)
+            except ValueError as exc:
+                click.echo(f"Invalid folder: {exc}")
+                continue
+
+        validation = discovery.browse_directory(
+            target, credentials, share, remote_path
+        )
+        if validation.ok:
+            return remote_path, validation
+        click.echo(
+            "Could not access folder: "
+            f"{_error_message(validation.error_kind, _redact(validation.detail, password))}"
+        )

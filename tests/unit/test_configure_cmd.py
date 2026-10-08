@@ -155,6 +155,7 @@ def _fake_setup_result(**overrides):
         share="Roms",
         username="stryph",
         password="hunter2",
+        remote_path="",
         detected_systems=("psx", "dreamcast"),
     )
     defaults.update(overrides)
@@ -183,9 +184,38 @@ class TestConfigureDelegatesToReusableSmbService:
         assert config.smb.server == "omnivault"
         assert config.smb.share == "Roms"
         assert config.smb.username == "stryph"
+        assert config.smb.remote_path == ""
 
         creds_path = cfg_path.parent / "credentials.toml"
         assert load_smb_password(creds_path) == "hunter2"
+
+    def test_source_wizard_persists_selected_remote_path(self, tmp_path, monkeypatch):
+        cfg_path = tmp_path / "romcloud.toml"
+        monkeypatch.setattr(
+            configure_cmd_module,
+            "build_default_smb_discovery_service",
+            lambda: "fake-discovery",
+        )
+        monkeypatch.setattr(
+            configure_cmd_module,
+            "run_smb_setup_wizard",
+            lambda discovery: _fake_setup_result(
+                share="batocera", remote_path="ROMS"
+            ),
+        )
+
+        result = CliRunner().invoke(
+            configure_cmd,
+            ["--source-type", "smb", "--rom-root", "/userdata/romcloud/source"],
+            obj={"config_path": str(cfg_path)},
+            input="\nn\n/userdata/romcloud/cache\n50\n5\n",
+        )
+
+        assert result.exit_code == 0, result.output
+        config = load_config(str(cfg_path))
+        assert config.source.rom_root == "/userdata/romcloud/source"
+        assert config.smb.share == "batocera"
+        assert config.smb.remote_path == "ROMS"
 
     def test_source_and_remote_smb_wizards_persist_independent_targets(
         self, tmp_path, monkeypatch

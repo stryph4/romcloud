@@ -373,7 +373,7 @@ class TestStop:
         monkeypatch.setattr(
             mount_cmd_module.mount,
             "unmount_cifs_source",
-            lambda path: calls.append(path) or True,
+            lambda path, **kwargs: calls.append(path) or True,
         )
         monkeypatch.setattr(
             connections_service,
@@ -432,7 +432,7 @@ class TestStop:
         calls = []
         monkeypatch.setattr(mount_cmd_module.mount_worker, "stop_worker", lambda *a: None)
 
-        def unmount(path):
+        def unmount(path, **kwargs):
             calls.append(path)
             if path == "/mnt/saves-rw":
                 raise MountError("remote busy")
@@ -490,7 +490,7 @@ class TestRemove:
         monkeypatch.setattr(
             mount_cmd_module.mount,
             "unmount_cifs_source",
-            lambda path: calls.append(path) or True,
+            lambda path, **kwargs: calls.append(path) or True,
         )
         monkeypatch.setattr(
             mount_cmd_module.mount_service,
@@ -705,7 +705,7 @@ class TestExistingStartBehaviorIntact:
         monkeypatch.setattr(
             mount_cmd_module.mount,
             "unmount_cifs_source",
-            lambda path: unmounted.append(path) or True,
+            lambda path, **kwargs: unmounted.append(path) or True,
         )
 
         result = _invoke(
