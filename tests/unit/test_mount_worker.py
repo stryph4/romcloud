@@ -901,6 +901,37 @@ class TestGetDiagnostics:
         assert diag.mounted is True
         assert diag.label == "mounted"
 
+    @pytest.mark.parametrize(
+        ("mounted_source", "expected"),
+        [
+            ("//nas.local/batocera/ROMS", True),
+            ("//nas.local/batocera", False),
+        ],
+    )
+    def test_subdirectory_readiness_rejects_share_root_view(
+        self, tmp_path, monkeypatch, mounted_source, expected
+    ):
+        mounts_text = f"{mounted_source} /mnt/roms cifs ro 0 0\n"
+        pure_identity_check = mw.mountlib.is_mounted_cifs_target
+
+        def check(target, **identity):
+            return pure_identity_check(target, mounts_text, **identity)
+
+        monkeypatch.setattr(mw.mountlib, "is_target_mounted_cifs", check)
+        config = _fake_config(
+            smb=SimpleNamespace(
+                server="nas.local",
+                share="batocera",
+                username="alice",
+                port=445,
+                remote_path="ROMS",
+            )
+        )
+
+        diag = mw.get_diagnostics(tmp_path, config)
+
+        assert diag.mounted is expected
+
     def test_worker_running_shows_waiting(self, tmp_path, monkeypatch):
         monkeypatch.setattr(mw.mountlib, "is_target_mounted_cifs", lambda *a, **k: False)
         mw.lock_path(tmp_path).parent.mkdir(parents=True)

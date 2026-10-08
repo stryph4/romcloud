@@ -17,6 +17,7 @@ from click.testing import CliRunner
 from romcloud.services.smb_discovery import (
     AuthResult,
     ListSharesResult,
+    SMBDirectoryEntry,
     ShareInfo,
     ShareValidationResult,
     SystemDetectionResult,
@@ -35,7 +36,9 @@ class FakeDiscovery:
     auth: AuthResult = field(default_factory=lambda: AuthResult(ok=True))
     shares: ListSharesResult = field(default_factory=lambda: ListSharesResult(ok=True, shares=(ShareInfo("Roms"),)))
     validations: dict = field(default_factory=dict)  # share name -> ShareValidationResult
+    browsed: dict = field(default_factory=dict)  # remote path -> ShareValidationResult
     validate_calls: list = field(default_factory=list)
+    browse_calls: list = field(default_factory=list)
 
     def validate_server(self, target):
         return self.reachable
@@ -50,9 +53,15 @@ class FakeDiscovery:
         self.validate_calls.append(share)
         return self.validations[share]
 
+    def browse_directory(self, target, credentials, share, path=""):
+        self.browse_calls.append((share, path))
+        return self.browsed[path]
+
     def detect_systems(self, validation):
         detected = tuple(
-            e for e in validation.top_level_entries if e.lower() in {"psx", "dreamcast", "gamecube"}
+            e
+            for e in validation.top_level_entries
+            if e.lower() in {"ps2", "psx", "snes", "dreamcast", "gamecube"}
         )
         unrecognized = tuple(e for e in validation.top_level_entries if e not in detected)
         return SystemDetectionResult(detected_systems=detected, unrecognized_entries=unrecognized)
@@ -67,7 +76,8 @@ def _make_command(discovery):
         else:
             click.echo(
                 "RESULT:"
-                f"{result.server}:{result.share}:{result.username}:{result.password}:"
+                f"{result.server}:{result.share}:{result.remote_path}:"
+                f"{result.username}:{result.password}:"
                 f"{','.join(result.detected_systems)}"
             )
 
@@ -85,12 +95,48 @@ class TestHappyPath:
         runner = CliRunner()
         result = runner.invoke(
             _make_command(discovery),
-            input="omnivault\nstryph\nhunter2\n1\ny\n",
+            input="omnivault\nstryph\nhunter2\n1\n3\ny\n",
         )
 
         assert result.exit_code == 0, result.output
-        assert "RESULT:omnivault:Roms:stryph:hunter2:" in result.output
+        assert "RESULT:omnivault:Roms::stryph:hunter2:" in result.output
         assert "psx" in result.output and "dreamcast" in result.output
+
+    def test_retronas_subdirectory_is_selected_and_detected(self):
+        discovery = FakeDiscovery(
+            validations={
+                "batocera": ShareValidationResult(
+                    ok=True,
+                    share="batocera",
+                    top_level_entries=("BIOS", "ROMS", "SAVES"),
+                    entries=(
+                        SMBDirectoryEntry("BIOS", True),
+                        SMBDirectoryEntry("ROMS", True),
+                        SMBDirectoryEntry("SAVES", True),
+                    ),
+                )
+            },
+            shares=ListSharesResult(
+                ok=True, shares=(ShareInfo("batocera"),)
+            ),
+            browsed={
+                "ROMS": ShareValidationResult(
+                    ok=True,
+                    share="batocera",
+                    top_level_entries=("ps2", "psx", "snes"),
+                )
+            },
+        )
+
+        result = CliRunner().invoke(
+            _make_command(discovery),
+            input="192.168.6.5\nplayer\nsecret\n1\n2\ny\n",
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "RESULT:192.168.6.5:batocera:ROMS:" in result.output
+        assert discovery.browse_calls == [("batocera", "ROMS")]
+        assert all(system in result.output for system in ("ps2", "psx", "snes"))
 
     def test_reused_connection_skips_server_username_and_password_prompts(self):
         discovery = FakeDiscovery(
@@ -178,12 +224,12 @@ class TestManualShareFallback:
         runner = CliRunner()
         result = runner.invoke(
             _make_command(discovery),
-            input="omnivault\nstryph\nhunter2\nRoms\ny\n",
+            input="omnivault\nstryph\nhunter2\nRoms\n2\ny\n",
         )
 
         assert result.exit_code == 0, result.output
         assert "Falling back to manual share entry" in result.output
-        assert "RESULT:omnivault:Roms:" in result.output
+        assert "RESULT:omnivault:Roms::" in result.output
 
     def test_manual_share_still_goes_through_validation(self):
         """Even in the manual fallback path, the share must be validated —
@@ -218,11 +264,63 @@ class TestManualEntryFromMenu:
         runner = CliRunner()
         result = runner.invoke(
             _make_command(discovery),
-            input="omnivault\nstryph\nhunter2\n2\nCustomShare\ny\n",
+            input="omnivault\nstryph\nhunter2\n2\nCustomShare\n1\ny\n",
         )
 
         assert result.exit_code == 0, result.output
-        assert "RESULT:omnivault:CustomShare:" in result.output
+        assert "RESULT:omnivault:CustomShare::" in result.output
+
+    def test_manual_nested_directory_is_validated_and_selected(self):
+        discovery = FakeDiscovery(
+            validations={
+                "batocera": ShareValidationResult(
+                    ok=True, share="batocera", top_level_entries=("Libraries",)
+                )
+            },
+            shares=ListSharesResult(
+                ok=True, shares=(ShareInfo("batocera"),)
+            ),
+            browsed={
+                "Libraries/ROMs": ShareValidationResult(
+                    ok=True,
+                    share="batocera",
+                    top_level_entries=("psx",),
+                )
+            },
+        )
+
+        result = CliRunner().invoke(
+            _make_command(discovery),
+            input=(
+                "omnivault\nstryph\nhunter2\n1\n3\n"
+                "Libraries/ROMs\ny\n"
+            ),
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "RESULT:omnivault:batocera:Libraries/ROMs:" in result.output
+        assert discovery.browse_calls == [("batocera", "Libraries/ROMs")]
+
+    def test_unsafe_manual_directory_is_rejected_before_browsing(self):
+        discovery = FakeDiscovery(
+            validations={
+                "batocera": ShareValidationResult(
+                    ok=True, share="batocera", top_level_entries=()
+                )
+            },
+            shares=ListSharesResult(
+                ok=True, shares=(ShareInfo("batocera"),)
+            ),
+        )
+
+        result = CliRunner().invoke(
+            _make_command(discovery),
+            input="omnivault\nstryph\nhunter2\n1\n2\n../ROMS\n1\ny\n",
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Invalid folder" in result.output
+        assert discovery.browse_calls == []
 
 
 class TestShareValidationFailureThenRetryDeclined:
@@ -256,7 +354,7 @@ class TestDecliningUseThisLibrary:
         runner = CliRunner()
         result = runner.invoke(
             _make_command(discovery),
-            input="omnivault\nstryph\nhunter2\n1\nn\nn\n",
+            input="omnivault\nstryph\nhunter2\n1\n2\nn\nn\n",
         )
 
         assert result.exit_code == 0, result.output
@@ -270,10 +368,13 @@ class TestNumberedSelector:
             validations={"two": ShareValidationResult(ok=True, share="two", top_level_entries=("psx",))},
         )
         runner = CliRunner()
-        result = runner.invoke(_make_command(discovery), input="omnivault\nstryph\nhunter2\n2\ny\n")
+        result = runner.invoke(
+            _make_command(discovery),
+            input="omnivault\nstryph\nhunter2\n2\n2\ny\n",
+        )
 
         assert result.exit_code == 0, result.output
-        assert "RESULT:omnivault:two:" in result.output
+        assert "RESULT:omnivault:two::" in result.output
 
     def test_invalid_numeric_input_reprompts_cleanly(self):
         discovery = FakeDiscovery(
@@ -281,10 +382,13 @@ class TestNumberedSelector:
             validations={"b": ShareValidationResult(ok=True, share="b", top_level_entries=())},
         )
         runner = CliRunner()
-        result = runner.invoke(_make_command(discovery), input="omnivault\nstryph\nhunter2\n99\n2\ny\n")
+        result = runner.invoke(
+            _make_command(discovery),
+            input="omnivault\nstryph\nhunter2\n99\n2\n1\ny\n",
+        )
 
         assert result.exit_code == 0, result.output
-        assert "RESULT:omnivault:b:" in result.output
+        assert "RESULT:omnivault:b::" in result.output
 
     def test_ctrl_c_cancels_cleanly(self, monkeypatch):
         discovery = FakeDiscovery(

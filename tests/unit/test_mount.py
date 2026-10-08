@@ -113,6 +113,31 @@ class TestIsMounted:
             read_only=False,
         ) is False
 
+    @pytest.mark.parametrize(
+        ("mount_source", "options", "remote_path", "expected"),
+        [
+            ("//nas/batocera/ROMS", "ro", "ROMS", True),
+            ("//nas/batocera/Libraries/ROMs", "ro", "Libraries/ROMs", True),
+            ("//nas/batocera", "ro,prefixpath=ROMS", "ROMS", True),
+            ("//nas/batocera", "ro", "ROMS", False),
+            ("//nas/batocera/ROMS", "ro", "", False),
+            ("//nas/batocera/ROMS", "ro,prefixpath=SAVES", "ROMS", False),
+        ],
+    )
+    def test_cifs_identity_requires_exact_subdirectory_view(
+        self, mount_source, options, remote_path, expected
+    ):
+        mounts = f"{mount_source} /userdata/romcloud/source cifs {options} 0 0\n"
+
+        assert mount.is_mounted_cifs_target(
+            "/userdata/romcloud/source",
+            mounts,
+            server="nas",
+            share="batocera",
+            read_only=True,
+            remote_path=remote_path,
+        ) is expected
+
 
 class TestBuildArgv:
     def test_mount_argv_never_contains_password(self):
@@ -155,8 +180,30 @@ class TestBuildArgv:
             Path("/creds/file"),
             remote_path="Libraries/Roms",
         )
+        assert argv[3] == "//nas.local/ROMs/Libraries/Roms"
         options = argv[argv.index("-o") + 1]
-        assert "prefixpath=Libraries/Roms" in options.split(",")
+        assert not any(option.startswith("prefixpath=") for option in options.split(","))
+
+    def test_mount_argv_keeps_share_root_for_blank_remote_path(self):
+        argv = mount.build_mount_argv(
+            "nas.local", "batocera", "/mnt/roms", Path("/creds/file")
+        )
+
+        assert argv[3] == "//nas.local/batocera"
+
+    @pytest.mark.parametrize(
+        "remote_path",
+        ["../ROMS", "Libraries//ROMs", "Libraries/./ROMs", 'Libraries/\"ROMs'],
+    )
+    def test_mount_argv_rejects_unsafe_remote_path(self, remote_path):
+        with pytest.raises(ValueError):
+            mount.build_mount_argv(
+                "nas.local",
+                "batocera",
+                "/mnt/roms",
+                Path("/creds/file"),
+                remote_path=remote_path,
+            )
 
     def test_unmount_argv(self):
         assert mount.build_unmount_argv("/mnt/roms") == ["umount", "/mnt/roms"]
@@ -579,6 +626,16 @@ class TestUnmountCifsSource:
     @pytest.mark.parametrize(
         ("mount_line", "target", "identity"),
         [
+            (
+                "//nas/batocera /userdata/romcloud/source cifs ro 0 0\n",
+                "/userdata/romcloud/source",
+                {
+                    "expected_server": None,
+                    "expected_share": "batocera",
+                    "expected_read_only": True,
+                    "expected_remote_path": "ROMS",
+                },
+            ),
             (
                 "//other-nas/Other /userdata/romcloud/source cifs ro 0 0\n",
                 "/userdata/romcloud/source",

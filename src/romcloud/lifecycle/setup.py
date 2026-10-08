@@ -842,7 +842,7 @@ def apply_setup(
     data_claimable = claimable_root(Path(config.data_path), "data")
     cache_claimable = claimable_root(Path(config.cache.path), "cache")
     _guard_pending_legacy_save_provider_change(existing, config)
-    mounted_during_setup: list[str] = []
+    mounted_during_setup: list[mount_worker.ConfiguredMount] = []
     save_sync_report = None
     save_conflict_ids: tuple[str, ...] = ()
 
@@ -883,7 +883,7 @@ def apply_setup(
             assert password is not None
             outcome = mount_worker.mount_configured_target(config, target, password)
             if outcome is not None and not outcome.already_mounted:
-                mounted_during_setup.append(target.mount_point)
+                mounted_during_setup.append(target)
         if mount_worker.configured_mounts(config):
             emit_progress(progress, "configure", "mount", "success", "Mounted successfully")
             protection = describe_protection(config.credentials_path, "smb")
@@ -1082,11 +1082,19 @@ def apply_setup(
         from romcloud.infrastructure.mount import unmount_cifs_source
 
         cleanup_errors: list[str] = []
-        for mount_point in reversed(mounted_during_setup):
+        for target in reversed(mounted_during_setup):
             try:
-                unmount_cifs_source(mount_point)
+                unmount_cifs_source(
+                    target.mount_point,
+                    expected_server=(
+                        None if target.read_only else target.smb.server
+                    ),
+                    expected_share=target.smb.share,
+                    expected_read_only=target.read_only,
+                    expected_remote_path=target.smb.remote_path,
+                )
             except Exception as cleanup_exc:  # noqa: BLE001 - try every new mount
-                cleanup_errors.append(f"{mount_point}: {cleanup_exc}")
+                cleanup_errors.append(f"{target.mount_point}: {cleanup_exc}")
         safe_error = _redact(str(exc), request.password, request.remote_password)
         if cleanup_errors:
             cleanup_detail = _redact(

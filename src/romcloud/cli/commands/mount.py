@@ -308,7 +308,17 @@ def mount_remove_cmd(ctx: click.Context) -> None:
         mount_worker.stop_worker(romcloud_home)
         for target in reversed(targets):
             try:
-                mount.unmount_cifs_source(target.mount_point)
+                mount.unmount_cifs_source(
+                    target.mount_point,
+                    expected_server=(
+                        None if target.read_only else target.smb.server
+                    ),
+                    expected_share=target.smb.share,
+                    expected_read_only=target.read_only,
+                    expected_remote_path=getattr(
+                        target.smb, "remote_path", ""
+                    ),
+                )
             except ROMCloudError as exc:
                 errors.append(f"{target.label}: {exc}")
         mount_worker.cleanup_runtime_state(romcloud_home)
