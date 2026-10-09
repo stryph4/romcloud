@@ -285,8 +285,12 @@ def test_shared_install_update_repair_reconciler_invokes_layout_cleanup(
         "install_ports_ui",
         lambda **kwargs: SimpleNamespace(installed=False),
     )
-    monkeypatch.setattr(install, "reconcile_mount_service", lambda *args: None)
-    monkeypatch.setattr(install, "reconcile_es_override", lambda *args: None)
+    monkeypatch.setattr(
+        install, "_reconcile_mount_service_status", lambda *args: (True, True)
+    )
+    monkeypatch.setattr(
+        install, "_reconcile_es_override_with_change", lambda *args: (None, False)
+    )
     monkeypatch.setattr(install, "reconcile_ports_gamelist", lambda *args: None)
 
     install.reconcile_install(romcloud_home=home, project_root=project)

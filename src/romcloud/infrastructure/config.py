@@ -37,6 +37,7 @@ from romcloud.infrastructure.credentials import (
     migrate_legacy_smb_credentials,
     migrate_plaintext_credentials,
 )
+from romcloud.infrastructure.smb_path import normalize_smb_remote_path
 
 # ── defaults ──────────────────────────────────────────────────────────────────
 
@@ -85,18 +86,12 @@ def canonical_system_ids(
 
 def _validated_smb_remote_path(value: object, context: object = "configuration") -> str:
     """Validate the persisted share-relative mount path without I/O."""
-    raw = str(value or "").replace("\\", "/").strip("/")
-    if not raw:
-        return ""
-    parts = raw.split("/")
-    if (
-        any(part in ("", ".", "..") for part in parts)
-        or any(char in raw for char in ('"', "\n", "\r", "\x00", ","))
-    ):
+    try:
+        return normalize_smb_remote_path(value)
+    except ValueError as exc:
         raise ConfigurationError(
             f"{context}: SMB remote_path must be a safe path inside the selected share."
-        )
-    return "/".join(parts)
+        ) from exc
 
 
 def _validated_posix_absolute(value: object, label: str, context: object) -> str:
@@ -305,6 +300,31 @@ def load_config(
     migrate_legacy_smb_credentials(config.credentials_path)
     migrate_plaintext_credentials(config.credentials_path)
     return config
+
+
+def load_config_read_only(
+    config_path: Optional[str] = None, *, resolve_paths: bool = False
+) -> AppConfig:
+    """Parse and validate configuration without migrations or other writes.
+
+    Maintenance diagnostics must be able to describe legacy or malformed
+    installations without changing the evidence they are inspecting. Keep
+    this entry point intentionally smaller than :func:`load_config`: it reads
+    one TOML document and runs the existing pure schema parser, but never
+    rewrites storage defaults or credentials.
+    """
+
+    path = Path(config_path) if config_path else default_config_path()
+    if not path.exists():
+        raise ConfigurationNotFoundError(
+            f"No configuration found at {path}. Run `romcloud configure` to set up."
+        )
+    try:
+        with path.open("rb") as fh:
+            data = tomllib.load(fh)
+    except Exception as exc:
+        raise ConfigurationError(f"Failed to parse config {path}: {exc}") from exc
+    return _parse(data, path, resolve_paths=resolve_paths)
 
 
 def migrate_legacy_storage_config(
@@ -731,6 +751,9 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
     ]
 
     if config.smb:
+        source_remote_path = _validated_smb_remote_path(
+            config.smb.remote_path, path
+        )
         lines += [
             "\n",
             "[smb]\n",
@@ -739,8 +762,8 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
             f'username = "{config.smb.username}"\n',
             f"port = {config.smb.port}\n",
         ]
-        if config.smb.remote_path:
-            lines.append(f'remote_path = "{config.smb.remote_path}"\n')
+        if source_remote_path:
+            lines.append(f'remote_path = "{source_remote_path}"\n')
 
     if config.sftp:
         lines += ["\n", "[sftp]\n"] + _sftp_toml_lines(config.sftp)
@@ -754,6 +777,9 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
             f"root = {_toml_quote(config.remote_data.root)}\n",
         ]
         if config.remote_data.smb is not None:
+            remote_data_remote_path = _validated_smb_remote_path(
+                config.remote_data.smb.remote_path, path
+            )
             lines += [
                 "\n",
                 "[remote_data.smb]\n",
@@ -762,9 +788,9 @@ def write_config(config: AppConfig, config_path: Optional[str] = None) -> Path:
                 f'username = "{config.remote_data.smb.username}"\n',
                 f"port = {config.remote_data.smb.port}\n",
             ]
-            if config.remote_data.smb.remote_path:
+            if remote_data_remote_path:
                 lines.append(
-                    f'remote_path = "{config.remote_data.smb.remote_path}"\n'
+                    f'remote_path = "{remote_data_remote_path}"\n'
                 )
         if config.remote_data.sftp is not None:
             lines += ["\n", "[remote_data.sftp]\n"] + _sftp_toml_lines(

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from romcloud.core.exceptions import ProviderError
+from romcloud.infrastructure.smb_path import normalize_smb_remote_path
 
 
 @dataclass(frozen=True)
@@ -24,15 +25,7 @@ class DirectoryItem:
 
 def normalize_remote_directory(path: str) -> str:
     """Return a share-relative POSIX path and reject traversal/control data."""
-    raw = str(path or "").replace("\\", "/").strip("/")
-    if "\x00" in raw or "\n" in raw or "\r" in raw:
-        raise ValueError("Remote directory contains invalid control characters.")
-    if not raw:
-        return ""
-    parts = PurePosixPath(raw).parts
-    if any(part in ("", ".", "..") for part in parts):
-        raise ValueError("Remote directory must stay within the selected share.")
-    return "/".join(parts)
+    return normalize_smb_remote_path(path)
 
 
 def remote_parent(path: str) -> str:

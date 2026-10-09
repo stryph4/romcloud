@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.browser_test_support import usable_chromium
+
 
 ROOT = Path(__file__).parents[2]
 STATIC = ROOT / "src" / "romcloud" / "web" / "static"
@@ -17,11 +19,19 @@ def test_controller_assets_wire_all_required_inputs_and_focus_scopes() -> None:
     spatial = (STATIC / "spatial_navigation.js").read_text(encoding="utf-8")
     app = (STATIC / "app.js").read_text(encoding="utf-8")
     diagnostics = (STATIC / "diagnostics.js").read_text(encoding="utf-8")
+    download_polling = (STATIC / "download_polling.js").read_text(encoding="utf-8")
     css = (STATIC / "app.css").read_text(encoding="utf-8")
     server = (ROOT / "src" / "romcloud" / "web" / "server.py").read_text(encoding="utf-8")
 
-    assert html.index('/controller.js') < html.index('/spatial_navigation.js') < html.index('/app.js')
+    assert (
+        html.index('/controller.js')
+        < html.index('/spatial_navigation.js')
+        < html.index('/download_polling.js')
+        < html.index('/app.js')
+    )
     assert '"/spatial_navigation.js"' in server
+    assert '"/download_polling.js"' in server
+    assert "AdaptiveDownloadPoller" in download_polling
     assert "chooseSpatialTarget" in spatial
     for zone in ("systems", "tabs", "controls", "games", "dialog", "pager"):
         assert zone in javascript or f'data-controller-zone="{zone}"' in html
@@ -83,6 +93,47 @@ def test_game_and_diagnostics_are_consumers_of_the_shared_browser_navigator() ->
     assert "RepeatButton" in controller
 
 
+def test_downloads_view_renders_durable_states_controls_and_controller_zones() -> None:
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    app = (STATIC / "app.js").read_text(encoding="utf-8")
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+
+    assert 'id="nav-downloads"' in html and 'id="downloads-main"' in html
+    assert 'id="job"' in html and 'id="partial-usage"' in html
+    assert 'data-controller-zone="download-bulk"' in html
+    assert '"download-bulk", "downloads"' in (
+        STATIC / "controller.js"
+    ).read_text(encoding="utf-8")
+    assert 'id="download-selected"' in html and 'data-action="download_selected"' in html
+    assert 'id="cancel-all-dialog"' in html and 'id="cancel-all-confirm"' in html
+    assert '$("cancel-all-dialog").showModal()' in app
+    assert 'button.dataset.controllerZone = "downloads"' in app
+    assert 'if (state.view === "downloads")' in app
+    assert 'showLibrary();' in app
+    assert 'window.romcloudGamepad.focusZone("global")' in app
+    assert app.index('if (state.view === "downloads")') < app.index("if (state.selected.size)")
+    assert 'url.searchParams.set("view", view)' in app
+    assert 'url.searchParams.delete("view")' in app
+    assert 'history.replaceState(null, "", url)' in app
+    for endpoint in (
+        "/api/downloads", "/api/downloads/cancel-all",
+        "/api/downloads/retry-all-failed", "/api/downloads/cleanup",
+    ):
+        assert endpoint in app
+    for state in (
+        "running", "verifying", "queued", "paused", "interrupted",
+        "failed", "cancelled", "complete",
+    ):
+        assert state in app
+    for control in ("pause", "resume", "cancel", "retry", "discard", "remove"):
+        assert f'item, "{control}"' in app
+    assert "retained_files" in app and "remaining_files" in app
+    assert "staging_bytes" in app and "active_reserved_growth" in app
+    assert "downloadsRenderSignature" in app
+    assert "signature === downloadsRenderSignature" in app
+    assert ".downloads-list" in css and ".download-item" in css
+
+
 def test_remote_navigation_and_diagnostics_reuse_single_manager_view() -> None:
     html = (STATIC / "index.html").read_text(encoding="utf-8")
     app = (STATIC / "app.js").read_text(encoding="utf-8")
@@ -137,17 +188,57 @@ def test_controller_focus_and_repeat_state_machine_when_node_is_available() -> N
     assert "controller state tests passed" in result.stdout
 
 
+def test_download_polling_state_machine_when_node_is_available() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node is not installed on this development host")
+    result = subprocess.run(
+        [
+            node,
+            str(ROOT / "tests" / "js" / "download_polling_test.js"),
+            str(STATIC / "download_polling.js"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "download polling tests passed" in result.stdout
+
+
+def test_download_polling_executes_in_chromium_when_available(tmp_path: Path) -> None:
+    browser = usable_chromium()
+    harness = (ROOT / "tests" / "js" / "download_polling_harness.html").resolve().as_uri()
+    result = subprocess.run(
+        [
+            browser,
+            "--headless=new",
+            "--disable-gpu",
+            "--no-sandbox",
+            f"--user-data-dir={tmp_path / 'download-polling-profile'}",
+            "--virtual-time-budget=1000",
+            "--dump-dom",
+            harness,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    diagnostic = result.stdout + result.stderr
+    if (
+        result.returncode
+        and "crashpad" in diagnostic
+        and "Operation not permitted" in diagnostic
+    ):
+        pytest.skip("Chromium crash reporter is blocked by this test sandbox")
+    assert result.returncode == 0, diagnostic
+    assert 'data-result="passed"' in result.stdout, diagnostic
+
+
 def test_controller_core_executes_in_chromium_when_available(tmp_path: Path) -> None:
-    candidates = [
-        shutil.which("chromium"),
-        shutil.which("google-chrome"),
-        shutil.which("chrome"),
-        Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
-        Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
-    ]
-    browser = next((str(path) for path in candidates if path and Path(path).is_file()), None)
-    if browser is None:
-        pytest.skip("Chromium is not installed on this development host")
+    browser = usable_chromium()
     harness = (ROOT / "tests" / "js" / "controller_harness.html").resolve().as_uri()
     result = subprocess.run(
         [
@@ -176,16 +267,7 @@ def test_controller_core_executes_in_chromium_when_available(tmp_path: Path) -> 
 
 
 def test_gamepad_navigation_executes_in_chromium_when_available(tmp_path: Path) -> None:
-    candidates = [
-        shutil.which("chromium"),
-        shutil.which("google-chrome"),
-        shutil.which("chrome"),
-        Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
-        Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
-    ]
-    browser = next((str(path) for path in candidates if path and Path(path).is_file()), None)
-    if browser is None:
-        pytest.skip("Chromium is not installed on this development host")
+    browser = usable_chromium()
     harness = (ROOT / "tests" / "js" / "controller_browser_harness.html").resolve().as_uri()
     result = subprocess.run(
         [
@@ -214,14 +296,7 @@ def test_gamepad_navigation_executes_in_chromium_when_available(tmp_path: Path) 
 
 
 def test_diagnostics_navigation_executes_in_chromium_when_available(tmp_path: Path) -> None:
-    candidates = [
-        shutil.which("chromium"), shutil.which("google-chrome"), shutil.which("chrome"),
-        Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
-        Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
-    ]
-    browser = next((str(path) for path in candidates if path and Path(path).is_file()), None)
-    if browser is None:
-        pytest.skip("Chromium is not installed on this development host")
+    browser = usable_chromium()
     harness = (ROOT / "tests" / "js" / "diagnostics_browser_harness.html").resolve().as_uri()
     result = subprocess.run(
         [

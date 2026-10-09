@@ -36,13 +36,34 @@ def test_versioned_manifest_activates_only_executable_inside_owned_root(tmp_path
     assert runtime_status(data)["version"] == "152.0"
 
 
-def test_remove_deletes_only_managed_browser_root(tmp_path: Path) -> None:
+def test_remove_preserves_unverified_browser_root(tmp_path: Path) -> None:
     data = tmp_path / "data"
     root = runtime_root(data); root.mkdir(parents=True)
     (root / "current.json").write_text("{}")
     unrelated = tmp_path / "keep"; unrelated.write_text("yes")
+    with pytest.raises(RuntimeError, match="unverified"):
+        remove_managed_runtime(data)
+    assert root.exists()
+    assert unrelated.read_text() == "yes"
+
+
+def test_remove_deletes_activated_managed_browser_root_only(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    staged = staging_version_path(data, "2") / "chrome"
+    staged.parent.mkdir(parents=True)
+    staged.write_text("browser")
+    staged.chmod(0o755)
+    activate_staged_runtime(
+        data,
+        version="2",
+        executable="chrome",
+        smoke_test=lambda _: {"compatible": True},
+    )
+    unrelated = tmp_path / "keep"
+    unrelated.write_text("yes")
+
     assert remove_managed_runtime(data)
-    assert not root.exists()
+    assert not runtime_root(data).exists()
     assert unrelated.read_text() == "yes"
 
 

@@ -338,13 +338,13 @@ class TestStaleIndependentTrackDoesNotInterfere:
 
         # Repair should only need to fetch Track 2 — Track 1 already present.
         calls = []
-        real_transfer_to = provider.transfer_to
+        real_open_binary = provider.open_binary
 
-        def spying_transfer_to(source_path, dest_path, on_progress=None):
+        def spying_open_binary(source_path):
             calls.append(source_path)
-            return real_transfer_to(source_path, dest_path, on_progress)
+            return real_open_binary(source_path)
 
-        provider.transfer_to = spying_transfer_to
+        provider.open_binary = spying_open_binary
         cache_service.cache_game(legacy_cue_game.id)
 
         assert not any("Track 1" in c for c in calls)

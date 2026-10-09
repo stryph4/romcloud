@@ -40,11 +40,14 @@ class OperationSpec:
     args: tuple[str, ...]
     # Explicit ownership flag for the terminal GUI-relaunch handoff (see
     # ``ports_gfx.relaunch.GuiRelaunchCoordinator``): True only for the
-    # self-update action. A completed mode transition, catalog refresh,
-    # mount/reconnect, or any other operation must never arm a replacement
+    # runtime-replacing update/repair actions. A completed mode transition,
+    # catalog refresh, mount/reconnect, or any other operation must never arm a replacement
     # GUI launch — this is a data field, not a display-title string
     # comparison, so it can't drift if titles are ever renamed or reused.
     arms_gui_relaunch: bool = False
+    # Explicit identity for operation-specific relaunch messaging and policy.
+    # Only runtime-replacing operations set this (currently update/repair).
+    relaunch_operation: str | None = None
     # Successful, genuine mode changes return control to EmulationStation
     # instead of becoming a dismissible dashboard result.  This terminal-exit
     # ownership is deliberately separate from updater relaunch ownership.
@@ -68,6 +71,8 @@ class OperationScreenState:
     view is reset by starting a new operation)."""
     details_expanded: bool = False
     arms_gui_relaunch: bool = False
+    relaunch_operation: str | None = None
+    relaunch_acknowledged: bool = False
     exits_after_mode_change: bool = False
 
     @property
@@ -92,6 +97,85 @@ class OperationScreenState:
     def cancel_pending(self) -> None:
         if not self.runner.is_finished:
             self.runner.cancel()
+
+    @property
+    def quick_repair_available(self) -> bool:
+        """Whether a completed Troubleshoot scan advertised eligible fixes."""
+
+        if self.title != "Troubleshoot ROMCloud" or not self.succeeded:
+            return False
+        stdout = [line.text for line in self.runner.lines if line.stream == "stdout"]
+        if not stdout:
+            return False
+        try:
+            payload = json.loads(stdout[-1])
+        except (TypeError, ValueError):
+            return False
+        return bool(isinstance(payload, dict) and payload.get("ok") and payload.get("quick_repair_available"))
+
+    @property
+    def result_payload(self) -> dict:
+        if not self.succeeded:
+            return {}
+        stdout = [line.text for line in self.runner.lines if line.stream == "stdout"]
+        if not stdout:
+            return {}
+        try:
+            payload = json.loads(stdout[-1])
+        except (TypeError, ValueError):
+            return {}
+        return payload if isinstance(payload, dict) and payload.get("ok") else {}
+
+
+def troubleshoot_result_summary(screen: OperationScreenState) -> tuple[str, str]:
+    """Return a truthful completed-health summary independent of exit status."""
+
+    if screen.title not in {"Troubleshoot ROMCloud", "Quick Repair"}:
+        return "", ""
+    payload = screen.result_payload
+    summary = payload.get("summary")
+    if not isinstance(summary, dict):
+        return "", ""
+    warning = int(summary.get("warning", 0) or 0)
+    error = int(summary.get("error", 0) or 0)
+    skipped = int(summary.get("skipped", 0) or 0)
+    fixed = int(summary.get("fixed", 0) or 0)
+    remaining = warning + error + skipped
+    if screen.title == "Quick Repair":
+        if remaining:
+            return (
+                f"Quick Repair complete — {fixed} fixed; {remaining} issue(s) still need attention",
+                "warning" if not error else "error",
+            )
+        return f"Quick Repair complete — {fixed} fixed", "success"
+    if not remaining:
+        return "Diagnostics complete — No problems found", "success"
+    findings = payload.get("findings", [])
+    fixable = sum(
+        isinstance(item, dict)
+        and item.get("status") in {"warning", "error"}
+        and item.get("fixability") in {"automatic", "conditional"}
+        and not item.get("blocked_by")
+        for item in findings if isinstance(findings, list)
+    )
+    if fixable:
+        return (
+            f"Diagnostics complete — {remaining} issue(s) found; "
+            f"{fixable} can be repaired automatically",
+            "warning" if not error else "error",
+        )
+    return (
+        f"Diagnostics complete — {remaining} issue(s) need attention",
+        "warning" if not error else "error",
+    )
+
+
+def troubleshoot_quick_repair_requested(
+    screen: OperationScreenState, action: Action | None
+) -> bool:
+    """Quick Repair is entered only by explicit confirmation after stage one."""
+
+    return screen.quick_repair_available and action == Action.CONFIRM
 
 
 def display_lines(runner: OperationRunner, *, details: bool = True) -> list[str]:
@@ -198,6 +282,9 @@ def handle_operation_event(ievent: InputEvent, screen: OperationScreenState) -> 
 
     if action == Action.BACK:
         if not screen.runner.is_finished:
+            if screen.title in {"Troubleshoot ROMCloud", "Quick Repair"}:
+                screen.runner.request_cancel()
+                return OPERATION_SCREEN
             screen.runner.cancel()
         return MENU_SCREEN
 

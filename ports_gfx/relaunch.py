@@ -30,11 +30,11 @@ class RelaunchResult:
 
 
 class GuiRelaunchCoordinator:
-    """Records a terminal update outcome and permits one launcher request.
+    """Records a terminal runtime-replacement outcome and permits one launch.
 
-    The coordinator is marked only from the update operation's successful
-    final JSON result.  ``launch_once`` is called later, after Pygame and GUI
-    diagnostics have been closed by the old process.
+    The coordinator is marked only from an update/repair operation's
+    successful final JSON result. ``launch_once`` is called later, after
+    Pygame and GUI diagnostics have been closed by the old process.
     """
 
     def __init__(self, romcloud_bin: str) -> None:

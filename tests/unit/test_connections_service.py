@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from romcloud.services import connections
 
 
@@ -82,6 +84,47 @@ def test_mount_emits_connecting_then_connected_without_live_server(tmp_path, mon
     ]
 
 
+def test_mount_failure_rolls_back_only_the_verified_new_mount(tmp_path, monkeypatch):
+    config = _shutdown_config(tmp_path)
+    monkeypatch.setattr(
+        connections.mount_worker,
+        "credentials_for_mount",
+        lambda config, target: "secret",
+    )
+    attempts = []
+
+    def mount_target(config, target, password, *, mount_fn):
+        attempts.append(target)
+        if len(attempts) == 2:
+            raise RuntimeError("remote mount failed")
+        return SimpleNamespace(already_mounted=False)
+
+    monkeypatch.setattr(
+        connections.mount_worker, "mount_configured_target", mount_target
+    )
+    unmounts = []
+    monkeypatch.setattr(
+        connections.mount,
+        "unmount_cifs_source",
+        lambda path, **kwargs: unmounts.append((path, kwargs)) or True,
+    )
+
+    with pytest.raises(RuntimeError, match="remote mount failed"):
+        connections.mount_connections(config, mount_fn=lambda **kwargs: None)
+
+    assert unmounts == [
+        (
+            "/userdata/romcloud/source",
+            {
+                "expected_server": None,
+                "expected_share": "ROMs",
+                "expected_read_only": True,
+                "expected_remote_path": "Libraries/Roms",
+            },
+        )
+    ]
+
+
 def test_unmount_reverses_targets_and_reports_transition(tmp_path, monkeypatch):
     config = _config(tmp_path)
     calls = []
@@ -89,7 +132,7 @@ def test_unmount_reverses_targets_and_reports_transition(tmp_path, monkeypatch):
     monkeypatch.setattr(
         connections.mount,
         "unmount_cifs_source",
-        lambda path: calls.append(path) or True,
+        lambda path, **kwargs: calls.append(path) or True,
     )
     monkeypatch.setattr(
         connections,
@@ -231,6 +274,22 @@ def test_normal_stop_retains_resolved_path_validation(tmp_path, monkeypatch):
 
     assert set(resolved) == expected_paths
     assert calls == [
-        ("/userdata/romcloud/remote", {}),
-        ("/userdata/romcloud/source", {}),
+        (
+            "/userdata/romcloud/remote",
+            {
+                "expected_server": "omnivault",
+                "expected_share": "Emulation",
+                "expected_read_only": False,
+                "expected_remote_path": "",
+            },
+        ),
+        (
+            "/userdata/romcloud/source",
+            {
+                "expected_server": None,
+                "expected_share": "ROMs",
+                "expected_read_only": True,
+                "expected_remote_path": "Libraries/Roms",
+            },
+        ),
     ]

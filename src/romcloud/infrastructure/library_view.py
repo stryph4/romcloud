@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 from romcloud.infrastructure.atomic_file import atomic_write_text
@@ -13,8 +14,46 @@ STATE_FILENAME = "library-view.json"
 STATE_VERSION = 3
 
 
+@dataclass(frozen=True)
+class OperatingModeInspection:
+    state: str
+    mode: OperatingMode | None = None
+    detail: str = ""
+
+
 def state_path(config: AppConfig) -> Path:
     return Path(config.data_path) / STATE_FILENAME
+
+
+def inspect_operating_mode(config: AppConfig) -> OperatingModeInspection:
+    """Inspect the persisted mode without installing or migrating a fallback."""
+
+    path = state_path(config)
+    if not path.exists():
+        return OperatingModeInspection("missing", detail=str(path))
+    if path.is_symlink() or not path.is_file():
+        return OperatingModeInspection(
+            "malformed", detail="Operating-mode state is not a regular file."
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return OperatingModeInspection("malformed", detail=str(exc))
+    if not isinstance(payload, dict):
+        return OperatingModeInspection("malformed", detail="State must be an object.")
+    if payload.get("version") != STATE_VERSION:
+        return OperatingModeInspection(
+            "legacy",
+            detail=(
+                f"Stored operating-mode schema is {payload.get('version')!r}; "
+                f"expected {STATE_VERSION}."
+            ),
+        )
+    try:
+        mode = OperatingMode(payload.get("mode"))
+    except (TypeError, ValueError):
+        return OperatingModeInspection("malformed", detail="Stored mode is invalid.")
+    return OperatingModeInspection("valid", mode=mode)
 
 
 def operating_mode(config: AppConfig) -> OperatingMode:

@@ -13,6 +13,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+from xml.etree.ElementTree import ParseError
+
 from romcloud.integrations.batocera import ports_gamelist_config as cfg
 
 _ICON = cfg.ROMCLOUD_IMAGE_RELATIVE_PATH
@@ -32,6 +35,40 @@ class TestMissingGamelist:
 
 
 class TestExistingGamelistWithUnrelatedGames:
+    def test_unreadable_shared_gamelist_is_not_replaced(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        gamelist_path = tmp_path / "ports" / "gamelist.xml"
+        gamelist_path.parent.mkdir(parents=True)
+        original = b"<gameList><game><path>./ThirdParty.sh</path></game></gameList>"
+        gamelist_path.write_bytes(original)
+        real_read_text = Path.read_text
+
+        def fail_target_read(path: Path, *args, **kwargs):
+            if path == gamelist_path:
+                raise OSError("simulated read failure")
+            return real_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", fail_target_read)
+
+        with pytest.raises(OSError, match="simulated read failure"):
+            cfg.reconcile(image=_ICON, gamelist_path=gamelist_path)
+
+        assert gamelist_path.read_bytes() == original
+
+    def test_malformed_shared_gamelist_is_preserved_byte_for_byte(
+        self, tmp_path: Path
+    ) -> None:
+        gamelist_path = tmp_path / "ports" / "gamelist.xml"
+        gamelist_path.parent.mkdir(parents=True)
+        original = b"<gameList><game><path>./ThirdParty.sh</path><!-- keep me"
+        gamelist_path.write_bytes(original)
+
+        with pytest.raises(ParseError):
+            cfg.reconcile(image=_ICON, gamelist_path=gamelist_path)
+
+        assert gamelist_path.read_bytes() == original
+
     def test_unrelated_entry_preserved_and_romcloud_added(self, tmp_path: Path) -> None:
         gamelist_path = tmp_path / "ports" / "gamelist.xml"
         gamelist_path.parent.mkdir(parents=True)

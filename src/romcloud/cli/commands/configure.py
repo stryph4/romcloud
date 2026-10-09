@@ -224,6 +224,7 @@ def configure_cmd(
                 share=setup_result.share,
                 username=setup_result.username,
                 port=setup_result.port,
+                remote_path=setup_result.remote_path,
             )
             smb_password = setup_result.password
             source_setup_result = setup_result
@@ -436,6 +437,7 @@ def configure_cmd(
                     share=remote_result.share,
                     username=remote_result.username,
                     port=remote_result.port,
+                    remote_path=remote_result.remote_path,
                 ),
             )
         remote_password = remote_result.password

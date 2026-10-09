@@ -74,6 +74,7 @@ from ports_gfx.library_sync_screen import (
     LibrarySyncScreenState,
 )
 from ports_gfx.library_manager_screen import LibraryManagerScreenState
+from ports_gfx.lifecycle_screen import LifecycleScreenState, launch_lifecycle_helper
 from ports_gfx.system_selection_screen import (
     APPLYING as SYSTEMS_APPLYING,
     LOADING as SYSTEMS_LOADING,
@@ -101,6 +102,8 @@ from ports_gfx.operation_screen import (
     OperationSpec,
     display_lines,
     handle_operation_event,
+    troubleshoot_result_summary,
+    troubleshoot_quick_repair_requested,
     visible_window,
     wrap_lines,
 )
@@ -148,6 +151,8 @@ DIAGNOSTICS_ACTION = "diagnostics"
 SELECT_SYSTEMS_ACTION = "select-systems"
 STARTUP_RESTART_SCREEN = "startup-restart"
 MODE_SAVE_CONFLICT_SCREEN = "mode-save-conflict"
+LIFECYCLE_SCREEN = "lifecycle"
+UNINSTALL_ACTION = "uninstall-romcloud"
 
 MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
     "Library": (
@@ -179,7 +184,21 @@ MENU_CATEGORIES: dict[str, tuple[MenuItem, ...]] = {
         ),
         MenuItem("Check for Updates", "update-check"),
         MenuItem("Update ROMCloud", "update-install"),
-        MenuItem("Health Check", "healthcheck"),
+        MenuItem(
+            "Troubleshoot ROMCloud",
+            "troubleshoot",
+            "Run read-only diagnostics, then optionally choose Quick Repair.",
+        ),
+        MenuItem(
+            "Repair Installation",
+            "repair-install",
+            "Reinstall and restore ROMCloud runtime files without deleting user data.",
+        ),
+        MenuItem(
+            "Uninstall ROMCloud",
+            UNINSTALL_ACTION,
+            "Remove ROMCloud while preserving recoverable user state.",
+        ),
         MenuItem("Setup Controller Mapping", CONTROLLER_TEST_ACTION),
         MenuItem("Local Browser Runtime", "browser-runtime-status"),
     )
@@ -372,7 +391,22 @@ _OPERATIONS: dict[str, OperationSpec] = {
         max_runtime=35.0,
     ),
     "update-install": OperationSpec(
-        title="Update ROMCloud", args=("uidata", "update-install"), arms_gui_relaunch=True
+        title="Update ROMCloud",
+        args=("uidata", "update-install"),
+        arms_gui_relaunch=True,
+        relaunch_operation="update",
+    ),
+    "repair-install": OperationSpec(
+        title="Repair Installation",
+        args=("uidata", "repair-install"),
+        arms_gui_relaunch=True,
+        relaunch_operation="repair",
+    ),
+    "troubleshoot": OperationSpec(
+        title="Troubleshoot ROMCloud", args=("uidata", "troubleshoot")
+    ),
+    "troubleshoot-fix": OperationSpec(
+        title="Quick Repair", args=("uidata", "troubleshoot-fix")
     ),
     "browser-runtime-status": OperationSpec(
         title="Local Browser Runtime", args=("uidata", "browser-runtime-status")
@@ -555,6 +589,7 @@ def start_operation(action: str, romcloud_bin: str, *, popen=None) -> OperationS
         title=spec.title,
         runner=runner,
         arms_gui_relaunch=spec.arms_gui_relaunch,
+        relaunch_operation=spec.relaunch_operation,
         exits_after_mode_change=spec.exits_after_mode_change,
     )
 
@@ -585,6 +620,14 @@ def operation_summary_message(operation: OperationScreenState) -> tuple[str, str
     Pure function — no pygame — so it is fully unit-tested.
     """
     if operation.succeeded:
+        troubleshoot_summary = troubleshoot_result_summary(operation)
+        if troubleshoot_summary[0]:
+            return troubleshoot_summary
+        if hasattr(operation.runner, "lines"):
+            result = operation_result(operation.runner)
+            warnings = result.data.get("warnings", []) if result.ok else []
+            if warnings:
+                return f"{operation.title}: completed with warnings", "warning"
         return f"{operation.title}: succeeded", "success"
     detail = operation.runner.error
     if hasattr(operation.runner, "lines"):
@@ -634,13 +677,15 @@ def request_relaunch_for_completed_update(
     operation: OperationScreenState,
     relaunch: GuiRelaunchCoordinator,
 ) -> bool:
-    """Enter the terminal relaunch state for one confirmed update success."""
+    """Enter terminal relaunch after a confirmed update or repair success."""
     if not operation.arms_gui_relaunch or not operation.is_finished:
         return False
     if not operation.succeeded:
         relaunch.mark_update_failed()
         return False
     result = operation_result(operation.runner)
+    if repair_relaunch_needs_acknowledgment(operation):
+        return False
     # The final successful JSON is written only after perform_update has
     # returned, so the updater's install/reconciliation/post-update work is
     # committed before this process is allowed to enter its terminal state.
@@ -648,15 +693,57 @@ def request_relaunch_for_completed_update(
     return relaunch.mark_update_succeeded(progress_complete=progress_complete)
 
 
+def repair_relaunch_needs_acknowledgment(
+    operation: OperationScreenState,
+) -> bool:
+    """Return whether warning details must remain visible before relaunch."""
+    if (
+        operation.relaunch_operation != "repair"
+        or not operation.arms_gui_relaunch
+        or not operation.is_finished
+        or not operation.succeeded
+        or operation.relaunch_acknowledged
+    ):
+        return False
+    result = operation_result(operation.runner)
+    return bool(result.ok and result.data.get("warnings"))
+
+
+def acknowledge_completed_relaunch(
+    operation: OperationScreenState,
+    action: Action,
+) -> bool:
+    """Acknowledge a partial Repair before its terminal GUI handoff."""
+    if action not in (Action.BACK, Action.CONFIRM, Action.MENU):
+        return False
+    if not repair_relaunch_needs_acknowledgment(operation):
+        return False
+    operation.relaunch_acknowledged = True
+    return True
+
+
 def render_completed_update_relaunch(
     operation: OperationScreenState,
     relaunch: GuiRelaunchCoordinator,
     splash: SplashRenderer,
 ) -> bool:
-    """Confirm update success and paint the terminal frame before shutdown."""
+    """Confirm runtime replacement and paint its terminal frame before shutdown."""
     if not request_relaunch_for_completed_update(operation, relaunch):
         return False
-    splash.render("Update complete", "Restarting ROMCloud…", 1.0)
+    result = operation_result(operation.runner)
+    operation_name = (
+        "Repair" if operation.relaunch_operation == "repair" else "Update"
+    )
+    title = f"{operation_name} complete"
+    if result.ok and result.data.get("warnings"):
+        title = f"{operation_name} completed with warnings"
+    detail = "Restarting ROMCloud…"
+    if result.ok and result.data.get("es_restart_required"):
+        detail = (
+            f"Restart EmulationStation to apply the {operation_name.casefold()}; "
+            "restarting ROMCloud…"
+        )
+    splash.render(title, detail, 1.0)
     return True
 
 
@@ -1027,6 +1114,7 @@ def _run(  # noqa: ANN001
     library_sync_screen: Optional[LibrarySyncScreenState] = None
     library_manager_screen: Optional[LibraryManagerScreenState] = None
     system_selection_screen: Optional[SystemSelectionScreenState] = None
+    lifecycle_screen: Optional[LifecycleScreenState] = None
     startup_restart: StartupRestartPromptState | None = None
     mode_save_conflict: SetupSaveConflictState | None = None
     update_check: UpdateCheckState | None = None
@@ -1163,6 +1251,8 @@ def _run(  # noqa: ANN001
                     rects = (layout.safe_area,)
                 elif current_screen == "system_selection":
                     rects = (layout.safe_area,)
+                elif current_screen == LIFECYCLE_SCREEN and lifecycle_screen is not None:
+                    rects = tuple(layout.card_rects[: len(lifecycle_screen.choices)])
                 elif current_screen == STARTUP_RESTART_SCREEN:
                     rects = tuple(_startup_restart_action_rects(layout))
                 elif current_screen == MODE_SAVE_CONFLICT_SCREEN:
@@ -1252,6 +1342,9 @@ def _run(  # noqa: ANN001
                     elif ievent.action == Action.CONFIRM and item.action == SETUP_ACTION:
                         wizard = WizardState(call_backend(romcloud_bin, "setup-status"))
                         current_screen = "wizard"
+                    elif ievent.action == Action.CONFIRM and item.action == UNINSTALL_ACTION:
+                        lifecycle_screen = LifecycleScreenState()
+                        current_screen = LIFECYCLE_SCREEN
                     else:
                         running, current_screen, message, message_kind, new_operation = _handle_menu_event(
                             ievent, state, layout, romcloud_bin, running, message, message_kind,
@@ -1343,6 +1436,14 @@ def _run(  # noqa: ANN001
                     if current_screen == "menu":
                         system_selection_screen.cancel_pending()
                         system_selection_screen = None
+                elif current_screen == LIFECYCLE_SCREEN and lifecycle_screen is not None:
+                    if ievent.touch_index is not None and lifecycle_screen.view == "choices":
+                        if 0 <= ievent.touch_index < len(lifecycle_screen.choices):
+                            lifecycle_screen.selected_index = ievent.touch_index
+                    decision = lifecycle_screen.handle_event(ievent)
+                    if decision == "back":
+                        lifecycle_screen = None
+                        current_screen = "menu"
                 elif current_screen == "wizard" and wizard is not None:
                     if ievent.action == Action.BACK and _wizard_back_returns_to_menu(
                         wizard
@@ -1397,7 +1498,20 @@ def _run(  # noqa: ANN001
                             catalog_progress.scroll(-1, 6)
                         elif ievent.action == Action.DOWN:
                             catalog_progress.scroll(1, 6)
-                    if running and not relaunch.terminal:
+                    acknowledged_relaunch = acknowledge_completed_relaunch(
+                        operation_screen, ievent.action
+                    )
+                    quick_repair_started = False
+                    if troubleshoot_quick_repair_requested(operation_screen, ievent.action):
+                        operation_screen = start_operation("troubleshoot-fix", romcloud_bin)
+                        current_screen = OPERATION_SCREEN
+                        quick_repair_started = True
+                    if (
+                        running
+                        and not relaunch.terminal
+                        and not acknowledged_relaunch
+                        and not quick_repair_started
+                    ):
                         current_screen = handle_operation_event(ievent, operation_screen)
                     if current_screen == "menu" and not relaunch.terminal:
                         if operation_screen.title == "Check for Updates":
@@ -1479,6 +1593,24 @@ def _run(  # noqa: ANN001
             ):
                 for line in system_selection_screen.poll():
                     activity.ingest(line.text)
+            elif current_screen == LIFECYCLE_SCREEN and lifecycle_screen is not None:
+                if lifecycle_screen.update(dt):
+                    try:
+                        launch_lifecycle_helper(
+                            romcloud_bin,
+                            lifecycle_screen.operation,
+                            gui_pid=os.getpid(),
+                        )
+                    except (OSError, RuntimeError) as exc:
+                        lifecycle_screen.confirm.reset()
+                        lifecycle_screen.view = "choices"
+                        message = f"Could not start lifecycle helper: {exc}"
+                        message_kind = "error"
+                    else:
+                        # The helper waits for this exact PID. Leave through the
+                        # normal finally/pygame cleanup before it may mutate.
+                        current_screen = "lifecycle-handoff"
+                        running = False
             elif current_screen == "wizard" and wizard is not None:
                 for line in wizard.poll():
                     activity.ingest(line.text)
@@ -1538,6 +1670,9 @@ def _run(  # noqa: ANN001
                         startup_restart.move(-1)
                     elif action in (Action.DOWN, Action.RIGHT):
                         startup_restart.move(1)
+            elif current_screen == LIFECYCLE_SCREEN and lifecycle_screen is not None:
+                for action in input_manager.update(dt):
+                    lifecycle_screen.handle_event(InputEvent(action=action))
 
             if current_screen == "menu":
                 _render_menu(
@@ -1573,6 +1708,10 @@ def _run(  # noqa: ANN001
             elif current_screen == "library_sync" and library_sync_screen is not None:
                 _render_library_sync(
                     pygame, screen, fonts, layout, library_sync_screen, activity
+                )
+            elif current_screen == LIFECYCLE_SCREEN and lifecycle_screen is not None:
+                _render_lifecycle(
+                    pygame, screen, fonts, layout, lifecycle_screen
                 )
             elif (
                 current_screen == "library_manager"
@@ -2049,6 +2188,53 @@ def _render_menu(  # noqa: ANN001
     pygame.display.flip()
 
 
+def _render_lifecycle(  # noqa: ANN001
+    pygame,
+    screen,
+    fonts: dict,
+    layout: Layout,
+    state: LifecycleScreenState,
+) -> None:
+    screen.fill(_BG_COLOR)
+    title = fonts["title"].render(state.title, True, _ERROR_COLOR if state.operation == "purge" else _FG_COLOR)
+    screen.blit(title, (layout.header_rect.x, layout.header_rect.y))
+    y = layout.navigation_rect.y
+    line_h = layout.fonts.body + 7
+    max_chars = max(24, layout.navigation_rect.w // max(8, layout.fonts.body // 2))
+    for line in wrap_lines((state.body,), max_chars):
+        text = fonts["body"].render(line, True, _FG_COLOR)
+        screen.blit(text, (layout.navigation_rect.x, y))
+        y += line_h
+
+    if state.view == "choices":
+        for index, (label_text, rect) in enumerate(
+            zip(state.choices, layout.card_rects)
+        ):
+            draw_card(pygame, screen, rect, focused=index == state.selected_index)
+            label = fonts["body"].render(label_text, True, _FG_COLOR)
+            screen.blit(label, label.get_rect(center=rect.center))
+        hint_text = "D-pad choose   A/Enter select   B/Esc back"
+    else:
+        prompt = (
+            "Hold Confirm to purge all local ROMCloud data"
+            if state.operation == "purge"
+            else "Hold Confirm to uninstall ROMCloud"
+        )
+        prompt_surface = fonts["body"].render(prompt, True, _WARNING_COLOR)
+        screen.blit(prompt_surface, (layout.navigation_rect.x, y + line_h))
+        bar = Rect(
+            layout.navigation_rect.x,
+            y + line_h * 3,
+            min(layout.navigation_rect.w, 560),
+            max(8, layout.fonts.body // 2),
+        )
+        _draw_progress_bar(pygame, screen, bar, state.confirm.progress)
+        hint_text = "Hold A/Enter to confirm   B/Esc cancel"
+    hint = fonts["hint"].render(hint_text, True, _HINT_COLOR)
+    screen.blit(hint, (layout.hint_rect.x, layout.hint_rect.y))
+    pygame.display.flip()
+
+
 def _update_banner_rect(layout: Layout) -> Rect:
     width = min(layout.header_rect.w // 2, max(260, layout.header_rect.w * 2 // 5))
     return Rect(
@@ -2181,7 +2367,15 @@ def _render_operation(  # noqa: ANN001
         _ERROR_COLOR if state == OperationState.FAILED else _FG_COLOR
     )
     state_y = layout.navigation_rect.y
-    state_label = fonts["body"].render(_STATE_LABELS[state], True, state_color)
+    result_summary, result_kind = troubleshoot_result_summary(operation)
+    state_text = result_summary or _STATE_LABELS[state]
+    if result_summary:
+        state_color = {
+            "success": _SUCCESS_COLOR,
+            "warning": _WARNING_COLOR,
+            "error": _ERROR_COLOR,
+        }.get(result_kind, state_color)
+    state_label = fonts["body"].render(state_text, True, state_color)
     screen.blit(state_label, (layout.safe_area.x, state_y))
 
     output_top = state_y + layout.fonts.body + 12
@@ -2231,9 +2425,20 @@ def _render_operation(  # noqa: ANN001
     )
 
     detail_hint = "   Left/Right technical details"
-    hint_text = (
-        _OPERATION_HINT_FINISHED if operation.is_finished else _OPERATION_HINT_RUNNING
-    ) + detail_hint
+    if repair_relaunch_needs_acknowledgment(operation):
+        hint_text = (
+            "A/Enter/Esc/Tap acknowledge and restart ROMCloud   Up/Down scroll"
+        )
+    else:
+        if operation.quick_repair_available:
+            hint_text = "A/Enter Quick Repair   B/Esc return   Up/Down scroll"
+        else:
+            hint_text = (
+                _OPERATION_HINT_FINISHED
+                if operation.is_finished
+                else _OPERATION_HINT_RUNNING
+            )
+    hint_text += detail_hint
     hint = fonts["hint"].render(hint_text, True, _HINT_COLOR)
     screen.blit(hint, (layout.hint_rect.x, layout.hint_rect.y))
 

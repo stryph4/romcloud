@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -12,6 +13,8 @@ from romcloud.core.storage import RemoteEntry
 from romcloud.services.transfer import TransferService
 from romcloud.core.cancellation import TransferCancellationToken
 from romcloud.core.exceptions import TransferCancelledError, TransferValidationError
+from romcloud.infrastructure.providers.local import LocalFilesystemProvider
+from romcloud.infrastructure.repositories.download import StagingRepository
 
 
 class _ChunkedProvider:
@@ -163,7 +166,7 @@ class TestTransferService:
         with pytest.raises(TransferCancelledError):
             service.transfer(game, cancel_after_first_chunk, cancellation)
 
-        staging = cache_dir / ".partial" / "ps2" / "Test Game.iso"
+        staging = cache_dir / ".partial" / "ps2" / "Test Game.iso.part"
         final = cache_dir / "ps2" / "Test Game.iso"
         assert 0 < staging.stat().st_size < game.total_size_bytes
         assert not final.exists()
@@ -228,6 +231,262 @@ class TestTransferService:
             "PS3_GAME/USRDIR/DATA/LEVELS/level0.bin",
         }
 
+    def test_directory_member_rename_before_db_update_recovers_idempotently(
+        self, dir_game, cache_dir, db, monkeypatch
+    ):
+        game, _ = dir_game
+        staging = StagingRepository(db)
+        service = TransferService(
+            LocalFilesystemProvider(), str(cache_dir), staging_repository=staging
+        )
+        original_complete = staging.complete
+        failed = False
+
+        def crash_after_rename(*args, **kwargs):
+            nonlocal failed
+            if not failed:
+                failed = True
+                raise OSError("simulated crash after member rename")
+            return original_complete(*args, **kwargs)
+
+        monkeypatch.setattr(staging, "complete", crash_after_rename)
+        with pytest.raises(OSError, match="member rename"):
+            service.transfer(game)
+
+        staged_root = cache_dir / ".partial" / "ps3" / "GAME"
+        assert any(
+            path.is_file() and not path.name.endswith(".part")
+            for path in staged_root.rglob("*")
+        )
+
+        monkeypatch.setattr(staging, "complete", original_complete)
+        final = Path(service.transfer(game))
+        assert final == cache_dir / "ps3" / "GAME"
+        assert {
+            path.relative_to(final).as_posix(): path.read_bytes()
+            for path in final.rglob("*") if path.is_file()
+        } == {
+            ".package-meta": b"meta",
+            "PS3_GAME/USRDIR/EBOOT.BIN": b"eboot" * 50,
+            "PS3_GAME/USRDIR/DATA/config.dat": b"config" * 20,
+            "PS3_GAME/USRDIR/DATA/LEVELS/level0.bin": b"data" * 200,
+        }
+
+    def test_promoted_file_recovery_requires_durable_hash_and_current_source(
+        self, simple_game, cache_dir, db
+    ):
+        game, source_root = simple_game
+        staging = StagingRepository(db)
+        service = TransferService(
+            LocalFilesystemProvider(), str(cache_dir), staging_repository=staging
+        )
+
+        final = Path(service.transfer(game))
+        assert staging.get_file("ps2/Test Game.iso", "").content_sha256
+
+        # A valid crash-after-promotion image is adopted without rewriting it.
+        before = final.stat().st_mtime_ns
+        assert Path(service.transfer(game)) == final
+        assert final.stat().st_mtime_ns == before
+
+        # Same path and size are not source identity. Recovery must reject the
+        # old promoted bytes and replace them with the current source content.
+        source = source_root / "ps2" / "Test Game.iso"
+        replacement = b"X" * source.stat().st_size
+        source.write_bytes(replacement)
+        assert Path(service.transfer(game)).read_bytes() == replacement
+
+        # Durable evidence also rejects a same-size local corruption.
+        final.write_bytes(b"Y" * len(replacement))
+        assert Path(service.transfer(game)).read_bytes() == replacement
+
+    def test_healthy_final_does_not_gain_false_recovery_manifest_when_peer_fails(
+        self, tmp_path, cache_dir, db, cache_repo, data_dir, monkeypatch
+    ):
+        source_root = tmp_path / "source"
+        system = source_root / "psx"
+        system.mkdir(parents=True)
+        (system / "Shared.chd").write_bytes(b"shared")
+        (system / "Later.chd").write_bytes(b"later")
+        game = Game.create(
+            "psx", "Collection", "local", str(source_root),
+            [
+                GameAsset("Shared.chd", "psx/Shared.chd", 6, True),
+                GameAsset("Later.chd", "psx/Later.chd", 5, False),
+            ],
+        )
+        final_shared = cache_dir / "psx" / "Shared.chd"
+        final_shared.parent.mkdir(parents=True)
+        final_shared.write_bytes(b"shared")
+        staging = StagingRepository(db)
+        service = TransferService(
+            LocalFilesystemProvider(), str(cache_dir), staging_repository=staging
+        )
+        original = service._transfer_file
+
+        def fail_later(game_arg, file, *args, **kwargs):
+            if file.relative_path == "psx/Later.chd":
+                raise OSError("later asset failed")
+            return original(game_arg, file, *args, **kwargs)
+
+        monkeypatch.setattr(service, "_transfer_file", fail_later)
+        with pytest.raises(OSError, match="later asset failed"):
+            service.transfer(game)
+
+        assert staging.get_asset("psx/Shared.chd") is None
+        assert staging.get_asset("psx/Later.chd") is not None
+        assert final_shared.read_bytes() == b"shared"
+        from romcloud.infrastructure.cache_coordination import CacheStorageCoordinator
+
+        coordinator = CacheStorageCoordinator(
+            db=db, cache_repo=cache_repo, cache_root=cache_dir,
+            lock_root=data_dir / "locks", max_size_bytes=1024, min_free_bytes=0,
+        )
+        assert coordinator.snapshot()["staging_bytes"] == 0
+
+    @pytest.mark.parametrize("directory", [False, True])
+    def test_atomic_promotion_uses_replace_and_fsyncs_final_parent(
+        self, simple_game, dir_game, cache_dir, monkeypatch, directory
+    ):
+        game, _ = dir_game if directory else simple_game
+        import romcloud.services.transfer as transfer_module
+
+        fsynced: list[Path] = []
+        monkeypatch.setattr(
+            transfer_module, "_fsync_directory", lambda path: fsynced.append(Path(path))
+        )
+        monkeypatch.setattr(
+            transfer_module.shutil, "move",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("copy fallback")),
+        )
+        final = Path(
+            TransferService(LocalFilesystemProvider(), str(cache_dir)).transfer(game)
+        )
+
+        assert final.exists()
+        assert final.parent in fsynced
+
+    def test_final_rename_failure_preserves_staging_without_copy_fallback(
+        self, simple_game, cache_dir, monkeypatch
+    ):
+        game, _ = simple_game
+        import romcloud.services.transfer as transfer_module
+
+        final = cache_dir / "ps2" / "Test Game.iso"
+        original_replace = transfer_module.os.replace
+
+        def fail_final(source, destination):
+            if Path(destination) == final:
+                raise OSError("simulated final rename failure")
+            return original_replace(source, destination)
+
+        monkeypatch.setattr(transfer_module.os, "replace", fail_final)
+        service = TransferService(LocalFilesystemProvider(), str(cache_dir))
+        with pytest.raises(OSError, match="final rename failure"):
+            service.transfer(game)
+
+        assert (cache_dir / ".partial" / "ps2" / "Test Game.iso").is_file()
+        assert not final.exists()
+
+    def test_directory_recovery_promotes_staging_when_old_final_was_parked(
+        self, dir_game, cache_dir, db
+    ):
+        game, source_root = dir_game
+        staging_repo = StagingRepository(db)
+        service = TransferService(
+            LocalFilesystemProvider(), str(cache_dir), staging_repository=staging_repo
+        )
+        final = Path(service.transfer(game))
+        backup = final.with_name(final.name + ".romcloud-replaced")
+        staged = cache_dir / ".partial" / "ps3" / "GAME"
+
+        # Crash window A: the old final was parked, but the completed staging
+        # directory had not yet been installed in the final namespace.
+        final.replace(backup)
+        shutil.copytree(source_root / "ps3" / "GAME", staged)
+
+        recovered = Path(service.transfer(game))
+
+        assert recovered == final and recovered.is_dir()
+        assert not staged.exists() and not backup.exists()
+        assert (recovered / "PS3_GAME" / "USRDIR" / "EBOOT.BIN").read_bytes() == b"eboot" * 50
+
+    def test_directory_recovery_cleans_backup_after_successful_promotion(
+        self, dir_game, cache_dir, db
+    ):
+        game, _ = dir_game
+        staging_repo = StagingRepository(db)
+        service = TransferService(
+            LocalFilesystemProvider(), str(cache_dir), staging_repository=staging_repo
+        )
+        final = Path(service.transfer(game))
+        backup = final.with_name(final.name + ".romcloud-replaced")
+
+        # Crash window B: new final and durable recovery manifest exist, but
+        # the obsolete replacement backup has not been removed yet.
+        shutil.copytree(final, backup)
+        before = final.stat().st_mtime_ns
+
+        assert Path(service.transfer(game)) == final
+        assert final.stat().st_mtime_ns == before
+        assert not backup.exists()
+
+    def test_directory_second_rename_failure_restores_old_final_and_retries(
+        self, dir_game, cache_dir, db, monkeypatch
+    ):
+        game, _ = dir_game
+        staging_repo = StagingRepository(db)
+        service = TransferService(
+            LocalFilesystemProvider(), str(cache_dir), staging_repository=staging_repo
+        )
+        final = cache_dir / "ps3" / "GAME"
+        staged = cache_dir / ".partial" / "ps3" / "GAME"
+        backup = final.with_name(final.name + ".romcloud-replaced")
+        final.mkdir(parents=True)
+        (final / "old.txt").write_bytes(b"old final")
+        import romcloud.services.transfer as transfer_module
+
+        original_replace = transfer_module.os.replace
+
+        def fail_staged_install(source, destination):
+            if Path(source) == staged and Path(destination) == final:
+                raise OSError("simulated directory install failure")
+            return original_replace(source, destination)
+
+        monkeypatch.setattr(transfer_module.os, "replace", fail_staged_install)
+        with pytest.raises(OSError, match="directory install failure"):
+            service.transfer(game)
+
+        assert (final / "old.txt").read_bytes() == b"old final"
+        assert staged.is_dir()
+        assert staging_repo.get_asset("ps3/GAME") is not None
+        assert not backup.exists()
+
+        monkeypatch.setattr(transfer_module.os, "replace", original_replace)
+        assert Path(service.transfer(game)) == final
+        assert not (final / "old.txt").exists()
+        assert not staged.exists() and not backup.exists()
+
+    def test_directory_recovery_rejects_old_final_when_source_changed(
+        self, dir_game, cache_dir, db
+    ):
+        game, source_root = dir_game
+        staging_repo = StagingRepository(db)
+        service = TransferService(
+            LocalFilesystemProvider(), str(cache_dir), staging_repository=staging_repo
+        )
+        final = Path(service.transfer(game))
+        backup = final.with_name(final.name + ".romcloud-replaced")
+        shutil.copytree(final, backup)
+        source_member = source_root / "ps3" / "GAME" / "PS3_GAME" / "USRDIR" / "EBOOT.BIN"
+        replacement = b"N" * source_member.stat().st_size
+        source_member.write_bytes(replacement)
+
+        recovered = Path(service.transfer(game))
+
+        assert (recovered / "PS3_GAME" / "USRDIR" / "EBOOT.BIN").read_bytes() == replacement
+        assert not backup.exists()
+
     def test_subsequent_transfer_reuses_safe_staging_path_and_completes(
         self, simple_game, cache_dir
     ):
@@ -246,7 +505,7 @@ class TestTransferService:
 
         final = Path(service.transfer(game))
         assert final.read_bytes() == b"rom_content" * 100
-        assert not (cache_dir / ".partial" / "ps2" / "Test Game.iso").exists()
+        assert not (cache_dir / ".partial" / "ps2" / "Test Game.iso.part").exists()
 
     def test_estimates_unknown_directory_size_only_when_requested(
         self, dir_game, cache_dir
@@ -345,7 +604,7 @@ class TestTransferService:
             svc.transfer(game)
 
         # Staging must still exist for resume
-        staging = cache_dir / ".partial" / "ps2" / "game.iso"
+        staging = cache_dir / ".partial" / "ps2" / "game.iso.part"
         assert staging.exists()
 
     def test_transfers_directory(self, dir_game, cache_dir):

@@ -8,8 +8,6 @@ import mimetypes
 import ssl
 import signal
 import threading
-import uuid
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -40,6 +38,10 @@ _MAX_BODY = 128 * 1024
 _CONTROLLER_LOG_MAX_BYTES = 256 * 1024
 _CONTROLLER_EVENT_MAX_BYTES = 4096
 _CONTROLLER_BATCH_MAX = 64
+
+
+class DownloadManagerUnavailable(RuntimeError):
+    """The resident download service is not configured in this process."""
 
 
 class ControllerDiagnosticLog:
@@ -104,79 +106,6 @@ class ControllerDiagnosticLog:
         return len(lines)
 
 
-@dataclass
-class TransferJob:
-    id: str
-    state: str = "queued"
-    current_game: int = 0
-    total_games: int = 0
-    current_game_id: str | None = None
-    bytes_done: int = 0
-    bytes_total: int = 0
-    completed_game_ids: list[str] = field(default_factory=list)
-    error: str | None = None
-
-    def serialize(self) -> dict[str, object]:
-        return dict(vars(self))
-
-
-class JobRegistry:
-    def __init__(self, manager: LibraryManagerService, mutation_lock: threading.RLock) -> None:
-        self._manager = manager
-        self._jobs: dict[str, TransferJob] = {}
-        self._lock = threading.Lock()
-        self._transfer_lock = mutation_lock
-
-    def get(self, job_id: str) -> TransferJob | None:
-        with self._lock:
-            return self._jobs.get(job_id)
-
-    def start_pinned(self) -> TransferJob:
-        plan = self._manager.pinned_preflight()
-        if not plan["allowed"]:
-            raise ValueError(" ".join(str(reason) for reason in plan["reasons"]))
-        job = TransferJob(
-            id=uuid.uuid4().hex,
-            total_games=int(plan["games_needing_data"]),
-        )
-        with self._lock:
-            if any(item.state in {"queued", "running"} for item in self._jobs.values()):
-                raise ValueError("A pinned download is already running.")
-            self._jobs[job.id] = job
-        threading.Thread(target=self._run_pinned, args=(job,), daemon=True).start()
-        return job
-
-    def _run_pinned(self, job: TransferJob) -> None:
-        def on_game(index: int, total: int, game_id: str) -> None:
-            with self._lock:
-                job.current_game = index
-                job.total_games = total
-                job.current_game_id = game_id
-                job.bytes_done = 0
-                job.bytes_total = 0
-
-        def on_progress(done: int, total: int) -> None:
-            with self._lock:
-                job.bytes_done = done
-                job.bytes_total = total
-
-        with self._transfer_lock:
-            try:
-                with self._lock:
-                    job.state = "running"
-                completed = self._manager.download_pinned(
-                    on_game=on_game, on_progress=on_progress
-                )
-                with self._lock:
-                    job.completed_game_ids = completed
-                    job.state = "complete"
-            except Exception as exc:  # noqa: BLE001 - job exposes a safe message
-                log.exception("Pinned download job failed")
-                with self._lock:
-                    job.error = str(exc)
-                    job.state = "failed"
-
-
 class ManagerHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -188,6 +117,7 @@ class ManagerHTTPServer(ThreadingHTTPServer):
         auth_registry: BrowserAuthRegistry | None = None,
         controller_log_path: str | Path | None = None,
         diagnostics_path: str | Path | None = None,
+        start_downloads: bool = True,
     ) -> None:
         self.manager = manager
         self.auth_token = token
@@ -216,10 +146,26 @@ class ManagerHTTPServer(ThreadingHTTPServer):
             diagnostic_store if diagnostic_store is not None else None
         )
         self.mutation_lock = threading.RLock()
-        self.jobs = JobRegistry(manager, self.mutation_lock)
+        # DownloadManagerService belongs to the resident manager process, not
+        # to an individual browser connection or in-memory HTTP job registry.
+        descriptor = getattr(type(manager), "downloads", None)
+        try:
+            self.downloads = manager.downloads if descriptor is not None else None
+        except RuntimeError:
+            self.downloads = None
+        self._downloads_started = False
         super().__init__(address, ManagerRequestHandler)
+        if start_downloads:
+            self.start_downloads()
+
+    def start_downloads(self) -> None:
+        if self.downloads is not None and not self._downloads_started:
+            self.downloads.start()
+            self._downloads_started = True
 
     def server_close(self) -> None:
+        if self.downloads is not None and self._downloads_started:
+            self.downloads.shutdown()
         if self.diagnostic_store is not None and self._owns_diagnostic_store:
             self.diagnostic_store.close()
         self.diagnostic_store = None
@@ -261,12 +207,11 @@ class ManagerRequestHandler(BaseHTTPRequestHandler):
                     )
                 else:
                     self._diagnostics(parsed.query)
-            elif parsed.path.startswith("/api/jobs/"):
-                job = self.server.jobs.get(parsed.path.rsplit("/", 1)[-1])
-                self._json(
-                    HTTPStatus.OK if job else HTTPStatus.NOT_FOUND,
-                    job.serialize() if job else {"error": "Job not found."},
-                )
+            elif parsed.path == "/api/downloads":
+                if self.server.downloads is None:
+                    self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Download Manager is unavailable."})
+                else:
+                    self._json(HTTPStatus.OK, self.server.downloads.status())
             elif parsed.path.startswith("/api/local-session-status/"):
                 launch_id = parsed.path.rsplit("/", 1)[-1]
                 self._json(
@@ -276,11 +221,14 @@ class ManagerRequestHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/" or parsed.path == "/index.html":
                 self._static("index.html")
             elif parsed.path in {
-                "/app.js", "/app.css", "/controller.js", "/spatial_navigation.js", "/diagnostics.js"
+                "/app.js", "/app.css", "/controller.js", "/spatial_navigation.js",
+                "/download_polling.js", "/diagnostics.js"
             }:
                 self._static(parsed.path[1:])
             else:
                 self.send_error(HTTPStatus.NOT_FOUND)
+        except DownloadManagerUnavailable as exc:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
         except (ValueError, ROMCloudError, RuntimeError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except Exception:  # noqa: BLE001
@@ -345,21 +293,80 @@ class ManagerRequestHandler(BaseHTTPRequestHandler):
                         str(body.get("action", "")), body.get("game_ids", [])
                     )
                 self._json(HTTPStatus.OK, result)
-            elif self.path == "/api/download-pinned/preflight":
+            elif parsed.path == "/api/download-pinned/preflight":
                 with self.server.mutation_lock:
                     result = self.server.manager.pinned_preflight()
                 self._json(HTTPStatus.OK, result)
-            elif self.path == "/api/download-pinned":
-                with self.server.mutation_lock:
-                    job = self.server.jobs.start_pinned()
-                self._json(HTTPStatus.ACCEPTED, job.serialize())
+            elif parsed.path == "/api/download-pinned":
+                self._json(HTTPStatus.ACCEPTED, self.server.manager.enqueue_pinned())
+            elif parsed.path == "/api/downloads/enqueue":
+                self._require_download_manager()
+                body = self._body()
+                from romcloud.core.models.download import DownloadOrigin
+
+                origin = DownloadOrigin(str(body.get("origin", "manual")))
+                self._json(
+                    HTTPStatus.ACCEPTED,
+                    self.server.manager.enqueue_downloads(
+                        body.get("game_ids", []), origin=origin
+                    ),
+                )
+            elif parsed.path == "/api/downloads/cancel-all":
+                downloads = self._require_download_manager()
+                self._json(HTTPStatus.OK, {"cancelled": downloads.cancel_all()})
+            elif parsed.path == "/api/downloads/retry-all-failed":
+                downloads = self._require_download_manager()
+                self._json(HTTPStatus.OK, {"retried": downloads.retry_all_failed()})
+            elif parsed.path == "/api/downloads/cleanup":
+                downloads = self._require_download_manager()
+                self._json(HTTPStatus.OK, {"cleaned": downloads.cleanup_stale_partials()})
+            elif parsed.path == "/api/downloads/operating-mode":
+                if not self._bearer_authenticated():
+                    self._json(
+                        HTTPStatus.FORBIDDEN,
+                        {"error": "Operating-mode coordination is unavailable."},
+                    )
+                    return
+                downloads = self._require_download_manager()
+                offline = self._body().get("offline")
+                if not isinstance(offline, bool):
+                    raise ValueError("Operating-mode coordination requires an offline boolean.")
+                downloads.apply_operating_mode(offline=offline)
+                self._json(HTTPStatus.OK, {"offline": offline, "quiescent": True})
+            elif parsed.path.startswith("/api/downloads/"):
+                downloads = self._require_download_manager()
+                parts = parsed.path.strip("/").split("/")
+                if len(parts) != 4:
+                    self.send_error(HTTPStatus.NOT_FOUND)
+                    return
+                item_id, control = parts[2], parts[3]
+                operations = {
+                    "pause": downloads.pause,
+                    "resume": downloads.resume,
+                    "cancel": downloads.cancel,
+                    "retry": downloads.retry,
+                    "discard": downloads.discard_partial,
+                    "remove": downloads.remove_queued,
+                }
+                operation = operations.get(control)
+                if operation is None:
+                    raise ValueError(f"Unsupported download control: {control}")
+                operation(item_id)
+                self._json(HTTPStatus.OK, {"id": item_id, "action": control})
             else:
                 self.send_error(HTTPStatus.NOT_FOUND)
+        except DownloadManagerUnavailable as exc:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
         except (ValueError, ROMCloudError, RuntimeError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except Exception:  # noqa: BLE001
             log.exception("Browser manager POST failed")
             self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Internal server error."})
+
+    def _require_download_manager(self):  # noqa: ANN201
+        if self.server.downloads is None:
+            raise DownloadManagerUnavailable("Download Manager is unavailable.")
+        return self.server.downloads
 
     def _authenticated(self) -> bool:
         return self._trusted_local_request() or self._bearer_authenticated() or self._cookie_session() is not None
@@ -552,6 +559,7 @@ def serve_manager(
         auth_registry=registry,
         controller_log_path=controller_log_path,
         diagnostics_path=diagnostics_path,
+        start_downloads=False,
     )
     if tls_cert or tls_key:
         if not tls_cert or not tls_key:
@@ -566,6 +574,14 @@ def serve_manager(
         except Exception:
             server.server_close()
             raise
+    # Runtime state is now discoverable before source work can begin. An
+    # explicit Offline transition can therefore always quiesce this worker or
+    # the worker will observe the already-persisted Offline policy at startup.
+    try:
+        server.start_downloads()
+    except Exception:
+        server.server_close()
+        raise
     previous_term = None
     if threading.current_thread() is threading.main_thread():
         previous_term = signal.getsignal(signal.SIGTERM)

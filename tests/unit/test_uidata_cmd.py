@@ -523,7 +523,7 @@ class TestRefresh:
         monkeypatch.setattr(
             es_config,
             "install",
-            lambda systems: type(
+            lambda systems, **_kwargs: type(
                 "Result", (), {"included_systems": [], "missing_systems": []}
             )(),
         )
@@ -783,20 +783,90 @@ class TestUpdateBridge:
         assert payload["restart_required"] is True
         assert payload["warnings"] == ["Google Drive is temporarily unavailable."]
 
+    def test_repair_reports_partial_success_warnings_and_es_restart(
+        self, tmp_path, monkeypatch
+    ):
+        from romcloud.lifecycle import update as update_module
+
+        new = update_module.BuildInfo(
+            version="1.1.0",
+            commit="b" * 40,
+            commit_short="b" * 12,
+            build_date="x",
+            source="test",
+        )
+        monkeypatch.setattr(
+            update_module,
+            "perform_repair",
+            lambda home, python, channel, progress=None: update_module.UpdateResult(
+                previous=None,
+                new=new,
+                warnings=("Ports gamelist remains unchanged.",),
+                es_restart_required=True,
+            ),
+        )
+
+        result = CliRunner().invoke(
+            cli,
+            ["--config", str(tmp_path / "missing.toml"), "uidata", "repair-install"],
+        )
+
+        assert result.exit_code == 0
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        assert payload["result"] == "partial"
+        assert payload["warnings"] == ["Ports gamelist remains unchanged."]
+        assert payload["es_restart_required"] is True
+
+    def test_repair_es_restart_alone_reports_clean_success(self, tmp_path, monkeypatch):
+        from romcloud.lifecycle import update as update_module
+
+        new = update_module.BuildInfo(
+            version="1.1.0",
+            commit="b" * 40,
+            commit_short="b" * 12,
+            build_date="x",
+            source="test",
+        )
+        monkeypatch.setattr(
+            update_module,
+            "perform_repair",
+            lambda home, python, channel, progress=None: update_module.UpdateResult(
+                previous=None,
+                new=new,
+                warnings=(),
+                es_restart_required=True,
+            ),
+        )
+
+        result = CliRunner().invoke(
+            cli,
+            ["--config", str(tmp_path / "missing.toml"), "uidata", "repair-install"],
+        )
+
+        assert result.exit_code == 0
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        assert payload["result"] == "success"
+        assert payload["warnings"] == []
+        assert payload["es_restart_required"] is True
+
 
 class TestHealthcheck:
-    def test_emits_source_reachability(self, tmp_path):
+    def test_emits_shared_source_connectivity_finding(self, tmp_path):
         result = _write_and_invoke(tmp_path, ["healthcheck"])
 
         assert result.exit_code == 0, result.output
         payload = json.loads(result.output.strip())
         assert payload["ok"] is True
-        assert payload["source_type"] == "Local filesystem"
-        assert payload["source_internal_provider"] == "local"
-        assert payload["source_description"] == str(tmp_path / "roms")
-        assert payload["source_reachable"] is True
+        assert payload["operation"] == "troubleshoot"
+        source = next(
+            finding
+            for finding in payload["findings"]
+            if finding["id"] == "source.connectivity"
+        )
+        assert source["status"] == "healthy"
+        assert "readable" in source["message"].lower()
 
-    def test_emits_smb_labels_and_metadata_when_smb_configured(self, tmp_path):
+    def test_smb_healthcheck_uses_shared_structured_diagnostics(self, tmp_path):
         config = _build_config(tmp_path, smb=SMBConfig(server="nas.local", share="ROMs", username="alice"))
         config_dir = tmp_path / "config"
         config_dir.mkdir()
@@ -809,11 +879,9 @@ class TestHealthcheck:
         assert result.exit_code == 0, result.output
         payload = json.loads(result.output.strip())
         assert payload["ok"] is True
-        assert payload["source_type"] == "SMB"
-        assert payload["source_internal_provider"] == "local"
-        assert payload["source_server"] == "nas.local"
-        assert payload["source_share"] == "ROMs"
-        assert payload["source_description"] == "nas.local:ROMs"
+        assert payload["operation"] == "troubleshoot"
+        findings = {finding["id"]: finding for finding in payload["findings"]}
+        assert findings["source.connectivity"]["status"] == "healthy"
 
 
 class TestCacheStatus:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
 import threading
 import time
@@ -12,22 +11,31 @@ from pathlib import Path
 
 import pytest
 
-from romcloud.core.capabilities import CapabilityPolicy, OperatingMode
+from tests.browser_test_support import usable_chromium
+
+from romcloud.core.capabilities import Capability, CapabilityPolicy, OperatingMode
 from romcloud.core.models.cache import CachePolicy
+from romcloud.core.models.download import DownloadOrigin
 from romcloud.core.models.game import Game, GameAsset
 from romcloud.infrastructure.repositories.library_browser import LibraryBrowserRepository
 from romcloud.services.library_manager import LibraryManagerService
 from romcloud.web.server import ManagerHTTPServer
 
 
-def _manager(db, game_repo, cache_repo, cache_service, mode=OperatingMode.CACHE):
+def _manager(
+    db, game_repo, cache_repo, cache_service, mode=OperatingMode.CACHE, downloads=None,
+    *, source_reachable=True, blocked_capabilities=frozenset()
+):
     return LibraryManagerService(
         LibraryBrowserRepository(db),
         game_repo,
         cache_repo,
         cache_service,
-        policy_loader=lambda: CapabilityPolicy("smart_cache", mode),
-        source_reachable=lambda: True,
+        policy_loader=lambda: CapabilityPolicy(
+            "smart_cache", mode, blocked_capabilities=blocked_capabilities
+        ),
+        source_reachable=lambda: source_reachable,
+        downloads=downloads,
     )
 
 
@@ -45,6 +53,86 @@ def _game(game_repo, root: Path, system: str, title: str, suffix: str = ".rom") 
     )
     game_repo.save(game)
     return game
+
+
+class _RecordingDownloads:
+    def __init__(self) -> None:
+        self.enqueues = []
+        self.controls = []
+        self.started = 0
+        self.stopped = 0
+
+    def start(self):
+        self.started += 1
+
+    def shutdown(self):
+        self.stopped += 1
+
+    def enqueue(self, game_ids, *, origin, batch_id=None):
+        ids = list(game_ids)
+        self.enqueues.append((ids, origin, batch_id))
+        items = [{"id": f"download-{index}", "game_id": game_id} for index, game_id in enumerate(ids)]
+        return {"items": items, "created": len(items), "count": len(items)}
+
+    def status(self):
+        return {"items": [], "active": None, "retained_partial_bytes": 0}
+
+    def cancel_all(self):
+        self.controls.append(("cancel-all", None))
+        return 2
+
+    def retry_all_failed(self):
+        self.controls.append(("retry-all", None))
+        return 1
+
+    def cleanup_stale_partials(self):
+        self.controls.append(("cleanup", None))
+        return 3
+
+    def apply_operating_mode(self, *, offline):
+        self.controls.append(("operating-mode", offline))
+
+    def pause(self, item_id):
+        self.controls.append(("pause", item_id))
+
+    resume = pause
+    cancel = pause
+    retry = pause
+    discard_partial = pause
+    remove_queued = pause
+
+
+def test_resident_worker_starts_only_after_manager_is_discoverable(monkeypatch):
+    import romcloud.web.server as server_module
+
+    events = []
+
+    class StubServer:
+        def __init__(self, *_args, **kwargs):
+            assert kwargs["start_downloads"] is False
+
+        def start_downloads(self):
+            events.append("downloads")
+
+        def serve_forever(self, **_kwargs):
+            events.append("serve")
+
+        def server_close(self):
+            events.append("close")
+
+        def shutdown(self):
+            return None
+
+    monkeypatch.setattr(server_module, "ManagerHTTPServer", StubServer)
+    server_module.serve_manager(
+        object(),
+        "127.0.0.1",
+        0,
+        "secret",
+        on_ready=lambda: events.append("ready"),
+    )
+
+    assert events == ["ready", "downloads", "serve", "close"]
 
 
 def test_system_first_paging_search_filters_and_bulk_pin(
@@ -197,6 +285,42 @@ def test_already_cached_pinned_game_requires_zero_additional_bytes(
     assert plan.additional_bytes == 0
 
 
+def test_row_download_and_pinned_batch_enqueue_asynchronously(
+    db, cache_repo, game_repo, cache_service, tmp_path, monkeypatch
+):
+    root = tmp_path / "source"
+    first = _game(game_repo, root, "nes", "First")
+    second = _game(game_repo, root, "nes", "Second")
+    downloads = _RecordingDownloads()
+    manager = _manager(
+        db, game_repo, cache_repo, cache_service, downloads=downloads
+    )
+    monkeypatch.setattr(
+        cache_service, "cache_game",
+        lambda _game_id: (_ for _ in ()).throw(AssertionError("synchronous transfer")),
+    )
+
+    result = manager.action("cache", [first.id])
+    assert result["count"] == 1
+    assert downloads.enqueues[0] == ([first.id], DownloadOrigin.MANUAL, None)
+
+    selected = manager.action("download_selected", [first.id, second.id])
+    assert selected["count"] == 2
+    assert downloads.enqueues[1] == (
+        [first.id, second.id], DownloadOrigin.SELECTED, None
+    )
+
+    cache_service.pin(first.id)
+    cache_service.pin(second.id)
+    pinned = manager.enqueue_pinned()
+    ids, origin, batch_id = downloads.enqueues[2]
+    assert set(ids) == {first.id, second.id}
+    assert origin is DownloadOrigin.PINNED
+    assert batch_id and pinned["batch_id"] == batch_id
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM cache_reservations").fetchone()[0] == 0
+
+
 def test_large_catalog_page_query_is_bounded_and_fast(db, cache_repo, game_repo, cache_service):
     now = datetime.now(timezone.utc).isoformat()
     count = 28_000
@@ -273,6 +397,159 @@ def test_http_api_requires_token_and_serves_paginated_json(
         )
         with urllib.request.urlopen(preflight, timeout=2) as response:
             assert json.load(response)["games_needing_data"] == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_authenticated_download_api_exposes_queue_and_controls(
+    db, game_repo, cache_repo, cache_service, tmp_path
+):
+    game = _game(game_repo, tmp_path / "source", "nes", "Queued")
+    downloads = _RecordingDownloads()
+    server = ManagerHTTPServer(
+        ("127.0.0.1", 0),
+        _manager(
+            db, game_repo, cache_repo, cache_service, downloads=downloads
+        ),
+        "secret",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def request(path, body=None):
+        return urllib.request.Request(
+            f"{base}{path}",
+            data=None if body is None else json.dumps(body).encode(),
+            headers={
+                "Authorization": "Bearer secret",
+                "Content-Type": "application/json",
+            },
+            method="GET" if body is None else "POST",
+        )
+
+    try:
+        with pytest.raises(urllib.error.HTTPError) as denied:
+            urllib.request.urlopen(
+                urllib.request.Request(
+                    f"{base}/api/downloads", headers={"Host": "batocera.local"}
+                ),
+                timeout=2,
+            )
+        assert denied.value.code == 401
+        with urllib.request.urlopen(request("/api/downloads"), timeout=2) as response:
+            assert json.load(response)["items"] == []
+        with urllib.request.urlopen(
+            request("/api/downloads/enqueue", {"game_ids": [game.id]}), timeout=2
+        ) as response:
+            assert response.status == 202
+            assert json.load(response)["count"] == 1
+        with urllib.request.urlopen(
+            request("/api/downloads/item-1/pause", {}), timeout=2
+        ) as response:
+            assert json.load(response) == {"id": "item-1", "action": "pause"}
+        with urllib.request.urlopen(
+            request("/api/downloads/cancel-all", {}), timeout=2
+        ) as response:
+            assert json.load(response)["cancelled"] == 2
+        with urllib.request.urlopen(
+            request("/api/downloads/operating-mode", {"offline": True}), timeout=2
+        ) as response:
+            assert json.load(response) == {"offline": True, "quiescent": True}
+        assert downloads.enqueues[0] == ([game.id], DownloadOrigin.MANUAL, None)
+        assert ("pause", "item-1") in downloads.controls
+        assert ("operating-mode", True) in downloads.controls
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    assert downloads.started == 1 and downloads.stopped == 1
+
+
+@pytest.mark.parametrize(
+    ("mode", "reachable", "blocked", "message"),
+    [
+        (OperatingMode.OFFLINE, True, frozenset(), "Offline"),
+        (
+            OperatingMode.CACHE, True, frozenset({Capability.GAME_DOWNLOAD}),
+            "configured storage provider",
+        ),
+        (OperatingMode.CACHE, False, frozenset(), "ROM source is unavailable"),
+    ],
+)
+def test_direct_download_enqueue_enforces_policy_before_durable_queue_creation(
+    db, game_repo, cache_repo, cache_service, tmp_path,
+    mode, reachable, blocked, message,
+):
+    game = _game(game_repo, tmp_path / "source", "nes", "Rejected")
+    downloads = _RecordingDownloads()
+    manager = _manager(
+        db, game_repo, cache_repo, cache_service, mode, downloads,
+        source_reachable=reachable, blocked_capabilities=blocked,
+    )
+    server = ManagerHTTPServer(("127.0.0.1", 0), manager, "secret")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{server.server_address[1]}/api/downloads/enqueue",
+        data=json.dumps({"game_ids": [game.id]}).encode(),
+        headers={
+            "Authorization": "Bearer secret",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with pytest.raises(urllib.error.HTTPError) as rejected:
+            urllib.request.urlopen(request, timeout=2)
+        assert rejected.value.code == 400
+        assert message in rejected.value.read().decode()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert downloads.enqueues == []
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM download_items").fetchone()[0] == 0
+
+
+def test_all_download_routes_return_503_when_manager_is_unavailable(
+    db, game_repo, cache_repo, cache_service
+):
+    server = ManagerHTTPServer(
+        ("127.0.0.1", 0),
+        _manager(db, game_repo, cache_repo, cache_service),
+        "secret",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    routes = [
+        ("GET", "/api/downloads"),
+        ("POST", "/api/downloads/enqueue"),
+        ("POST", "/api/downloads/cancel-all"),
+        ("POST", "/api/downloads/retry-all-failed"),
+        ("POST", "/api/downloads/cleanup"),
+        ("POST", "/api/downloads/item-1/pause"),
+    ]
+    try:
+        for method, path in routes:
+            request = urllib.request.Request(
+                f"{base}{path}",
+                data=b"{}" if method == "POST" else None,
+                headers={
+                    "Authorization": "Bearer secret",
+                    "Content-Type": "application/json",
+                },
+                method=method,
+            )
+            with pytest.raises(urllib.error.HTTPError) as unavailable:
+                urllib.request.urlopen(request, timeout=2)
+            assert unavailable.value.code == 503, path
+            assert "Download Manager is unavailable" in unavailable.value.read().decode()
     finally:
         server.shutdown()
         server.server_close()
@@ -381,16 +658,7 @@ def test_local_diagnostics_reuses_active_store_without_reinitializing(
 def test_real_browser_loads_authenticated_manager_app(
     db, game_repo, cache_repo, cache_service, tmp_path
 ):
-    candidates = [
-        shutil.which("chromium"),
-        shutil.which("google-chrome"),
-        shutil.which("chrome"),
-        Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
-        Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
-    ]
-    browser = next((str(path) for path in candidates if path and Path(path).is_file()), None)
-    if browser is None:
-        pytest.skip("Chromium is not installed on this development host")
+    browser = usable_chromium()
     _game(game_repo, tmp_path / "source", "nes", "Rendered Browser Game")
     server = ManagerHTTPServer(
         ("127.0.0.1", 0),

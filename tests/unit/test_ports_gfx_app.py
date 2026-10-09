@@ -31,8 +31,10 @@ from ports_gfx.app import (
     menu_categories_for_state,
     root_menu_items_for_state,
     completed_mode_transition_requires_exit,
+    acknowledge_completed_relaunch,
     operation_summary_message,
     request_relaunch_for_completed_update,
+    repair_relaunch_needs_acknowledgment,
     render_completed_mode_transition_exit,
     render_completed_update_relaunch,
     start_operation,
@@ -111,18 +113,20 @@ class TestMenuItems:
 
         actions = [item.action for item in MENU_ITEMS]
         assert actions == [
-            app_module.SETUP_ACTION,
-            "connection-status",
-            "connection-mount",
-            "connection-unmount",
-            "status",
-            "refresh",
-            "healthcheck",
-            "cache-status",
+            "category:Library",
+            "library-connected",
+            app_module.ACTIVE_MODE_ACTION,
+            "library-offline",
+            "category:Storage",
             app_module.SAVESYNC_ACTION,
-            "update-check",
-            CONTROLLER_TEST_ACTION,
+            "category:Maintenance",
             EXIT_ACTION,
+        ]
+        maintenance = [item.action for item in MENU_CATEGORIES["Maintenance"]]
+        assert maintenance[3:6] == [
+            "troubleshoot",
+            "repair-install",
+            app_module.UNINSTALL_ACTION,
         ]
 
     def test_exit_is_the_last_item(self):
@@ -142,11 +146,8 @@ class TestMenuItems:
             for items in direct.values()
             for item in items
         )
-        assert all(
-            not item.action.startswith("library-")
-            for items in direct.values()
-            for item in items
-        )
+        mode_actions = {"library-connected", "library-cache", "library-offline"}
+        assert all(item.action not in mode_actions for items in direct.values() for item in items)
         direct_roots = root_menu_items_for_state(
             {"game_access_mode": "direct_nas", "operating_mode": "connected",
              "offline_mode": False, "capabilities": {}}
@@ -179,8 +180,9 @@ class TestMenuItems:
             "Direct", "Cached Storage", "Offline"
         ]
         assert not offline_roots[1].active and not offline_roots[2].active and offline_roots[3].active
+        mode_actions = {"library-connected", "library-cache", "library-offline"}
         assert all(
-            not item.action.startswith("library-")
+            item.action not in mode_actions
             for item in menu_categories_for_state(offline_state, True)["Library"]
         )
         assert [item.label for item in offline_roots] == [
@@ -760,10 +762,9 @@ class TestHandleMenuEvent:
         assert operation is None
 
     def test_confirm_on_controller_test_item_switches_screen(self):
-        state = self._state()
+        state = self._nav_state()
+        state.open_category("Maintenance", action=CONTROLLER_TEST_ACTION)
         layout = self._layout(state)
-        idx = next(i for i, item in enumerate(state.items) if item.action == CONTROLLER_TEST_ACTION)
-        state.select(idx)
 
         running, screen, message, kind, operation = _handle_menu_event(
             InputEvent(action=Action.CONFIRM), state, layout, "/opt/romcloud/bin/romcloud", True, None, "info",
@@ -906,10 +907,9 @@ class TestHandleMenuEvent:
 
         from ports_gfx import app as app_module
 
-        state = self._state()
+        state = self._nav_state()
+        state.open_category("Library", action="refresh")
         layout = self._layout(state)
-        refresh_index = next(i for i, item in enumerate(state.items) if item.action == "refresh")
-        state.select(refresh_index)
 
         def fake_popen(argv, **kwargs):
             import subprocess
@@ -1301,12 +1301,16 @@ class TestUpdateRelaunchRequest:
         lines: list[OperationLine],
         *,
         finished: bool = True,
+        relaunch_operation: str = "update",
     ):
         from ports_gfx.operation_screen import OperationScreenState
 
         runner = _FakeUpdateRunner(state, lines, finished=finished)
         return OperationScreenState(
-            title="Update ROMCloud", runner=runner, arms_gui_relaunch=True
+            title="Update ROMCloud",
+            runner=runner,
+            arms_gui_relaunch=True,
+            relaunch_operation=relaunch_operation,
         )
 
     def test_successful_final_result_enters_terminal_relaunch_state(self):
@@ -1374,11 +1378,80 @@ class TestUpdateRelaunchRequest:
         assert render_completed_update_relaunch(operation, coordinator, splash) is False
         assert frames == [("splash", "Update complete", "Restarting ROMCloud…", 1.0)]
 
+    def test_partial_repair_waits_for_acknowledgment_then_relaunches(self):
+        coordinator = GuiRelaunchCoordinator("/opt/romcloud/bin/romcloud")
+        operation = self._operation(
+            OperationState.SUCCEEDED,
+            [
+                OperationLine(
+                    "stdout",
+                    '{"ok":true,"result":"partial","es_restart_required":true,'
+                    '"warnings":["Restart ES"]}',
+                )
+            ],
+            relaunch_operation="repair",
+        )
+        frames: list[object] = []
+
+        assert repair_relaunch_needs_acknowledgment(operation) is True
+        assert request_relaunch_for_completed_update(operation, coordinator) is False
+        assert coordinator.terminal is False
+        assert acknowledge_completed_relaunch(operation, Action.CONFIRM) is True
+        assert repair_relaunch_needs_acknowledgment(operation) is False
+        assert render_completed_update_relaunch(
+            operation, coordinator, _RecordingSplash(frames)
+        ) is True
+        assert frames == [
+            (
+                "splash",
+                "Repair completed with warnings",
+                "Restart EmulationStation to apply the repair; restarting ROMCloud…",
+                1.0,
+            )
+        ]
+
+    def test_clean_repair_relaunches_immediately(self):
+        coordinator = GuiRelaunchCoordinator("/opt/romcloud/bin/romcloud")
+        operation = self._operation(
+            OperationState.SUCCEEDED,
+            [OperationLine("stdout", '{"ok":true,"warnings":[]}')],
+            relaunch_operation="repair",
+        )
+        frames: list[object] = []
+
+        assert render_completed_update_relaunch(
+            operation, coordinator, _RecordingSplash(frames)
+        ) is True
+        assert frames == [
+            ("splash", "Repair complete", "Restarting ROMCloud…", 1.0)
+        ]
+
+    def test_update_warning_message_never_says_repair(self):
+        coordinator = GuiRelaunchCoordinator("/opt/romcloud/bin/romcloud")
+        operation = self._operation(
+            OperationState.SUCCEEDED,
+            [OperationLine("stdout", '{"ok":true,"warnings":["optional"]}')],
+        )
+        frames: list[object] = []
+
+        assert render_completed_update_relaunch(
+            operation, coordinator, _RecordingSplash(frames)
+        ) is True
+        assert frames == [
+            (
+                "splash",
+                "Update completed with warnings",
+                "Restarting ROMCloud…",
+                1.0,
+            )
+        ]
+
     def test_failure_never_renders_successful_restart_splash(self):
         coordinator = GuiRelaunchCoordinator("/opt/romcloud/bin/romcloud")
         operation = self._operation(
             OperationState.FAILED,
             [OperationLine("stdout", '{"ok":false,"error":"install failed"}')],
+            relaunch_operation="repair",
         )
         frames: list[object] = []
 
@@ -1395,7 +1468,7 @@ class TestUpdateRelaunchRequest:
         from ports_gfx.app import _OPERATIONS
 
         armed = {action for action, spec in _OPERATIONS.items() if spec.arms_gui_relaunch}
-        assert armed == {"update-install"}
+        assert armed == {"update-install", "repair-install"}
 
     def test_only_mode_operations_own_normal_terminal_exit(self):
         from ports_gfx.app import _OPERATIONS
@@ -1548,6 +1621,21 @@ class TestOperationSummaryMessage:
         message, kind = operation_summary_message(operation)
         assert message == "Refresh Catalog: succeeded"
         assert kind == "success"
+
+    def test_partial_repair_reports_warning(self):
+        operation = self._operation(state=OperationState.SUCCEEDED)
+        operation.title = "Repair Installation"
+        operation.runner.lines = [
+            OperationLine(
+                "stdout",
+                '{"ok":true,"result":"partial","warnings":["Restart ES"]}',
+            )
+        ]
+
+        message, kind = operation_summary_message(operation)
+
+        assert message == "Repair Installation: completed with warnings"
+        assert kind == "warning"
 
     def test_failed_operation_reports_error_with_detail(self):
         operation = self._operation(state=OperationState.FAILED, error="exited with code 1")

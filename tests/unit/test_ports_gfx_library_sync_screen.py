@@ -52,6 +52,7 @@ class _Process:
 
 PREVIEW_PAYLOAD = {
     "ok": True,
+    "read_only": False,
     "games_eligible": 18200,
     "systems": ["ps2", "snes"],
     "gamelist_files": 2,
@@ -84,11 +85,39 @@ def test_preview_is_shown_before_quick_sync_starts():
 
     assert state.step == PREFLIGHT
     assert state.preview["games_eligible"] == 18200
-    assert actions == ["library-sync-preview"]
+    assert actions == ["library-sync-operation-preview"]
 
     state.start_sync()
     assert state.step == IMPORTING
-    assert actions == ["library-sync-preview", "library-sync"]
+    assert actions == ["library-sync-operation-preview", "library-sync"]
+
+
+def test_read_only_sftp_preview_routes_quick_and_full_to_pull():
+    actions = []
+    pull_preview = {
+        "ok": True,
+        "read_only": True,
+        "provider": "sftp",
+        "message": "SFTP is read-only.",
+    }
+
+    def popen(argv, **kwargs):
+        actions.append(argv[-1])
+        return _Process(pull_preview if "preview" in argv[-1] else {"ok": True})
+
+    state = LibrarySyncScreenState("romcloud", popen=popen)
+    state.start_preview()
+    _drain(state)
+    assert state.pull_only is True
+    assert state.sync_label == "Quick Pull"
+
+    state.start_sync()
+    assert actions[-1] == "library-sync-pull"
+
+    state.sync_mode = "full"
+    state.start_sync()
+    assert state.sync_label == "Full Pull"
+    assert actions[-1] == "library-sync-pull-full"
 
 
 def test_full_long_press_starts_import_and_reports_real_progress():
@@ -102,7 +131,7 @@ def test_full_long_press_starts_import_and_reports_real_progress():
 
     def popen(argv, **kwargs):
         actions.append(argv[-1])
-        if argv[-1] == "library-sync-preview":
+        if argv[-1] == "library-sync-operation-preview":
             return _Process(PREVIEW_PAYLOAD)
         return _Process({"ok": True, "metadata_added": 2, "media_transferred": 4, "rendered": 8}, stderr=progress)
 
@@ -113,7 +142,7 @@ def test_full_long_press_starts_import_and_reports_real_progress():
     state.handle_confirm_event(InputEvent(action=Action.CONFIRM))
     state.update_confirm(3.0)
     assert state.step == IMPORTING
-    assert actions == ["library-sync-preview", "library-sync-full"]
+    assert actions == ["library-sync-operation-preview", "library-sync-full"]
 
     _drain(state)
     assert state.step == RESULT
@@ -129,7 +158,7 @@ def test_cancel_is_retryable_and_terminates_only_the_import_process():
     def popen(argv, **kwargs):
         process = (
             _Process(PREVIEW_PAYLOAD)
-            if argv[-1] == "library-sync-preview"
+            if argv[-1] == "library-sync-operation-preview"
             else _Process(None, running=True)
         )
         processes.append(process)

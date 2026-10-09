@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import stat
 from dataclasses import replace
 from pathlib import Path
 
@@ -25,10 +26,12 @@ from romcloud.infrastructure.credentials import (
     remote_data_cifs_credentials_path,
 )
 from romcloud.infrastructure.database import Database
+from romcloud.infrastructure.ownership import record_owned_roots
 from romcloud.infrastructure.repositories.game import GameRepository
 from romcloud.infrastructure.repositories.proxy import ProxyRepository
 from romcloud.integrations.batocera.proxy_ownership import remove_owned_proxy_files
 from romcloud.lifecycle import manage
+from romcloud.troubleshoot import ActivitySnapshot, ActivityState
 
 
 def _config(tmp_path: Path) -> tuple[AppConfig, Path, Path, Path]:
@@ -47,6 +50,7 @@ def _config(tmp_path: Path) -> tuple[AppConfig, Path, Path, Path]:
         logging=LoggingConfig(path=str(home / "logs")),
     )
     write_config(config, str(home / "config" / "romcloud.toml"))
+    record_owned_roots(home, {"home": home, "data": home / "data", "cache": cache})
     return config, home, local_roms, cache
 
 
@@ -82,8 +86,23 @@ def _isolate_integrations(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(manage.auto_savesync, "stop_menu_loop", lambda data_root: False)
     monkeypatch.setattr(manage.mount_worker, "stop_worker", lambda home: False)
     monkeypatch.setattr(manage.mount_worker, "cleanup_runtime_state", lambda home: None)
-    monkeypatch.setattr(manage.mount_service, "remove_service", lambda: False)
-    monkeypatch.setattr(manage.es_config, "remove", lambda: False)
+    monkeypatch.setattr(manage.mount_service, "remove_service", lambda *args, **kwargs: False)
+    monkeypatch.setattr(manage.es_config, "remove", lambda *args, **kwargs: False)
+
+
+def _inactive_activity(**overrides: ActivityState) -> ActivitySnapshot:
+    inactive = ActivityState("inactive")
+    values = {
+        "game": inactive,
+        "download": inactive,
+        "savesync": inactive,
+        "library_sync": inactive,
+        "browser_manager": inactive,
+        "graphical_ui": inactive,
+        "mount_worker": inactive,
+    }
+    values.update(overrides)
+    return ActivitySnapshot(**values)
 
 
 def test_repair_restores_wrappers_and_proxy_without_changing_user_state(tmp_path: Path) -> None:
@@ -136,13 +155,23 @@ def test_uninstall_removes_active_artifacts_and_preserves_recoverable_state(
     for name in ("bin", "venv", "ports-gfx", "run", "runtime"):
         (home / name).mkdir(parents=True, exist_ok=True)
     (home / "runtime" / "google-oauth-client.json").write_text("release metadata")
+    source_icon = home / "ports-gfx" / "ports_gfx" / "assets" / "icon.png"
+    source_icon.parent.mkdir(parents=True)
+    source_icon.write_bytes(b"owned")
     (home / "version.json").write_text("{}")
     ports_dir = tmp_path / "ports"
     (ports_dir / "images").mkdir(parents=True)
-    (ports_dir / "ROMCloud.sh").write_text("owned")
+    wrapper = home / "bin" / "romcloud-ports"
+    display_log = home / "logs" / "gui-display.log"
+    (ports_dir / "ROMCloud.sh").write_text(
+        "#!/bin/bash\n"
+        + manage.install._display_trace_shell(display_log, "port_entry_start")
+        + f'exec "{wrapper}" "$@"\n'
+    )
     (ports_dir / "images" / "ROMCloud.png").write_bytes(b"owned")
     (ports_dir / "gamelist.xml").write_text(
-        '<?xml version="1.0"?><gameList><game><path>./ROMCloud.sh</path></game>'
+        '<?xml version="1.0"?><gameList><game><path>./ROMCloud.sh</path>'
+        '<name>ROMCloud</name><image>./images/ROMCloud.png</image></game>'
         '<game><path>./Other.sh</path></game></gameList>'
     )
     calls: list[str] = []
@@ -154,8 +183,8 @@ def test_uninstall_removes_active_artifacts_and_preserves_recoverable_state(
     )
     monkeypatch.setattr(manage.mount_worker, "stop_worker", lambda home: calls.append("worker-stop"))
     monkeypatch.setattr(manage.mount_worker, "cleanup_runtime_state", lambda home: calls.append("runtime-cleanup"))
-    monkeypatch.setattr(manage.mount_service, "remove_service", lambda: calls.append("service"))
-    monkeypatch.setattr(manage.es_config, "remove", lambda: calls.append("es"))
+    monkeypatch.setattr(manage.mount_service, "remove_service", lambda *args, **kwargs: calls.append("service"))
+    monkeypatch.setattr(manage.es_config, "remove", lambda *args, **kwargs: calls.append("es"))
 
     first = manage.uninstall(config=config, romcloud_home=home, ports_dir=ports_dir)
     second = manage.uninstall(config=config, romcloud_home=home, ports_dir=ports_dir)
@@ -202,11 +231,11 @@ def test_purge_removes_owned_state_and_signed_orphan_only(
     report = manage.purge(config=config, romcloud_home=home, ports_dir=tmp_path / "ports")
     repeated = manage.purge(config=config, romcloud_home=home, ports_dir=tmp_path / "ports")
 
-    assert report.proxies_removed == 2
+    assert report.proxies_removed == 1
     assert repeated.proxies_removed == 0
     assert not home.exists()
     assert not cache.exists()
-    assert not proxy.exists() and not signed_orphan.exists()
+    assert not proxy.exists() and signed_orphan.exists()
     assert foreign_proxy.exists() and real_rom.exists() and unrelated.exists()
 
 
@@ -252,7 +281,9 @@ def test_install_boot_integration_then_purge_stops_and_removes_only_owned_paths(
     monkeypatch.setattr(
         manage.mount_service,
         "remove_service",
-        lambda: original_remove_service(service_path=service_path),
+        lambda *args, **kwargs: original_remove_service(
+            str(home / "bin" / "romcloud"), service_path=service_path
+        ),
     )
     monkeypatch.setattr(manage.es_config, "remove", lambda: False)
 
@@ -293,9 +324,8 @@ def test_proxy_cleanup_scans_candidates_once_without_weakening_ownership(
         keep_game_ids={"kept"},
     )
 
-    assert removed == 1
-    assert kept.is_file() and foreign.is_file()
-    assert not orphan.exists()
+    assert removed == 0
+    assert kept.is_file() and foreign.is_file() and orphan.is_file()
 
 
 def test_purge_preserves_user_controlled_remote_data(
@@ -344,17 +374,19 @@ def test_uninstall_unmounts_remote_before_source_and_removes_both_helpers(
     monkeypatch.setattr(
         manage.mountlib,
         "unmount_cifs_source",
-        lambda path: calls.append(path) or True,
+        lambda path, **kwargs: calls.append(path) or True,
     )
+    monkeypatch.setattr(manage.mountlib, "is_target_mounted", lambda path: True)
+    monkeypatch.setattr(manage.mountlib, "is_target_mounted_cifs", lambda path, **kwargs: True)
 
     manage.uninstall(config=config, romcloud_home=home, ports_dir=tmp_path / "ports")
 
     assert calls == [str(remote_root), config.source.rom_root]
-    assert not cifs_credentials_path(config.credentials_path).exists()
-    assert not remote_data_cifs_credentials_path(config.credentials_path).exists()
+    assert cifs_credentials_path(config.credentials_path).exists()
+    assert remote_data_cifs_credentials_path(config.credentials_path).exists()
 
 
-def test_uninstall_removes_the_canonical_and_legacy_credential_files(
+def test_uninstall_preserves_the_canonical_and_legacy_credential_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config, home, _local_roms, _cache = _config(tmp_path)
@@ -373,10 +405,11 @@ def test_uninstall_removes_the_canonical_and_legacy_credential_files(
 
     manage.uninstall(config=config, romcloud_home=home, ports_dir=tmp_path / "ports")
 
-    assert not config.credentials_path.exists()
-    assert not legacy.exists()
-    assert not setup_state.exists()
-    assert not stale_ephemeral.exists()
+    assert config.credentials_path.exists()
+    assert legacy.exists()
+    assert setup_state.exists()
+    assert stale_ephemeral.exists()
+    assert stat.S_IMODE(config.credentials_path.stat().st_mode) == 0o600
 
 
 def test_uninstall_stops_before_runtime_removal_if_a_mount_cannot_unmount(
@@ -392,15 +425,17 @@ def test_uninstall_stops_before_runtime_removal_if_a_mount_cannot_unmount(
     monkeypatch.setattr(
         manage.mountlib,
         "unmount_cifs_source",
-        lambda path: (_ for _ in ()).throw(RuntimeError("target busy")),
+        lambda path, **kwargs: (_ for _ in ()).throw(RuntimeError("target busy")),
     )
+    monkeypatch.setattr(manage.mountlib, "is_target_mounted", lambda path: True)
+    monkeypatch.setattr(manage.mountlib, "is_target_mounted_cifs", lambda path, **kwargs: True)
     monkeypatch.setattr(
         manage.mount_service,
         "remove_service",
         lambda: calls.append("service"),
     )
 
-    with pytest.raises(RuntimeError, match="uninstall stopped"):
+    with pytest.raises(RuntimeError, match="target busy"):
         manage.uninstall(config=config, romcloud_home=home)
 
     assert runtime_file.exists()
@@ -419,7 +454,7 @@ def test_purge_refuses_cache_root_containing_real_roms(
         logging=config.logging,
     )
     _isolate_integrations(monkeypatch)
-    with pytest.raises(RuntimeError, match="protected ROM data"):
+    with pytest.raises(RuntimeError, match="protected user/provider data"):
         manage.purge(config=unsafe, romcloud_home=home, ports_dir=tmp_path / "ports")
     assert local_roms.exists()
 
@@ -517,6 +552,8 @@ def test_cli_repair_uses_persisted_channel(tmp_path: Path, monkeypatch: pytest.M
             previous=None,
             new=new,
             reconcile_log="warning: Google Drive configuration could not be retrieved.",
+            warnings=("Google Drive configuration could not be retrieved.",),
+            es_restart_required=True,
         ),
     )
 
@@ -524,8 +561,10 @@ def test_cli_repair_uses_persisted_channel(tmp_path: Path, monkeypatch: pytest.M
 
     assert result.exit_code == 0, result.output
     assert captured == ["develop"]
+    assert "Repair completed with warnings" in result.output
     assert "from develop" in result.output
     assert "Google Drive configuration could not be retrieved" in result.output
+    assert "Restart EmulationStation" in result.output
 
 
 def test_cli_repeated_purge_is_safe_after_config_is_gone(
@@ -544,3 +583,310 @@ def test_cli_repeated_purge_is_safe_after_config_is_gone(
     assert result.exit_code == 0
     assert len(received) == 1
     assert received[0].local_roms_path == "/.__romcloud_missing_config__/roms"
+
+
+@pytest.mark.parametrize("state", ["active", "unknown"])
+def test_preflight_blocks_active_or_unknown_relevant_activity(
+    tmp_path: Path, state: str
+) -> None:
+    config, home, _local_roms, _cache = _config(tmp_path)
+    activity = _inactive_activity(game=ActivityState(state, "test signal"))
+
+    with pytest.raises(RuntimeError, match=f"game:{state}"):
+        manage.lifecycle_preflight(
+            operation="uninstall",
+            config=config,
+            romcloud_home=home,
+            activity=activity,
+        )
+
+
+def test_purge_rejects_owned_root_below_actual_save_root(tmp_path: Path) -> None:
+    config, home, _local_roms, _cache = _config(tmp_path)
+    save_root = tmp_path / "actual-saves"
+    save_root.mkdir()
+    unsafe = replace(
+        config,
+        saves=SavesConfig(local_path=str(save_root)),
+        cache=CacheConfig(path=str(save_root / "romcloud-cache")),
+    )
+
+    with pytest.raises(RuntimeError, match="protected user/provider data"):
+        manage.lifecycle_preflight(
+            operation="purge",
+            config=unsafe,
+            romcloud_home=home,
+            activity=_inactive_activity(),
+        )
+
+
+def test_purge_rejects_owned_root_containing_actual_save_root(tmp_path: Path) -> None:
+    config, home, _local_roms, _cache = _config(tmp_path)
+    owned = tmp_path / "owned"
+    save_root = owned / "real-saves"
+    save_root.mkdir(parents=True)
+    unsafe = replace(
+        config,
+        saves=SavesConfig(local_path=str(save_root)),
+        cache=CacheConfig(path=str(owned)),
+    )
+
+    with pytest.raises(RuntimeError, match="protected user/provider data"):
+        manage.lifecycle_preflight(
+            operation="purge",
+            config=unsafe,
+            romcloud_home=home,
+            activity=_inactive_activity(),
+        )
+
+
+def test_preflight_rejects_local_presentation_inside_actual_save_root(tmp_path: Path) -> None:
+    config, home, _local_roms, _cache = _config(tmp_path)
+    save_root = tmp_path / "actual-saves"
+    local_roms = save_root / "romcloud-presentation"
+    local_roms.mkdir(parents=True)
+    unsafe = replace(
+        config,
+        saves=SavesConfig(local_path=str(save_root)),
+        local_roms_path=str(local_roms),
+    )
+
+    with pytest.raises(RuntimeError, match="presentation root overlaps save root"):
+        manage.lifecycle_preflight(
+            operation="uninstall",
+            config=unsafe,
+            romcloud_home=home,
+            activity=_inactive_activity(),
+        )
+
+
+def test_preflight_rejects_local_presentation_overlapping_source_root(tmp_path: Path) -> None:
+    config, home, _local_roms, _cache = _config(tmp_path)
+    unsafe = replace(config, local_roms_path=config.source.rom_root)
+
+    with pytest.raises(RuntimeError, match="presentation root overlaps ROM source root"):
+        manage.lifecycle_preflight(
+            operation="uninstall",
+            config=unsafe,
+            romcloud_home=home,
+            activity=_inactive_activity(),
+        )
+
+
+def test_preflight_blocks_foreign_mount_at_configured_point(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, home, _local_roms, _cache = _config(tmp_path)
+    config = replace(config, smb=SMBConfig("expected-server", "ROMs", "reader"))
+    monkeypatch.setattr(manage.mountlib, "is_target_mounted", lambda path: True)
+    monkeypatch.setattr(manage.mountlib, "is_target_mounted_cifs", lambda path, **kwargs: False)
+
+    with pytest.raises(RuntimeError, match="foreign mount"):
+        manage.lifecycle_preflight(
+            operation="uninstall",
+            config=config,
+            romcloud_home=home,
+            activity=_inactive_activity(),
+        )
+
+
+def test_required_purge_delete_failure_is_reported_and_non_successful(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, home, _local_roms, cache = _config(tmp_path)
+    _isolate_integrations(monkeypatch)
+    original = manage.shutil.rmtree
+
+    def fail_cache(path: Path, *args, **kwargs) -> None:
+        if Path(path) == cache:
+            raise OSError("injected cache delete failure")
+        original(path, *args, **kwargs)
+
+    monkeypatch.setattr(manage.shutil, "rmtree", fail_cache)
+
+    with pytest.raises(manage.LifecycleFailure, match="injected cache") as raised:
+        manage.purge(config=config, romcloud_home=home, ports_dir=tmp_path / "ports")
+
+    assert any(stage.status == "failed" for stage in raised.value.report.stages)
+    assert home.exists()
+    assert cache.exists()
+
+
+def test_missing_config_never_authorizes_custom_recursive_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, home, _local_roms, _cache = _config(tmp_path)
+    marker = home / "foreign.txt"
+    marker.write_text("preserve")
+    _isolate_integrations(monkeypatch)
+
+    report = manage.purge(
+        config=config,
+        romcloud_home=home,
+        ports_dir=tmp_path / "ports",
+        config_trusted=False,
+    )
+
+    assert marker.read_text() == "preserve"
+    assert any("Configuration is missing" in warning for warning in report.warnings)
+
+
+def test_configured_arbitrary_data_and_cache_without_ownership_are_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, home, _local_roms, _cache = _config(tmp_path)
+    shared_data = tmp_path / "shared-data"
+    shared_cache = tmp_path / "shared-cache"
+    shared_data.mkdir()
+    shared_cache.mkdir()
+    (shared_data / "foreign").write_text("keep")
+    (shared_cache / "foreign").write_text("keep")
+    config = replace(
+        config,
+        data_path=str(shared_data),
+        cache=CacheConfig(path=str(shared_cache)),
+    )
+    write_config(config, str(home / "config" / "romcloud.toml"))
+    _isolate_integrations(monkeypatch)
+
+    report = manage.purge(config=config, romcloud_home=home, ports_dir=tmp_path / "ports")
+
+    assert (shared_data / "foreign").read_text() == "keep"
+    assert (shared_cache / "foreign").read_text() == "keep"
+    assert {stage.status for stage in report.stages if stage.name.startswith("persistent-")} == {"uncertain"}
+
+
+def test_valid_config_alone_cannot_authorize_arbitrary_home_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "user-home"
+    local_roms = tmp_path / "roms"
+    source = tmp_path / "source"
+    cache = tmp_path / "shared-cache"
+    for path in (local_roms, source, cache):
+        path.mkdir()
+    config = AppConfig(
+        source=SourceConfig(provider="local", rom_root=str(source)),
+        cache=CacheConfig(path=str(cache)),
+        local_roms_path=str(local_roms),
+        data_path=str(tmp_path / "shared-data"),
+        logging=LoggingConfig(path=str(home / "logs")),
+    )
+    write_config(config, str(home / "config" / "romcloud.toml"))
+    foreign = home / "bin" / "personal-tool"
+    foreign.parent.mkdir(parents=True)
+    foreign.write_text("keep")
+    _isolate_integrations(monkeypatch)
+
+    report = manage.purge(config=config, romcloud_home=home, ports_dir=tmp_path / "ports")
+
+    assert foreign.read_text() == "keep"
+    assert (home / "config" / "romcloud.toml").is_file()
+    assert any(stage.status == "uncertain" for stage in report.stages)
+
+
+def test_owned_idle_manager_may_be_quiesced_but_download_still_blocks(tmp_path: Path) -> None:
+    config, home, _local_roms, _cache = _config(tmp_path)
+    active_manager = ActivityState("active", "Owned manager endpoint is reachable.")
+    preflight = manage.lifecycle_preflight(
+        operation="uninstall",
+        config=config,
+        romcloud_home=home,
+        activity=_inactive_activity(browser_manager=active_manager),
+    )
+    assert preflight.activity.browser_manager.state == "active"
+
+    with pytest.raises(RuntimeError, match="download:active"):
+        manage.lifecycle_preflight(
+            operation="uninstall",
+            config=config,
+            romcloud_home=home,
+            activity=_inactive_activity(
+                browser_manager=active_manager,
+                download=ActivityState("active", "verifying=1"),
+            ),
+        )
+
+
+def test_unknown_manager_ownership_blocks_lifecycle(tmp_path: Path) -> None:
+    config, home, _local_roms, _cache = _config(tmp_path)
+    with pytest.raises(RuntimeError, match="browser_manager:unknown"):
+        manage.lifecycle_preflight(
+            operation="uninstall",
+            config=config,
+            romcloud_home=home,
+            activity=_inactive_activity(
+                browser_manager=ActivityState("unknown", "unverified manager")
+            ),
+        )
+
+
+def test_fake_cifs_pattern_file_survives_purge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, home, _local_roms, _cache = _config(tmp_path)
+    fake = config.credentials_path.parent / ".romcloud-cifs-source-abcdef"
+    fake.write_text("unrelated user file\n")
+    fake.chmod(0o600)
+    _isolate_integrations(monkeypatch)
+
+    manage.purge(config=config, romcloud_home=home, ports_dir=tmp_path / "ports")
+
+    assert fake.read_text() == "unrelated user file\n"
+
+
+def test_owned_service_cleanup_failure_is_a_warning_not_already_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, home, _local_roms, _cache = _config(tmp_path)
+    service = tmp_path / "romcloud-service"
+    service.write_text("owned")
+    _isolate_integrations(monkeypatch)
+    monkeypatch.setattr(manage.mount_service, "SERVICE_SCRIPT_PATH", service)
+    monkeypatch.setattr(manage.mount_service, "service_is_owned", lambda *args, **kwargs: service.exists())
+    monkeypatch.setattr(manage.mount_service, "remove_service", lambda *args, **kwargs: False)
+
+    report = manage.uninstall(config=config, romcloud_home=home, ports_dir=tmp_path / "ports")
+
+    stage = next(item for item in report.stages if item.name == "startup-service")
+    assert stage.status == "warning"
+    assert service.exists()
+
+
+def test_missing_custom_config_cli_creates_no_parent_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "custom" / "nested" / "romcloud.toml"
+    monkeypatch.setattr(manage, "purge", lambda **kwargs: manage.LifecycleReport())
+
+    result = CliRunner().invoke(cli, ["--config", str(config_path), "purge", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert not config_path.parent.exists()
+
+
+def test_uninstall_removes_managed_browser_and_preserves_external_browser(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from romcloud.web.browser_runtime import activate_staged_runtime, runtime_root, staging_version_path
+
+    config, home, _local_roms, _cache = _config(tmp_path)
+    staged = staging_version_path(config.data_path, "1") / "chrome"
+    staged.parent.mkdir(parents=True)
+    staged.write_text("browser")
+    staged.chmod(0o755)
+    activate_staged_runtime(
+        config.data_path,
+        version="1",
+        executable="chrome",
+        smoke_test=lambda _: {"compatible": True},
+    )
+    external = tmp_path / "external-chromium.AppImage"
+    external.write_text("external")
+    _isolate_integrations(monkeypatch)
+
+    report = manage.uninstall(config=config, romcloud_home=home, ports_dir=tmp_path / "ports")
+
+    assert not runtime_root(config.data_path).exists()
+    assert external.read_text() == "external"
+    assert next(item for item in report.stages if item.name == "managed-browser").status == "removed"

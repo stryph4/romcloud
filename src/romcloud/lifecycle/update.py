@@ -240,6 +240,7 @@ class UpdateResult:
     new: BuildInfo
     reconcile_log: str = ""
     warnings: tuple[str, ...] = ()
+    es_restart_required: bool = False
 
 
 # ── GitHub API / download ────────────────────────────────────────────────────
@@ -252,6 +253,13 @@ def _reconciliation_warnings(output: str) -> tuple[str, ...]:
         for line in output.splitlines()
         if line.casefold().startswith("warning:")
         and line.partition(":")[2].strip()
+    )
+
+
+def _reconciliation_es_restart_required(output: str) -> bool:
+    return any(
+        line.strip().casefold() == "repair-state: es_restart_required=true"
+        for line in output.splitlines()
     )
 
 
@@ -736,6 +744,8 @@ def perform_update(
     progress: ProgressSink = None,
     install_timeout: float = 300.0,
     reconcile_timeout: float = 120.0,
+    _repair: bool = False,
+    _progress_operation: str = "update",
 ) -> UpdateResult:
     """Download the latest commit's archive, build and smoke-test it in a
     throwaway candidate venv, activate it in place of the live venv, and
@@ -768,7 +778,7 @@ def perform_update(
         except Exception:  # noqa: BLE001 - update can proceed with the standard layout
             pass
     emit_progress(
-        progress, "update", "resolve", "running", "Resolving the latest ROMCloud release"
+        progress, _progress_operation, "resolve", "running", "Resolving the latest ROMCloud release"
     )
     latest = get_latest_commit(repo, source.ref, opener=opener)
 
@@ -776,7 +786,7 @@ def perform_update(
     try:
         archive_path = tmp_root / "romcloud-update.zip"
         emit_progress(
-            progress, "update", "download", "running", "Downloading the update"
+            progress, _progress_operation, "download", "running", "Downloading the update"
         )
         download_file(
             archive_download_url(repo, latest.sha),
@@ -787,7 +797,7 @@ def perform_update(
 
         extract_dir = tmp_root / "extracted"
         emit_progress(
-            progress, "update", "verify", "running", "Verifying and unpacking the update"
+            progress, _progress_operation, "verify", "running", "Verifying and unpacking the update"
         )
         safe_extract_zip(archive_path, extract_dir)
         project_root = find_extracted_project_root(extract_dir)
@@ -796,7 +806,7 @@ def perform_update(
         candidate_dir = tmp_root / "venv-candidate"
         log.info("Staging update candidate at %s from %s", candidate_dir, project_root)
         emit_progress(
-            progress, "update", "stage", "running", "Building and smoke-testing the update"
+            progress, _progress_operation, "stage", "running", "Building and smoke-testing the update"
         )
         _build_and_smoke_test_candidate(
             candidate_dir,
@@ -819,7 +829,7 @@ def perform_update(
 
         log.info("Activating validated candidate at %s", live_venv_dir)
         emit_progress(
-            progress, "update", "install", "running", "Activating the ROMCloud update"
+            progress, _progress_operation, "install", "running", "Activating the ROMCloud runtime"
         )
         if had_previous_venv:
             live_venv_dir.rename(backup_venv_dir)
@@ -829,27 +839,30 @@ def perform_update(
             log.info("Reconciling installed runtime artifacts from %s", project_root)
             emit_progress(
                 progress,
-                "update",
+                _progress_operation,
                 "reconcile",
                 "running",
                 "Updating ROMCloud launchers and integrations",
             )
+            reconcile_argv = [
+                str(venv_python),
+                "-m",
+                "romcloud.cli.main",
+                "_reconcile-install",
+                "--romcloud-home",
+                str(romcloud_home),
+                "--project-root",
+                str(project_root),
+                "--ports-dir",
+                str(resolved_ports_dir),
+                "--system-python",
+                system_python or "",
+            ]
+            if _repair:
+                reconcile_argv.append("--repair")
             try:
                 reconcile_result = runner(
-                    [
-                        str(venv_python),
-                        "-m",
-                        "romcloud.cli.main",
-                        "_reconcile-install",
-                        "--romcloud-home",
-                        str(romcloud_home),
-                        "--project-root",
-                        str(project_root),
-                        "--ports-dir",
-                        str(resolved_ports_dir),
-                        "--system-python",
-                        system_python or "",
-                    ],
+                    reconcile_argv,
                     capture_output=True,
                     text=True,
                     timeout=reconcile_timeout,
@@ -858,7 +871,11 @@ def perform_update(
                 raise UpdateInstallError(
                     f"Runtime reconciliation timed out after {reconcile_timeout:.0f}s"
                 ) from exc
-            reconcile_log = (reconcile_result.stdout or "") + (reconcile_result.stderr or "")
+            reconcile_log = "\n".join(
+                part.rstrip()
+                for part in (reconcile_result.stdout or "", reconcile_result.stderr or "")
+                if part.strip()
+            )
             if reconcile_result.returncode != 0:
                 detail = reconcile_log.strip() or "unknown reconciliation error"
                 raise UpdateInstallError(
@@ -887,18 +904,20 @@ def perform_update(
         write_build_info(romcloud_home, new_info)
         log.info("Updated ROMCloud to %s (%s)", new_info.version, new_info.commit_short)
         reconciliation_warnings = _reconciliation_warnings(reconcile_log)
+        es_restart_required = _reconciliation_es_restart_required(reconcile_log)
         completion_message = f"ROMCloud {new_info.version} installed successfully"
         if reconciliation_warnings:
             completion_message += "; optional features need attention"
         emit_progress(
             progress,
-            "update",
+            _progress_operation,
             "completed",
             "success",
             completion_message,
             metadata={
                 "version": new_info.version,
                 "restart_required": True,
+                "es_restart_required": es_restart_required,
                 "warnings": list(reconciliation_warnings),
             },
         )
@@ -907,6 +926,7 @@ def perform_update(
             new=new_info,
             reconcile_log=reconcile_log.strip(),
             warnings=reconciliation_warnings,
+            es_restart_required=es_restart_required,
         )
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
@@ -935,5 +955,7 @@ def perform_repair(
         romcloud_home,
         venv_python,
         channel=resolve_channel(channel).channel,
+        _repair=True,
+        _progress_operation="repair",
         **kwargs,
     )

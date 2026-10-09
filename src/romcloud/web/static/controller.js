@@ -3,7 +3,8 @@
 
   const DEFAULT_ZONES = [
     "auth", "systems", "primary", "tabs", "controls", "bulk",
-    "select", "games", "diagnostic-nav", "diagnostic-filters",
+    "select", "games", "download-bulk", "downloads",
+    "diagnostic-nav", "diagnostic-filters",
     "diagnostic-actions", "diagnostic-list", "pager", "global", "dialog",
   ];
 

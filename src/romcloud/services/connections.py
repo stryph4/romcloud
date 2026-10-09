@@ -109,7 +109,7 @@ def mount_connections(
     if not targets:
         raise ConfigurationError("This configuration uses a local folder and does not need mounting.")
     mount_fn = mount_fn or mount.mount_cifs_source
-    mounted_now: list[str] = []
+    mounted_now: list[mount_worker.ConfiguredMount] = []
     try:
         for target in targets:
             emit_progress(
@@ -128,7 +128,7 @@ def mount_connections(
                 config, target, password, mount_fn=mount_fn
             )
             if not outcome.already_mounted:
-                mounted_now.append(target.mount_point)
+                mounted_now.append(target)
             emit_progress(
                 progress,
                 "mount",
@@ -145,9 +145,19 @@ def mount_connections(
             _friendly_connection_error(exc),
             detail=str(exc),
         )
-        for mount_point in reversed(mounted_now):
+        for target in reversed(mounted_now):
             try:
-                mount.unmount_cifs_source(mount_point)
+                mount.unmount_cifs_source(
+                    target.mount_point,
+                    expected_server=(
+                        None if target.read_only else target.smb.server
+                    ),
+                    expected_share=target.smb.share,
+                    expected_read_only=target.read_only,
+                    expected_remote_path=getattr(
+                        target.smb, "remote_path", ""
+                    ),
+                )
             except ROMCloudError:
                 pass
         raise
@@ -183,22 +193,20 @@ def unmount_connections(
             f"Disconnecting {target.label}…",
         )
         try:
+            unmount_kwargs = {
+                "expected_server": None if target.read_only else target.smb.server,
+                "expected_share": target.smb.share,
+                "expected_read_only": target.read_only,
+                "expected_remote_path": getattr(target.smb, "remote_path", ""),
+            }
             if shutdown:
-                unmounted = mount.unmount_cifs_source(
-                    target.mount_point,
+                unmount_kwargs.update(
                     lazy=True,
                     command_timeout=5.0,
-                    expected_server=(
-                        None if target.read_only else target.smb.server
-                    ),
-                    expected_share=target.smb.share,
-                    expected_read_only=target.read_only,
-                    expected_remote_path=getattr(
-                        target.smb, "remote_path", ""
-                    ),
                 )
-            else:
-                unmounted = mount.unmount_cifs_source(target.mount_point)
+            unmounted = mount.unmount_cifs_source(
+                target.mount_point, **unmount_kwargs
+            )
             changed = unmounted or changed
             emit_progress(
                 progress,

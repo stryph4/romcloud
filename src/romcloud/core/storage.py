@@ -224,6 +224,15 @@ class StorageProvider(ABC):
     ) -> None:
         """Copy *source_path* from this provider to local *dest_path*."""
 
+    def open_binary(self, path: str):  # noqa: ANN201
+        """Open a seekable, read-only binary source stream.
+
+        Providers advertising ``can_resume_download`` must implement this.
+        The returned object may be a file object or a context manager yielding
+        one.  This API intentionally has no write surface.
+        """
+        raise NotImplementedError("Provider does not support resumable reads")
+
     def resolve_path(self, root: str, relative_path: str) -> str:
         """Resolve a catalog-relative path in this provider's namespace.
 

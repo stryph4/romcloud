@@ -135,6 +135,30 @@ class TestGenerateServiceScript:
 
 
 class TestInstallService:
+    def test_enable_failure_is_observable_separately_from_written_script(
+        self, tmp_path, monkeypatch
+    ):
+        service_path = tmp_path / "services" / mount_service.SERVICE_NAME
+        config_path = tmp_path / "batocera.conf"
+        config_path.write_text("system.services=other_service\n")
+        monkeypatch.setattr(
+            mount_service.subprocess,
+            "run",
+            lambda *args, **kwargs: subprocess.CompletedProcess(
+                args[0], 1, "", "enable failed"
+            ),
+        )
+
+        result_path = mount_service.install_service(
+            "/bin/romcloud",
+            service_path=service_path,
+            services_config_path=config_path,
+        )
+
+        assert result_path == service_path
+        assert service_path.is_file()
+        assert mount_service.is_service_enabled(config_path=config_path) is False
+
     def test_writes_executable_script(self, tmp_path):
         service_path = tmp_path / "services" / mount_service.SERVICE_NAME
         result_path = mount_service.install_service("/bin/romcloud", service_path=service_path)

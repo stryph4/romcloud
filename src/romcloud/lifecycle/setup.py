@@ -822,8 +822,27 @@ def apply_setup(
     config = _build_config(
         config_path, request, existing, selected_systems=selected_systems
     )
+    from romcloud.infrastructure.ownership import root_is_owned
+
+    setup_home = config_path.parent.parent
+    home_was_owned = root_is_owned(setup_home, "home", setup_home)
+
+    def claimable_root(path: Path, kind: str) -> bool:
+        if root_is_owned(setup_home, kind, path):
+            return True
+        if path == setup_home / kind and home_was_owned:
+            return True
+        if path.is_symlink():
+            return False
+        try:
+            return not path.exists() or (path.is_dir() and not any(path.iterdir()))
+        except OSError:
+            return False
+
+    data_claimable = claimable_root(Path(config.data_path), "data")
+    cache_claimable = claimable_root(Path(config.cache.path), "cache")
     _guard_pending_legacy_save_provider_change(existing, config)
-    mounted_during_setup: list[str] = []
+    mounted_during_setup: list[mount_worker.ConfiguredMount] = []
     save_sync_report = None
     save_conflict_ids: tuple[str, ...] = ()
 
@@ -864,7 +883,7 @@ def apply_setup(
             assert password is not None
             outcome = mount_worker.mount_configured_target(config, target, password)
             if outcome is not None and not outcome.already_mounted:
-                mounted_during_setup.append(target.mount_point)
+                mounted_during_setup.append(target)
         if mount_worker.configured_mounts(config):
             emit_progress(progress, "configure", "mount", "success", "Mounted successfully")
             protection = describe_protection(config.credentials_path, "smb")
@@ -894,7 +913,15 @@ def apply_setup(
                     "Configured ROMCloud data location failed validation: "
                     f"{remote_probe.detail}"
                 )
-            if remote_probe.ok:
+            if config.remote_data.provider == "sftp":
+                emit_progress(
+                    progress,
+                    "configure",
+                    "read_only",
+                    "success",
+                    "SFTP data access verified — read-only; Library Sync pull is available, SaveSync and publishing are disabled",
+                )
+            elif remote_probe.writable:
                 emit_progress(progress, "configure", "write", "success", "Write test created")
                 emit_progress(progress, "configure", "read_back", "success", "Read-back verified")
                 emit_progress(progress, "configure", "cleanup", "success", "Test file removed")
@@ -1055,11 +1082,19 @@ def apply_setup(
         from romcloud.infrastructure.mount import unmount_cifs_source
 
         cleanup_errors: list[str] = []
-        for mount_point in reversed(mounted_during_setup):
+        for target in reversed(mounted_during_setup):
             try:
-                unmount_cifs_source(mount_point)
+                unmount_cifs_source(
+                    target.mount_point,
+                    expected_server=(
+                        None if target.read_only else target.smb.server
+                    ),
+                    expected_share=target.smb.share,
+                    expected_read_only=target.read_only,
+                    expected_remote_path=target.smb.remote_path,
+                )
             except Exception as cleanup_exc:  # noqa: BLE001 - try every new mount
-                cleanup_errors.append(f"{mount_point}: {cleanup_exc}")
+                cleanup_errors.append(f"{target.mount_point}: {cleanup_exc}")
         safe_error = _redact(str(exc), request.password, request.remote_password)
         if cleanup_errors:
             cleanup_detail = _redact(
@@ -1099,6 +1134,17 @@ def apply_setup(
         )
         raise RuntimeError(f"{step}: {safe_error}") from exc
 
+    # Configuration is not deletion authority.  Only a fully successful setup
+    # may bind its persistent roots into the install-owned ledger.
+    from romcloud.infrastructure.ownership import record_owned_roots
+
+    if home_was_owned:
+        owned_roots = {"home": setup_home}
+        if data_claimable:
+            owned_roots["data"] = Path(config.data_path)
+        if cache_claimable:
+            owned_roots["cache"] = Path(config.cache.path)
+        record_owned_roots(setup_home, owned_roots)
     state_path.unlink(missing_ok=True)
     log.info(
         "Setup outcome: complete — save_sync_initialized=%s unresolved_conflict_count=%d",

@@ -70,9 +70,95 @@ CREATE TABLE IF NOT EXISTS proxy_records (
 );
 
 CREATE INDEX IF NOT EXISTS idx_proxy_records_path ON proxy_records(proxy_path);
+
+CREATE TABLE IF NOT EXISTS download_items (
+    id                 TEXT PRIMARY KEY,
+    batch_id           TEXT,
+    game_id            TEXT REFERENCES games(id) ON DELETE SET NULL,
+    game_title         TEXT NOT NULL,
+    system             TEXT NOT NULL,
+    origin             TEXT NOT NULL CHECK (origin IN ('manual', 'pinned', 'selected')),
+    state              TEXT NOT NULL CHECK (state IN (
+        'queued', 'running', 'paused', 'interrupted', 'verifying',
+        'failed', 'cancelled', 'complete'
+    )),
+    queue_seq          INTEGER NOT NULL,
+    worker_instance_id TEXT,
+    bytes_total        INTEGER NOT NULL DEFAULT 0 CHECK (bytes_total >= 0),
+    bytes_present      INTEGER NOT NULL DEFAULT 0 CHECK (bytes_present >= 0),
+    error_code         TEXT,
+    error_message      TEXT,
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL,
+    started_at         TEXT,
+    finished_at        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_download_items_state_queue
+    ON download_items(state, queue_seq);
+CREATE INDEX IF NOT EXISTS idx_download_items_batch ON download_items(batch_id);
+CREATE INDEX IF NOT EXISTS idx_download_items_game ON download_items(game_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_download_items_active_game
+    ON download_items(game_id)
+    WHERE game_id IS NOT NULL AND state IN (
+        'queued', 'running', 'paused', 'interrupted', 'verifying'
+    );
+
+CREATE TABLE IF NOT EXISTS cache_staging_assets (
+    relative_path         TEXT PRIMARY KEY,
+    system                TEXT NOT NULL,
+    asset_kind            TEXT NOT NULL CHECK (asset_kind IN ('file', 'directory')),
+    source_provider       TEXT NOT NULL,
+    source_root           TEXT NOT NULL,
+    expected_size         INTEGER CHECK (expected_size IS NULL OR expected_size >= 0),
+    source_manifest_sha256 TEXT,
+    manifest_version      INTEGER NOT NULL DEFAULT 1,
+    created_at            TEXT NOT NULL,
+    updated_at            TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS cache_staging_files (
+    asset_relative_path  TEXT NOT NULL REFERENCES cache_staging_assets(relative_path) ON DELETE CASCADE,
+    member_relative_path TEXT NOT NULL,
+    expected_size        INTEGER CHECK (expected_size IS NULL OR expected_size >= 0),
+    source_object_id     TEXT,
+    source_revision      TEXT,
+    source_checksum      TEXT,
+    source_modified_epoch REAL,
+    state                TEXT NOT NULL CHECK (state IN ('pending', 'transferring', 'partial', 'complete')),
+    checkpoint_bytes     INTEGER NOT NULL DEFAULT 0 CHECK (checkpoint_bytes >= 0),
+    checkpoint_sha256    TEXT,
+    content_sha256       TEXT,
+    completed_at         TEXT,
+    PRIMARY KEY (asset_relative_path, member_relative_path),
+    CHECK (checkpoint_bytes = 0 OR checkpoint_sha256 IS NOT NULL)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cache_staging_files_state
+    ON cache_staging_files(state);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cache_staging_one_transfer
+    ON cache_staging_files(asset_relative_path) WHERE state = 'transferring';
+
+CREATE TABLE IF NOT EXISTS cache_reservations (
+    id                 TEXT PRIMARY KEY,
+    download_item_id   TEXT REFERENCES download_items(id) ON DELETE SET NULL,
+    game_id            TEXT REFERENCES games(id) ON DELETE SET NULL,
+    owner_kind         TEXT NOT NULL CHECK (owner_kind IN ('manager', 'launch', 'cli')),
+    owner_instance_id  TEXT NOT NULL,
+    reserved_bytes     INTEGER NOT NULL CHECK (reserved_bytes >= 0),
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cache_reservations_game
+    ON cache_reservations(game_id);
+CREATE INDEX IF NOT EXISTS idx_cache_reservations_download
+    ON cache_reservations(download_item_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cache_reservations_one_download
+    ON cache_reservations(download_item_id) WHERE download_item_id IS NOT NULL;
 """
 
-_CURRENT_SCHEMA_VERSION = 3
+_CURRENT_SCHEMA_VERSION = 4
 
 
 class Database:
@@ -147,6 +233,11 @@ class Database:
                     )
                 self._migrate_cache_membership(conn)
                 version = 3
+            if version < 4:
+                # The v4 tables are additive and are created by ``_SCHEMA``
+                # before this migration gate.  Advancing the version inside
+                # the same transaction preserves every v3 catalog/cache row.
+                version = 4
             conn.execute("UPDATE schema_version SET version = ?", (version,))
             self._create_query_indexes(conn)
 

@@ -35,6 +35,15 @@ MANIFEST_VERSION = 1
 log = logging.getLogger(__name__)
 
 
+def _coordinate_download_manager_mode(config: AppConfig, mode: OperatingMode) -> None:
+    """Synchronize an explicit persisted mode change with a resident manager."""
+    from romcloud.web.lifecycle import coordinate_download_manager_mode
+
+    coordinate_download_manager_mode(
+        config.data_path, offline=mode is OperatingMode.OFFLINE
+    )
+
+
 class DirectLinkConflictError(RuntimeError):
     """The reserved Connected Mode path is not a verified ROMCloud link."""
 
@@ -56,6 +65,8 @@ def _selected_catalog_games(config: AppConfig, container: Container):  # noqa: A
 class DirectLinkReport:
     created: int = 0
     removed: int = 0
+    uncertain: int = 0
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -90,21 +101,35 @@ def _manifest_path(config: AppConfig) -> Path:
     return Path(config.data_path) / MANIFEST_FILENAME
 
 
-def _load_manifest(config: AppConfig) -> dict[str, str]:
+def _load_manifest_result(config: AppConfig) -> tuple[dict[str, str], str]:
     path = _manifest_path(config)
+    if not path.exists():
+        return {}, "missing"
     if not path.is_file() or path.is_symlink():
-        return {}
+        return {}, "malformed"
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {}
-    if payload.get("version") != MANIFEST_VERSION or not isinstance(payload.get("links"), list):
-        return {}
+        return {}, "malformed"
+    if not isinstance(payload, dict) or payload.get("version") != MANIFEST_VERSION or not isinstance(payload.get("links"), list):
+        return {}, "malformed"
     records: dict[str, str] = {}
     for item in payload["links"]:
-        if isinstance(item, dict) and isinstance(item.get("path"), str) and isinstance(item.get("target"), str):
-            records[item["path"]] = item["target"]
-    return records
+        if not (
+            isinstance(item, dict)
+            and isinstance(item.get("path"), str)
+            and item["path"]
+            and isinstance(item.get("target"), str)
+            and item["target"]
+        ):
+            return {}, "malformed"
+        records[item["path"]] = item["target"]
+    return records, "valid"
+
+
+def _load_manifest(config: AppConfig) -> dict[str, str]:
+    records, state = _load_manifest_result(config)
+    return records if state == "valid" else {}
 
 
 def _write_manifest(config: AppConfig, records: dict[str, str]) -> None:
@@ -181,18 +206,56 @@ def _is_verified_link(path: Path, target: str, records: dict[str, str]) -> bool:
 
 def remove_direct_links(config: AppConfig) -> DirectLinkReport:
     """Unlink only symlinks whose path and target match ROMCloud's manifest."""
-    records = _load_manifest(config)
+    records, manifest_state = _load_manifest_result(config)
+    manifest_path = _manifest_path(config)
+    if manifest_state == "missing":
+        return DirectLinkReport()
+    if manifest_state != "valid":
+        return DirectLinkReport(
+            uncertain=1,
+            warnings=(f"Preserved malformed Direct-link manifest: {manifest_path}",),
+        )
+
+    local_root = Path(_lexical_absolute(Path(config.local_roms_path)))
+    source_root = Path(_lexical_absolute(Path(config.source.rom_root)))
     removed = 0
+    uncertain = 0
+    warnings: list[str] = []
     remaining: dict[str, str] = {}
     for raw_path, target in records.items():
         path = Path(raw_path)
-        if _is_verified_link(path, target, records):
+        target_path = Path(target)
+        safe_shape = False
+        try:
+            relative = Path(_lexical_absolute(path)).relative_to(local_root)
+            target_relative = Path(_lexical_absolute(target_path)).relative_to(source_root)
+            safe_shape = (
+                len(relative.parts) == 2
+                and relative.name == LINK_NAME
+                and len(target_relative.parts) == 1
+                and relative.parent.name == target_relative.name
+                and path.parent.is_dir()
+                and not path.parent.is_symlink()
+                and path.parent.resolve(strict=True).parent == local_root.resolve(strict=True)
+                and target_path.resolve(strict=True).is_dir()
+            )
+        except (OSError, ValueError):
+            safe_shape = False
+        if safe_shape and _is_verified_link(path, target, records):
             path.unlink()
             removed += 1
-        elif path.is_symlink() or path.exists():
+        else:
+            uncertain += 1
             remaining[raw_path] = target
+            warnings.append(f"Preserved unverified Direct link: {path}")
+    # A valid manifest remains the ownership ledger for every uncertain entry.
+    # Delete it only when all records were safely reconciled.
     _write_manifest(config, remaining)
-    return DirectLinkReport(removed=removed)
+    return DirectLinkReport(
+        removed=removed,
+        uncertain=uncertain,
+        warnings=tuple(warnings),
+    )
 
 
 def reconcile_direct_links(
@@ -749,6 +812,7 @@ def set_operating_mode(
     with _operating_mode_lock(config):
         previous = operating_mode(config)
         if requested is previous:
+            _coordinate_download_manager_mode(config, requested)
             _migrate_legacy_direct_saves(
                 config,
                 progress=progress,
@@ -778,9 +842,14 @@ def set_operating_mode(
         )
         presentation_attempted = False
         state_committed = False
+        manager_coordinated = False
         save_reconcile = None
         transition_stage = "prepare the mode transition"
         try:
+            if requested is OperatingMode.OFFLINE:
+                transition_stage = "quiesce the Download Manager"
+                _coordinate_download_manager_mode(config, requested)
+                manager_coordinated = True
             if requested is OperatingMode.CONNECTED:
                 transition_stage = "connect to the configured ROM source"
                 _prepare_connected_source(config, progress)
@@ -815,6 +884,9 @@ def set_operating_mode(
             # a later manual ROMCloud launch both observe the requested mode.
             write_operating_mode(config, requested)
             state_committed = True
+            transition_stage = "coordinate the Download Manager"
+            _coordinate_download_manager_mode(config, requested)
+            manager_coordinated = True
             transition_stage = "refresh EmulationStation"
             _update_emulationstation(
                 config,
@@ -849,6 +921,11 @@ def set_operating_mode(
             if state_committed:
                 try:
                     write_operating_mode(config, previous)
+                except Exception as rollback_exc:
+                    rollback_errors.append(rollback_exc)
+            if state_committed or manager_coordinated:
+                try:
+                    _coordinate_download_manager_mode(config, previous)
                 except Exception as rollback_exc:
                     rollback_errors.append(rollback_exc)
             if presentation_attempted:

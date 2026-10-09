@@ -33,7 +33,7 @@ def _fake_config(
 ):
     home = Path(romcloud_home)
     return SimpleNamespace(
-        source=SimpleNamespace(rom_root=rom_root),
+        source=SimpleNamespace(provider="local", rom_root=rom_root),
         smb=smb,
         credentials_path=home / "config" / "credentials.toml",
         data_path=str(home / "data"),
@@ -373,7 +373,7 @@ class TestStop:
         monkeypatch.setattr(
             mount_cmd_module.mount,
             "unmount_cifs_source",
-            lambda path: calls.append(path) or True,
+            lambda path, **kwargs: calls.append(path) or True,
         )
         monkeypatch.setattr(
             connections_service,
@@ -432,7 +432,7 @@ class TestStop:
         calls = []
         monkeypatch.setattr(mount_cmd_module.mount_worker, "stop_worker", lambda *a: None)
 
-        def unmount(path):
+        def unmount(path, **kwargs):
             calls.append(path)
             if path == "/mnt/saves-rw":
                 raise MountError("remote busy")
@@ -490,7 +490,7 @@ class TestRemove:
         monkeypatch.setattr(
             mount_cmd_module.mount,
             "unmount_cifs_source",
-            lambda path: calls.append(path) or True,
+            lambda path, **kwargs: calls.append(path) or True,
         )
         monkeypatch.setattr(
             mount_cmd_module.mount_service,
@@ -519,7 +519,8 @@ class TestInstall:
         monkeypatch.setattr(
             mount_cmd_module.mount_service,
             "install_service",
-            lambda romcloud_bin: captured.setdefault("bin", romcloud_bin) or Path("/svc/romcloud_mount"),
+            lambda romcloud_bin, **_kwargs: captured.setdefault("bin", romcloud_bin)
+            or Path("/svc/romcloud_mount"),
         )
 
         result = _invoke(["install"], _fake_config(smb=_fake_smb(), romcloud_home="/opt/romcloud"))
@@ -704,7 +705,7 @@ class TestExistingStartBehaviorIntact:
         monkeypatch.setattr(
             mount_cmd_module.mount,
             "unmount_cifs_source",
-            lambda path: unmounted.append(path) or True,
+            lambda path, **kwargs: unmounted.append(path) or True,
         )
 
         result = _invoke(

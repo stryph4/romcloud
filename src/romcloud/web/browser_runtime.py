@@ -11,7 +11,10 @@ import json
 import os
 import re
 import shutil
+import stat
 from pathlib import Path
+
+from romcloud.infrastructure.atomic_file import atomic_write_text
 
 CANDIDATE = {
     "name": "Chrome for Testing Stable",
@@ -25,9 +28,30 @@ CANDIDATE = {
     ),
 }
 
+OWNERSHIP_FILENAME = ".romcloud-browser-root.json"
+
 
 def runtime_root(data_path: str | Path) -> Path:
     return Path(data_path).parent / "browser"
+
+
+def _ownership_path(data_path: str | Path) -> Path:
+    return runtime_root(data_path) / OWNERSHIP_FILENAME
+
+
+def managed_runtime_is_owned(data_path: str | Path) -> bool:
+    """Require an exact path-bound marker created by browser activation."""
+
+    root = runtime_root(data_path)
+    marker = _ownership_path(data_path)
+    if root.is_symlink() or marker.is_symlink() or not root.is_dir() or not marker.is_file():
+        return False
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        recorded = str(payload["root"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return payload.get("schema_version") == 1 and recorded == os.path.realpath(root)
 
 
 def current_manifest_path(data_path: str | Path) -> Path:
@@ -114,6 +138,15 @@ def activate_staged_runtime(
         payload = {"version": version, "executable": relative.as_posix()}
         temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         temporary.replace(manifest)
+        atomic_write_text(
+            _ownership_path(data_path),
+            json.dumps(
+                {"schema_version": 1, "root": os.path.realpath(root)},
+                sort_keys=True,
+            )
+            + "\n",
+            mode=0o600,
+        )
     except Exception:
         temporary.unlink(missing_ok=True)
         stage.parent.mkdir(parents=True, exist_ok=True)
@@ -135,7 +168,22 @@ def request_managed_install(*, accepted: bool) -> dict[str, object]:
 def remove_managed_runtime(data_path: str | Path) -> bool:
     """Remove only ROMCloud's browser directory; external browsers are untouched."""
     root = runtime_root(data_path)
-    if not root.exists():
+    if not root.exists() and not root.is_symlink():
         return False
+    if not managed_runtime_is_owned(data_path):
+        raise RuntimeError(f"Preserved unverified managed-browser runtime: {root}")
+    before = root.lstat()
+    if stat.S_ISLNK(before.st_mode):
+        raise RuntimeError(f"Preserved symlinked managed-browser runtime: {root}")
+    # Recheck both marker authority and inode immediately before recursion.
+    if not managed_runtime_is_owned(data_path):
+        raise RuntimeError(f"Managed-browser ownership changed before deletion: {root}")
+    current = root.lstat()
+    if (before.st_dev, before.st_ino, before.st_mode) != (
+        current.st_dev,
+        current.st_ino,
+        current.st_mode,
+    ):
+        raise RuntimeError(f"Managed-browser root changed before deletion: {root}")
     shutil.rmtree(root)
     return True

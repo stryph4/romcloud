@@ -549,3 +549,25 @@ def install_hook(
     temporary.chmod(0o755)
     temporary.replace(hook_path)
     return hook_path
+
+
+def hook_is_owned(romcloud_bin: Path, *, hook_path: Optional[Path] = None) -> bool:
+    """Return whether the fixed hook path contains exactly our generated hook."""
+    path = Path(hook_path or HOOK_PATH)
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        return path.read_text(encoding="utf-8") == hook_content(romcloud_bin)
+    except (OSError, UnicodeError):
+        return False
+
+
+def remove_hook(romcloud_bin: Path, *, hook_path: Optional[Path] = None) -> bool:
+    """Remove only a positively verified ROMCloud lifecycle hook."""
+    path = Path(hook_path or HOOK_PATH)
+    if not (path.exists() or path.is_symlink()):
+        return False
+    if not hook_is_owned(romcloud_bin, hook_path=path):
+        return False
+    path.unlink()
+    return True

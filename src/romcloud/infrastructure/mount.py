@@ -38,6 +38,7 @@ from typing import Callable, Optional
 
 from romcloud.core.exceptions import MountError, ProviderAuthError, ProviderNotReachableError
 from romcloud.infrastructure.logging import get_logger
+from romcloud.infrastructure.smb_path import normalize_smb_remote_path
 
 log = get_logger("mount")
 
@@ -101,7 +102,8 @@ def _mount_record(target: str, mounts_text: str) -> Optional[tuple[str, str, set
         mount_target = parts[1].encode().decode("unicode_escape")
         if posixpath.normpath(mount_target) == normalized:
             source = parts[0].encode().decode("unicode_escape")
-            return source, parts[2].lower(), set(parts[3].split(","))
+            options = parts[3].encode().decode("unicode_escape")
+            return source, parts[2].lower(), set(options.split(","))
     return None
 
 
@@ -178,25 +180,36 @@ def is_mounted_cifs_target(
     source, filesystem_type, options = record
     if filesystem_type != "cifs" or not source.startswith("//"):
         return False
-    try:
-        mounted_server, mounted_share = source[2:].split("/", 1)
-    except ValueError:
+    source_parts = source[2:].split("/")
+    if len(source_parts) < 2 or not source_parts[0] or not source_parts[1]:
         return False
+    mounted_server, mounted_share = source_parts[:2]
+    mounted_remote_path = "/".join(source_parts[2:]).strip("/")
     if server is not None and mounted_server.casefold() != server.casefold():
         return False
     if (
         share is not None
-        and mounted_share.rstrip("/").casefold() != share.rstrip("/").casefold()
+        and mounted_share.casefold() != share.strip("/").casefold()
     ):
         return False
     if read_only is True and "ro" not in options:
         return False
     if read_only is False and "rw" not in options:
         return False
-    if remote_path:
-        expected_prefix = f"prefixpath={remote_path}"
-        if expected_prefix not in options:
+    option_prefixes = {
+        option.removeprefix("prefixpath=").strip("/")
+        for option in options
+        if option.startswith("prefixpath=")
+    }
+    if len(option_prefixes) > 1:
+        return False
+    option_remote_path = next(iter(option_prefixes), "")
+    if mounted_remote_path and option_remote_path:
+        if mounted_remote_path != option_remote_path:
             return False
+    actual_remote_path = mounted_remote_path or option_remote_path
+    if actual_remote_path != (remote_path or "").strip("/"):
+        return False
     return True
 
 
@@ -465,10 +478,12 @@ def build_mount_argv(
     sources. General ROMCloud remote data explicitly passes
     ``read_only=False`` for its independently configured writable mount.
     """
+    remote_path = normalize_smb_remote_path(remote_path)
     options = f"credentials={credentials_path},{'ro' if read_only else 'rw'}"
+    source = f"//{server}/{share.strip('/')}"
     if remote_path:
-        options += f",prefixpath={remote_path}"
-    return ["mount", "-t", "cifs", f"//{server}/{share}", str(mount_point), "-o", options]
+        source = f"{source}/{remote_path.strip('/')}"
+    return ["mount", "-t", "cifs", source, str(mount_point), "-o", options]
 
 
 def build_unmount_argv(mount_point: str) -> list[str]:
@@ -602,7 +617,7 @@ def mount_cifs_source(
         read_only=read_only,
         remote_path=remote_path,
     )
-    log.info("Mounting %s at %s", f"//{server}/{share}", mount_point)
+    log.info("Mounting %s at %s", argv[3], mount_point)
     remaining = operation_deadline - time.monotonic()
     if remaining <= 0:
         raise ProviderNotReachableError(
@@ -626,7 +641,7 @@ def mount_cifs_source(
     if result.returncode != 0:
         raise _classify_mount_failure(result.stderr or result.stdout or "unknown error")
 
-    log.info("Mounted %s at %s", f"//{server}/{share}", mount_point)
+    log.info("Mounted %s at %s", argv[3], mount_point)
     return MountOutcome(mounted=True, already_mounted=False, detail="mounted")
 
 

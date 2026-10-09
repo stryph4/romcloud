@@ -12,6 +12,7 @@ from romcloud.infrastructure.repositories.cache import CacheRepository
 from romcloud.infrastructure.repositories.game import GameRepository
 from romcloud.infrastructure.repositories.library_browser import LibraryBrowserRepository
 from romcloud.services.cache import CacheService
+from romcloud.core.models.download import DownloadOrigin
 
 
 class LibraryManagerService:
@@ -25,6 +26,7 @@ class LibraryManagerService:
         cache: CacheService,
         policy_loader: Callable[[], CapabilityPolicy],
         source_reachable: Callable[[], bool],
+        downloads=None,  # noqa: ANN001
     ) -> None:
         self._browser_repo = browser_repo
         self._game_repo = game_repo
@@ -32,6 +34,7 @@ class LibraryManagerService:
         self._cache = cache
         self._policy_loader = policy_loader
         self._source_reachable = source_reachable
+        self._downloads = downloads
 
     def status(self) -> dict[str, object]:
         policy = self._policy_loader()
@@ -95,13 +98,10 @@ class LibraryManagerService:
                     "state": state,
                     "cache_status": entry.status.value if entry else None,
                     "pinned": bool(entry and entry.is_pinned),
-                    "has_local_copy": bool(
-                        entry
-                        and (
-                            entry.size_bytes > 0
-                            or memberships.get(row.game_id)
-                        )
-                    ),
+                    # A membership snapshot is ownership metadata, not proof
+                    # of playable bytes. Only the canonical validity check may
+                    # advertise a local copy to the browser.
+                    "has_local_copy": valid,
                     "offline_ready": valid,
                 }
             )
@@ -119,13 +119,21 @@ class LibraryManagerService:
         ids = tuple(dict.fromkeys(str(value) for value in game_ids if value))
         if not ids or len(ids) > 500:
             raise ValueError("Select between 1 and 500 games.")
-        if action == "cache":
-            self._policy_loader().require(Capability.GAME_DOWNLOAD, "Downloading a game")
-            if not self._source_reachable():
-                raise RuntimeError("The ROM source is unavailable; downloads cannot start.")
-            for game_id in ids:
-                self._cache.cache_game(game_id)
-            completed = list(ids)
+        if action in {"cache", "download_selected"}:
+            self._require_download_available("Downloading a game")
+            if self._downloads is None:
+                if action == "download_selected":
+                    raise RuntimeError("Download Manager is unavailable.")
+                for game_id in ids:
+                    self._cache.cache_game(game_id)
+                completed = list(ids)
+            else:
+                origin = (
+                    DownloadOrigin.SELECTED
+                    if action == "download_selected" else DownloadOrigin.MANUAL
+                )
+                result = self._downloads.enqueue(ids, origin=origin)
+                return {"action": action, "queued": result["items"], "count": result["count"]}
         elif action == "pin":
             for game_id in ids:
                 self._cache.pin(game_id)
@@ -142,6 +150,26 @@ class LibraryManagerService:
             raise ValueError(f"Unsupported action: {action}")
         return {"action": action, "completed": completed, "count": len(completed)}
 
+    def enqueue_downloads(
+        self,
+        game_ids: Iterable[str],
+        *,
+        origin: DownloadOrigin = DownloadOrigin.MANUAL,
+    ) -> dict[str, object]:
+        """Queue user-requested downloads behind the shared policy boundary."""
+        ids = tuple(dict.fromkeys(str(value) for value in game_ids if value))
+        if not ids or len(ids) > 500:
+            raise ValueError("Select between 1 and 500 games.")
+        self._require_download_available("Downloading a game")
+        if self._downloads is None:
+            raise RuntimeError("Download Manager is unavailable.")
+        return self._downloads.enqueue(ids, origin=origin)
+
+    def _require_download_available(self, operation: str) -> None:
+        self._policy_loader().require(Capability.GAME_DOWNLOAD, operation)
+        if not self._source_reachable():
+            raise RuntimeError("The ROM source is unavailable; downloads cannot start.")
+
     def pinned_preflight(self) -> dict[str, object]:
         self._policy_loader().require(Capability.GAME_DOWNLOAD, "Download Pinned preflight")
         if not self._source_reachable():
@@ -153,6 +181,31 @@ class LibraryManagerService:
         if not self._source_reachable():
             raise RuntimeError("The ROM source is unavailable; pinned downloads cannot start.")
         return self._cache.download_pinned(**callbacks)  # type: ignore[arg-type]
+
+    def enqueue_pinned(self) -> dict[str, object]:
+        self._policy_loader().require(Capability.GAME_DOWNLOAD, "Download Pinned")
+        if not self._source_reachable():
+            raise RuntimeError("The ROM source is unavailable; pinned downloads cannot start.")
+        plan = self._cache.preflight_pinned()
+        if not plan.allowed:
+            raise ValueError(" ".join(plan.reasons))
+        if not plan.game_ids:
+            return {"items": [], "created": 0, "count": 0, "batch_id": None}
+        if self._downloads is None:
+            raise RuntimeError("Download Manager is unavailable.")
+        import uuid
+
+        batch_id = uuid.uuid4().hex
+        result = self._downloads.enqueue(
+            plan.game_ids, origin=DownloadOrigin.PINNED, batch_id=batch_id
+        )
+        return {**result, "batch_id": batch_id}
+
+    @property
+    def downloads(self):  # noqa: ANN201
+        if self._downloads is None:
+            raise RuntimeError("Download Manager is unavailable.")
+        return self._downloads
 
 
 def _optional_text(value: object) -> str | None:

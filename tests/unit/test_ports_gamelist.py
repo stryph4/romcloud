@@ -8,6 +8,9 @@ idempotency of reapplying the same inputs.
 
 from __future__ import annotations
 
+import pytest
+from xml.etree.ElementTree import ParseError
+
 from romcloud.integrations.batocera.ports_gamelist import (
     ROMCLOUD_GAME_NAME,
     ROMCLOUD_ROM_PATH,
@@ -47,6 +50,12 @@ class TestMissingGamelist:
 
 
 class TestUnrelatedEntriesPreserved:
+    def test_malformed_existing_document_is_rejected_not_rebuilt(self):
+        malformed = "<gameList><game><path>./Other.sh</path>"
+
+        with pytest.raises(ParseError):
+            upsert_romcloud_entry(malformed, image=_ICON)
+
     def test_existing_unrelated_game_untouched(self):
         result = upsert_romcloud_entry(_EXISTING_WITH_UNRELATED, image=_ICON)
 

@@ -30,7 +30,15 @@ from romcloud.integrations.batocera.game_access import (
     reconcile_game_access,
     set_operating_mode,
 )
-from romcloud.services.library_sync import OWNERSHIP_TAG, library_id_for_game
+from romcloud.services.library_sync import (
+    CANONICAL_FILENAME,
+    LOCAL_MEDIA_DIR,
+    OWNERSHIP_TAG,
+    SCHEMA_VERSION,
+    _serialize_dataset,
+    _write_dataset,
+    library_id_for_game,
+)
 from romcloud.core.models.librarysync import LibrarySyncReport
 
 
@@ -151,6 +159,71 @@ def _stub_mode_frontend(monkeypatch) -> None:  # noqa: ANN001
         "romcloud.integrations.batocera.game_access._migrate_legacy_direct_saves",
         lambda *_args, **_kwargs: None,
     )
+
+
+@pytest.mark.parametrize("unsafe_system", ["../escape", "/absolute/system"])
+def test_media_purge_rejects_unsafe_canonical_system_paths(
+    tmp_path: Path, unsafe_system: str
+) -> None:
+    config = _config(tmp_path)
+    blob = b"owned-looking"
+    digest = hashlib.sha256(blob).hexdigest()
+    outside = tmp_path / "outside" / LOCAL_MEDIA_DIR / digest[:2] / digest
+    outside.parent.mkdir(parents=True)
+    outside.write_bytes(blob)
+    canonical = Path(config.data_path) / "library" / CANONICAL_FILENAME
+    canonical.parent.mkdir(parents=True)
+    canonical.write_text(
+        json.dumps(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "records": {
+                    "bad": {
+                        "system": unsafe_system,
+                        "media": {"image": {"sha256": digest, "size": len(blob), "suffix": ""}},
+                    }
+                },
+            }
+        )
+    )
+
+    removed, warnings = Container(config).library_sync.remove_owned_local_media()
+
+    assert removed == 0
+    assert outside.read_bytes() == blob
+    assert any("unsafe canonical system" in item for item in warnings)
+
+
+def test_media_purge_rejects_symlinked_system_escape(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    blob = b"owned-looking"
+    digest = hashlib.sha256(blob).hexdigest()
+    outside_system = tmp_path / "outside-system"
+    target = outside_system / LOCAL_MEDIA_DIR / digest[:2] / digest
+    target.parent.mkdir(parents=True)
+    target.write_bytes(blob)
+    (Path(config.local_roms_path) / "evil").symlink_to(outside_system, target_is_directory=True)
+    canonical = Path(config.data_path) / "library" / CANONICAL_FILENAME
+    canonical.parent.mkdir(parents=True)
+    canonical.write_text(
+        json.dumps(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "records": {
+                    "bad": {
+                        "system": "evil",
+                        "media": {"image": {"sha256": digest, "size": len(blob), "suffix": ""}},
+                    }
+                },
+            }
+        )
+    )
+
+    removed, warnings = Container(config).library_sync.remove_owned_local_media()
+
+    assert removed == 0
+    assert target.read_bytes() == blob
+    assert any("symlinked system" in item for item in warnings)
 
 
 def test_opt_in_disabled_does_no_library_work(tmp_path: Path):
@@ -341,6 +414,198 @@ def test_import_sync_and_smart_cache_render_are_safe_and_idempotent(tmp_path: Pa
     assert second.conflicts == []
     assert _canonical(config).read_bytes() == canonical_before
     assert source_xml.read_bytes() == source_before
+
+
+def test_sync_reuses_one_catalog_and_proxy_snapshot_and_one_serialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Operation counts stay constant as systems and games are added."""
+    import romcloud.services.library_sync as library_sync_module
+
+    config, container, _ = _setup(tmp_path)
+    for index, system in enumerate(("nes", "snes", "gba", "gb", "genesis")):
+        game = Game.create(
+            system,
+            f"Indexed {index}",
+            "local",
+            config.source.rom_root,
+            [
+                GameAsset(
+                    f"Indexed{index}.rom",
+                    f"{system}/Indexed{index}.rom",
+                    is_primary=True,
+                )
+            ],
+        )
+        container.game_repo.save(game)
+    container.library_sync.sync()
+
+    real_list_all = container.game_repo.list_all
+    catalog_rows = real_list_all(include_ineligible=True)
+
+    class CountingGames(list):
+        scans = 0
+
+        def __iter__(self):  # noqa: ANN204
+            self.scans += 1
+            return super().__iter__()
+
+    returned_rows = CountingGames(catalog_rows)
+    catalog_loads: list[bool] = []
+    proxy_loads = 0
+    serializations = 0
+    canonical_reads: list[Path] = []
+    real_proxy_list_all = container.proxy_repo.list_all
+    real_serialize = library_sync_module._serialize_dataset
+    real_read_bytes = Path.read_bytes
+
+    def recording_catalog_load(*, include_ineligible: bool = False):
+        catalog_loads.append(include_ineligible)
+        return returned_rows
+
+    def recording_proxy_load():
+        nonlocal proxy_loads
+        proxy_loads += 1
+        return real_proxy_list_all()
+
+    def recording_serialize(dataset: dict):
+        nonlocal serializations
+        serializations += 1
+        return real_serialize(dataset)
+
+    def recording_read_bytes(path: Path) -> bytes:
+        if path.name == CANONICAL_FILENAME:
+            canonical_reads.append(path)
+        return real_read_bytes(path)
+
+    monkeypatch.setattr(container.game_repo, "list_all", recording_catalog_load)
+    monkeypatch.setattr(
+        container.game_repo,
+        "list_systems",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("separate system query bypassed catalog snapshot")
+        ),
+    )
+    monkeypatch.setattr(container.proxy_repo, "list_all", recording_proxy_load)
+    monkeypatch.setattr(
+        container.proxy_repo,
+        "get",
+        lambda _game_id: (_ for _ in ()).throw(
+            AssertionError("per-game proxy query bypassed proxy snapshot")
+        ),
+    )
+    monkeypatch.setattr(library_sync_module, "_serialize_dataset", recording_serialize)
+    monkeypatch.setattr(Path, "read_bytes", recording_read_bytes)
+
+    container.library_sync.sync()
+
+    assert catalog_loads == [True]
+    assert returned_rows.scans == 1
+    assert proxy_loads == 1
+    assert serializations == 1
+    assert canonical_reads.count(_canonical(config)) == 1
+    assert canonical_reads.count(
+        Path(config.data_path) / "library" / CANONICAL_FILENAME
+    ) == 1
+
+
+def test_canonical_writer_reuses_deterministic_bytes_and_skips_unchanged_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / CANONICAL_FILENAME
+    dataset = {
+        "records": {"é": {"media": {}, "metadata": {"name": "Éclair"}}},
+        "schema_version": SCHEMA_VERSION,
+    }
+    serialized = _serialize_dataset(dataset)
+    expected = (
+        '{\n  "records": {\n    "é": {\n      "media": {},\n'
+        '      "metadata": {\n        "name": "Éclair"\n      }\n'
+        '    }\n  },\n  "schema_version": 1\n}\n'
+    ).encode("utf-8")
+
+    assert serialized.encoded == expected
+    assert _write_dataset(path, serialized) is True
+    monkeypatch.setattr(
+        "romcloud.services.library_sync.atomic_write_bytes",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unchanged canonical file was rewritten")
+        ),
+    )
+    assert _write_dataset(path, serialized) is False
+
+
+def test_canonical_writer_detects_corrupt_committed_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / CANONICAL_FILENAME
+    serialized = _serialize_dataset(_empty_canonical_for_test())
+
+    def corrupt_write(destination: Path, content: bytes, **_kwargs) -> None:
+        destination.write_bytes(content[:-1])
+
+    monkeypatch.setattr(
+        "romcloud.services.library_sync.atomic_write_bytes", corrupt_write
+    )
+
+    with pytest.raises(LibrarySyncError, match="verification failed"):
+        _write_dataset(path, serialized)
+
+
+def test_sync_rejects_malformed_existing_canonical_without_overwriting_it(
+    tmp_path: Path,
+) -> None:
+    config, container, _ = _setup(tmp_path)
+    canonical = _canonical(config)
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    malformed = b'{"schema_version": 1, "records": '
+    canonical.write_bytes(malformed)
+
+    with pytest.raises(LibrarySyncError, match="Cannot read canonical library"):
+        container.library_sync.sync()
+
+    assert canonical.read_bytes() == malformed
+
+
+def test_empty_catalog_sync_writes_valid_empty_canonical_state(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+
+    report = Container(config).library_sync.sync()
+
+    expected = _empty_canonical_for_test()
+    assert report.rendered == 0
+    assert json.loads(_canonical(config).read_bytes()) == expected
+    local = Path(config.data_path) / "library" / CANONICAL_FILENAME
+    assert json.loads(local.read_bytes()) == expected
+
+
+def test_remote_only_record_for_missing_system_is_preserved(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    canonical = _canonical(config)
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    remote_only = {
+        "schema_version": SCHEMA_VERSION,
+        "records": {
+            "remote-only": {
+                "system": "missing-system",
+                "source_path": "Remote.rom",
+                "metadata": {"name": "Remote only"},
+                "media": {},
+            }
+        },
+    }
+    canonical.write_text(json.dumps(remote_only), encoding="utf-8")
+
+    report = Container(config).library_sync.sync()
+
+    assert report.rendered == 0
+    assert json.loads(canonical.read_bytes()) == remote_only
+    local = Path(config.data_path) / "library" / CANONICAL_FILENAME
+    assert json.loads(local.read_bytes()) == remote_only
+
+
+def _empty_canonical_for_test() -> dict:
+    return {"schema_version": SCHEMA_VERSION, "records": {}}
 
 
 def test_quick_sync_skips_existing_payloads_without_opening_or_comparing_them(
@@ -1111,6 +1376,32 @@ def test_remove_local_touches_only_owned_entries_and_never_media_trees(tmp_path:
     assert [item.findtext("name") for item in root.findall("game")] == ["User-owned local game"]
     assert all(path.exists() for path in media_files)
     assert _canonical(config).is_file()
+
+
+def test_remove_local_metadata_rejects_catalog_system_path_traversal(tmp_path: Path):
+    config = _config(tmp_path)
+    container = Container(config)
+    unsafe = Game.create(
+        "../outside",
+        "Unsafe catalog row",
+        "local",
+        config.source.rom_root,
+        [GameAsset("Game.chd", "../outside/Game.chd", is_primary=True)],
+    )
+    container.game_repo.save(unsafe)
+    outside = tmp_path / "outside" / "gamelist.xml"
+    outside.parent.mkdir()
+    marker = "a" * 64
+    outside.write_text(
+        f"<gameList><game><name>Keep</name><{OWNERSHIP_TAG}>{marker}</{OWNERSHIP_TAG}></game></gameList>",
+        encoding="utf-8",
+    )
+    before = outside.read_bytes()
+
+    with pytest.raises(LibrarySyncError, match="Unsafe catalog system"):
+        container.library_sync.remove_local_metadata()
+
+    assert outside.read_bytes() == before
 
 
 def test_malformed_local_xml_and_unsafe_media_fail_safely(tmp_path: Path):

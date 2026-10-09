@@ -10,9 +10,10 @@ from pathlib import Path
 import click
 
 from romcloud.cli.context import get_container
-from romcloud.core.capabilities import OperatingMode
+from romcloud.core.capabilities import Capability, OperatingMode
 from romcloud.core.exceptions import SaveSyncWorkerBusyError
 from romcloud.infrastructure import savesync_prompts
+from romcloud.infrastructure.capabilities import capability_policy
 from romcloud.infrastructure.config import load_config
 from romcloud.infrastructure.library_view import operating_mode
 from romcloud.infrastructure.logging import get_logger
@@ -58,10 +59,11 @@ def _coordinator(ctx: click.Context) -> AutoSaveSyncCoordinator:
 
 
 def _auto_sync_enabled(config) -> bool:  # noqa: ANN001
-    """Automatic SaveSync runs whenever gameplay is online and locally owned."""
+    """Automatic SaveSync runs only when the configured provider supports it."""
     return (
         bool(config.saves.auto_sync_enabled)
         and operating_mode(config) is not OperatingMode.OFFLINE
+        and capability_policy(config).allows(Capability.SAVE_SYNC)
     )
 
 
@@ -359,6 +361,8 @@ def game_stop(
             (
                 "offline-mode"
                 if mode is OperatingMode.OFFLINE
+                else "provider-unsupported"
+                if not capability_policy(config).allows(Capability.SAVE_SYNC)
                 else "auto-sync-disabled"
             ),
             os.environ.get("ROMCLOUD_DIAGNOSTIC_OPERATION_ID", "none"),
@@ -397,7 +401,10 @@ def game_stop(
         log.info("gameStop Quick Sync started: worker_pid=%d", worker_pid)
         try:
             conflict_ids = coordinator.game_stop(
-                system=system, emulator=emulator, core=core, rom=rom,
+                system=system,
+                emulator=emulator,
+                core=core,
+                rom=rom,
                 progress=progress,
             )
         except Exception:

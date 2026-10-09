@@ -535,7 +535,7 @@ class TestPositiveRecursiveDiscovery:
             "xbox360/XBLA/Only Game/default.xex"
         )
 
-    def test_authoritative_refresh_removes_stale_legacy_container_presentation(
+    def test_authoritative_refresh_preserves_unowned_stale_legacy_container_presentation(
         self, provider, game_repo, cache_repo, proxy_repo, local_roms_dir, tmp_path
     ):
         root = tmp_path / "roms"
@@ -567,9 +567,8 @@ class TestPositiveRecursiveDiscovery:
         stale_proxy = Path(service.ensure_proxy(legacy).proxy_path)
         foreign_file = stale_proxy.with_name("foreign-not-romcloud.romcloud")
         foreign_file.write_text("user-owned content", encoding="utf-8")
-        # A signed proxy may outlive its manifest row after a legacy repair or
-        # interrupted presentation transition. Its embedded game identity is
-        # still sufficient to prove ROMCloud ownership.
+        # Payload shape is not ownership authority. Once the manifest row is
+        # gone, even a valid-looking orphan must be preserved.
         proxy_repo.delete(legacy.id)
         assert stale_proxy.is_file()
 
@@ -582,7 +581,7 @@ class TestPositiveRecursiveDiscovery:
         assert retained.last_played == legacy.last_played
         assert cache_repo.get(legacy.id) == cached
         assert cached_content.read_bytes() == b"preserved"
-        assert not stale_proxy.exists()
+        assert stale_proxy.is_file()
         assert foreign_file.read_text(encoding="utf-8") == "user-owned content"
         visible = game_repo.find_by_system("xbox360")
         assert len(visible) == 2 and legacy.id not in {game.id for game in visible}
@@ -596,7 +595,7 @@ class TestPositiveRecursiveDiscovery:
         second = service.refresh()
 
         assert second.added == 0
-        assert not stale_proxy.exists()
+        assert stale_proxy.is_file()
         assert foreign_file.is_file()
 
 

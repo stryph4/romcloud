@@ -60,6 +60,8 @@ class CapabilityDecision:
 class CapabilityPolicy:
     game_access_mode: str
     operating_mode: OperatingMode = OperatingMode.CACHE
+    blocked_capabilities: frozenset[Capability] = frozenset()
+    blocked_reason: str | None = None
 
     @property
     def effective_mode(self) -> OperatingMode:
@@ -80,6 +82,12 @@ class CapabilityPolicy:
         )
 
     def decision(self, capability: Capability) -> CapabilityDecision:
+        if capability in self.blocked_capabilities:
+            return CapabilityDecision(
+                False,
+                self.blocked_reason
+                or "Unavailable with the configured storage provider.",
+            )
         if self.offline and capability in _OFFLINE_BLOCKED:
             return CapabilityDecision(
                 False,

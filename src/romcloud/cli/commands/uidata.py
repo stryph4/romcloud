@@ -97,6 +97,16 @@ def _configure_uidata_logging(ctx: click.Context) -> None:
     exceptions) ever reached ``romcloud.log``.
     """
     config_path = Path(ctx.obj["config_path"])
+    if ctx.invoked_subcommand in {"healthcheck", "troubleshoot", "troubleshoot-fix"}:
+        # The diagnostic subprocess must not create log directories, migrate
+        # config/credentials, or initialize diagnostics.db before inspection.
+        configure_logging(
+            level="DEBUG" if ctx.obj.get("debug") else "INFO",
+            log_dir=None,
+            console=False,
+            diagnostic_db=None,
+        )
+        return
     try:
         config = load_config(str(config_path))
         level = "DEBUG" if ctx.obj.get("debug") else config.logging.level
@@ -868,24 +878,100 @@ def uidata_update_install(ctx: click.Context) -> None:
     _run_action(ctx, build)
 
 
+@uidata_group.command("repair-install")
+@click.pass_context
+def uidata_repair_install(ctx: click.Context) -> None:
+    """Reinstall and reconcile ROMCloud while preserving user data."""
+
+    def build() -> dict:
+        from romcloud.core.capabilities import Capability
+        from romcloud.lifecycle.update import perform_repair
+
+        _require_capability_if_configured(ctx, Capability.UPDATE_NETWORK, "ROMCloud repair")
+        channel = _configured_update_channel(ctx)
+        progress = _progress_sink({"progress": True})
+        home = Path(sys.prefix).parent
+        try:
+            result = perform_repair(
+                home,
+                Path(sys.executable),
+                channel=channel,
+                progress=progress,
+            )
+        except Exception as exc:
+            emit_progress(
+                progress,
+                "repair",
+                "completed",
+                "error",
+                "ROMCloud repair failed",
+                detail=str(exc),
+            )
+            raise
+        for warning in result.warnings:
+            emit_progress(
+                progress,
+                "repair",
+                "warning",
+                "warning",
+                "Repair completed with an item that needs attention",
+                detail=warning,
+            )
+        return {
+            "version": result.new.version,
+            "commit": result.new.commit_short,
+            "channel": result.new.channel,
+            "result": "partial" if result.warnings else "success",
+            "restart_required": True,
+            "es_restart_required": result.es_restart_required,
+            "warnings": list(result.warnings),
+        }
+
+    _run_action(ctx, build)
+
+
 @uidata_group.command("healthcheck")
 @click.pass_context
 def uidata_healthcheck(ctx: click.Context) -> None:
-    """Source reachability as JSON (a lightweight subset of `romcloud healthcheck`)."""
+    """Compatibility endpoint backed by the shared pure diagnostics engine."""
 
-    def build() -> dict:
-        _load_context_config(ctx)
-        container = get_container(ctx)
-        config = container.config
-        reachable = container.provider.is_reachable(config.source.rom_root)
-        payload = {
-            "source_provider": config.source.provider,
-            "source_reachable": reachable,
-            "remote_data_configured": container.saves.is_remote_configured,
-            "remote_data_reachable": container.saves.is_remote_reachable(),
-        }
-        payload.update(source_display_summary(config))
-        return payload
+    from romcloud.troubleshoot import collect_diagnostics
+
+    _run_action(ctx, lambda: collect_diagnostics(ctx.obj["config_path"])[0].as_dict())
+
+
+@uidata_group.command("troubleshoot")
+@click.pass_context
+def uidata_troubleshoot(ctx: click.Context) -> None:
+    """Run stage-one read-only diagnostics for the graphical UI."""
+
+    from romcloud.troubleshoot import collect_diagnostics, cooperative_cancellation
+
+    def build():
+        with cooperative_cancellation() as token:
+            return collect_diagnostics(
+                ctx.obj["config_path"],
+                progress=_progress_sink({"progress": True}),
+                cancelled=token,
+            )[0].as_dict()
+
+    _run_action(ctx, build)
+
+
+@uidata_group.command("troubleshoot-fix")
+@click.pass_context
+def uidata_troubleshoot_fix(ctx: click.Context) -> None:
+    """Run the explicit Quick Repair phase and re-diagnose."""
+
+    from romcloud.troubleshoot import cooperative_cancellation, run_quick_repair
+
+    def build():
+        with cooperative_cancellation() as token:
+            return run_quick_repair(
+                ctx.obj["config_path"],
+                progress=_progress_sink({"progress": True}),
+                cancelled=token,
+            ).as_dict()
 
     _run_action(ctx, build)
 

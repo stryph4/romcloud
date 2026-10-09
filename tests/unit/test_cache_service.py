@@ -7,17 +7,20 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from romcloud.core.capabilities import CapabilityPolicy, OperatingMode
 from romcloud.core.models.game import Game, GameAsset
 from romcloud.core.models.cache import CacheEntry, CachePolicy, CacheStatus
 from romcloud.core.cancellation import TransferCancellationToken
 from romcloud.core.exceptions import (
     CacheError,
+    CapabilityUnavailableError,
     GameNotFoundError,
     GamePinnedError,
     InsufficientSpaceError,
     TransferCancelledError,
     TransferError,
 )
+from romcloud.services.cache import CacheService
 
 
 @pytest.fixture
@@ -31,6 +34,34 @@ def game_with_file(game_repo, rom_root) -> Game:
     game = Game.create("ps2", "Final Fantasy X", "local", str(rom_root), [asset])
     game_repo.save(game)
     return game
+
+
+def test_cache_game_uses_current_capability_policy(
+    cache_repo,
+    game_repo,
+    transfer_service,
+    cache_dir,
+    policy,
+    game_with_file,
+) -> None:
+    current_mode = [OperatingMode.CACHE]
+    service = CacheService(
+        cache_repo=cache_repo,
+        game_repo=game_repo,
+        transfer_service=transfer_service,
+        cache_root=str(cache_dir),
+        policy=policy,
+        capability_policy_loader=lambda: CapabilityPolicy(
+            "smart_cache", current_mode[0]
+        ),
+    )
+    current_mode[0] = OperatingMode.OFFLINE
+
+    with pytest.raises(CapabilityUnavailableError, match="Offline"):
+        service.cache_game(game_with_file.id)
+
+    assert cache_repo.get(game_with_file.id) is None
+    assert not (cache_dir / "ps2" / "Final Fantasy X.iso").exists()
 
 
 class TestCacheServiceIsNotCached:
@@ -226,10 +257,10 @@ class TestCacheGameCancellation:
             )
 
         entry = cache_repo.get(game_with_file.id)
-        staging = cache_dir / ".partial" / "ps2" / "Final Fantasy X.iso"
+        staging = cache_dir / ".partial" / "ps2" / "Final Fantasy X.iso.part"
         final = cache_dir / "ps2" / "Final Fantasy X.iso"
         assert entry.status is CacheStatus.INCOMPLETE
-        assert entry.is_evictable
+        assert not entry.is_evictable
         assert cache_service.is_cached(game_with_file.id) is False
         assert cache_service.get_launch_path(game_with_file.id) is None
         assert staging.exists()

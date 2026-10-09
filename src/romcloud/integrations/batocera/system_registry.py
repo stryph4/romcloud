@@ -131,6 +131,21 @@ def load_effective_system_registry(
     )
 
 
+def inspect_live_system_registry(
+    *,
+    user_config_dir: Path = USER_ES_CONFIG_DIR,
+    system_config_dir: Path = SYSTEM_ES_CONFIG_DIR,
+    legacy_config_dir: Path = LEGACY_ES_CONFIG_DIR,
+) -> EffectiveSystemRegistry:
+    """Read the live Batocera registry without refreshing the LKG cache."""
+
+    return _load_live_registry(
+        user_config_dir=user_config_dir,
+        system_config_dir=system_config_dir,
+        legacy_config_dir=legacy_config_dir,
+    )
+
+
 def _load_live_registry(
     *, user_config_dir: Path, system_config_dir: Path, legacy_config_dir: Path
 ) -> EffectiveSystemRegistry:

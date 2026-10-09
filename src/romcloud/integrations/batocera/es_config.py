@@ -236,7 +236,39 @@ def status(
     )
 
 
-def remove(*, override_path: Path = ROMCLOUD_OVERRIDE_PATH) -> bool:
+def override_is_owned(
+    override_path: Path, *, wrapper_path: Path = WRAPPER_SCRIPT_PATH
+) -> bool:
+    """Verify the narrow generated override shape before removing it."""
+    if override_path.is_symlink() or not override_path.is_file():
+        return False
+    try:
+        raw = override_path.read_text(encoding="utf-8")
+        root = ET.fromstring(raw)
+    except (OSError, UnicodeError, ET.ParseError):
+        return False
+    if root.tag != "systemList" or "ROMCloud-managed EmulationStation" not in raw:
+        return False
+    for system in root.findall("system"):
+        children = [child.tag for child in system]
+        extension = (system.findtext("extension") or "").split()
+        command = (system.findtext("command") or "").strip()
+        if (
+            children != ["name", "extension", "command"]
+            or not (system.findtext("name") or "").strip()
+            or ".romcloud" not in {value.casefold() for value in extension}
+            or not command
+            or command.split(maxsplit=1)[0] != str(wrapper_path)
+        ):
+            return False
+    return True
+
+
+def remove(
+    *,
+    override_path: Path = ROMCLOUD_OVERRIDE_PATH,
+    wrapper_path: Path = WRAPPER_SCRIPT_PATH,
+) -> bool:
     """Remove ROMCloud's override and restore its tracked overlay fields.
 
     Never touches the stock ``es_systems.cfg``. Third-party fields are restored
@@ -245,10 +277,14 @@ def remove(*, override_path: Path = ROMCLOUD_OVERRIDE_PATH) -> bool:
     """
     restored = restore_owned_patches(override_path.parent)
     removed = False
-    if override_path.exists():
+    if override_path.exists() and override_is_owned(
+        override_path, wrapper_path=wrapper_path
+    ):
         override_path.unlink()
         log.info("Removed ES override: %s", override_path)
         removed = True
+    elif override_path.exists() or override_path.is_symlink():
+        log.warning("Preserved foreign or unverifiable ES override: %s", override_path)
     if restored:
         log.info("Restored ROMCloud-owned fields in third-party ES overlays")
     return removed or restored
