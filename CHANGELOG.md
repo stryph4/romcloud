@@ -24,6 +24,8 @@ channel.
 - Improved SFTP performance and lifecycle behavior with bounded session reuse
   during catalog scans and logical game transfers, while keeping SFTP read-only,
   host-key pinned, and free of persistent background connections.
+- Fixed SMB sources whose Batocera system folders live below the share root,
+  including RetroNAS-style layouts such as `batocera/ROMS`.
 - Strengthened Library Sync provider handling so read-only providers can still
   read existing metadata/media while write-dependent publishing remains gated by
   durable transaction capabilities.
@@ -42,6 +44,20 @@ channel.
   work reaches a safe boundary before the mode transition completes.
 - Reduced unnecessary browser download polling/DOM work while keeping active
   transfer status responsive.
+
+### SMB and setup
+
+- Fixed SMB subdirectory source mounting when the selected Batocera library is
+  inside a share rather than at the share root. ROMCloud now mounts the selected
+  share-relative directory directly instead of relying on `prefixpath` behavior.
+- Added CLI directory selection inside SMB shares so `romcloud configure` can
+  choose the folder that directly contains Batocera system directories, matching
+  the graphical setup flow.
+- Tightened SMB mount identity and health checks to verify the expected share,
+  access mode, and subdirectory view, while retaining compatibility with legacy
+  mounts that report an exact matching `prefixpath`.
+- Hardened SMB rollback and unmount paths so ROMCloud verifies mount ownership
+  before detaching a configured location.
 
 ### SFTP
 
