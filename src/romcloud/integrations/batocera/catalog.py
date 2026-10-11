@@ -12,7 +12,9 @@ Responsibilities
 from __future__ import annotations
 
 import json
+import os
 import posixpath
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -336,9 +338,12 @@ class CatalogService:
                     for game in existing_system_games
                 )
                 proxy_records = (
-                    self._proxy_repo.list_all() if needs_proxy_index else []
+                    self._proxy_repo.list_all() if needs_proxy_index else (
+                        self._proxy_repo.find_by_system(system)
+                        if self._write_proxies_enabled and existing_system_games else []
+                    )
                 )
-                if needs_proxy_index:
+                if needs_proxy_index or (self._write_proxies_enabled and existing_system_games):
                     metrics.proxy_manifest_prefetches += 1
                 proxy_records_by_id = {
                     record.game_id: record for record in proxy_records
@@ -367,6 +372,7 @@ class CatalogService:
                 # collision inside `_write_proxy`.
                 removed += self._prune_stale_entries(system, consumed_paths)
 
+                pending_new: list[Game] = []
                 progress_interval = max(1, game_total // 100)
                 for game_index, game in enumerate(games, start=1):
                     metrics.games_processed += 1
@@ -430,6 +436,12 @@ class CatalogService:
                                 " after source migration" if source_changed else "",
                             )
                         else:
+                            if self._write_proxies_enabled:
+                                record = proxy_records_by_id.get(existing.id)
+                                if record is not None and not Path(record.proxy_path).exists():
+                                    self._write_proxy_payload_atomically(
+                                        Path(record.proxy_path), existing
+                                    )
                             skipped += 1
                         if duplicates:
                             duplicate_games.update(
@@ -442,16 +454,19 @@ class CatalogService:
                         )
                         continue
 
-                    self._game_repo.save(game)
-                    metrics.game_row_writes += 1
-                    metrics.game_write_batches += 1
-                    self._write_proxy(game)
-                    added += 1
-                    log.info("Catalogued %r [%s]", game.title, system)
+                    pending_new.append(game)
+                    if len(pending_new) >= 64:
+                        self._register_new_games(pending_new, metrics)
+                        added += len(pending_new)
+                        pending_new.clear()
 
                     self._emit_system_progress(
                         progress, system, game_index, game_total, progress_interval
                     )
+
+                if pending_new:
+                    self._register_new_games(pending_new, metrics)
+                    added += len(pending_new)
 
                 if migration_updates:
                     self._game_repo.save_many(list(migration_updates.values()))
@@ -1434,6 +1449,44 @@ class CatalogService:
         self._proxy_repo.save(record)
         return record
 
+    def _register_new_games(
+        self, games: list[Game], metrics: CatalogRefreshMetrics
+    ) -> None:
+        """Commit bounded ownership batches before materializing their files.
+
+        A failed file write leaves durable ownership that a later refresh can
+        repair. A failed transaction creates no files or partial registrations.
+        """
+        reserved: set[Path] = set()
+        registrations = []
+        for game in games:
+            path = self._allocate_proxy_path(game, reserved)
+            reserved.add(path)
+            registrations.append(
+                (game, ProxyRecord.create(game_id=game.id, proxy_path=str(path)))
+            )
+        self._game_repo.register_many(registrations)
+        metrics.game_row_writes += len(games)
+        metrics.game_write_batches += 1
+        if self._write_proxies_enabled:
+            for game, record in registrations:
+                path = Path(record.proxy_path)
+                self._write_proxy_payload_atomically(path, game)
+        log.info("Catalogued batch of %d games [%s]", len(games), games[0].system)
+
+    def _write_proxy_payload_atomically(self, path: Path, game: Game) -> None:
+        # Keep interrupted writes out of the final owned path. Missing files
+        # can be recreated from the committed registration on the next refresh.
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".romcloud-", dir=path.parent)
+        os.close(fd)
+        staged = Path(temporary)
+        try:
+            self._write_proxy_payload(staged, game)
+            staged.replace(path)
+        finally:
+            staged.unlink(missing_ok=True)
+
     def _write_proxy(self, game: Game) -> None:
         """Record proxy ownership and materialize it when presentation allows."""
         proxy_dir = self._local_roms_root / game.system
@@ -1448,7 +1501,7 @@ class CatalogService:
         record = ProxyRecord.create(game_id=game.id, proxy_path=str(proxy_path))
         self._proxy_repo.save(record)
 
-    def _allocate_proxy_path(self, game: Game) -> Path:
+    def _allocate_proxy_path(self, game: Game, reserved: Optional[set[Path]] = None) -> Path:
         """Return a path that does not steal another game's durable identity.
 
         Connected and Offline presentation may intentionally remove a proxy
@@ -1461,13 +1514,14 @@ class CatalogService:
         proxy_dir = self._local_roms_root / game.system
         safe_title = _safe_filename(game.title)
         default = proxy_dir / f"{safe_title}.romcloud"
-        if not self._proxy_path_conflicts(default, game.id):
+        reserved = reserved or set()
+        if default not in reserved and not self._proxy_path_conflicts(default, game.id):
             return default
 
         safe_id = _safe_filename(game.id[:8]) or "game"
         candidate = proxy_dir / f"{safe_title}.{safe_id}.romcloud"
         collision = 2
-        while self._proxy_path_conflicts(candidate, game.id):
+        while candidate in reserved or self._proxy_path_conflicts(candidate, game.id):
             candidate = proxy_dir / f"{safe_title}.{safe_id}.{collision}.romcloud"
             collision += 1
         return candidate
