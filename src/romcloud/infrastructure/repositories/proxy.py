@@ -38,20 +38,24 @@ class ProxyRepository:
         destroying either ownership record.
         """
         with self._db.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO proxy_records (game_id, proxy_path, created_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(game_id) DO UPDATE SET
-                    proxy_path = excluded.proxy_path,
-                    created_at = excluded.created_at
-                """,
-                (
-                    record.game_id,
-                    record.proxy_path,
-                    record.created_at.isoformat(),
-                ),
-            )
+            self._save_with_connection(conn, record)
+
+    @staticmethod
+    def _save_with_connection(conn, record: ProxyRecord) -> None:
+        conn.execute(
+            """
+            INSERT INTO proxy_records (game_id, proxy_path, created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(game_id) DO UPDATE SET
+                proxy_path = excluded.proxy_path,
+                created_at = excluded.created_at
+            """,
+            (
+                record.game_id,
+                record.proxy_path,
+                record.created_at.isoformat(),
+            ),
+        )
 
     def delete(self, game_id: str) -> None:
         with self._db.connect() as conn:
@@ -78,6 +82,14 @@ class ProxyRepository:
             if row is None:
                 return None
             return self._row(row)
+
+    def find_by_system(self, system: str) -> list[ProxyRecord]:
+        with self._db.connect() as conn:
+            rows = conn.execute(
+                "SELECT p.* FROM proxy_records p JOIN games g ON g.id = p.game_id "
+                "WHERE g.system = ?", (system,),
+            ).fetchall()
+            return [self._row(row) for row in rows]
 
     def owns_path(self, path: str) -> bool:
         """Return True if *path* is a proxy file ROMCloud created."""
