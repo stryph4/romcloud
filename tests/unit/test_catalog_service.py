@@ -1185,3 +1185,45 @@ class TestCatalogServiceResolveProxy:
         game = svc.resolve_proxy(str(proxy_path))
         assert game.title == "Fallback Game"
         assert game.system == "ps2"
+
+
+def test_new_registration_batches_and_collisions(catalog_service, rom_root, game_repo, proxy_repo):
+    for i in range(130):
+        (rom_root / 'nes' / f'Batch {i}.nes').write_bytes(b'rom')
+    # Same derived title, different supported extensions.
+    (rom_root / 'nes' / 'Collision.nes').write_bytes(b'rom')
+    (rom_root / 'nes' / 'Collision.zip').write_bytes(b'rom')
+    result = catalog_service.refresh()
+    assert not result.errors
+    records = proxy_repo.list_all()
+    assert len({r.proxy_path for r in records}) == game_repo.count()
+    assert all(Path(r.proxy_path).exists() for r in records)
+    assert result.metrics.game_write_batches < result.metrics.game_row_writes / 10
+
+
+def test_registration_recovers_after_file_write_failure(catalog_service, game_repo, proxy_repo, monkeypatch):
+    original = catalog_service._write_proxy_payload
+    def fail(path, game):
+        path.write_text('{partial')
+        raise OSError('simulated storage interruption')
+    monkeypatch.setattr(catalog_service, '_write_proxy_payload', fail)
+    first = catalog_service.refresh()
+    assert first.errors
+    ids = {g.id for g in game_repo.list_all()}
+    assert ids
+    assert len(proxy_repo.list_all()) == len(ids)
+    monkeypatch.setattr(catalog_service, '_write_proxy_payload', original)
+    second = catalog_service.refresh()
+    assert not second.errors
+    assert {g.id for g in game_repo.list_all()} == ids
+    assert all(Path(r.proxy_path).exists() for r in proxy_repo.list_all())
+
+
+def test_registration_rolls_back_on_ownership_conflict(game_repo, proxy_repo):
+    import sqlite3
+    games = [Game.create(system='nes', title=str(i), source_provider='local', source_root='/roms', assets=[]) for i in range(2)]
+    records = [ProxyRecord.create(game_id=g.id, proxy_path='/same.romcloud') for g in games]
+    with pytest.raises(sqlite3.IntegrityError):
+        game_repo.register_many(list(zip(games, records)))
+    assert game_repo.count() == 0
+    assert proxy_repo.list_all() == []
