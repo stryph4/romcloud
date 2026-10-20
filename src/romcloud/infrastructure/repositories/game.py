@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from romcloud.core.models.game import Game, GameAsset
+from romcloud.core.models.proxy import ProxyRecord
 from romcloud.infrastructure.database import Database
 
 
@@ -52,6 +53,17 @@ class GameRepository:
         with self._db.connect() as conn:
             for game in games:
                 self._save_with_connection(conn, game)
+
+    def register_many(self, registrations: list[tuple[Game, ProxyRecord]]) -> None:
+        """Atomically persist new games and their reserved proxy ownership."""
+        from romcloud.infrastructure.repositories.proxy import ProxyRepository
+
+        if not registrations:
+            return
+        with self._db.connect() as conn:
+            for game, record in registrations:
+                self._save_with_connection(conn, game)
+                ProxyRepository._save_with_connection(conn, record)
 
     @staticmethod
     def _save_with_connection(conn, game: Game) -> None:  # type: ignore[no-untyped-def]

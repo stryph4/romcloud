@@ -64,10 +64,50 @@ DEFAULT_OPERATION_TIMEOUT = 30.0
 
 _CONNECT_RETRY_DELAY = 1.0
 _PROBE_CONTENT = b"ROMCloud writable storage probe\n"
+_SFTP_PREFETCH_REQUESTS = 64
+"""Bound outstanding SFTP reads to the OpenSSH-compatible request window."""
 
 _SFTP_CAPABILITIES = ProviderCapabilities(
     has_filesystem_semantics=False, can_resume_download=True
 )
+
+
+class _PrefetchingSFTPFile:
+    """Proxy a Paramiko SFTP file and pipeline the actual transfer stream.
+
+    TransferService always seeks to the durable resume checkpoint before its
+    sequential copy loop. Source-equivalence verification deliberately does
+    not seek. Arming prefetch on ``seek`` therefore accelerates the real copy
+    without causing a prefix-verification read to speculatively fetch the
+    entire remote file.
+    """
+
+    def __init__(self, file_handle: paramiko.SFTPFile) -> None:
+        self._file_handle = file_handle
+        self._prefetch_armed = False
+        self._prefetch_started = False
+
+    def __getattr__(self, name: str):  # noqa: ANN201
+        return getattr(self._file_handle, name)
+
+    def seek(self, offset: int, whence: int = 0):  # noqa: ANN201
+        result = self._file_handle.seek(offset, whence)
+        self._prefetch_armed = True
+        return result
+
+    def read(self, size: Optional[int] = None):  # noqa: ANN201
+        if self._prefetch_armed and not self._prefetch_started:
+            self._prefetch_started = True
+            try:
+                self._file_handle.prefetch(
+                    max_concurrent_requests=_SFTP_PREFETCH_REQUESTS
+                )
+            except Exception as exc:  # noqa: BLE001 - optimization must fail open
+                log.debug(
+                    "SFTP prefetch unavailable; continuing with synchronous reads: %s",
+                    exc,
+                )
+        return self._file_handle.read(size)
 
 
 @dataclass(frozen=True)
@@ -732,7 +772,7 @@ class SFTPProvider(StorageProvider):
             try:
                 self._record_file_open()
                 with sftp.open(path, "rb") as fh:
-                    yield fh
+                    yield _PrefetchingSFTPFile(fh)
             except FileNotFoundError as exc:
                 raise ProviderError(f"Cannot read {path}: not found") from exc
             except PermissionError as exc:
