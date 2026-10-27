@@ -279,7 +279,7 @@ class TestInstallPortsUi:
         assert result.launch_progress_wrapper_path == bin_dir / "romcloud-launch-progress"
         launch_progress_content = result.launch_progress_wrapper_path.read_text()
         assert f'exec "{fake_python}" -m ports_gfx.launch_progress "$@"' in launch_progress_content
-        assert "ROMCLOUD_BIN" not in launch_progress_content
+        assert f'export ROMCLOUD_BIN="{bin_dir / "romcloud"}"' in launch_progress_content
         assert result.port_entry_path == ports_dir / "ROMCloud.sh"
         port_entry_content = result.port_entry_path.read_text()
         assert f'exec "{result.wrapper_path}" "$@"' in port_entry_content
