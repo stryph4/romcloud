@@ -6,9 +6,13 @@ from __future__ import annotations
 
 import io
 
+from ports_gfx.controller_config import save_mapping
+from tests.unit._pygame_fakes import FakeEvent, FakeJoystick, make_fake_pygame
+
 from ports_gfx.launch_progress import (
     LaunchProgressState,
     _is_cancel_input,
+    _open_cancel_controllers,
     _open_display,
     main,
     parse_event,
@@ -98,37 +102,110 @@ class TestProgressFraction:
 
 
 class TestCancelInput:
-    def test_escape_requests_the_shared_cancel_action(self):
-        pygame = type(
-            "Pygame",
-            (),
-            {
-                "KEYDOWN": 1,
-                "K_ESCAPE": 27,
-                "K_q": 113,
-                "JOYBUTTONDOWN": 2,
-                "CONTROLLERBUTTONDOWN": 3,
-            },
-        )()
-        event = type("Event", (), {"type": pygame.KEYDOWN, "key": pygame.K_ESCAPE})()
+    @staticmethod
+    def _pygame(*, guid="generic-pad", controller_indices=frozenset()):
+        pygame = make_fake_pygame(
+            joysticks={0: FakeJoystick(guid=guid)},
+            controller_indices=controller_indices,
+        )
+        pygame.K_q = ord("q")
+        return pygame
 
-        assert _is_cancel_input(pygame, event) is True
+    def test_escape_and_q_cancel_from_keyboard(self):
+        pygame = self._pygame()
+        controllers = _open_cancel_controllers(pygame)
 
-    def test_controller_b_requests_the_shared_cancel_action(self):
-        pygame = type(
-            "Pygame",
-            (),
-            {
-                "KEYDOWN": 1,
-                "K_ESCAPE": 27,
-                "K_q": 113,
-                "JOYBUTTONDOWN": 2,
-                "CONTROLLERBUTTONDOWN": 3,
-            },
-        )()
-        for event_type in (pygame.JOYBUTTONDOWN, pygame.CONTROLLERBUTTONDOWN):
-            event = type("Event", (), {"type": event_type, "button": 1})()
-            assert _is_cancel_input(pygame, event) is True
+        for key in (pygame.K_ESCAPE, pygame.K_q):
+            event = FakeEvent(type=pygame.KEYDOWN, key=key)
+            assert _is_cancel_input(pygame, event, controllers) is True
+
+        other = FakeEvent(type=pygame.KEYDOWN, key=pygame.K_RETURN)
+        assert _is_cancel_input(pygame, other, controllers) is False
+
+    def test_raw_joystick_b_uses_generic_mapping_on_connected_device(self):
+        pygame = self._pygame()
+        controllers = _open_cancel_controllers(pygame)
+        assert controllers.device_count == 1
+
+        assert _is_cancel_input(
+            pygame, FakeEvent(type=pygame.JOYBUTTONDOWN, instance_id=1, button=1), controllers
+        ) is True
+        assert _is_cancel_input(
+            pygame, FakeEvent(type=pygame.JOYBUTTONDOWN, instance_id=1, button=0), controllers
+        ) is False
+
+    def test_steam_deck_b_uses_verified_raw_button_four(self):
+        pygame = self._pygame(guid="03000000de2800000512000010010000")
+        controllers = _open_cancel_controllers(pygame)
+
+        assert _is_cancel_input(
+            pygame, FakeEvent(type=pygame.JOYBUTTONDOWN, instance_id=1, button=4), controllers
+        ) is True
+        assert _is_cancel_input(
+            pygame, FakeEvent(type=pygame.JOYBUTTONDOWN, instance_id=1, button=3), controllers
+        ) is False
+
+    def test_logical_controller_b_uses_pygame_constant_not_raw_index(self):
+        pygame = self._pygame(controller_indices=frozenset({0}))
+        controllers = _open_cancel_controllers(pygame)
+        assert _is_cancel_input(
+            pygame,
+            FakeEvent(
+                type=pygame.CONTROLLERBUTTONDOWN,
+                instance_id=1,
+                button=pygame.CONTROLLER_BUTTON_B,
+            ),
+            controllers,
+        ) is True
+        assert _is_cancel_input(
+            pygame,
+            FakeEvent(
+                type=pygame.CONTROLLERBUTTONDOWN,
+                instance_id=1,
+                button=pygame.CONTROLLER_BUTTON_A,
+            ),
+            controllers,
+        ) is False
+
+    def test_reads_same_persisted_custom_remap_as_ports_menu(self, tmp_path, monkeypatch):
+        romcloud_bin = str(tmp_path / "bin" / "romcloud")
+        save_mapping(romcloud_bin, "guid:my-pad", {"button": {"7": "back"}})
+        monkeypatch.setenv("ROMCLOUD_BIN", romcloud_bin)
+
+        pygame = self._pygame(guid="my-pad")
+        controllers = _open_cancel_controllers(pygame)
+        assert _is_cancel_input(
+            pygame, FakeEvent(type=pygame.JOYBUTTONDOWN, instance_id=1, button=7), controllers
+        ) is True
+
+    def test_hotplugged_pad_can_cancel(self):
+        pygame = make_fake_pygame()
+        pygame.K_q = ord("q")
+        controllers = _open_cancel_controllers(pygame)
+        assert controllers.device_count == 0
+
+        pygame.joystick._joysticks[0] = FakeJoystick()
+        assert _is_cancel_input(
+            pygame, FakeEvent(type=pygame.JOYDEVICEADDED, device_index=0), controllers
+        ) is False
+        assert controllers.device_count == 1
+        assert _is_cancel_input(
+            pygame, FakeEvent(type=pygame.JOYBUTTONDOWN, instance_id=1, button=1), controllers
+        ) is True
+
+    def test_joystick_init_failure_still_allows_keyboard_cancel(self, monkeypatch):
+        pygame = self._pygame()
+
+        def fail():
+            raise OSError("no input device")
+
+        monkeypatch.setattr(pygame.joystick, "init", fail)
+        monkeypatch.setattr(pygame.joystick, "get_count", fail)
+        controllers = _open_cancel_controllers(pygame)
+
+        assert _is_cancel_input(
+            pygame, FakeEvent(type=pygame.KEYDOWN, key=pygame.K_ESCAPE), controllers
+        ) is True
 
 
 class TestReadEvents:
