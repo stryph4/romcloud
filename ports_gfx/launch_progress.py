@@ -30,11 +30,15 @@ below — never requires pygame to be installed, same precedent as
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 from dataclasses import dataclass, field
 from typing import IO, Optional
 
+from ports_gfx.actions import Action
+from ports_gfx.controller import ControllerManager
+from ports_gfx.controller_config import make_loader
 from ports_gfx.layout import Layout, compute_layout
 from ports_gfx.theme import (
     ACCENT,
@@ -216,6 +220,7 @@ def _run(pygame, state: LaunchProgressState) -> int:  # noqa: ANN001
         font_body = system_font(pygame, layout.fonts.body)
         font_hint = system_font(pygame, layout.fonts.hint)
         clock = pygame.time.Clock()
+        controllers = _open_cancel_controllers(pygame)
 
         launching_since: Optional[float] = None
         error_since: Optional[float] = None
@@ -227,7 +232,7 @@ def _run(pygame, state: LaunchProgressState) -> int:  # noqa: ANN001
                 if event.type == pygame.QUIT:
                     state.request_cancel()
                     running = False
-                elif _is_cancel_input(pygame, event):
+                elif _is_cancel_input(pygame, event, controllers):
                     state.request_cancel()
 
             if state.cancelled:
@@ -258,14 +263,41 @@ def _run(pygame, state: LaunchProgressState) -> int:  # noqa: ANN001
         pygame.quit()
 
 
-def _is_cancel_input(pygame, event) -> bool:  # noqa: ANN001
-    """Return whether an input event is the Preparing Game cancel action."""
+def _open_cancel_controllers(pygame) -> ControllerManager:  # noqa: ANN001
+    """Use the same controller identities, profiles and remaps as the Ports UI.
+
+    Existing joysticks must be opened explicitly: pygame emits device-added
+    events for hot-plugs, not for controllers already connected at startup.
+    Initialization failures are best-effort so keyboard cancellation survives.
+    """
+    try:
+        pygame.joystick.init()
+    except Exception:  # noqa: BLE001
+        pass
+    controller_module = getattr(pygame, "controller", None)
+    if controller_module is not None:
+        try:
+            controller_module.init()
+        except Exception:  # noqa: BLE001
+            pass
+
+    romcloud_bin = os.environ.get("ROMCLOUD_BIN")
+    controllers = ControllerManager(
+        pygame,
+        load_mapping=make_loader(romcloud_bin) if romcloud_bin else None,
+    )
+    try:
+        controllers.open_existing_devices(pygame.joystick.get_count())
+    except Exception:  # noqa: BLE001
+        pass
+    return controllers
+
+
+def _is_cancel_input(pygame, event, controllers: ControllerManager) -> bool:  # noqa: ANN001
+    """Cancel only on keyboard Esc/Q or the shared controller BACK action."""
     if event.type == pygame.KEYDOWN:
         return event.key in (pygame.K_ESCAPE, pygame.K_q)
-    return event.type in (
-        getattr(pygame, "JOYBUTTONDOWN", object()),
-        getattr(pygame, "CONTROLLERBUTTONDOWN", object()),
-    ) and getattr(event, "button", None) == 1
+    return controllers.handle_event(event) == Action.BACK
 
 
 def _render(pygame, screen, layout: Layout, font_title, font_body, font_hint, state: LaunchProgressState) -> None:  # noqa: ANN001
