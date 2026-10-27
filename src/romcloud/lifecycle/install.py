@@ -270,10 +270,11 @@ def install_ports_ui(
 
         # The cache-miss graphical progress screen (see
         # romcloud.ui.graphical_progress) is driven directly over stdin/stdout
-        # by the venv-side launcher process, never via ROMCLOUD_BIN/uidata —
-        # it has nothing to ask the backend for, so no ROMCLOUD_BIN export.
+        # by the venv-side launcher process, without any uidata calls.
+        # Export ROMCLOUD_BIN only to locate the shared per-device input remaps.
         launch_progress_wrapper_content = (
             "#!/bin/bash\n"
+            f'export ROMCLOUD_BIN="{romcloud_bin}"\n'
             f'export PYTHONPATH="{ports_gfx_dir}${{PYTHONPATH:+:$PYTHONPATH}}"\n'
             f'exec "{resolved_python}" -m ports_gfx.launch_progress "$@"\n'
         )
